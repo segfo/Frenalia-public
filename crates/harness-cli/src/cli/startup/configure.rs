@@ -215,38 +215,44 @@ pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, Ex
 
     let tools = ToolRegistry::with_builtin_tools();
 
-    // §非対話モード「危険/ワイルドカードは`--dangerously-allow`」: accept-allモードは
-    // fail-fastで拒否する（`--dangerously-allow`が無いままの誤起動を防ぐ）。
-    if matches!(cli.permission_mode, PermissionModeArg::AcceptAll) && !cli.dangerously_allow {
+    // `accept-all`へ入ってよいか。**ここで1回だけ決め**、起動時のモードとTUIの`/mode`が同じ値を見る
+    // （棚卸しの S1-8。以前は TUI から確認を通らずに切り替えられた）。`DESIGN-CLI-OPTIONS.md`の
+    // D-74（全自動にしてよい条件は構成から導く）が実装されたら、この値の決め方だけが変わる。
+    let accept_all_permitted = cli.dangerously_allow;
+    // §非対話モード: accept-allモードはfail-fastで拒否する（`--dangerously-allow`が無いままの誤起動を防ぐ）。
+    if matches!(cli.permission_mode, PermissionModeArg::AcceptAll) && !accept_all_permitted {
         eprintln!(
             "--permission-mode accept-all requires --dangerously-allow (see plans/DESIGN.md §非対話モード)"
         );
         return Err(ExitCode::FAILURE);
     }
 
-    let allowlist: Vec<_> = settings
-        .allow
-        .clone()
-        .unwrap_or_default()
-        .iter()
-        .chain(cli.allow.iter())
-        .filter_map(|rule| match parse_allowlist_rule(rule) {
-            None => {
-                eprintln!("ignoring malformed --allow rule (expected tool:pattern): {rule}");
-                None
+    let mut arbiter =
+        PermissionArbiter::new(cli.permission_mode.into(), vec![], workspace_root.clone())
+            .with_accept_all_permitted(accept_all_permitted);
+    // 規則の入口は2つ（コマンドライン・ユーザー層設定）。**プロジェクト層の`allow`は入口ではない**
+    // （D-95。`Settings::load`が読み込み時に捨てる）。ワイルドカードの解錠フラグは要らない——
+    // 残る2つはどちらもユーザー自身が書いたものだからである。読めない規則は黙って別の意味に読まず、
+    // 理由を出して無視する。
+    for (origin, rules) in [
+        ("user settings", settings.allow.clone().unwrap_or_default()),
+        ("--allow", cli.allow.clone()),
+    ] {
+        for rule in rules {
+            match parse_allowlist_rule(&rule) {
+                Ok(r) => arbiter.add_rule(r),
+                Err(reason) => eprintln!("ignoring {origin} rule {rule:?}: {reason}"),
             }
-            Some(r) if crate::is_dangerous_wildcard(&r.pattern) && !cli.dangerously_allow => {
-                eprintln!("ignoring wildcard --allow rule without --dangerously-allow: {rule}");
-                None
-            }
-            Some(r) => Some(r),
-        })
-        .collect();
-    let arbiter = PermissionArbiter::new(
-        cli.permission_mode.into(),
-        allowlist,
-        workspace_root.clone(),
-    );
+        }
+    }
+    if settings.ignored_project_allow > 0 {
+        eprintln!(
+            "note: ignored {} allow rule(s) in the project settings (.harness/settings.json); \
+             project-level allow rules are never used for auto-approval — put them in your user \
+             settings or pass --allow",
+            settings.ignored_project_allow
+        );
+    }
 
     Ok(Configured {
         cli,

@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 
 use harness_core::{AgentEvent, PermissionSubject, RiskClass};
 use harness_engine::{
-    AllowlistRule, Classification, Decision, PermissionArbiter, PermissionGate, PermissionMode,
+    AllowRule, Classification, Decision, PermissionArbiter, PermissionGate, PermissionMode,
 };
 
 pub struct InteractiveGate {
@@ -44,8 +44,9 @@ impl InteractiveGate {
 
     /// `/mode`スラッシュコマンド（M9）。engineタスクを介さず直接`arbiter`を書き換える
     /// （`arbiter`は`Mutex`越しに参照されるだけなので、進行中のツール判定と競合しない）。
-    pub fn set_mode(&self, mode: PermissionMode) {
-        self.arbiter.lock().unwrap().set_mode(mode);
+    /// `accept-all`は起動時に許された場合だけ（`Err`は画面へ出す理由）。
+    pub fn set_mode(&self, mode: PermissionMode) -> Result<(), String> {
+        self.arbiter.lock().unwrap().set_mode(mode)
     }
 
     pub fn mode(&self) -> PermissionMode {
@@ -53,7 +54,7 @@ impl InteractiveGate {
     }
 
     /// `/allow`スラッシュコマンド（M9）。
-    pub fn add_allow(&self, rule: AllowlistRule) {
+    pub fn add_allow(&self, rule: AllowRule) {
         self.arbiter.lock().unwrap().add_rule(rule);
     }
 }
@@ -103,6 +104,27 @@ mod tests {
         PermissionSubject::Command(CommandSubject {
             line: line.to_string(),
         })
+    }
+
+    /// `/mode accept-all`は、起動時に許された場合だけ効く（S1-8）。許されていなければモードは変わらない。
+    #[test]
+    fn slash_mode_accept_all_is_refused_unless_permitted_at_startup() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let gate = InteractiveGate::new(
+            PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace"),
+            tx,
+        );
+        assert!(gate.set_mode(PermissionMode::AcceptAll).is_err());
+        assert_eq!(gate.mode(), PermissionMode::Default);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let gate = InteractiveGate::new(
+            PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace")
+                .with_accept_all_permitted(true),
+            tx,
+        );
+        assert!(gate.set_mode(PermissionMode::AcceptAll).is_ok());
+        assert_eq!(gate.mode(), PermissionMode::AcceptAll);
     }
 
     /// read_onlyはallowlist/モードだけで判定できるため、モーダル（`PermissionRequired`）を

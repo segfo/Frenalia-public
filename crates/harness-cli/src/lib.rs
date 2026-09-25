@@ -256,11 +256,3 @@ pub async fn run_headless<W: Write>(
         }
     }
 }
-
-/// `--allow`ルールのうち、パターンが完全ワイルドカード（`*`、そのツールの全入力を許可）の
-/// ものは`--dangerously-allow`が無いと危険すぎるため無視する
-/// （§非対話モード「危険/ワイルドカードは`--dangerously-allow`」）。前方一致の
-/// `git status*`のような具体的パターンはこの制限を受けない。
-pub fn is_dangerous_wildcard(pattern: &str) -> bool {
-    pattern == "*"
-}

@@ -593,15 +593,15 @@ pub(crate) struct Cli {
     #[arg(long = "permission-mode", value_enum, default_value_t = PermissionModeArg::default())]
     permission_mode: PermissionModeArg,
 
-    /// allowlistルール（`tool:pattern`形式、繰り返し指定可）。例: `run_shell:git status*`
-    /// パターンが完全ワイルドカード（`*`単体）の場合は`--dangerously-allow`が無いと無視される
-    /// （§非対話モード「危険/ワイルドカードは`--dangerously-allow`」）。
+    /// allowlistルール（`tool:pattern`形式、繰り返し指定可）。例: `run_shell:cargo test`（完全一致だけ）、
+    /// `run_program:["git","log","-n",null]`（引数の配列。`null`は毎回変わってよい引数1個）、
+    /// `write_file:src/*`（前方一致は書込先パスにだけ使える）。読めない規則は理由を出して無視する
+    /// （`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §3.4）。
     #[arg(long = "allow")]
     allow: Vec<String>,
 
-    /// `--permission-mode accept-all`の使用、および`--allow`の完全ワイルドカード
-    /// （`tool:*`）パターンを許可する明示フラグ。無いとどちらも起動時に拒否/無視される
-    /// （§非対話モード「危険/ワイルドカードは`--dangerously-allow`」）。
+    /// `--permission-mode accept-all`（とTUIの`/mode accept-all`）を許可する明示フラグ。無いと起動時に拒否する
+    /// （§非対話モード）。`--allow`のワイルドカードには要らない（ユーザー自身が書いた規則なので。D-95）。
     #[arg(long = "dangerously-allow", default_value_t = false)]
     dangerously_allow: bool,
 

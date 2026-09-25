@@ -5,7 +5,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 
 use harness_core::{AgentEvent, RiskClass, StopReason, ToolOutput, Usage};
-use harness_engine::{parse_allowlist_rule, AllowlistRule, Decision, PermissionMode};
+use harness_engine::{parse_allowlist_rule, AllowRule, Decision, PermissionMode};
 
 use harness_sandbox::textdiff::{diff_lines, DiffLine};
 

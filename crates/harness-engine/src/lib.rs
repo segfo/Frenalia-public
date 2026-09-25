@@ -26,7 +26,7 @@ use harness_core::{
 use harness_tools::ToolRegistry;
 
 pub use permission::{
-    parse_allowlist_rule, AllowlistRule, Classification, Decision, PermissionArbiter,
+    parse_allowlist_rule, AllowRule, AllowlistRule, Classification, Decision, PermissionArbiter,
     PermissionGate, PermissionMode,
 };
 pub use session::{SessionStore, SessionSummary};
@@ -1234,7 +1234,7 @@ mod tests {
         assert!(content.contains("hello"));
     }
 
-    /// allowlistで`run_shell:echo*`を明示した場合は、Defaultモードのヘッドレス既定拒否を
+    /// allowlistで`run_shell:echo allowed`（完全一致、D-96）を明示した場合は、Defaultモードのヘッドレス既定拒否を
     /// 上書きして許可される（§パーミッション「allowlist: closed-by-default」）。
     #[tokio::test]
     async fn allowlisted_run_shell_executes() {
@@ -1255,7 +1255,7 @@ mod tests {
         let ctx = ToolCtx::new(dir.path().to_path_buf());
         let arbiter = PermissionArbiter::new(
             PermissionMode::Default,
-            vec![AllowlistRule::new("run_shell", "echo*")],
+            vec![AllowlistRule::exact("run_shell", "echo allowed")],
             "/workspace",
         );
 

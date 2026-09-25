@@ -10,7 +10,7 @@ use super::*;
 pub enum SlashCommand {
     Model(String),
     Mode(PermissionMode),
-    Allow(AllowlistRule),
+    Allow(AllowRule),
     Compact,
     Clear,
     /// 現在のセッションをForkし、以降の追記を新しいセッションファイルへ切り替える。
@@ -73,7 +73,7 @@ pub(super) fn parse_slash_command(input: &str) -> Result<SlashCommand, String> {
         "/mode" => rest.parse::<PermissionMode>().map(SlashCommand::Mode),
         "/allow" => parse_allowlist_rule(rest)
             .map(SlashCommand::Allow)
-            .ok_or_else(|| "usage: /allow <tool>:<pattern>".to_string()),
+            .map_err(|reason| format!("/allow: {reason}")),
         "/compact" => Ok(SlashCommand::Compact),
         "/clear" => Ok(SlashCommand::Clear),
         "/fork" => Ok(SlashCommand::Fork),

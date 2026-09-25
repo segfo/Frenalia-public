@@ -18,6 +18,28 @@ fn parses_fork_and_sessions_slash_commands() {
     assert_eq!(parse_slash_command("/sessions"), Ok(SlashCommand::Sessions));
 }
 
+/// `/allow`はコマンドラインと同じ構文解析を通る（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §3.4）。
+/// 受け付けない形は理由付きの`Err`になり、画面に出る（黙って別の意味に読まない）。
+#[test]
+fn slash_allow_uses_the_same_rule_parser_as_the_command_line() {
+    assert!(matches!(
+        parse_slash_command("/allow run_shell:cargo test"),
+        Ok(SlashCommand::Allow(AllowRule::Pattern(_)))
+    ));
+    assert!(matches!(
+        parse_slash_command(r#"/allow run_program:["git","log",null]"#),
+        Ok(SlashCommand::Allow(AllowRule::Program(_)))
+    ));
+    for bad in [
+        "/allow run_shell:git log*",
+        "/allow run_program:*",
+        "/allow nocolon",
+    ] {
+        let err = parse_slash_command(bad).unwrap_err();
+        assert!(err.starts_with("/allow: "), "{bad}: {err}");
+    }
+}
+
 #[test]
 fn parses_fsstage_subcommands() {
     assert_eq!(

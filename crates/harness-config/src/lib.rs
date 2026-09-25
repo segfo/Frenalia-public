@@ -18,7 +18,14 @@ pub struct Settings {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
+    /// 承認の許可リスト（`tool:pattern`）。**ユーザー層の値だけが入る**——プロジェクト層の
+    /// `.harness/settings.json` の `allow` は読み込み時に捨てる（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` D-95、
+    /// [`clamp_project_allow`]）。捨てた件数は [`Settings::ignored_project_allow`]。
     pub allow: Option<Vec<String>>,
+    /// プロジェクト層の `allow` から捨てた規則の件数（D-95）。起動時に告知するために運ぶ。
+    /// 設定ファイルには書かれない（読み込みの結果であって、設定の値ではない）。
+    #[serde(skip)]
+    pub ignored_project_allow: usize,
     pub max_tokens: Option<u32>,
     pub max_turns: Option<usize>,
     pub output_format: Option<String>,
@@ -787,6 +794,38 @@ fn deep_merge(base: &mut serde_json::Value, overlay: serde_json::Value) {
     }
 }
 
+/// 層の JSON が持つ `allow` の件数。
+fn count_allow_rules(layer: &serde_json::Value) -> usize {
+    layer
+        .get("allow")
+        .and_then(|v| v.as_array())
+        .map_or(0, Vec::len)
+}
+
+/// 【D-95】プロジェクト層の `allow` を捨て、ユーザー層の値へ戻す
+/// （`plans/DESIGN-RUNSHELL-ALLOWLIST.md` D-95）。
+///
+/// プロジェクト層の設定はワークスペースの中にあり、`run_shell` から書け、クローンしたリポジトリに
+/// 同梱されていることもある——**敵対者が用意し得る入力**なので、自動承認の根拠にしない。
+/// 他のクランプと違い「上限へ抑える」のではなく**丸ごと捨てる**。
+///
+/// **マージに頼らずユーザー層の値を明示的に戻す。** 深いマージは配列を丸ごと置き換えるので
+/// （[`deep_merge`]）、マージ後の `allow` はプロジェクト層の配列そのものになっている——
+/// 以前はこれでユーザー層の規則が**消えて**、プロジェクト層の規則に**置き換わって**いた。
+pub fn clamp_project_allow(user: &serde_json::Value, merged: &mut serde_json::Value) {
+    let Some(obj) = merged.as_object_mut() else {
+        return;
+    };
+    match user.get("allow") {
+        Some(user_allow) => {
+            obj.insert("allow".to_string(), user_allow.clone());
+        }
+        None => {
+            obj.remove("allow");
+        }
+    }
+}
+
 impl Settings {
     /// 既定（空）→ユーザ→プロジェクトの順にマージする。`project_root`はワークスペースルート
     /// （`--cwd`解決後のディレクトリ）を渡す。
@@ -802,15 +841,20 @@ impl Settings {
         // 【T5】のクランプに要るので、プロジェクト層を載せる前のユーザ層を控えておく
         // （マージ後はどの層の値かが分からなくなる）。
         let user_layer = merged.clone();
-        if let Some(project_json) = read_json(&project_settings_path(project_root)) {
+        let project_json = read_json(&project_settings_path(project_root));
+        let ignored_project_allow = project_json.as_ref().map_or(0, count_allow_rules);
+        if let Some(project_json) = project_json {
             deep_merge(&mut merged, project_json);
         }
         clamp_project_source_trust(&user_layer, &mut merged);
         clamp_project_mcp_http_gates(&user_layer, &mut merged);
         clamp_project_recall_allow_unversioned(&user_layer, &mut merged);
         clamp_project_recall_stale_reverification_floor(&user_layer, &mut merged);
+        clamp_project_allow(&user_layer, &mut merged);
 
-        serde_json::from_value(merged).unwrap_or_default()
+        let mut settings: Settings = serde_json::from_value(merged).unwrap_or_default();
+        settings.ignored_project_allow = ignored_project_allow;
+        settings
     }
 }
 
@@ -1226,20 +1270,77 @@ mod tests {
         );
     }
 
+    /// プロジェクト層の設定は読むが、その `allow` だけは捨てて件数を数える（D-95）。
+    /// ユーザー層はこの環境の実ファイルなので、`allow` が「プロジェクト層の規則を含まない」ことだけを見る。
     #[test]
-    fn load_reads_project_settings_json() {
+    fn load_reads_project_settings_json_but_drops_its_allow() {
         let dir = tempfile::tempdir().unwrap();
         let harness_dir = dir.path().join(".harness");
         std::fs::create_dir_all(&harness_dir).unwrap();
         std::fs::write(
             harness_dir.join("settings.json"),
-            r#"{"model": "from-project", "allow": ["read_file:*"]}"#,
+            r#"{"model": "from-project", "allow": ["write_file:*", "run_shell:rm -rf /"]}"#,
         )
         .unwrap();
 
         let settings = Settings::load(dir.path());
         assert_eq!(settings.model.as_deref(), Some("from-project"));
-        assert_eq!(settings.allow, Some(vec!["read_file:*".to_string()]));
+        let allow = settings.allow.unwrap_or_default();
+        assert!(!allow.contains(&"write_file:*".to_string()), "{allow:?}");
+        assert!(
+            !allow.contains(&"run_shell:rm -rf /".to_string()),
+            "{allow:?}"
+        );
+        assert_eq!(settings.ignored_project_allow, 2);
+    }
+
+    /// クランプはユーザー層の値を**明示的に戻す**。深いマージは配列を丸ごと置き換えるので、
+    /// これが無いとプロジェクト層の `allow` がユーザー層の `allow` を置き換える。
+    #[test]
+    fn the_allow_clamp_restores_the_user_layer_and_never_keeps_the_project_layer() {
+        let cases = [
+            // (ユーザー層, プロジェクト層, 期待)
+            (
+                serde_json::json!({ "allow": ["a:x"] }),
+                serde_json::json!({ "allow": ["b:y"] }),
+                Some(vec!["a:x"]),
+            ),
+            (
+                serde_json::json!({}),
+                serde_json::json!({ "allow": ["b:y"] }),
+                None,
+            ),
+            (
+                serde_json::json!({ "allow": ["a:x"] }),
+                serde_json::json!({ "allow": [] }),
+                Some(vec!["a:x"]),
+            ),
+            (
+                serde_json::json!({ "allow": ["a:x"] }),
+                serde_json::json!({ "model": "m" }),
+                Some(vec!["a:x"]),
+            ),
+        ];
+        for (user, project, expected) in cases {
+            let mut merged = serde_json::json!({});
+            deep_merge(&mut merged, user.clone());
+            deep_merge(&mut merged, project.clone());
+            clamp_project_allow(&user, &mut merged);
+            let settings: Settings = serde_json::from_value(merged).unwrap();
+            assert_eq!(
+                settings.allow,
+                expected.map(|v| v.into_iter().map(String::from).collect::<Vec<_>>()),
+                "user={user} project={project}"
+            );
+        }
+        assert_eq!(
+            count_allow_rules(&serde_json::json!({ "allow": ["a", "b"] })),
+            2
+        );
+        assert_eq!(
+            count_allow_rules(&serde_json::json!({ "allow": "oops" })),
+            0
+        );
     }
 
     /// M11: `.harness/settings.json`の`read`キーが`ReadScopeConfig`へ正しく変換される

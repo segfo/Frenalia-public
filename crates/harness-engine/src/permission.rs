@@ -14,7 +14,7 @@
 //! 発行しoneshot応答を待つ（§リッチTUI「承認ダイアログ」）。
 
 use async_trait::async_trait;
-use harness_core::{PermissionSubject, ProgramSubject, RiskClass};
+use harness_core::{ArgPattern, PermissionSubject, ProgramRule, RiskClass};
 use std::path::PathBuf;
 
 /// §パーミッション（承認）システム「モード」。
@@ -100,25 +100,104 @@ impl AllowlistRule {
         }
     }
 
-    fn matches(&self, tool: &str, text: &str) -> bool {
+    /// `prefix_allowed`は、材料が前方一致の意味を持つ（正規化した書込先パス）ときだけ真。
+    /// それ以外の材料では前方一致の規則を**何にも当てない**——入力JSON全体の前方一致は後ろの
+    /// キーを縛らず（D-101）、`run_shell`の行の前方一致は同じ行に別のコマンドを紛れ込ませる（D-96）。
+    /// 構文解析でも拒否するが、`AllowlistRule::new`で直接作れるので照合の側でも止める。
+    fn matches(&self, tool: &str, text: &str, prefix_allowed: bool) -> bool {
         if self.tool != tool {
             return false;
         }
         match self.kind {
             MatchKind::Any => true,
-            MatchKind::Prefix => text.starts_with(self.pattern.strip_suffix('*').unwrap_or("")),
+            MatchKind::Prefix => {
+                prefix_allowed && text.starts_with(self.pattern.strip_suffix('*').unwrap_or(""))
+            }
             MatchKind::Exact => text == self.pattern,
         }
     }
 }
 
-/// `tool:pattern`形式の1行を`AllowlistRule`へパースする（CLIの`--allow`フラグ用）。
-pub fn parse_allowlist_rule(rule: &str) -> Option<AllowlistRule> {
-    let (tool, pattern) = rule.split_once(':')?;
+/// 規則1件。汎用の`tool:pattern`か、`run_program`の引数の配列か。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowRule {
+    Pattern(AllowlistRule),
+    Program(ProgramRule),
+}
+
+/// 前方一致（末尾`*`）を受け付けるツール。材料が正規化した書込先パス（`WritePath`）になるものだけ。
+const PREFIX_TOOLS: &[&str] = &["write_file", "edit_file"];
+
+/// `tool:pattern`形式の1行を規則へ読む。コマンドライン・ユーザー層設定・TUI の`/allow`が
+/// **同じこの関数を呼ぶ**（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §3.4）——入口ごとに読み方が違うと、
+/// 片方でだけ通る書き方が生まれる。読めないものは`Err(理由)`で、黙って別の意味に読まない。
+///
+/// | 形 | 意味 |
+/// |---|---|
+/// | `run_program:["git","log",null]` | JSON 配列。先頭がプログラム、残りが引数、`null`が穴 |
+/// | `run_shell:cargo test` | 完全一致。末尾`*`と`*`は受け付けない（D-96） |
+/// | `write_file:src/*`・`edit_file:src/*` | 書込先パスの前方一致 |
+/// | `<ツール>:<値>`・`<ツール>:*` | 完全一致か全部 |
+pub fn parse_allowlist_rule(rule: &str) -> Result<AllowRule, String> {
+    let Some((tool, pattern)) = rule.split_once(':') else {
+        return Err("expected <tool>:<pattern>".to_string());
+    };
     if tool.is_empty() || pattern.is_empty() {
-        return None;
+        return Err("expected <tool>:<pattern>".to_string());
     }
-    Some(AllowlistRule::new(tool, pattern))
+    if tool == harness_tools::RUN_PROGRAM_TOOL {
+        return parse_program_rule(pattern).map(AllowRule::Program);
+    }
+    if tool == "run_shell" {
+        if pattern.ends_with('*') {
+            return Err(
+                "run_shell rules are exact matches only; a trailing * is not accepted \
+                 (it would also match other commands chained on the same line). \
+                 Use run_program:[\"program\",\"arg\",null] for program invocations"
+                    .to_string(),
+            );
+        }
+        return Ok(AllowRule::Pattern(AllowlistRule::exact(tool, pattern)));
+    }
+    if pattern != "*" && pattern.ends_with('*') && !PREFIX_TOOLS.contains(&tool) {
+        return Err(format!(
+            "a trailing * (prefix match) is only accepted for {}; {tool} takes an exact value or *",
+            PREFIX_TOOLS.join("/")
+        ));
+    }
+    Ok(AllowRule::Pattern(AllowlistRule::new(tool, pattern)))
+}
+
+/// `run_program`の規則（JSON 配列）を読む。
+fn parse_program_rule(pattern: &str) -> Result<ProgramRule, String> {
+    const SHAPE: &str =
+        r#"run_program rules are a JSON array such as ["git","log","-n",null] (null = a hole)"#;
+    let items: Vec<Option<String>> =
+        serde_json::from_str(pattern).map_err(|_| SHAPE.to_string())?;
+    let mut items = items.into_iter();
+    let program = match items.next() {
+        Some(Some(p)) if !p.is_empty() => p,
+        _ => return Err(SHAPE.to_string()),
+    };
+    let args: Vec<ArgPattern> = items
+        .map(|a| a.map_or(ArgPattern::Hole, ArgPattern::Exact))
+        .collect();
+    let rule = ProgramRule { program, args };
+    if harness_core::is_interpreter_program(&rule.program) {
+        if rule.has_hole() {
+            return Err(format!(
+                "{} runs its arguments as code, so its rules cannot have holes",
+                rule.program
+            ));
+        }
+        // 中身のハッシュで縛る仕組み（段4）が入るまでは、ファイルに依存する規則を作れない。
+        return Err(format!(
+            "{} runs its arguments as code; rules for it must be bound to file contents, \
+             which is not supported yet — approve it in the approval screen instead",
+            rule.program
+        ));
+    }
+    Ok(rule)
 }
 
 /// `classify`の判定内訳。ヘッドレス既定の自動拒否（例: `Plan`/`Deny`モード）と、
@@ -139,9 +218,13 @@ pub enum Classification {
 pub struct PermissionArbiter {
     mode: PermissionMode,
     allowlist: Vec<AllowlistRule>,
-    /// 承認画面で「常に許可」した`run_program`の呼び出し（プログラムの綴りと引数の完全一致）。
-    /// `(ツール名, 材料)`。引数の配列を1本の文字列へ潰して照合しないために、`allowlist`とは分けて持つ。
-    remembered_programs: Vec<(String, ProgramSubject)>,
+    /// `run_program`の規則（コマンドライン・設定・承認画面の「常に許可」）。引数の配列を1本の文字列へ
+    /// 潰して照合しないために、`allowlist`とは分けて持つ。
+    program_rules: Vec<ProgramRule>,
+    /// 実行中に`accept-all`へ切り替えてよいか（TUI の`/mode`）。起動時に1回だけ決める
+    /// （`--permission-mode accept-all`を受け付ける条件と同じ値。`DESIGN-CLI-OPTIONS.md`の D-74 が
+    /// 実装されたら、この値の決め方だけが変わる）。既定は偽（切り替えさせない）。
+    accept_all_permitted: bool,
     /// 層3 hard-denyの判定器が、モデルの書いた**絶対パス**をworkspace相対へ畳むのに使う
     /// （[BUG-126](../../../docs/bugs/BUG-126.md)）。
     ///
@@ -164,9 +247,16 @@ impl PermissionArbiter {
         Self {
             mode,
             allowlist,
-            remembered_programs: Vec::new(),
+            program_rules: Vec::new(),
+            accept_all_permitted: false,
             workspace_root: workspace_root.into(),
         }
+    }
+
+    /// 実行中に`accept-all`へ切り替えてよいかを設定する（起動処理が1回だけ呼ぶ）。
+    pub fn with_accept_all_permitted(mut self, permitted: bool) -> Self {
+        self.accept_all_permitted = permitted;
+        self
     }
 
     /// `subject`は判定の材料（D-101）。各ツールが自分の入力を型付き構造体で解釈して返したもので、
@@ -237,13 +327,15 @@ impl PermissionArbiter {
     /// 規則のどれかに当たるか。`run_program`は引数の配列のまま照合し、他は材料の文字列で照合する。
     fn matches_a_rule(&self, tool: &str, subject: &PermissionSubject) -> bool {
         match subject {
-            PermissionSubject::Program(p) => self
-                .remembered_programs
-                .iter()
-                .any(|(t, remembered)| t == tool && remembered == p),
-            other => other
-                .rule_text()
-                .is_some_and(|text| self.allowlist.iter().any(|r| r.matches(tool, text))),
+            PermissionSubject::Program(p) => self.program_rules.iter().any(|r| r.matches(p)),
+            other => {
+                let prefix_allowed = matches!(other, PermissionSubject::WritePath(_));
+                other.rule_text().is_some_and(|text| {
+                    self.allowlist
+                        .iter()
+                        .any(|r| r.matches(tool, text, prefix_allowed))
+                })
+            }
         }
     }
 
@@ -264,7 +356,7 @@ impl PermissionArbiter {
     pub fn remember_allow(&mut self, tool: impl Into<String>, subject: &PermissionSubject) {
         let tool = tool.into();
         match subject {
-            PermissionSubject::Program(p) => self.remembered_programs.push((tool, p.clone())),
+            PermissionSubject::Program(p) => self.program_rules.push(ProgramRule::exact(p)),
             other => {
                 if let Some(text) = other.rule_text() {
                     self.allowlist.push(AllowlistRule::exact(tool, text));
@@ -274,18 +366,32 @@ impl PermissionArbiter {
     }
 
     /// 実行時にモードを切り替える（M9スラッシュコマンド`/mode`）。
-    pub fn set_mode(&mut self, mode: PermissionMode) {
+    ///
+    /// `accept-all`へは、起動時に許された場合だけ切り替えられる（棚卸しの S1-8。以前は TUI から
+    /// `--dangerously-allow`の確認を通らずに切り替えられた）。
+    pub fn set_mode(&mut self, mode: PermissionMode) -> Result<(), String> {
+        if mode == PermissionMode::AcceptAll && !self.accept_all_permitted {
+            return Err(
+                "accept-all needs --dangerously-allow at startup (the same condition as \
+                 --permission-mode accept-all)"
+                    .to_string(),
+            );
+        }
         self.mode = mode;
+        Ok(())
     }
 
     pub fn mode(&self) -> PermissionMode {
         self.mode
     }
 
-    /// allowlistへ任意のルールを追記する（M9スラッシュコマンド`/allow`。`remember_allow`と
-    /// 異なりTUIの承認応答経由でなく、ユーザが明示コマンドで追加する経路）。
-    pub fn add_rule(&mut self, rule: AllowlistRule) {
-        self.allowlist.push(rule);
+    /// 規則を足す（コマンドライン・ユーザー層設定・M9スラッシュコマンド`/allow`。`remember_allow`と
+    /// 異なり承認応答経由でなく、ユーザが明示的に書いた規則。読むのは[`parse_allowlist_rule`]）。
+    pub fn add_rule(&mut self, rule: AllowRule) {
+        match rule {
+            AllowRule::Pattern(r) => self.allowlist.push(r),
+            AllowRule::Program(r) => self.program_rules.push(r),
+        }
     }
 }
 
@@ -368,7 +474,7 @@ fn looks_like_allowlist_bypass(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harness_core::CommandSubject;
+    use harness_core::{CommandSubject, ProgramSubject};
 
     /// そのツールが実際に返すのと同じ種類の判定の材料を作る（D-101）。
     /// `run_shell`は行、`write_file`・`edit_file`は書込先パス、それ以外は代表の文字列。
@@ -411,23 +517,49 @@ mod tests {
         );
     }
 
+    /// 前方一致の規則は、正規化した書込先パス（`WritePath`）にだけ効く（D-101・D-96）。
+    /// `run_shell`の行（同じ行に別のコマンドを紛れ込ませられる）と`Text`（URLや入力JSON）には
+    /// 何も当てない——`AllowlistRule::new`で直接作った規則でも照合の側で止まる。
     #[test]
-    fn allowlist_prefix_match_allows_exec() {
+    fn a_prefix_rule_applies_only_to_write_paths() {
         let arbiter = PermissionArbiter::new(
             PermissionMode::Default,
-            vec![AllowlistRule::new("run_shell", "git status*")],
+            vec![
+                AllowlistRule::new("run_shell", "git status*"),
+                AllowlistRule::new("write_file", "src/*"),
+                AllowlistRule::new("web_fetch", "https://docs.rs/*"),
+            ],
             "/workspace",
         );
+        for line in ["git status --short", "git status | rm -rf /", "git status"] {
+            assert_eq!(
+                arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", line)),
+                Decision::Deny,
+                "{line:?}"
+            );
+        }
         assert_eq!(
             arbiter.decide(
-                "run_shell",
-                RiskClass::Exec,
-                &subj("run_shell", "git status --short")
+                "write_file",
+                RiskClass::Write,
+                &subj("write_file", "src/main.rs")
             ),
             Decision::Allow
         );
         assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", "git push")),
+            arbiter.decide(
+                "write_file",
+                RiskClass::Write,
+                &subj("write_file", "docs/x.md")
+            ),
+            Decision::Deny
+        );
+        assert_eq!(
+            arbiter.decide(
+                "web_fetch",
+                RiskClass::Network,
+                &subj("web_fetch", "https://docs.rs/serde")
+            ),
             Decision::Deny
         );
     }
@@ -830,10 +962,96 @@ mod tests {
 
     #[test]
     fn parses_allowlist_rule() {
-        let rule = parse_allowlist_rule("run_shell:git status*").unwrap();
-        assert_eq!(rule.tool, "run_shell");
-        assert_eq!(rule.pattern, "git status*");
-        assert!(parse_allowlist_rule("no-colon").is_none());
+        // 受け付ける形。
+        assert_eq!(
+            parse_allowlist_rule("run_shell:cargo test"),
+            Ok(AllowRule::Pattern(AllowlistRule::exact(
+                "run_shell",
+                "cargo test"
+            )))
+        );
+        assert_eq!(
+            parse_allowlist_rule("write_file:src/*"),
+            Ok(AllowRule::Pattern(AllowlistRule::new(
+                "write_file",
+                "src/*"
+            )))
+        );
+        assert_eq!(
+            parse_allowlist_rule("web_fetch:*"),
+            Ok(AllowRule::Pattern(AllowlistRule::new("web_fetch", "*")))
+        );
+        assert_eq!(
+            parse_allowlist_rule(r#"run_program:["git","log","-n",null]"#),
+            Ok(AllowRule::Program(ProgramRule {
+                program: "git".into(),
+                args: vec![
+                    ArgPattern::Exact("log".into()),
+                    ArgPattern::Exact("-n".into()),
+                    ArgPattern::Hole
+                ],
+            }))
+        );
+        // 受け付けない形。黙って別の意味に読まない。
+        for bad in [
+            "no-colon",
+            ":x",
+            "run_shell:",
+            "run_shell:git log*",
+            "run_shell:*",
+            "web_fetch:https://docs.rs/*",
+            "recall:{\"action\":\"remember\"*",
+            "run_program:*",
+            "run_program:git log",
+            "run_program:[]",
+            "run_program:[null,\"x\"]",
+            r#"run_program:["python",null]"#,
+            r#"run_program:["python","build.py"]"#,
+        ] {
+            assert!(
+                parse_allowlist_rule(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// `run_program`の規則は引数の配列で照合し、穴には`-`で始まる値が当たらない。
+    #[test]
+    fn a_program_rule_from_the_command_line_matches_by_argument_array() {
+        let mut arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
+        arbiter.add_rule(parse_allowlist_rule(r#"run_program:["git","log","-n",null]"#).unwrap());
+        let tool = harness_tools::RUN_PROGRAM_TOOL;
+        assert_eq!(
+            arbiter.classify(tool, RiskClass::Exec, &prog("git", &["log", "-n", "5"])),
+            Classification::Allow
+        );
+        for args in [
+            &["log", "-n", "--upload-pack=x"][..],
+            &["log", "-n"][..],
+            &["log", "-n", "5", "6"][..],
+            &["push", "-n", "5"][..],
+        ] {
+            assert_eq!(
+                arbiter.classify(tool, RiskClass::Exec, &prog("git", args)),
+                Classification::Prompt,
+                "{args:?}"
+            );
+        }
+    }
+
+    /// `accept-all`へは、起動時に許された場合だけ実行中に切り替えられる（S1-8）。他のモードは常に切り替えられる。
+    #[test]
+    fn switching_to_accept_all_needs_the_startup_permission() {
+        let mut arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
+        assert!(arbiter.set_mode(PermissionMode::AcceptAll).is_err());
+        assert_eq!(arbiter.mode(), PermissionMode::Default);
+        assert!(arbiter.set_mode(PermissionMode::AcceptEdits).is_ok());
+        assert_eq!(arbiter.mode(), PermissionMode::AcceptEdits);
+
+        let mut arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace")
+            .with_accept_all_permitted(true);
+        assert!(arbiter.set_mode(PermissionMode::AcceptAll).is_ok());
+        assert_eq!(arbiter.mode(), PermissionMode::AcceptAll);
     }
 
     fn run_program_classification(

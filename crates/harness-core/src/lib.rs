@@ -9,6 +9,7 @@ pub mod interpreter;
 pub mod message;
 pub mod net_policy;
 pub mod permission_subject;
+pub mod program_rule;
 pub mod prompt;
 pub mod provider;
 pub mod schema;
@@ -32,6 +33,7 @@ pub use net_policy::{
     DomainPolicyDecision,
 };
 pub use permission_subject::{CommandSubject, PermissionSubject, ProgramSubject};
+pub use program_rule::{hole_accepts, is_format_char, ArgPattern, ProgramRule};
 pub use prompt::{render as render_environment_prompt, EnvironmentFacts, OsKind};
 pub use provider::{
     BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities, ProviderError,

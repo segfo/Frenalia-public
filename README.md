@@ -95,10 +95,16 @@ Frenaliaは、エージェントエンジンが特定のAPI形式へ依存しな
 
 ```text
 run_shell:cargo test
-run_shell:git status
-write_file:src/**
-web_fetch:*.rust-lang.org
+run_program:["git","log","-n",null]
+write_file:src/*
+web_fetch:https://docs.rs/serde
 ```
+
+`run_shell` は完全一致だけです。`run_program` は JSON 配列で、`null` の位置は毎回変わってよい引数1個
+（`-` で始まる値などは当たりません）です。前方一致（末尾 `*`）は `write_file`・`edit_file` の書込先にだけ使えます。
+規則はコマンドラインの `--allow` とユーザー層の設定に書けます。**プロジェクトの `.harness/settings.json` の
+`allow` は使いません**（クローンしたリポジトリが同梱できるため。起動時に件数を告知します）。
+詳細は [`plans/DESIGN-RUNSHELL-ALLOWLIST.md`](plans/DESIGN-RUNSHELL-ALLOWLIST.md)。
 
 パーミッション層は、TUIとヘッドレスモードの両方で共通です。
 

@@ -695,7 +695,11 @@ pub async fn run(
                                 Action::Cancel => engine.cancel_current(),
                                 Action::Slash(cmd) => match cmd {
                                     SlashCommand::Model(m) => engine.set_model(m),
-                                    SlashCommand::Mode(mode) => engine.gate.set_mode(mode),
+                                    SlashCommand::Mode(mode) => {
+                                        if let Err(reason) = engine.gate.set_mode(mode) {
+                                            app.transcript.push(app::TranscriptItem::Error(reason));
+                                        }
+                                    }
                                     SlashCommand::Allow(rule) => engine.gate.add_allow(rule),
                                     // BUG-070: 要約はLLM呼び出しなので数秒〜数十秒かかる。
                                     // 進捗を出さないとユーザーは「効いていない」と思って
