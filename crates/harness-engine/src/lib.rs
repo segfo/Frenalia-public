@@ -1184,6 +1184,69 @@ mod tests {
         let (content, is_error) = find_tool_result(&state);
         assert!(is_error, "denied tool call should be recorded as an error");
         assert!(content.contains("permission denied"));
+        // 規則に当たらなかった拒否は「対話なら聞いていた」ので、直し方を添える（段10）。
+        // **接頭辞は変えていない**——ヘッドレスのJSONはこの接頭辞で`"denied"`を決めている。
+        assert!(
+            content.starts_with("permission denied by policy"),
+            "{content}"
+        );
+        assert!(
+            content.contains("an interactive session would have asked"),
+            "{content}"
+        );
+        assert!(content.contains("--allow"), "{content}");
+    }
+
+    /// 対照: モードによる拒否には「聞いていた」の一言を足さない（段10）。
+    /// 直し方が違う——こちらは規則を1本書いても通らず、モードを変えるしかない。
+    #[tokio::test]
+    async fn a_mode_level_denial_does_not_claim_it_would_have_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = MockProvider {
+            turns: Mutex::new(vec![
+                tool_use_turn(
+                    "call_1",
+                    "run_shell",
+                    serde_json::json!({ "command": "echo hi" }),
+                ),
+                end_turn("done"),
+            ]),
+        };
+        let tools = harness_tools::ToolRegistry::with_builtin_tools();
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let arbiter = PermissionArbiter::new(PermissionMode::Deny, vec![], "/workspace");
+        let mut state = ConversationState::new(Vec::new());
+        state.push_user_text("run a shell command");
+        run_agent_loop(
+            &provider,
+            &mut state,
+            &tools,
+            &ctx,
+            &arbiter,
+            AgentLoopConfig {
+                model: "mock".into(),
+                max_tokens: 100,
+                max_turns: 5,
+                compaction: Default::default(),
+                degeneracy: None,
+            },
+            None,
+            None,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let (content, is_error) = find_tool_result(&state);
+        assert!(is_error);
+        assert!(
+            content.starts_with("permission denied by policy"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("would have asked"),
+            "モードによる拒否に「聞いていた」と書いている: {content}"
+        );
     }
 
     /// §実装マイルストーン M4 検証条件のもう一方「ジェイル脱出が拒否される」に対する、

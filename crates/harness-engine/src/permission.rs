@@ -39,11 +39,23 @@ pub enum Decision {
     AllowAndRemember,
     Deny,
     DenyAndRemember,
+    /// 拒否だが、**対話なら聞いていた**（ヘッドレスだけが作る）。
+    ///
+    /// 判定は8通りの理由から非許可になる——モード・セッション限りの拒否・設定注入パスは
+    /// 「そもそも拒否」で、規則に当たらなかった・危険な綴りを見つけたは「聞くはずだった」である。
+    /// 全部を同じ`Deny`へ潰すと、**直し方が違うものが同じ文言で返る**：前者は設定を変えるしかなく、
+    /// 後者は規則を1本書けば通る。モデルにも人にも、その差が見えないと次の手が決まらない。
+    DenyWouldPrompt,
 }
 
 impl Decision {
     pub fn is_allow(self) -> bool {
         matches!(self, Decision::Allow | Decision::AllowAndRemember)
+    }
+
+    /// 対話なら聞いていた拒否か。文言を足すかどうかの判断に使う。
+    pub fn would_have_prompted(self) -> bool {
+        matches!(self, Decision::DenyWouldPrompt)
     }
 }
 
@@ -385,7 +397,10 @@ impl PermissionArbiter {
     pub fn decide(&self, tool: &str, risk: RiskClass, subject: &PermissionSubject) -> Decision {
         match self.classify(tool, risk, subject) {
             Classification::Allow => Decision::Allow,
-            Classification::Deny | Classification::Prompt => Decision::Deny,
+            Classification::Deny => Decision::Deny,
+            // **潰さずに残す。** 畳むのは「実行しない」という結論だけで、理由まで畳むと
+            // 直し方の違う2つが同じ文言で返る（[`Decision::DenyWouldPrompt`]）。
+            Classification::Prompt => Decision::DenyWouldPrompt,
         }
     }
 
@@ -653,13 +668,22 @@ mod tests {
         );
     }
 
+    /// ヘッドレスは聞けないので拒否するが、**「聞くはずだった」拒否として返す**
+    /// （D-107追記）。モードによる拒否と同じ値にすると、規則を1本書けば通るのか、
+    /// 設定を変えるしかないのかが区別できない。
     #[test]
     fn default_mode_denies_unallowlisted_exec_headless() {
         let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
-        assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", "rm -rf /")),
-            Decision::Deny
-        );
+        let verdict = arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", "rm -rf /"));
+        assert_eq!(verdict, Decision::DenyWouldPrompt);
+        assert!(!verdict.is_allow());
+        assert!(verdict.would_have_prompted());
+
+        // 対照: モードによる拒否は「そもそも拒否」で、直し方が違う。
+        let arbiter = PermissionArbiter::new(PermissionMode::Deny, vec![], "/workspace");
+        let verdict = arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", "rm -rf /"));
+        assert_eq!(verdict, Decision::Deny);
+        assert!(!verdict.would_have_prompted());
     }
 
     /// 前方一致の規則は、正規化した書込先パス（`WritePath`）にだけ効く（D-101・D-96）。
@@ -679,7 +703,7 @@ mod tests {
         for line in ["git status --short", "git status | rm -rf /", "git status"] {
             assert_eq!(
                 arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", line)),
-                Decision::Deny,
+                Decision::DenyWouldPrompt,
                 "{line:?}"
             );
         }
@@ -697,7 +721,7 @@ mod tests {
                 RiskClass::Write,
                 &subj("write_file", "docs/x.md")
             ),
-            Decision::Deny
+            Decision::DenyWouldPrompt
         );
         assert_eq!(
             arbiter.decide(
@@ -705,7 +729,7 @@ mod tests {
                 RiskClass::Network,
                 &subj("web_fetch", "https://docs.rs/serde")
             ),
-            Decision::Deny
+            Decision::DenyWouldPrompt
         );
     }
 
@@ -751,7 +775,7 @@ mod tests {
                 RiskClass::Exec,
                 &subj("run_shell", "cargo test")
             ),
-            Decision::Deny
+            Decision::DenyWouldPrompt
         );
     }
 
@@ -785,7 +809,7 @@ mod tests {
         // D-102: run_shell は accept-all でも、承認した文字列と一致しない限り聞く（ヘッドレスは拒否）。
         assert_eq!(
             arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", "rm -rf /")),
-            Decision::Deny
+            Decision::DenyWouldPrompt
         );
         assert_eq!(
             arbiter.classify("run_shell", RiskClass::Exec, &subj("run_shell", "rm -rf /")),
@@ -1222,7 +1246,7 @@ mod tests {
                 RiskClass::Network,
                 &subj("mcp__jira__create_issue", &input)
             ),
-            Decision::Deny
+            Decision::DenyWouldPrompt
         );
     }
 
@@ -1264,7 +1288,7 @@ mod tests {
                 RiskClass::Network,
                 &subj("mcp__other__create_issue", "{}")
             ),
-            Decision::Deny
+            Decision::DenyWouldPrompt
         );
     }
 

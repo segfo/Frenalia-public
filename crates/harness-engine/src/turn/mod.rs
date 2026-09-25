@@ -104,6 +104,14 @@ impl RawTurnRequest {
 /// （別々に持つと片方だけ変わる、B-05）。
 pub const INVALID_TOOL_INPUT_PREFIX: &str = "invalid tool input";
 
+/// 「対話なら聞いていた」拒否に足す一言（[`harness_engine::Decision::DenyWouldPrompt`]）。
+///
+/// **直し方が違うものを同じ文言で返さない。** モードや設定注入パスによる拒否は設定を変えるしか
+/// 無いが、こちらは規則を1本書けば通る——どちらなのかが分からないと、モデルも人も次の手を選べない。
+pub const WOULD_HAVE_PROMPTED_HINT: &str =
+    " — no rule matched this call, so an interactive session would have asked. Headless runs deny \
+     instead of asking. Pass --allow with an exact rule for this call, or run interactively.";
+
 /// そのツール呼び出しが**実際に実行されたか**、されなかったなら何故か。
 ///
 /// `Executed`以外はいずれも「`Tool::call`を呼んでいない」ことを意味し、`output`には
@@ -663,9 +671,15 @@ impl<'a> TurnExecutor<'a> {
         };
         let verdict = self.gate.resolve(name, risk, &subject, input).await;
         if !verdict.is_allow() {
+            // 「聞くはずだった」拒否には直し方を足す。**接頭辞は変えない**——ヘッドレスのJSONは
+            // この接頭辞で`"denied"`を決めており、文言の先頭を変えると分類が壊れる。
+            let hint = match verdict.would_have_prompted() {
+                true => WOULD_HAVE_PROMPTED_HINT,
+                false => "",
+            };
             return (
                 ToolOutput {
-                    content: format!("permission denied by policy: {name} ({risk:?})"),
+                    content: format!("permission denied by policy: {name} ({risk:?}){hint}"),
                     is_error: true,
                 },
                 ToolCallDecision::DeniedByPolicy,
