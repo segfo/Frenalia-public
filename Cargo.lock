@@ -1173,6 +1173,7 @@ dependencies = [
  "harness-grant-ledger",
  "harness-providers",
  "harness-tools",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
