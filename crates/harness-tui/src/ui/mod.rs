@@ -3,6 +3,7 @@
 //! レビューパネル（1画面を占める自己完結した面）の描画だけは[`review`]へ分けている
 //! （`docs/CODE-STRUCTURE-RULES.md`規則3）。
 
+mod approval;
 mod review;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -13,7 +14,6 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{AppState, ToolCardStatus, TranscriptItem, SPINNER_FRAMES};
-use harness_sandbox::textdiff::DiffKind;
 
 /// 入力欄が自動で伸びる最大行数。これを超えると内部スクロールする（カーソル行が
 /// 常に見えるよう毎フレーム再計算する。transcriptの`scroll_offset`のような永続的な
@@ -24,7 +24,7 @@ const MAX_INPUT_VISIBLE_LINES: u16 = 6;
 /// （[BUG-076](../../../docs/bugs/BUG-076.md)）。総行数は折り畳み状態と端末幅に依存するため
 /// 描画時にしか決まらない。呼び出し側は戻り値で`AppState::clamp_scroll`を呼び、状態そのものを
 /// 切り詰める——ここで表示だけ止めても、状態は青天井に伸び続けてしまう。
-pub fn render(f: &mut Frame, app: &AppState) -> u16 {
+pub fn render(f: &mut Frame, app: &AppState) -> Ceilings {
     // 複数行入力（既定でEnterが改行を挿入するようになったため）にあわせ、入力欄の高さを
     // 行数に応じて`MAX_INPUT_VISIBLE_LINES`まで自動で伸ばす（それ以上は内部スクロール）。
     let input_line_count = app.input.split('\n').count() as u16;
@@ -42,8 +42,9 @@ pub fn render(f: &mut Frame, app: &AppState) -> u16 {
     render_status(f, root[1], app);
     render_input(f, root[2], app);
 
+    let mut modal_scroll = 0;
     if let Some(pending) = &app.pending_permission {
-        render_permission_modal(f, f.area(), pending);
+        modal_scroll = approval::render_permission_modal(f, f.area(), pending);
     } else if let Some(panel) = &app.review_panel {
         review::render_review_panel(f, f.area(), panel);
     } else if app.selection_range().is_none() {
@@ -60,7 +61,18 @@ pub fn render(f: &mut Frame, app: &AppState) -> u16 {
         set_input_cursor(f, root[2], app);
     }
 
-    max_scroll
+    Ceilings {
+        transcript: max_scroll,
+        modal: modal_scroll,
+    }
+}
+
+/// 1フレーム描いて初めて分かるスクロールの上限。**面ごとに別々に持つ**——1つの値にまとめると、
+/// モーダルを開いた瞬間に transcript の上限がモーダルのもので上書きされる。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Ceilings {
+    pub transcript: u16,
+    pub modal: u16,
 }
 
 /// Tier3サンドボックス準備中の待機画面（`sandbox_prep::run_prep_screen`から呼ばれる）。
@@ -516,53 +528,7 @@ fn render_input(f: &mut Frame, area: Rect, app: &AppState) {
     f.render_widget(paragraph, area);
 }
 
-fn render_permission_modal(f: &mut Frame, area: Rect, pending: &crate::app::PermissionView) {
-    // diffがある(edit_file)場合はモーダルが縦に長くなりがちなので広めに取る
-    // （§リッチTUI「edit_fileの差分プレビューを承認モーダル内に描画」）。
-    let rect = if pending.diff.is_some() {
-        centered_rect(80, 60, area)
-    } else {
-        centered_rect(70, 40, area)
-    };
-    f.render_widget(Clear, rect);
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("tool: {}  risk: {:?}", pending.tool, pending.risk),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-    match &pending.diff {
-        Some(diff_lines) => {
-            for d in diff_lines {
-                let (prefix, color) = match d.kind {
-                    DiffKind::Context => (" ", Color::Gray),
-                    DiffKind::Removed => ("-", Color::Red),
-                    DiffKind::Added => ("+", Color::Green),
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("{prefix} {}", d.text),
-                    Style::default().fg(color),
-                )));
-            }
-        }
-        None => lines.push(Line::from(pending.input.clone())),
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from("[y] allow once   [a] allow always"));
-    lines.push(Line::from("[n] deny once    [d] deny always"));
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("permission required")
-        .style(Style::default().fg(Color::White).bg(Color::Black));
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(paragraph, rect);
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

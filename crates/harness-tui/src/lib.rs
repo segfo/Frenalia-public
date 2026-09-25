@@ -2,6 +2,7 @@
 //! 承認モーダルを`tokio::select!`ループで描画する（`plans/DESIGN.md` §リッチTUI）。
 
 mod app;
+mod approvals;
 mod engine;
 mod gate;
 mod picker;
@@ -554,6 +555,14 @@ pub async fn run(
     );
     let mut app = AppState::new(provider_label, model);
     app.enter_submits = enter_submits;
+    app.workspace_root = workspace_root_for_panel.to_string_lossy().into_owned();
+    // 承認の台帳（D-107）。**読み書きするのはこの描画ループ**——判定器は記録の中身を作るところまでで、
+    // ファイル操作は待たせずに済ませたい（`InteractiveGate::respond_remember`のdoc）。
+    let approval_store =
+        std::sync::Arc::new(harness_engine::approval_ledger::ApprovalStore::open_default());
+    // 描画ループの外でやった仕事（台帳への書込）の結果を受ける口。
+    let (background_tx, mut background_rx) =
+        tokio::sync::mpsc::unbounded_channel::<approvals::BackgroundEvent>();
     app.host_is_vscode = harness_term::host_is_vscode();
     app.workspace_label = workspace_root_for_panel
         .file_name()
@@ -640,6 +649,15 @@ pub async fn run(
                             _ => None,
                         };
                         app.apply(ev);
+                        // 承認モーダルが立った直後に、前回の承認で残した写しを読む（差分表示用）。
+                        // **ファイルを読むのは`AppState`の外**（`AppState`はサンドボックスも
+                        // ユーザー層の置き場も触らない、というこのクレートの決め事）。
+                        if app.pending_permission.as_ref().is_some_and(|v| v.wants_previous()) {
+                            let previous = approvals::previous_copies(&approval_store, &app);
+                            if let Some(view) = app.pending_permission.as_mut() {
+                                view.previous = Some(previous);
+                            }
+                        }
                         if switched {
                             if let Some(messages) = pending_restore.take() {
                                 app.restore_transcript(&messages);
@@ -692,6 +710,16 @@ pub async fn run(
                             match action {
                                 Action::Submit(text) => engine.submit(text),
                                 Action::Respond(id, decision) => engine.gate.respond(&id, decision),
+                                Action::RespondRemember(id, holes) => {
+                                    approvals::record_approval(
+                                        &engine,
+                                        &approval_store,
+                                        &background_tx,
+                                        &mut app,
+                                        &id,
+                                        &holes,
+                                    );
+                                }
                                 Action::Cancel => engine.cancel_current(),
                                 Action::Slash(cmd) => match cmd {
                                     SlashCommand::Model(m) => engine.set_model(m),
@@ -1052,6 +1080,9 @@ pub async fn run(
                     _ => {}
                 }
             }
+            Some(background) = background_rx.recv() => {
+                background.apply(&mut app);
+            }
             _ = tick.tick() => {
                 app.tick();
                 app.wait_state = poll_wait_state();
@@ -1061,9 +1092,12 @@ pub async fn run(
         // BUG-076: 遡れる上限は折り畳み状態と端末幅に依存し、描画時にしか決まらない。
         // 描いた直後に状態そのものを切り詰める——表示側だけで止めると、先頭に着いた後も
         // ホイールを回した分だけ`scroll_offset`が伸び、同じ回数下へ回すまで画面が動かない。
-        let mut max_scroll = 0u16;
-        term.draw(|f| max_scroll = ui::render(f, &app))?;
-        app.clamp_scroll(max_scroll);
+        let mut ceilings = ui::Ceilings::default();
+        term.draw(|f| ceilings = ui::render(f, &app))?;
+        app.clamp_scroll(ceilings.transcript);
+        if let Some(pending) = app.pending_permission.as_mut() {
+            pending.clamp_scroll(ceilings.modal);
+        }
 
         if app.should_quit {
             break;

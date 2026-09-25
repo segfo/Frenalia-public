@@ -148,20 +148,19 @@ impl AppState {
 
     /// キー入力を処理し、engineアクター/InteractiveGateへ伝えるべきアクションを返す。
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
-        if let Some(pending) = &self.pending_permission {
-            let decision = match key.code {
-                KeyCode::Char('y') => Some(Decision::Allow),
-                KeyCode::Char('a') => Some(Decision::AllowAndRemember),
-                KeyCode::Char('n') | KeyCode::Esc => Some(Decision::Deny),
-                KeyCode::Char('d') => Some(Decision::DenyAndRemember),
-                _ => None,
-            };
-            if let Some(decision) = decision {
-                let id = pending.id.clone();
-                self.pending_permission = None;
-                return Some(Action::Respond(id, decision));
-            }
-            return None;
+        // 承認モーダルは自分でキーを解釈する（確認の一段・穴の選択・枠のスクロールがあるので、
+        // 「決定キー以外は捨てる」では足りない）。ここに残るのは**応答への写像**だけである
+        // （審査パネルと同じ分け方。`app::approval`のモジュールdoc参照）。
+        if let Some(pending) = &mut self.pending_permission {
+            let command = pending.on_key(key)?;
+            let id = pending.id.clone();
+            self.pending_permission = None;
+            return Some(match command {
+                ApprovalCommand::Once => Action::Respond(id, Decision::Allow),
+                ApprovalCommand::Deny => Action::Respond(id, Decision::Deny),
+                ApprovalCommand::DenySession => Action::Respond(id, Decision::DenyAndRemember),
+                ApprovalCommand::Remember(holes) => Action::RespondRemember(id, holes),
+            });
         }
 
         // レビューパネル表示中は全キーをパネルへ渡す。骨格（選択・トグル・スクロール・

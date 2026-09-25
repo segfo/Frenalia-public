@@ -31,6 +31,10 @@ pub enum AgentEvent {
         tool: String,
         risk: RiskClass,
         input: serde_json::Value,
+        /// 判定器が実際に見た材料（D-101）。**画面はこれを見て描く**——`input`はモデルが書いた
+        /// JSON そのもので、判定が何を照合したのか（縛ったファイル・ハッシュ・解決先・穴の候補）を
+        /// 知らない。ヘッドレスはこのイベントを一切見ない（`Prompt`を`Deny`へ畳むため）。
+        subject: crate::PermissionSubject,
     },
     ToolStarted {
         id: String,

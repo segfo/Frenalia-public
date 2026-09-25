@@ -219,6 +219,28 @@ pub fn is_format_char(c: char) -> bool {
     )
 }
 
+/// 画面へ出すために、見えない文字を綴りへ置き換える（D-106）。
+///
+/// 端末は双方向制御やゼロ幅の文字をそのまま解釈するので、**人が見た並びと実際に渡る並びが違う**
+/// ものを承認させられる（Trojan Source）。判定の側で弾く表（[`is_format_char`]・[`hole_accepts`]）と
+/// **同じ表を使う**——表が2つあると、片方だけが更新されて「弾かないのに見えない文字」が生まれる。
+///
+/// 制御文字は改行とタブも含めて潰すので、**行に割ってから1行ずつ渡す**こと。
+pub fn escape_for_display(s: &str) -> String {
+    if !s.chars().any(|c| c.is_control() || is_format_char(c)) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() || is_format_char(c) {
+            out.push_str(&format!("\\u{{{:04X}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,5 +430,21 @@ mod tests {
         other.unverifiable = true;
         assert!(!r.matches(&other, WS));
         assert!(!r.matches(&approved, "C:/other"));
+    }
+
+    /// 見えない文字は綴りに置き換え、普通の文字はそのまま出す（D-106）。
+    /// **判定が弾く文字と、画面で綴りに変える文字は同じ表**——弾かないのに見えない文字を作らない。
+    #[test]
+    fn invisible_characters_are_shown_as_their_spelling() {
+        assert_eq!(escape_for_display("build.py"), "build.py");
+        assert_eq!(escape_for_display("日本語もそのまま"), "日本語もそのまま");
+        assert_eq!(escape_for_display("gp\u{202E}yp.exe"), r"gp\u{202E}yp.exe");
+        assert_eq!(escape_for_display("a\u{200B}b"), r"a\u{200B}b");
+        assert_eq!(escape_for_display("a\tb\nc"), r"a\u{0009}b\u{000A}c");
+        // 弾く側と同じ文字が対象になっている（表が2つに割れていない）。
+        for c in ['\u{202E}', '\u{200B}', '\u{0007}'] {
+            assert!(!hole_accepts(&format!("x{c}")));
+            assert_ne!(escape_for_display(&c.to_string()), c.to_string());
+        }
     }
 }

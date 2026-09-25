@@ -36,7 +36,8 @@ pub use permission_subject::{
     BoundFile, CommandSubject, FilePreview, PermissionSubject, ProgramSubject,
 };
 pub use program_rule::{
-    fold_path_for_rule, hole_accepts, is_format_char, ArgPattern, ProgramRule, ShellRule,
+    escape_for_display, fold_path_for_rule, hole_accepts, is_format_char, ArgPattern, ProgramRule,
+    ShellRule,
 };
 pub use prompt::{render as render_environment_prompt, EnvironmentFacts, OsKind};
 pub use provider::{

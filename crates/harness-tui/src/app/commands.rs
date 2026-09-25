@@ -123,6 +123,10 @@ pub(super) fn parse_fsstage_subcommand(rest: &str) -> Result<FsStageCommand, Str
 pub enum Action {
     Submit(String),
     Respond(String, Decision),
+    /// 承認モーダルの「恒久的に承認」（確認の一段を通ったもの）。中身は承認要求のidと、
+    /// 穴にする引数の位置（D-105）。`Respond`と分けているのは、**規則を作って台帳へ書く**という
+    /// 別の仕事が要るからである（`InteractiveGate::respond_remember`）。
+    RespondRemember(String, Vec<usize>),
     Slash(SlashCommand),
     /// 現在進行中のターンをキャンセルする（M9、Escキー）。
     Cancel,

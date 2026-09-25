@@ -28,7 +28,7 @@ use harness_tools::ToolRegistry;
 
 pub use permission::{
     parse_allowlist_rule, AllowRule, AllowlistRule, Classification, Decision, PermissionArbiter,
-    PermissionGate, PermissionMode,
+    PermissionGate, PermissionMode, Remembered,
 };
 pub use session::{SessionStore, SessionSummary};
 pub use turn::{

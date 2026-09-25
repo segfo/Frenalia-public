@@ -75,6 +75,7 @@ impl AppState {
                 tool,
                 risk,
                 input,
+                subject,
             } => {
                 // `edit_file`は`old_string`/`new_string`から差分を作れる場合のみdiffを埋める
                 // （§リッチTUI「edit_fileの差分プレビューを承認モーダル内に描画」）。
@@ -88,13 +89,15 @@ impl AppState {
                 } else {
                     None
                 };
-                self.pending_permission = Some(PermissionView {
+                self.pending_permission = Some(PermissionView::new(
                     id,
                     tool,
                     risk,
-                    input: pretty(&input),
+                    subject,
+                    pretty(&input),
                     diff,
-                });
+                    self.workspace_root.clone(),
+                ));
             }
             AgentEvent::ToolStarted { .. } => {}
             // [BUG-082フォローアップ] `run_shell`等が背景条件（D-54のworkspace ACL伝播ジョブ等）

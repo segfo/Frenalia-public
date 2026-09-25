@@ -4,10 +4,10 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 
-use harness_core::{AgentEvent, RiskClass, StopReason, ToolOutput, Usage};
+use harness_core::{AgentEvent, StopReason, ToolOutput, Usage};
 use harness_engine::{parse_allowlist_rule, AllowRule, Decision, PermissionMode};
 
-use harness_sandbox::textdiff::{diff_lines, DiffLine};
+use harness_sandbox::textdiff::diff_lines;
 
 use events::{pretty, MAX_OUTPUT_PREVIEW};
 
@@ -47,27 +47,21 @@ pub enum TranscriptItem {
     Info(String),
 }
 
-#[derive(Debug, Clone)]
-pub struct PermissionView {
-    pub id: String,
-    pub tool: String,
-    pub risk: RiskClass,
-    pub input: String,
-    /// `tool == "edit_file"`の場合、`old_string`/`new_string`から計算した差分（M9、
-    /// DESIGN.md L349「edit_fileの差分プレビューを承認モーダル内に描画」）。
-    /// 差分エンジンはレビューパネルと共有の`harness_sandbox::textdiff`。
-    pub diff: Option<Vec<DiffLine>>,
-}
-
 /// `/model /mode /allow /compact /clear /fork /sessions /fsstage`（M9、DESIGN.md L349
 /// 「スラッシュコマンド」+ セッションFork/一覧の拡張。`/fsstage`はM10の変更（changes）パネルを
 /// キーバインドではなくスラッシュコマンドから操作するためのもの。Ctrl+GはVSCode統合ターミナルの
 /// 既定ショートカットと衝突するため、`/fsstage`へ置き換えて廃止した）。
+mod approval;
 mod commands;
 mod events;
 mod input;
 mod review;
 
+#[cfg(test)]
+pub use approval::MODAL_INPUT_GRACE;
+pub use approval::{
+    ApprovalCommand, ApprovalLine, ApprovalStage, LineStyle, PermissionView, PreviousCopy,
+};
 use commands::parse_slash_command;
 pub use commands::{Action, FsStageCommand, MemoryCommand, SlashCommand};
 pub use review::{
@@ -137,6 +131,9 @@ pub struct AppState {
     input_last_edit_was_insert: bool,
     pub pending_permission: Option<PermissionView>,
     pub provider_label: String,
+    /// 今のワークスペースのルート（承認画面が「記録はこのワークスペースだけ」を見せるのに使う）。
+    /// 起動時に`harness_tui::run`が入れる（`AppState`自身はファイルを触らない）。
+    pub workspace_root: String,
     pub model: String,
     pub last_usage: Usage,
     pub last_stop_reason: Option<StopReason>,
@@ -245,6 +242,7 @@ impl AppState {
             input_last_edit_was_insert: false,
             pending_permission: None,
             provider_label,
+            workspace_root: String::new(),
             model,
             last_usage: Usage::default(),
             last_stop_reason: None,
