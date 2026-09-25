@@ -610,6 +610,19 @@ pub trait VmShellExecutor: Send + Sync + std::fmt::Debug {
         env: &[(String, String)],
         timeout: std::time::Duration,
     ) -> Result<(String, String, Option<i32>), String>;
+
+    /// コンテナ内で`argv`を**シェルを通さずに**実行する（`run_program`、D-108）。
+    ///
+    /// **既定の実装を置かない。** 置くと「まだ対応していない実装」が黙って`sh -c`へ落ちるか、
+    /// 黙って失敗するかのどちらかになる——どちらも、構造化で消したはずの解釈する層を戻すか、
+    /// 理由の分からないエラーを出す（D-96）。実装する側が毎回決める。
+    fn exec_argv(
+        &self,
+        argv: &[String],
+        cwd: &std::path::Path,
+        env: &[(String, String)],
+        timeout: std::time::Duration,
+    ) -> Result<(String, String, Option<i32>), String>;
 }
 
 /// 起動中のMCPサーバ1件について、モデルへ伝える事実（M15.5、`plans/DESIGN-MCP.md`）。

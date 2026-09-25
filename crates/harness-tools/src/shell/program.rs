@@ -29,13 +29,11 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::time::Duration;
 
-use harness_core::{
-    is_interpreter_program, RiskClass, ShellTier, Tool, ToolCtx, ToolError, ToolOutput,
-};
+use harness_core::{is_interpreter_program, RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
 use harness_core::{parse_tool_input, PermissionSubject, ProgramSubject};
 
 use super::net_decision::classify_net_program;
-use super::runner::{Launch, TIER3_PROGRAM_UNSUPPORTED};
+use super::runner::Launch;
 use super::{
     join_output, prepare_run, push_run_footer, resolve_cwd, run_in_tier, DEFAULT_TIMEOUT_MS,
 };
@@ -62,11 +60,8 @@ const RUN_PROGRAM_DESCRIPTION: &str =
     "シェルを通さず、プログラムを直接起動して stdout+stderr+終了コードを返す。\
      program は実行ファイルの名前かパス、args は引数の配列で、各要素はそのまま1つの引数として\
      届く（空白・;・|・引用符を含んでよく、シェルに解釈されない）。\
-     パイプ・リダイレクト・PowerShell のコマンドレットは使えない——それらが要るときは run_shell を使う。\
+     パイプ・リダイレクト・シェルの組み込み機能は使えない——それらが要るときは run_shell を使う。\
      素の名前は PATH からだけ探し、作業ディレクトリは探さない。";
-
-const RUN_PROGRAM_TIER3_DESCRIPTION: &str =
-    "Tier3（VM）では使えない。コマンドを実行するときは run_shell を使うこと。";
 
 /// `run_program`の実体。
 ///
@@ -132,15 +127,10 @@ impl Tool for RunProgramTool {
         run_program_input_schema()
     }
 
-    fn spec_for_ctx(&self, ctx: &ToolCtx) -> harness_core::ToolSpec {
-        let description = if ctx.shell_tier.tier == ShellTier::Tier3 {
-            RUN_PROGRAM_TIER3_DESCRIPTION
-        } else {
-            RUN_PROGRAM_DESCRIPTION
-        };
+    fn spec_for_ctx(&self, _ctx: &ToolCtx) -> harness_core::ToolSpec {
         harness_core::ToolSpec {
             name: self.name().to_string(),
-            description: description.to_string(),
+            description: RUN_PROGRAM_DESCRIPTION.to_string(),
             input_schema: self.input_schema(),
         }
     }
@@ -171,20 +161,23 @@ impl Tool for RunProgramTool {
 
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let input: RunProgramInput = parse_tool_input(&input)?;
-        // 起動経路（`run_tier3`）も断るが、ここで先に断る——子を起こす準備（プロキシ等）を
-        // 立ててから断ると、使わない部品を立てては捨てることになる。
-        if ctx.shell_tier.tier == ShellTier::Tier3 {
-            return Err(ToolError::InvalidInput(
-                TIER3_PROGRAM_UNSUPPORTED.to_string(),
-            ));
-        }
         let args = input.args.unwrap_or_default();
         let cwd = resolve_cwd(input.cwd.as_deref(), ctx)?;
         let dur = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+
         let prepared = prepare_run(ctx).await;
 
-        let exe = resolve_program(&input.program, &cwd, &prepared.env)?;
-        refuse_disguised_interpreter(&input.program, &exe)?;
+        // Tier3（D-108）: **プログラムの解決はコンテナの中で起きる。** ホストのPATHで解けば
+        // Windows の絶対パスが argv[0] になり、Linux のコンテナでは必ず失敗する。名前のまま渡す。
+        // 偽装インタプリタの拒否（短い名前・リンク）もホストで子を起こすときの検査なので通さない。
+        let exe = match ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+            true => std::path::PathBuf::from(&input.program),
+            false => {
+                let exe = resolve_program(&input.program, &cwd, &prepared.env)?;
+                refuse_disguised_interpreter(&input.program, &exe)?;
+                exe
+            }
+        };
         let exe_str = exe.to_str().ok_or_else(|| {
             ToolError::InvalidInput(format!(
                 "the resolved program path is not valid Unicode: {}",
@@ -248,7 +241,12 @@ fn program_subject(
 
     let mut env = harness_sandbox::build_child_env();
     super::env::append_path_extra(&mut env, &ctx.run_shell_path_extra);
-    let resolved = resolve_program(&program, cwd, &env).ok();
+    // Tier3 では解決はコンテナの中で起きるので、ホストのPATHで解かない（D-108）。
+    // 解いてしまうと、記録は**走りもしない Windows の絶対パス**に縛られる。
+    let resolved = match ctx.shell_tier.tier == harness_core::ShellTier::Tier3 {
+        true => None,
+        false => resolve_program(&program, cwd, &env).ok(),
+    };
     let in_workspace = resolved
         .as_deref()
         .is_some_and(|r| approval_binding::is_inside_workspace(&ctx.workspace_root, r));

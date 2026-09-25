@@ -293,14 +293,10 @@ fn render_os_and_shell(os: &OsKind, tier: ShellTier) -> String {
 /// `run_shell`は承認した行と一字一句同じでない限りどのモードでも確認が入ること（D-102。だから起動だけなら
 /// `run_program`を選ぶ）、そして**隔離の事実は同じく当たること**（言わないと「シェルを通らないから制約も
 /// 違う」と読みうる）。
-fn render_run_program(tier: ShellTier) -> String {
-    if tier == ShellTier::Tier3 {
-        return "run_program: Tier3では使えません。コマンドの実行にはrun_shellを使ってください。"
-            .to_string();
-    }
+fn render_run_program(_tier: ShellTier) -> String {
     "run_program: シェルを通さずにプログラムを直接起動します。programは実行ファイルの名前かパス、\
      argsは引数の配列で、各要素はそのまま1つの引数として届きます（空白・;・|・引用符を含んでも\
-     シェルに解釈されません）。パイプ・リダイレクト・PowerShellのコマンドレットは使えないので、\
+     シェルに解釈されません）。パイプ・リダイレクト・シェルの組み込み機能は使えないので、\
      それらが要るときはrun_shellを使ってください。素の名前はPATHからだけ探し、作業ディレクトリは\
      探しません。cmd・powershell・python等、引数やファイルをコードとして実行するプログラムと、\
      ワークスペース内に置かれた実行ファイルは、ユーザーが同じ引数・同じ中身で承認済みでない限り、\
@@ -844,11 +840,14 @@ mod tests {
                 .to_string()
         };
 
+        // **Tier3 も同じ説明になる**（D-108）。以前は「Tier3では使えません」と言っていたが、
+        // 電文が引数の配列を運べるようになったので、どのTierでも同じ道具として使える。
         for tier in [
             ShellTier::Tier0,
             ShellTier::Tier1,
             ShellTier::Tier2a,
             ShellTier::Tier2b,
+            ShellTier::Tier3,
         ] {
             let rendered = line(tier);
             for claim in [
@@ -866,10 +865,11 @@ mod tests {
             }
         }
 
-        // Tier3 では使えないことを言う。**使えると読める文を出さない**（禁止側と対にする）。
-        let tier3 = line(ShellTier::Tier3);
-        assert!(tier3.contains("使えません"), "{tier3}");
-        assert!(!tier3.contains("直接起動します"), "{tier3}");
+        // 対照: どのTierでも「使えません」とは言わない（D-108 で Tier3 も使えるようになった）。
+        for tier in [ShellTier::Tier0, ShellTier::Tier3] {
+            let rendered = line(tier);
+            assert!(!rendered.contains("使えません"), "{tier:?}: {rendered}");
+        }
     }
 
     /// **降格の告知はもう出ない**（D-75）。

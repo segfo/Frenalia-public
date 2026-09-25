@@ -198,7 +198,23 @@ fn serve_inner(
 ) -> Result<(), VmSandboxIpcError> {
     // 1件目: StartSession を待つ。ただし[BUG-029] `QueryActiveSessions`（`harness tier3 gc`が
     // 「本当にセッションが実行中か」を確認するための軽量リクエスト）も1件目として受理する。
-    let request_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
+    //
+    // D-108: その手前に版の握手（`Hello`）が1通来ることがある。**握手は接続を消費しない**
+    // ——応えたら同じ接続で`StartSession`を待ち続ける。
+    let mut request_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
+    if let Ok(VmRequest::Hello { client_build }) =
+        serde_json::from_slice::<VmRequest>(&request_bytes)
+    {
+        let _ = client_build;
+        send_response(
+            pipe,
+            &VmResponse::Hello {
+                daemon_build: env!("CARGO_PKG_VERSION").to_string(),
+                supports: vec![crate::vmsandboxd::CAP_EXEC_ARGV.to_string()],
+            },
+        )?;
+        request_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
+    }
     let (workspace_root, allow_domains, warm) =
         match serde_json::from_slice::<VmRequest>(&request_bytes) {
             Ok(VmRequest::StartSession {
@@ -318,6 +334,37 @@ fn serve_inner(
                     Err(e) => VmResponse::Err(format!("exec failed: {e}")),
                 };
                 send_response(pipe, &resp)?;
+            }
+            VmRequest::ExecArgv {
+                argv,
+                cwd,
+                env,
+                timeout_secs,
+            } => {
+                let cwd_path = workspace_root.join(cwd.trim_start_matches('/'));
+                let result = session.exec_argv(
+                    &argv,
+                    &cwd_path,
+                    &workspace_root,
+                    &env,
+                    std::time::Duration::from_secs(timeout_secs.max(1)),
+                );
+                let resp = match result {
+                    Ok((stdout, stderr, exit_code)) => VmResponse::ExecResult {
+                        stdout,
+                        stderr,
+                        exit_code,
+                    },
+                    Err(e) => VmResponse::Err(format!("exec failed: {e}")),
+                };
+                send_response(pipe, &resp)?;
+            }
+            VmRequest::Hello { .. } => {
+                // 握手は最初の1通だけ（`serve_inner`冒頭）。セッション中に来るのは配線の誤りである。
+                let _ = send_response(
+                    pipe,
+                    &VmResponse::Err("Hello is only valid as the first message".to_string()),
+                );
             }
             VmRequest::Teardown => {
                 let teardown_result = session.teardown(&workspace_root, &config);

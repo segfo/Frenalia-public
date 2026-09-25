@@ -109,16 +109,16 @@ pub(crate) async fn run_isolated(
     run_tier0(launch, cwd, env, dur).await
 }
 
-/// Tier3で`run_program`を断る理由。**呼び出し元（`RunProgramTool::call`）が先に断る**ので、
-/// ここへ来るのは配線の誤りである——それでも黙って`sh -c`へ畳まない。
-pub(crate) const TIER3_PROGRAM_UNSUPPORTED: &str =
-    "run_program is not available under tier3: the VM sandbox daemon only carries a shell \
-     command string, not an argument array. Use run_shell instead.";
-
 /// Tier3（Hyper-V外層VM + Incusコンテナ）実行経路。他Tierと異なり実プロセスをホスト側に
 /// spawnせず、`ctx.vm_sandbox`（`VmSandboxHandle`、`plans/DESIGN-SANDBOX-VMISOLATION.md`）経由で
 /// コンテナ内実行に委譲する。同期IPC呼び出しのため`spawn_blocking`で包む
 /// （`harness_core::VmShellExecutor`のdocコメント参照）。
+/// [`run_tier3`]が`spawn_blocking`へ持ち込む所有権付きの起動内容（[`Launch`]は借用を持つ）。
+enum Tier3Launch {
+    Shell(String),
+    Program(Vec<String>),
+}
+
 async fn run_tier3(
     launch: Launch<'_>,
     cwd: &Path,
@@ -126,17 +126,9 @@ async fn run_tier3(
     dur: Duration,
     vm_sandbox: Option<&std::sync::Arc<dyn harness_core::VmShellExecutor>>,
 ) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
-    // コンテナへの実行要求は常駐デーモン（vmsandboxd）との電文を通り、その電文が
-    // コマンド文字列1本しか運べない。**argvを`sh -c`の文字列へ組み直して通すことはしない**
+    // D-108: 引数の配列は配列のまま電文へ載せる。**`sh -c`の文字列へ組み直して通さない**
     // ——それをすると、構造化で消したはずの「解釈する層」がここで戻る（D-96）。
-    let command = match launch {
-        Launch::Shell { command } => command,
-        Launch::Program { .. } => {
-            return Err(ToolError::ExecutionFailed(
-                TIER3_PROGRAM_UNSUPPORTED.to_string(),
-            ))
-        }
-    };
+    // 相手が古くて配列を運べないときは、組み直さずに断る（案内は`STALE_DAEMON_HINT`）。
     let executor = vm_sandbox.cloned().ok_or_else(|| {
         ToolError::ExecutionFailed(
             "tier3 selected but ToolCtx.vm_sandbox is not set (internal error, harness-cli \
@@ -152,13 +144,22 @@ async fn run_tier3(
     // （TODO: Linux向けのenv許可リストが必要になった場合はPhase 2で再検討する）。
     let _ = env;
     let env: Vec<(String, String)> = Vec::new();
-    let command = command.to_string();
     let cwd = cwd.to_path_buf();
-    let (stdout, stderr, exit_code) =
-        tokio::task::spawn_blocking(move || executor.exec(&command, &cwd, &env, dur))
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("tier3 exec task panicked: {e}")))?
-            .map_err(ToolError::ExecutionFailed)?;
+    let owned = match launch {
+        Launch::Shell { command } => Tier3Launch::Shell(command.to_string()),
+        Launch::Program { exe, args } => {
+            let mut argv = vec![exe.to_string()];
+            argv.extend(args.iter().cloned());
+            Tier3Launch::Program(argv)
+        }
+    };
+    let (stdout, stderr, exit_code) = tokio::task::spawn_blocking(move || match owned {
+        Tier3Launch::Shell(command) => executor.exec(&command, &cwd, &env, dur),
+        Tier3Launch::Program(argv) => executor.exec_argv(&argv, &cwd, &env, dur),
+    })
+    .await
+    .map_err(|e| ToolError::ExecutionFailed(format!("tier3 exec task panicked: {e}")))?
+    .map_err(ToolError::ExecutionFailed)?;
     Ok((stdout, stderr, exit_code, "incus-exec"))
 }
 

@@ -60,9 +60,26 @@ use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 use crate::vmsandbox::{VmSandboxConfig, VmSession};
 use harness_sandbox::win_common::wide;
 
-/// 親→daemonへ送るメッセージ。`StartSession`→`Exec`(N回)→`Teardown`の順に送る。
+/// この電文で「話せる要求」の名前（D-108）。**相手が知らない要求を送る前に確かめる**ための札で、
+/// 増えるたびにここへ足す。
+pub const CAP_EXEC_ARGV: &str = "ExecArgv";
+
+/// 親→daemonへ送るメッセージ。`Hello`→`StartSession`→`Exec`/`ExecArgv`(N回)→`Teardown`の順に送る。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VmRequest {
+    /// 版の握手（D-108）。**最初の1通**として送り、相手が話せる要求の名前を受け取る。
+    ///
+    /// # なぜ要るのか
+    ///
+    /// この電文には版の取り決めが無く、常駐daemonは最後のセッションから15分生き残る
+    /// （[`DAEMON_IDLE_ACCEPT_TIMEOUT`]）。harnessを再ビルドして15分以内に走らせると、
+    /// **新しいクライアントが古いdaemonに当たる**——それ自体は避けられないので、
+    /// 当たったことが分かるようにする。分からないと「知らない種類だ」という直しようのない
+    /// エラーが出るだけになる。
+    Hello {
+        /// クライアント側の版（人が読むためだけの値。判断は`supports`で行う）。
+        client_build: String,
+    },
     StartSession {
         workspace_root: String,
         /// 出口許可リスト（SNIプロキシ+nftables DNAT、Phase 2）の対象ドメイン。空なら
@@ -76,6 +93,18 @@ pub enum VmRequest {
     },
     Exec {
         cmd: String,
+        cwd: String,
+        env: Vec<(String, String)>,
+        timeout_secs: u64,
+    },
+    /// 引数の配列をそのまま運ぶ実行要求（`run_program`、D-108）。応答は[`VmResponse::ExecResult`]。
+    ///
+    /// **`Exec`と違ってシェルを挟まない。** コンテナへ渡す口（Incus の REST API）は元々
+    /// 配列を受け取るので、`sh -c` を差し込んでいたのは電文に配列を入れる場所が無かったからである。
+    /// 送る前に[`CAP_EXEC_ARGV`]を相手が話せるか確かめること——**`sh -c`の文字列へ
+    /// 組み直して送る逃げ道は作らない**（D-96。構造化で消した「解釈する層」が戻る）。
+    ExecArgv {
+        argv: Vec<String>,
         cwd: String,
         env: Vec<(String, String)>,
         timeout_secs: u64,
@@ -99,6 +128,13 @@ pub enum VmRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VmResponse {
+    /// [`VmRequest::Hello`]への応答（D-108）。
+    Hello {
+        /// daemon側の版（人が読むためだけの値）。
+        daemon_build: String,
+        /// このdaemonが話せる要求の名前（[`CAP_EXEC_ARGV`]等）。
+        supports: Vec<String>,
+    },
     Ready,
     ExecResult {
         stdout: String,
@@ -204,6 +240,127 @@ pub use daemon::{serve_gc, serve_resident};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 版の握手（D-108）が往復すること。
+    #[test]
+    fn the_version_handshake_roundtrips() {
+        let req = VmRequest::Hello {
+            client_build: "0.1.0".to_string(),
+        };
+        let decoded: VmRequest =
+            serde_json::from_slice(&serde_json::to_vec(&req).unwrap()).unwrap();
+        assert!(matches!(decoded, VmRequest::Hello { .. }));
+
+        let resp = VmResponse::Hello {
+            daemon_build: "0.1.0".to_string(),
+            supports: vec![CAP_EXEC_ARGV.to_string()],
+        };
+        let decoded: VmResponse =
+            serde_json::from_slice(&serde_json::to_vec(&resp).unwrap()).unwrap();
+        match decoded {
+            VmResponse::Hello { supports, .. } => assert_eq!(supports, vec![CAP_EXEC_ARGV]),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// 引数の配列がそのまま往復すること（D-108）。**空白や`;`を含む要素が1つのまま残る**
+    /// ——ここが崩れると、構造化で消したはずの解釈が電文の上で戻る。
+    #[test]
+    fn the_argument_array_roundtrips_without_being_flattened() {
+        let argv = vec![
+            "git".to_string(),
+            "commit".to_string(),
+            "-m".to_string(),
+            "a b; rm -rf /".to_string(),
+        ];
+        let req = VmRequest::ExecArgv {
+            argv: argv.clone(),
+            cwd: "sub/dir".to_string(),
+            env: vec![],
+            timeout_secs: 30,
+        };
+        let decoded: VmRequest =
+            serde_json::from_slice(&serde_json::to_vec(&req).unwrap()).unwrap();
+        match decoded {
+            VmRequest::ExecArgv { argv: got, .. } => assert_eq!(got, argv),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// **能力の名前は、電文の変種の綴りと同じでなければならない。**
+    ///
+    /// daemonは「話せる要求の名前」として[`CAP_EXEC_ARGV`]を申告し、クライアントはそれを見て
+    /// [`VmRequest::ExecArgv`]を送ってよいか決める。変種の名前を変えたのに定数を直し忘れると、
+    /// **申告と実際に送るものがずれたまま**、どちらも正しく見える。
+    #[test]
+    fn the_capability_name_matches_the_request_variant() {
+        let value = serde_json::to_value(VmRequest::ExecArgv {
+            argv: vec![],
+            cwd: String::new(),
+            env: vec![],
+            timeout_secs: 1,
+        })
+        .unwrap();
+        let tag = value
+            .as_object()
+            .and_then(|o| o.keys().next().cloned())
+            .expect("externally tagged enum");
+        assert_eq!(tag, CAP_EXEC_ARGV);
+    }
+
+    /// **古いdaemonは`Hello`を「知らない種類」として断る**——クライアントの「古い相手」判定は
+    /// この事実に乗っている（`client::hello`が`Ok(None)`を返す条件）。
+    ///
+    /// 古い側を模すために、`Hello`・`ExecArgv`を持たない同じ形の列挙を1つ置く。
+    #[test]
+    fn an_older_daemon_cannot_parse_the_new_requests() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        enum OldVmRequest {
+            StartSession {
+                workspace_root: String,
+                allow_domains: Vec<String>,
+                #[serde(default)]
+                warm: bool,
+            },
+            Exec {
+                cmd: String,
+                cwd: String,
+                env: Vec<(String, String)>,
+                timeout_secs: u64,
+            },
+            Teardown,
+            Gc,
+            QueryActiveSessions,
+            ShutdownIfIdle,
+        }
+
+        for req in [
+            VmRequest::Hello {
+                client_build: "0.1.0".to_string(),
+            },
+            VmRequest::ExecArgv {
+                argv: vec!["git".to_string()],
+                cwd: String::new(),
+                env: vec![],
+                timeout_secs: 1,
+            },
+        ] {
+            let bytes = serde_json::to_vec(&req).unwrap();
+            assert!(
+                serde_json::from_slice::<OldVmRequest>(&bytes).is_err(),
+                "古いdaemonが読めてしまうと、握手で版を見分けられない: {req:?}"
+            );
+        }
+
+        // 対照: 古いdaemonが読める要求は、新しい側でも同じ意味で読める。
+        let old_bytes = serde_json::to_vec(&VmRequest::Teardown).unwrap();
+        assert!(serde_json::from_slice::<OldVmRequest>(&old_bytes).is_ok());
+        assert!(matches!(
+            serde_json::from_slice::<VmRequest>(&old_bytes).unwrap(),
+            VmRequest::Teardown
+        ));
+    }
 
     #[test]
     fn start_session_request_roundtrips_through_json() {

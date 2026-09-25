@@ -435,6 +435,21 @@ mod tests {
         ) -> Result<(String, String, Option<i32>), String> {
             Ok(("hello from tier3".to_string(), String::new(), Some(0)))
         }
+
+        fn exec_argv(
+            &self,
+            argv: &[String],
+            _cwd: &std::path::Path,
+            _env: &[(String, String)],
+            _timeout: std::time::Duration,
+        ) -> Result<(String, String, Option<i32>), String> {
+            // 配列のまま届いたことが見えるように、区切りを入れて返す（`run_program`のテストが読む）。
+            Ok((
+                format!("argv:{}", argv.join("\u{1}")),
+                String::new(),
+                Some(0),
+            ))
+        }
     }
 
     #[tokio::test]
@@ -1069,7 +1084,7 @@ mod tests {
             harness_sandbox::tier2a::spawnd::TransitionPolicy::empty(""),
             harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
         )
-            .expect("Tier2a product path requires a Spawn Daemon");
+        .expect("Tier2a product path requires a Spawn Daemon");
         let tool = RunShellTool::with_spawn_daemon(daemon, false);
 
         // (a) ワークスペース内への書込（絶対パス）→ 成功する（再帰ACL付与でパッケージSIDが
@@ -1237,7 +1252,7 @@ mod tests {
             harness_sandbox::tier2a::spawnd::TransitionPolicy::empty(""),
             harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
         )
-            .expect("Tier2a product path requires a Spawn Daemon");
+        .expect("Tier2a product path requires a Spawn Daemon");
         let tool = RunShellTool::with_spawn_daemon(daemon, false);
         // TCPソケットを直接開くprobe（HTTP_PROXYに依存しない、capability機構そのものを見る）。
         let connect_probe = "try { \

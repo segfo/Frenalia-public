@@ -489,6 +489,9 @@ impl VmSession {
 
     /// `run_shell`から呼ばれる実行チャネル本体。`cwd`はワークスペースルートからの相対パスへ
     /// 変換した上で`/workspace`配下へマッピングする。
+    ///
+    /// **`sh -c`を差し込むのはここだけ**——`run_shell`はその場のコードをシェルへ渡す道具なので
+    /// それが正しい。引数の配列を渡す`run_program`は[`Self::exec_argv`]を通る。
     pub fn exec(
         &self,
         cmd: &str,
@@ -497,17 +500,7 @@ impl VmSession {
         env: &[(String, String)],
         timeout: Duration,
     ) -> Result<(String, String, Option<i32>), VmError> {
-        let rel_cwd = cwd
-            .strip_prefix(workspace_root)
-            .unwrap_or_else(|_| Path::new("."));
-        let remote_cwd = if rel_cwd.as_os_str().is_empty() || rel_cwd == Path::new(".") {
-            WORKSPACE_MOUNT.to_string()
-        } else {
-            format!(
-                "{WORKSPACE_MOUNT}/{}",
-                rel_cwd.to_string_lossy().replace('\\', "/")
-            )
-        };
+        let remote_cwd = self.remote_cwd(cwd, workspace_root);
         self.incus.exec(
             &self.container_name,
             &["sh", "-c", cmd],
@@ -515,6 +508,39 @@ impl VmSession {
             env,
             timeout,
         )
+    }
+
+    /// `run_program`から呼ばれる実行チャネル（D-108）。**引数の配列をそのまま渡す。**
+    ///
+    /// コンテナへ渡す口（[`crate::vmsandbox::incus::Incus::exec`]）は元々配列を受け取るので、
+    /// ここでシェルを挟む理由が無い——挟むと、構造化で消したはずの「解釈する層」が戻る（D-96）。
+    pub fn exec_argv(
+        &self,
+        argv: &[String],
+        cwd: &Path,
+        workspace_root: &Path,
+        env: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<(String, String, Option<i32>), VmError> {
+        let remote_cwd = self.remote_cwd(cwd, workspace_root);
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        self.incus
+            .exec(&self.container_name, &borrowed, &remote_cwd, env, timeout)
+    }
+
+    /// ホストの作業ディレクトリを、コンテナ内の`/workspace`配下へ写す。
+    fn remote_cwd(&self, cwd: &Path, workspace_root: &Path) -> String {
+        let rel_cwd = cwd
+            .strip_prefix(workspace_root)
+            .unwrap_or_else(|_| Path::new("."));
+        if rel_cwd.as_os_str().is_empty() || rel_cwd == Path::new(".") {
+            WORKSPACE_MOUNT.to_string()
+        } else {
+            format!(
+                "{WORKSPACE_MOUNT}/{}",
+                rel_cwd.to_string_lossy().replace('\\', "/")
+            )
+        }
     }
 
     /// **Phase B**: VM自体はもう`self`が所有していない（`crate::vm_host::VmHost`が参照カウント

@@ -13,6 +13,7 @@
 //! 環境変数での合図は使えない。
 
 use super::*;
+use harness_core::ShellTier;
 use serde_json::json;
 
 /// 子が出す行の印。
@@ -246,41 +247,112 @@ async fn unknown_input_fields_are_rejected() {
     assert!(matches!(err, ToolError::InvalidInput(_)), "{err:?}");
 }
 
+/// Tier3 でも道具の説明は同じ（D-108）。以前は「Tier3では使えない」と差し替えていた。
 #[test]
-fn tier3_spec_says_run_program_is_unavailable() {
+fn tier3_describes_run_program_like_every_other_tier() {
     let dir = tempfile::tempdir().unwrap();
-    let mut ctx = ToolCtx::new(dir.path().to_path_buf());
-    ctx.shell_tier = harness_core::ShellTierSelection::direct(ShellTier::Tier3);
+    let mut tier3 = ToolCtx::new(dir.path().to_path_buf());
+    tier3.shell_tier = harness_core::ShellTierSelection::direct(ShellTier::Tier3);
+    let tier1 = ToolCtx::new(dir.path().to_path_buf());
 
-    let spec = RunProgramTool::default().spec_for_ctx(&ctx);
-
-    assert!(
-        spec.description.contains("run_shell"),
-        "{}",
-        spec.description
-    );
-    assert!(
-        spec.description.contains("使えない"),
-        "{}",
-        spec.description
+    let tool = RunProgramTool::default();
+    assert_eq!(
+        tool.spec_for_ctx(&tier3).description,
+        tool.spec_for_ctx(&tier1).description
     );
 }
 
-/// Tier3 では起動の準備に入る前に断る。**`sh -c` の文字列へ組み直して通さない**（D-96）。
+/// 引数の配列を持ったまま常駐デーモンへ渡す（D-108）。**`sh -c` の文字列へ組み直さない**（D-96）。
 #[tokio::test]
-async fn tier3_refuses_instead_of_rebuilding_a_shell_string() {
+async fn tier3_sends_the_argument_array_without_rebuilding_a_shell_string() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let dir = tempfile::tempdir().unwrap();
     let mut ctx = ToolCtx::new(dir.path().to_path_buf());
     ctx.shell_tier = harness_core::ShellTierSelection::direct(ShellTier::Tier3);
+    ctx.vm_sandbox = Some(std::sync::Arc::new(RecordingExecutor {
+        calls: calls.clone(),
+        fail_argv: None,
+    }));
+
+    let out = RunProgramTool::default()
+        .call(
+            json!({ "program": "git", "args": ["commit", "-m", "a b; rm -rf /"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+    let seen = calls.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec!["exec_argv: git|commit|-m|a b; rm -rf /".to_string()],
+        "配列のまま届いていない（`exec` へ落ちていれば `sh -c` へ畳まれている）"
+    );
+    // **ホストのPATHで解決しない**——解決すると Windows の絶対パスが argv[0] になる。
+    assert!(out.content.contains("[program: git]"), "{}", out.content);
+}
+
+/// 相手が古くて配列を運べないときは、**組み直さずに断る**（D-96・D-108）。
+#[tokio::test]
+async fn tier3_refuses_rather_than_falling_back_when_the_daemon_is_old() {
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let dir = tempfile::tempdir().unwrap();
+    let mut ctx = ToolCtx::new(dir.path().to_path_buf());
+    ctx.shell_tier = harness_core::ShellTierSelection::direct(ShellTier::Tier3);
+    ctx.vm_sandbox = Some(std::sync::Arc::new(RecordingExecutor {
+        calls: calls.clone(),
+        fail_argv: Some("the resident Tier3 daemon is older than this harness".to_string()),
+    }));
 
     let err = RunProgramTool::default()
         .call(json!({ "program": "git", "args": ["status"] }), &ctx)
         .await
         .unwrap_err();
 
-    match err {
-        ToolError::InvalidInput(msg) => assert!(msg.contains("tier3"), "{msg}"),
-        other => panic!("expected InvalidInput, got {other:?}"),
+    assert!(
+        format!("{err:?}").contains("older than this harness"),
+        "{err:?}"
+    );
+    // 断った後にシェルへ落としていない（`exec` は1度も呼ばれない）。
+    let seen = calls.lock().unwrap().clone();
+    assert!(seen.iter().all(|c| c.starts_with("exec_argv:")), "{seen:?}");
+}
+
+/// どちらの口が呼ばれたかを記録するだけの実行チャネル。
+#[derive(Debug)]
+struct RecordingExecutor {
+    calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// `Some`なら`exec_argv`をこの理由で断る（古い常駐デーモンの模擬）。
+    fail_argv: Option<String>,
+}
+
+impl harness_core::VmShellExecutor for RecordingExecutor {
+    fn exec(
+        &self,
+        cmd: &str,
+        _cwd: &std::path::Path,
+        _env: &[(String, String)],
+        _timeout: Duration,
+    ) -> Result<(String, String, Option<i32>), String> {
+        self.calls.lock().unwrap().push(format!("exec: {cmd}"));
+        Ok((String::new(), String::new(), Some(0)))
+    }
+
+    fn exec_argv(
+        &self,
+        argv: &[String],
+        _cwd: &std::path::Path,
+        _env: &[(String, String)],
+        _timeout: Duration,
+    ) -> Result<(String, String, Option<i32>), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("exec_argv: {}", argv.join("|")));
+        match &self.fail_argv {
+            Some(reason) => Err(reason.clone()),
+            None => Ok((String::new(), String::new(), Some(0))),
+        }
     }
 }
 

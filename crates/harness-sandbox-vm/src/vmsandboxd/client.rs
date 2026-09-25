@@ -69,6 +69,9 @@ unsafe fn launch_daemon_elevated(
 pub struct VmSandboxHandle {
     pipe: HANDLE,
     daemon_process: Option<HANDLE>,
+    /// 相手が話せる要求の名前（D-108 の版の握手で受け取る）。**空は「握手できなかった」**
+    /// ——古い常駐daemonに当たったということで、新しい要求は送らない。
+    supports: Vec<String>,
     /// `harness_core::VmShellExecutor::exec`（`cwd: &Path`が絶対ホストパス）を、IPC上の
     /// 相対パス文字列（daemon側が`workspace_root.join(..)`で復元する）へ変換するために保持する。
     workspace_root: PathBuf,
@@ -264,12 +267,49 @@ pub(super) fn connect_to_pipe_as_client(
     }
 }
 
+/// 古い常駐daemonに当たったときに人へ返す案内（D-108）。
+///
+/// **直しようのないエラーにしない。** 常駐daemonは最後のセッションから15分生き残るので、
+/// harnessを再ビルドして15分以内に走らせると必ずこれに当たる。何をすれば直るのかを書く。
+pub const STALE_DAEMON_HINT: &str =
+    "the resident Tier3 daemon is older than this harness and does not understand argument \
+     arrays, so run_program cannot be used with it. Run `harness tier3 stop-if-idle` to stop it \
+     (it also stops by itself 15 minutes after the last session), then try again. run_shell works \
+     with the old daemon.";
+
+/// 版の握手（D-108）。**接続の最初の1通**として送る。
+///
+/// 戻り値は3通り。`Ok(Some(supports))`は握手できた、`Ok(None)`は**相手が古くて`Hello`を
+/// 知らない**（相手は応答を返して接続を切る）、`Err`はIPC自体の失敗である。
+/// 古いときに落とさず`None`を返すのは、**`run_shell`は古いdaemonでもそのまま動く**からである
+/// ——ここで止めると、再ビルドしてから15分の間 Tier3 が丸ごと使えなくなる。
+fn hello(pipe: HANDLE) -> Result<Option<Vec<String>>, VmSandboxIpcError> {
+    let req = VmRequest::Hello {
+        client_build: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let bytes = serde_json::to_vec(&req)
+        .map_err(|e| VmSandboxIpcError::Ipc(format!("failed to serialize hello: {e}")))?;
+    write_framed_timeout(pipe, &bytes, REQUEST_WRITE_TIMEOUT)?;
+    let response_bytes = read_framed_timeout(pipe, START_SESSION_TIMEOUT)?;
+    let response: VmResponse = serde_json::from_slice(&response_bytes)
+        .map_err(|e| VmSandboxIpcError::Ipc(format!("failed to parse hello response: {e}")))?;
+    match response {
+        VmResponse::Hello { supports, .. } => Ok(Some(supports)),
+        // 古いdaemonは`Hello`を「知らない種類」として断る。それが版の答えである。
+        VmResponse::Err(_) => Ok(None),
+        other => Err(VmSandboxIpcError::Ipc(format!(
+            "unexpected response for Hello: {other:?}"
+        ))),
+    }
+}
+
 fn connect_and_start_session(
     pipe: HANDLE,
     daemon_process: Option<HANDLE>,
     workspace_root_str: String,
     allow_domains: Vec<String>,
     warm: bool,
+    supports: Vec<String>,
 ) -> Result<VmSandboxHandle, VmSandboxIpcError> {
     // S-2でパイプの向きが反転して以降、親側は`CreateFileW`（クライアント）で既に接続済みの
     // 状態でここへ来る。旧モデル（親=サーバ）の`ConnectNamedPipe`待ちはもう不要。
@@ -300,6 +340,7 @@ fn connect_and_start_session(
         Ok(()) => Ok(VmSandboxHandle {
             pipe,
             daemon_process,
+            supports,
             workspace_root,
             stopped: std::sync::atomic::AtomicBool::new(false),
         }),
@@ -397,12 +438,53 @@ impl VmSandboxHandle {
             return Err(e);
         }
 
+        // D-108: 何を送ってよいかを先に確かめる。古い常駐daemonは`Hello`を断って接続を切るので、
+        // そのときは張り直して握手なしで続ける——**`run_shell`は古いdaemonでもそのまま動く**ので、
+        // ここで止めると再ビルドから15分の間 Tier3 が丸ごと使えなくなる。
+        let supports = match hello(pipe) {
+            Ok(Some(supports)) => supports,
+            Ok(None) => {
+                unsafe {
+                    let _ = CloseHandle(pipe);
+                }
+                let pipe = match connect_to_pipe_as_client(pipe_name, CONNECT_TIMEOUT, true) {
+                    Ok(pipe) => pipe,
+                    Err(e) => {
+                        unsafe {
+                            if let Some(h) = daemon_process {
+                                let _ = CloseHandle(h);
+                            }
+                        }
+                        return Err(e);
+                    }
+                };
+                return connect_and_start_session(
+                    pipe,
+                    daemon_process,
+                    workspace_root.to_string_lossy().to_string(),
+                    allow_domains.to_vec(),
+                    warm,
+                    Vec::new(),
+                );
+            }
+            Err(e) => {
+                unsafe {
+                    let _ = CloseHandle(pipe);
+                    if let Some(h) = daemon_process {
+                        let _ = CloseHandle(h);
+                    }
+                }
+                return Err(e);
+            }
+        };
+
         connect_and_start_session(
             pipe,
             daemon_process,
             workspace_root.to_string_lossy().to_string(),
             allow_domains.to_vec(),
             warm,
+            supports,
         )
     }
 
@@ -417,13 +499,36 @@ impl VmSandboxHandle {
         allow_domains: &[String],
         warm: bool,
     ) -> Result<Self, VmSandboxIpcError> {
+        // D-108: 版の握手。**この経路は接続を張り直せない**（パイプ名を持たず、既に繋がった
+        // ものを受け取る）ので、古いdaemonに当たったら止める。案内は[`STALE_DAEMON_HINT`]。
+        let supports = match hello(pipe) {
+            Ok(Some(supports)) => supports,
+            Ok(None) => {
+                unsafe {
+                    let _ = CloseHandle(pipe);
+                }
+                return Err(VmSandboxIpcError::Rejected(STALE_DAEMON_HINT.to_string()));
+            }
+            Err(e) => {
+                unsafe {
+                    let _ = CloseHandle(pipe);
+                }
+                return Err(e);
+            }
+        };
         connect_and_start_session(
             pipe,
             None,
             workspace_root.to_string_lossy().to_string(),
             allow_domains.to_vec(),
             warm,
+            supports,
         )
+    }
+
+    /// 相手がこの要求を話せるか（D-108）。
+    pub fn supports(&self, capability: &str) -> bool {
+        self.supports.iter().any(|c| c == capability)
     }
 
     /// `harness_core::VmShellExecutor::exec`（`ToolCtx.vm_sandbox`経由の呼び出し）専用の内部関数。
@@ -444,6 +549,45 @@ impl VmSandboxHandle {
             .map_err(|e| e.to_string())
     }
 
+    /// `harness_core::VmShellExecutor::exec_argv`専用の内部関数（D-108）。[`Self::exec_for_trait`]の
+    /// 引数配列版で、cwdの変換だけを共有する。
+    fn exec_argv_for_trait(
+        &self,
+        argv: &[String],
+        cwd: &std::path::Path,
+        env: &[(String, String)],
+        timeout: std::time::Duration,
+    ) -> Result<(String, String, Option<i32>), String> {
+        // **握手が取れていない相手へは送らない。** 送れば「知らない種類だ」という直しようのない
+        // エラーが返るだけである。`sh -c`へ組み直す逃げ道も作らない（D-96）。
+        if !self.supports(crate::vmsandboxd::CAP_EXEC_ARGV) {
+            return Err(STALE_DAEMON_HINT.to_string());
+        }
+        let rel = cwd
+            .strip_prefix(&self.workspace_root)
+            .unwrap_or(std::path::Path::new(""));
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        self.exec_argv_ipc(argv, &rel_str, env.to_vec(), timeout)
+            .map_err(|e| e.to_string())
+    }
+
+    /// `ExecArgv`を送って応答を待つ（D-108）。送る前に[`Self::supports`]を確かめること。
+    pub fn exec_argv_ipc(
+        &self,
+        argv: &[String],
+        cwd: &str,
+        env: Vec<(String, String)>,
+        timeout: std::time::Duration,
+    ) -> Result<(String, String, Option<i32>), VmSandboxIpcError> {
+        let req = VmRequest::ExecArgv {
+            argv: argv.to_vec(),
+            cwd: cwd.to_string(),
+            env,
+            timeout_secs: timeout.as_secs(),
+        };
+        self.round_trip_exec(&req, timeout)
+    }
+
     /// `Exec`を送って応答を待つ（`run_shell`呼び出しのたびに反復）。`cwd`はワークスペース
     /// ルートからの相対パス文字列（daemon側で`workspace_root.join(..)`により復元される）。
     /// `harness_core::VmShellExecutor`実装（下記`impl`）はこれを、絶対ホストパスからの
@@ -461,7 +605,16 @@ impl VmSandboxHandle {
             env,
             timeout_secs: timeout.as_secs(),
         };
-        let bytes = serde_json::to_vec(&req).map_err(|e| {
+        self.round_trip_exec(&req, timeout)
+    }
+
+    /// 実行要求を1往復させる（`Exec`・`ExecArgv`が共有する。**応答の扱いは1箇所**）。
+    fn round_trip_exec(
+        &self,
+        req: &VmRequest,
+        timeout: std::time::Duration,
+    ) -> Result<(String, String, Option<i32>), VmSandboxIpcError> {
+        let bytes = serde_json::to_vec(req).map_err(|e| {
             VmSandboxIpcError::Ipc(format!("failed to serialize exec request: {e}"))
         })?;
         write_framed_timeout(self.pipe, &bytes, REQUEST_WRITE_TIMEOUT)?;
@@ -727,5 +880,15 @@ impl harness_core::VmShellExecutor for VmSandboxHandle {
         timeout: std::time::Duration,
     ) -> Result<(String, String, Option<i32>), String> {
         self.exec_for_trait(cmd, cwd, env, timeout)
+    }
+
+    fn exec_argv(
+        &self,
+        argv: &[String],
+        cwd: &std::path::Path,
+        env: &[(String, String)],
+        timeout: std::time::Duration,
+    ) -> Result<(String, String, Option<i32>), String> {
+        self.exec_argv_for_trait(argv, cwd, env, timeout)
     }
 }
