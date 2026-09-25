@@ -749,61 +749,76 @@ pub fn preflight_with_privhelper_launcher(
     // **古いpackage SID宛のACEは足さないだけでよい。** 死んだセッションのぶんは
     // [`sweep_stale_redirector_dll_aces`]が剥がし、生きているセッションのぶんは
     // そのセッションが終わるときに台帳経由で剥がれる。
-    {
-        for (dll, issued) in super::issue_redirector_dll_capabilities() {
-            let dll = &dll;
-            // 宛先SIDを作れなければ**この許可は書かない**（fail-closed）。package SIDへ
-            // 退避しないのは、それが「移行したつもりで全ドメインに開く」最悪の退避だからである。
-            let capability = match issued.and_then(|capability_name| {
-                super::capability_sid_from_name(&capability_name)
-                    .map(|sid| (capability_name, sid))
-                    .map_err(|e| e.to_string())
-            }) {
-                Ok(capability) => capability,
-                Err(e) => {
-                    warnings.push(format!(
-                        "could not derive the capability for the redirector DLL ({}): {e} -- \
-                         injection will fail for this session",
-                        dll.display()
-                    ));
-                    continue;
-                }
-            };
-            let (capability_name, capability_sid) = capability;
-            match grant_ace_inheritable_access(dll, capability_sid.as_psid(), FsAccess::ReadExec) {
-                Ok(()) => {
-                    crate::tier2a::session_profile::record_granted_capability(dll, &capability_name)
-                }
-                // BUG-059 / BUG-017と同じ保険: `Err`は「何も起きなかった」を意味しない。
-                // 副作用を伴う関数が途中で失敗したとき、ACEが既に載っているかは呼び出し側からは
-                // 分からない。載っているのに記録しないと**撤収経路の無い孤立ACE**になる
-                // （実機に4件残留していた）。rootを権威的にプローブして実在すれば記録する。
-                // `grant_ace_inheritable_access`側のファイル分岐（層1）を直した後も、この保険は
-                // 残す——記録漏れの代償（孤立ACE）は、幻の台帳エントリより重い。
-                // **宛先が変わっても理由は変わらないので、移行後も残す。**
-                Err(e) => {
-                    if matches!(sid_ace_mask(dll, capability_sid.as_psid()), Ok(Some(_))) {
-                        crate::tier2a::session_profile::record_granted_capability(
-                            dll,
-                            &capability_name,
-                        );
+    //
+    // # 名前を引いてから台帳へ記録するまでを、撤収側と同じ錠の中で行う（[BUG-165]）
+    //
+    // この宛先は**マシンに1つしかないDLL 2本に対して全セッションが共有する**ので、
+    // ここで引いた名前を、別のセッションの終了処理が**この処理の途中で**捨てうる。
+    // 引く・付ける・記録するの3つを1区間にすると、撤収側は「記録済みの生きたセッションが
+    // 居る」ことを必ず見られる（`session_profile::SHARED_CAPABILITY_LOCK`のdoc）。
+    harness_grant_ledger::with_named_lock(
+        crate::tier2a::session_profile::SHARED_CAPABILITY_LOCK,
+        || {
+            for (dll, issued) in super::issue_redirector_dll_capabilities() {
+                let dll = &dll;
+                // 宛先SIDを作れなければ**この許可は書かない**（fail-closed）。package SIDへ
+                // 退避しないのは、それが「移行したつもりで全ドメインに開く」最悪の退避だからである。
+                let capability = match issued.and_then(|capability_name| {
+                    super::capability_sid_from_name(&capability_name)
+                        .map(|sid| (capability_name, sid))
+                        .map_err(|e| e.to_string())
+                }) {
+                    Ok(capability) => capability,
+                    Err(e) => {
                         warnings.push(format!(
+                            "could not derive the capability for the redirector DLL ({}): {e} -- \
+                         injection will fail for this session",
+                            dll.display()
+                        ));
+                        continue;
+                    }
+                };
+                let (capability_name, capability_sid) = capability;
+                match grant_ace_inheritable_access(
+                    dll,
+                    capability_sid.as_psid(),
+                    FsAccess::ReadExec,
+                ) {
+                    Ok(()) => crate::tier2a::session_profile::record_granted_capability(
+                        dll,
+                        &capability_name,
+                    ),
+                    // BUG-059 / BUG-017と同じ保険: `Err`は「何も起きなかった」を意味しない。
+                    // 副作用を伴う関数が途中で失敗したとき、ACEが既に載っているかは呼び出し側からは
+                    // 分からない。載っているのに記録しないと**撤収経路の無い孤立ACE**になる
+                    // （実機に4件残留していた）。rootを権威的にプローブして実在すれば記録する。
+                    // `grant_ace_inheritable_access`側のファイル分岐（層1）を直した後も、この保険は
+                    // 残す——記録漏れの代償（孤立ACE）は、幻の台帳エントリより重い。
+                    // **宛先が変わっても理由は変わらないので、移行後も残す。**
+                    Err(e) => {
+                        if matches!(sid_ace_mask(dll, capability_sid.as_psid()), Ok(Some(_))) {
+                            crate::tier2a::session_profile::record_granted_capability(
+                                dll,
+                                &capability_name,
+                            );
+                            warnings.push(format!(
                             "granting the redirector DLL to its declaration capability reported an \
                              error ({}): {e} -- but the ACE is present on the file, so it was \
                              recorded in the session ledger and will be revoked at session end",
                             dll.display()
                         ));
-                    } else {
-                        warnings.push(format!(
-                            "failed to grant the redirector DLL to its declaration capability \
+                        } else {
+                            warnings.push(format!(
+                                "failed to grant the redirector DLL to its declaration capability \
                              ({}): {e}",
-                            dll.display()
-                        ));
+                                dll.display()
+                            ));
+                        }
                     }
                 }
             }
-        }
-    }
+        },
+    );
     let mut denied_passthrough: Vec<(std::path::PathBuf, String, String)> = Vec::new();
     let mut granted_passthrough: Vec<harness_core::GrantedPassthrough> = Vec::new();
     // 本体プロセス内（非管理者）でACCESS_DENIEDになったエントリ（システム保護パス等）だけを

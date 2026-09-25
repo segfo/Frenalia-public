@@ -211,6 +211,20 @@ pub(crate) unsafe fn inject_redirector(process: HANDLE) -> Result<(), AppContain
                 dll_path.display()
             )));
         }
+        // **待ちが成功したのは`WAIT_OBJECT_0`のときだけである。** ここを`WAIT_TIMEOUT`との
+        // 比較だけで済ませると、`WAIT_FAILED`（ハンドルが無効等）のとき終了コードが
+        // `STILL_ACTIVE`(259)のまま＝非0なので、**Redirector DLLが入っていない子をそのまま
+        // 起こしてしまう**——上の表が潰したはずの「時間切れが成功に見える」と同じ形が、
+        // 経路を変えて残っていた（`bug-pattern-rules` B-09、BUG-165の横展開で発見）。
+        if wait != windows::Win32::Foundation::WAIT_OBJECT_0 {
+            return Err(AppContainerError::Win32(format!(
+                "WaitForSingleObject on the LoadLibraryW thread returned 0x{:08x} ({}): {} — \
+                 whether the DLL loaded is unknown, so the child is not started",
+                wait.0,
+                dll_path.display(),
+                windows::core::Error::from_win32()
+            )));
+        }
         if let Err(e) = exit_code_read {
             return Err(AppContainerError::Win32(format!(
                 "GetExitCodeThread after LoadLibraryW({}): {e} — whether the DLL loaded is unknown, \

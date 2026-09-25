@@ -247,6 +247,47 @@ pub fn token_of_profile(name: &str) -> Option<&str> {
     (!token.is_empty() && !server_id.is_empty()).then_some(token)
 }
 
+/// **生きているセッションがまだ使っているcapability宛の付与**（`(パス, capability名)`の集合）。
+///
+/// # なぜ要るのか
+///
+/// capability SIDの宛先は`(発行元, 宣言パス, access級)`が鍵で**セッションを含まない**
+/// （`workspace_capability`のdoc）ので、**同じ付与を複数のセッションが記録する**。
+/// 記録した側の都合だけで剥がすと、**生きている側の足元のACEを消す**——症状はそのセッションの
+/// 次の操作が`ACCESS_DENIED`で落ちることで、剥がした側には何も起きないので原因に辿り着けない。
+///
+/// Redirector DLLは**全セッションが同じ2ファイルへ同じ宛先で**記録するので、常に踏む形である
+/// （[BUG-165](../../../../docs/bugs/BUG-165.md)）。
+///
+/// # なぜ`granted_paths`には同じ見張りが要らないのか
+///
+/// あちらの宛先は**そのセッションのpackage SID**で、定義からセッションごとに違う。
+/// 共有され得るのはcapability宛だけである。
+///
+/// # `except_token`
+///
+/// **自分自身の撤収を計画するときは、自分を除く**（[`plan_end_session`]）。`end_session`は
+/// 自分の生存マーカーをまだ握ったまま走るので、除かないと自分の記録が自分を止めて
+/// **何も剥がせなくなる**（逆向きの漏れ＝孤立ACE）。死んだセッションの回収
+/// （[`plan_reclaim`]）では対象が既に死んでいるので`None`でよい。
+fn capabilities_held_by_live<'a>(
+    ledger: &'a SessionLedger,
+    is_live: &dyn Fn(&str) -> bool,
+    except_token: Option<&str>,
+) -> std::collections::HashSet<(&'a str, &'a str)> {
+    ledger
+        .sessions
+        .iter()
+        .filter(|e| except_token != Some(e.token.as_str()))
+        .filter(|e| is_live(&e.token))
+        .flat_map(|e| {
+            e.granted_capabilities
+                .iter()
+                .map(|g| (g.path.as_str(), g.capability_name.as_str()))
+        })
+        .collect()
+}
+
 /// 台帳と「実在するharnessプロファイル名の一覧」から、回収すべきものを決める。
 ///
 /// - 台帳にあり、生存マーカーが無い → そのパスのACEを剥がしてプロファイルを消す
@@ -266,26 +307,11 @@ pub fn plan_reclaim(
     existing_profiles: &[String],
     is_live: &dyn Fn(&str) -> bool,
 ) -> Vec<ReclaimTarget> {
-    // **capability SID宛の付与は共有される。** 宛先の鍵は`(workspace, 宣言パス, access級)`で
-    // セッションを含まない（`workspace_capability`のdoc）ので、**同じものを複数のセッションが
-    // 記録している**ことがある。死んだ側の記録だけを見て剥がすと、**生きている側の足元の
-    // ACEを消す**——症状はそのセッションの次の操作が`ACCESS_DENIED`で落ちることで、
-    // 剥がした側には何も起きないので原因に辿り着けない。
-    //
-    // # なぜ`granted_paths`には同じ見張りが要らないのか
-    //
-    // あちらの宛先は**そのセッションのpackage SID**で、定義からセッションごとに違う。
-    // 共有され得るのはcapability宛だけである。
-    let held_by_live: std::collections::HashSet<(&str, &str)> = ledger
-        .sessions
-        .iter()
-        .filter(|e| is_live(&e.token))
-        .flat_map(|e| {
-            e.granted_capabilities
-                .iter()
-                .map(|g| (g.path.as_str(), g.capability_name.as_str()))
-        })
-        .collect();
+    // **capability SID宛の付与は共有される。** 見張りの中身と理由は
+    // [`capabilities_held_by_live`]が持つ（正常終了側の[`plan_end_session`]と同じ1つを使う
+    // ——2つ書くと片方だけ直る）。ここは死んだセッションを回収する側なので、除外する
+    // トークンは無い。
+    let held_by_live = capabilities_held_by_live(ledger, is_live, None);
 
     let mut targets = Vec::new();
     for entry in &ledger.sessions {
@@ -1483,16 +1509,47 @@ pub fn live_probe_report() -> String {
     )
 }
 
+/// 共有される宣言capabilityの**付与と撤収**を直列化する名前付きミューテックス
+/// （OSに名前を1つ登録して、同時に1人しか握れないようにする仕組み）の名前。
+///
+/// # 何のためにあるのか（[BUG-165] の残り半分）
+///
+/// 「生きている他セッションが使っている宛先は剥がさない」という見張り
+/// （[`capabilities_held_by_live`]）だけでは、**判断した後・実際に剥がすまでの窓**が残る。
+///
+/// ```text
+/// 撤収する側: 他に誰も居ない、と判断 ─────────→ ACEを剥がす ──→ 名前を捨てる
+/// 起動する側:            begin_session → 名前を引く → ACEを付ける → 台帳へ記録
+///                                        ↑ここで引いた名前が、この後で捨てられる
+/// ```
+///
+/// 起動した側は「名前は引けたのに、その名前が台帳から消えている」状態になり、
+/// 次のspawnで宛先が0本になる。**判断と実行を1つの臨界区間に入れるとこの窓が閉じる。**
+///
+/// 付ける側は`win_appcontainer::preflight`のRedirector DLLのブロックが同じ名前で握る。
+///
+/// # ここで握っても止まらないもの
+///
+/// 昇格（UAC）の応答待ちはこの区間に入らない——入れてはいけない。
+/// `traverse_ledger`が同じ理由で付与側の錠を意図的に持たないと書いている
+/// （握ると2つ目の`harness.exe`が1つ目のダイアログに無限に待たされる）。
+/// 撤収と、Redirector DLL 2本へのACE書込はどちらも非昇格で完結する。
+pub(crate) const SHARED_CAPABILITY_LOCK: &str = "Local\\harness-shared-capability-grants";
+
 /// 死んだセッションの資源を回収する（起動時に呼ぶ）。
 ///
 /// 返り値は**実際に回収できた件数**であって、対象として挙がった件数ではない
 /// （`grants_known: false`のものは意図的に見送るため、両者は一致しない）。
 /// 見送りや削除失敗の内訳は[`ReclaimOutcome`]で受け取る。
+///
+/// 計画から撤収までを[`SHARED_CAPABILITY_LOCK`]の中で行う（[BUG-165]）。
 pub fn gc_dead_sessions_reporting(
     revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers,
 ) -> ReclaimOutcome {
-    let targets = plan_reclaim(&ledger().load(), &win::existing_profiles(), &win::is_live);
-    reclaim_targets(&targets, revoke)
+    harness_grant_ledger::with_named_lock(SHARED_CAPABILITY_LOCK, || {
+        let targets = plan_reclaim(&ledger().load(), &win::existing_profiles(), &win::is_live);
+        reclaim_targets(&targets, revoke)
+    })
 }
 
 /// [`gc_dead_sessions_reporting`]の件数だけが要る呼び出し向け。
@@ -1500,33 +1557,42 @@ pub fn gc_dead_sessions(revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers) -> usiz
     gc_dead_sessions_reporting(revoke).deleted_profiles
 }
 
-/// このセッションの資源を撤収する（正常終了時に呼ぶ。落ちた場合は次回起動の
-/// [`gc_dead_sessions`]が同じ経路で回収する）。
+/// 自分のセッションの撤収対象を決める（[`end_session`]の判断の部分）。
 ///
-/// [BUG-103] **結果を返す**（`#[must_use]`）。かつては`()`で、剥がせなかったノードが
-/// ここで消えていた——`end_session`はセッション終了時の**唯一の撤収経路**なので、
-/// ここで捨てると孤立ACEは誰の目にも触れずに実マシンへ残る。
-#[must_use]
-pub fn end_session(revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers) -> ReclaimOutcome {
-    let token = session_token();
-    let Some(entry) = ledger()
-        .load()
-        .sessions
-        .into_iter()
-        .find(|e| e.token == token)
-    else {
-        return ReclaimOutcome::default();
+/// # なぜ[`plan_reclaim`]と対で純関数にしてあるのか
+///
+/// **撤収の経路は2つある**——落ちた場合の回収（[`plan_reclaim`]）と、正常終了（ここ）。
+/// [BUG-165](../../../../docs/bugs/BUG-165.md)は、共有されるcapability宛の見張りを
+/// **前者にだけ**入れたために起きた（3経路のうち2経路にしか無く、残る1経路が正常終了だった）。
+/// 同じ形の2つの関数として並べ、どちらも実世界を引数で受け取ることで、
+/// **次に判断を足す人が両方を見る**ようにしてある。
+fn plan_end_session(
+    ledger: &SessionLedger,
+    token: &str,
+    is_live: &dyn Fn(&str) -> bool,
+) -> Vec<ReclaimTarget> {
+    let Some(entry) = ledger.sessions.iter().find(|e| e.token == token) else {
+        return Vec::new();
     };
+    // **生きている他のセッションがまだ使っているcapability宛は剥がさない**（BUG-165）。
+    // 自分を除くのは、`end_session`が自分の生存マーカーを握ったまま走るからである
+    // （[`capabilities_held_by_live`]のdoc）。
+    let held_by_live = capabilities_held_by_live(ledger, is_live, Some(token));
     // MCPサーバのプロファイルも同じ経路で撤収する（このセッションと同じ寿命、D-38）。
     // 自セッションは台帳エントリを読めているので`grants_known: true`（付与が0件だったのなら、
     // それは「分からない」ではなく「無かった」である）。
     let mut targets = vec![ReclaimTarget {
-        profile_name: entry.profile_name,
-        granted_paths: entry.granted_paths,
-        granted_capabilities: entry.granted_capabilities,
+        profile_name: entry.profile_name.clone(),
+        granted_paths: entry.granted_paths.clone(),
+        granted_capabilities: entry
+            .granted_capabilities
+            .iter()
+            .filter(|g| !held_by_live.contains(&(g.path.as_str(), g.capability_name.as_str())))
+            .cloned()
+            .collect(),
         grants_known: true,
     }];
-    targets.extend(entry.mcp.into_iter().map(|m| ReclaimTarget {
+    targets.extend(entry.mcp.iter().cloned().map(|m| ReclaimTarget {
         profile_name: m.profile_name,
         granted_paths: m.granted_paths,
         // MCPサーバはcapability群の対象外（§22.2.2）。`plan_reclaim`側と同じ理由。
@@ -1536,13 +1602,32 @@ pub fn end_session(revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers) -> ReclaimOu
     // [#55] 遷移先ドメインの入れ物も同じ寿命で回収する（`plan_reclaim`側と同じ理由）。
     // **2つの経路の片方だけに足さない**——正常終了はここ、落ちた場合は次回起動の
     // `gc_dead_sessions`（`plan_reclaim`経由）で、どちらかが欠けるとその回の入れ物が残る。
-    targets.extend(entry.domains.into_iter().map(|d| ReclaimTarget {
+    targets.extend(entry.domains.iter().cloned().map(|d| ReclaimTarget {
         profile_name: d.profile_name,
         granted_paths: d.granted_paths,
         granted_capabilities: Vec::new(),
         grants_known: true,
     }));
-    reclaim_targets(&targets, revoke)
+    targets
+}
+
+/// このセッションの資源を撤収する（正常終了時に呼ぶ。落ちた場合は次回起動の
+/// [`gc_dead_sessions`]が同じ経路で回収する）。
+///
+/// [BUG-103] **結果を返す**（`#[must_use]`）。かつては`()`で、剥がせなかったノードが
+/// ここで消えていた——`end_session`はセッション終了時の**唯一の撤収経路**なので、
+/// ここで捨てると孤立ACEは誰の目にも触れずに実マシンへ残る。
+///
+/// 何を対象にするかの判断は[`plan_end_session`]が持つ（実世界を引数で受ける純関数なので、
+/// 「生きている他セッションの足元を剥がさない」を単体テストで固定できる）。
+/// その判断と実際の撤収は[`SHARED_CAPABILITY_LOCK`]の中で続けて行う——**判断だけでは
+/// 窓が残る**（同定数のdoc）。
+#[must_use]
+pub fn end_session(revoke: &dyn Fn(&Path, &str) -> RevokeLeftovers) -> ReclaimOutcome {
+    harness_grant_ledger::with_named_lock(SHARED_CAPABILITY_LOCK, || {
+        let targets = plan_end_session(&ledger().load(), session_token(), &win::is_live);
+        reclaim_targets(&targets, revoke)
+    })
 }
 
 #[cfg(test)]
@@ -2029,6 +2114,97 @@ mod tests {
         assert!(
             targets.iter().all(|t| t.granted_capabilities.len() == 1),
             "誰も使っていない宛先が剥がされずに残っている: {targets:?}"
+        );
+    }
+
+    /// [BUG-165] **正常終了でも、生きている他セッションの足元は剥がさない。**
+    ///
+    /// 上の`plan_reclaim`側の見張りと**同じ判断が、撤収のもう1つの経路にも要る**。
+    /// 入っていなかったので、同時に走っているharnessのうち1本が正常終了しただけで
+    /// 残り全員のRedirector DLLの許可が消え、`e2e-all`が毎回赤になっていた。
+    #[test]
+    fn end_session_does_not_strip_a_capability_that_a_live_session_still_holds() {
+        let dll = ("C:\\tools\\harness_redirector.dll", "harnessDeclShared");
+        let own = ("C:\\ws\\.harness\\diff", "harnessDeclOwn");
+        let ledger = SessionLedger {
+            sessions: vec![
+                entry_with_capabilities("me", &[dll, own]),
+                entry_with_capabilities("other", &[dll]),
+            ],
+        };
+        let live: HashSet<String> = ["me", "other"].iter().map(|s| s.to_string()).collect();
+
+        let targets = plan_end_session(&ledger, "me", &liveness(&live));
+        let names: Vec<&str> = targets[0]
+            .granted_capabilities
+            .iter()
+            .map(|g| g.capability_name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["harnessDeclOwn"],
+            "まだ走っている他セッションが使っている宛先を剥がそうとしている: {targets:?}"
+        );
+    }
+
+    /// **対の側**（`B-35`）: 他に誰も居なければ、共有されていた宛先も剥がす。
+    /// これが無いと「正常終了では一切剥がさない」実装でも上のテストは緑になり、
+    /// **撤収経路の無い孤立ACE**がDLLに残り続ける。
+    #[test]
+    fn end_session_strips_a_shared_capability_when_it_is_the_last_holder() {
+        let dll = ("C:\\tools\\harness_redirector.dll", "harnessDeclShared");
+        let ledger = SessionLedger {
+            sessions: vec![
+                entry_with_capabilities("me", &[dll]),
+                // 記録は残っているが、もう生きていない（落ちた側）。
+                entry_with_capabilities("dead", &[dll]),
+            ],
+        };
+        let live: HashSet<String> = ["me".to_string()].into_iter().collect();
+
+        let targets = plan_end_session(&ledger, "me", &liveness(&live));
+        assert_eq!(
+            targets[0].granted_capabilities.len(),
+            1,
+            "最後の1本なのに剥がしていない（孤立ACEになる）: {targets:?}"
+        );
+    }
+
+    /// **自分の生存マーカーで自分を止めない。**
+    ///
+    /// `end_session`は自分のマーカーを握ったまま走るので、`plan_reclaim`と同じ式を
+    /// そのまま持ってくると**自分の記録が自分を止めて1本も剥がせなくなる**
+    /// ——見張りを入れたつもりで、逆向きの漏れ（孤立ACE）を作る。
+    #[test]
+    fn end_session_is_not_blocked_by_its_own_liveness_marker() {
+        let dll = ("C:\\tools\\harness_redirector.dll", "harnessDeclShared");
+        let ledger = SessionLedger {
+            sessions: vec![entry_with_capabilities("me", &[dll])],
+        };
+        let live: HashSet<String> = ["me".to_string()].into_iter().collect();
+
+        let targets = plan_end_session(&ledger, "me", &liveness(&live));
+        assert_eq!(
+            targets[0].granted_capabilities.len(),
+            1,
+            "自分だけが生きている状況で自分の付与を剥がせていない: {targets:?}"
+        );
+    }
+
+    /// package SID宛の付与は正常終了でも無条件に剥がす（**宛先がセッションごとに違う**ので
+    /// 共有され得ない）。`plan_reclaim`側の同名のテストと対になる。
+    #[test]
+    fn end_session_path_grants_are_not_affected_by_the_shared_capability_guard() {
+        let ledger = SessionLedger {
+            sessions: vec![entry("me", &["C:\\ws"]), entry("other", &["C:\\ws"])],
+        };
+        let live: HashSet<String> = ["me", "other"].iter().map(|s| s.to_string()).collect();
+
+        let targets = plan_end_session(&ledger, "me", &liveness(&live));
+        assert_eq!(
+            targets[0].granted_paths,
+            vec!["C:\\ws".to_string()],
+            "package SID宛はセッションごとに違うので、同じパスでも剥がしてよい"
         );
     }
 
