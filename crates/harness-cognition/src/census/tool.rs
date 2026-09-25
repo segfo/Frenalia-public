@@ -45,11 +45,19 @@ use async_trait::async_trait;
 use harness_core::{LlmProvider, RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
 use harness_engine::{PermissionGate, TurnExecutor};
 use harness_tools::ToolRegistry;
+use serde::Deserialize;
 
 use crate::census::{CensusContext, CensusEngine, CensusLimits, CensusStop};
 use crate::context::ContextAssembler;
 use crate::phase::PhaseBudgets;
 use crate::scratch::ScratchStore;
+
+/// `census`の入力。**知らない項目は拒否する**（BUG-164・D-101）。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CensusInput {
+    goal: String,
+}
 
 pub struct CensusTool {
     provider: Arc<dyn LlmProvider>,
@@ -112,10 +120,9 @@ impl Tool for CensusTool {
     }
 
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let goal = input
-            .get("goal")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("goal is required".to_string()))?;
+        let input: CensusInput =
+            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let goal = input.goal.as_str();
 
         let session_id = format!(
             "census-{}",
@@ -309,6 +316,35 @@ mod tests {
         );
         // 拒否されたので観測ゼロ→そのitemは失敗として記録され、ツール出力は最終回答に現れない。
         assert!(!output.content.contains("a.txt"), "{}", output.content);
+    }
+
+    /// 知らない項目は拒否する（BUG-164・D-101）。LLM を1回も呼ばずに止まる
+    /// （応答を1つも積んでいない MockProvider が呼ばれれば、結果は `InvalidInput` にならない）。
+    /// 素直な入力（`goal` だけ）が通ることは上のテストが測っている。
+    #[tokio::test]
+    async fn an_unknown_field_is_refused_before_any_llm_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let census = CensusTool::new(
+            Arc::new(MockProvider::new(vec![])),
+            Arc::new(RecordingGate::new()),
+            Arc::new(ToolRegistry::with_builtin_tools()),
+            PhaseBudgets::default(),
+            "mock".to_string(),
+            200_000,
+        );
+
+        let err = census
+            .call(
+                serde_json::json!({ "goal": "aを調べて", "command": "x" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::InvalidInput(m) if m.contains("unknown field")),
+            "{err:?}"
+        );
     }
 
     /// 7. `census`ツールの`tool_result`は`notes/`の要約を結合したものだけで、

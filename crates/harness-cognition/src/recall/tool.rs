@@ -11,11 +11,24 @@
 
 use async_trait::async_trait;
 use harness_core::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
+use serde::Deserialize;
 
 use super::checkpoint;
 use super::search;
 use super::store::RecallStore;
 use super::write::write_checkpoint;
+
+/// `recall`の入力。**知らない項目は拒否する**（BUG-164・D-101）——余分な項目を黙って捨てると、
+/// 判定だけを騙す細工を最後まで通す部品になる。`action`を列挙型にしないのは、未知の値に
+/// `unknown action: …`と返す既存の文言を保つため。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecallInput {
+    action: String,
+    query: Option<String>,
+    text: Option<String>,
+    tags: Option<Vec<String>>,
+}
 
 pub struct RecallTool {
     /// `cognition.recall.allow_unversioned`（設定、ユーザー層限定）。
@@ -77,12 +90,10 @@ impl Tool for RecallTool {
     }
 
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let action = input
-            .get("action")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("action is required".to_string()))?;
+        let input: RecallInput =
+            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
-        match action {
+        match input.action.as_str() {
             "search" => self.call_search(input, ctx).await,
             "remember" => self.call_remember(input, ctx).await,
             other => Err(ToolError::InvalidInput(format!("unknown action: {other}"))),
@@ -91,14 +102,10 @@ impl Tool for RecallTool {
 }
 
 impl RecallTool {
-    async fn call_search(
-        &self,
-        input: serde_json::Value,
-        ctx: &ToolCtx,
-    ) -> Result<ToolOutput, ToolError> {
+    async fn call_search(&self, input: RecallInput, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let query = input
-            .get("query")
-            .and_then(|v| v.as_str())
+            .query
+            .as_deref()
             .ok_or_else(|| ToolError::InvalidInput("query is required for search".to_string()))?;
 
         let store = match RecallStore::for_workspace(&ctx.workspace_root) {
@@ -148,22 +155,14 @@ impl RecallTool {
 
     async fn call_remember(
         &self,
-        input: serde_json::Value,
+        input: RecallInput,
         ctx: &ToolCtx,
     ) -> Result<ToolOutput, ToolError> {
         let text = input
-            .get("text")
-            .and_then(|v| v.as_str())
+            .text
+            .as_deref()
             .ok_or_else(|| ToolError::InvalidInput("text is required for remember".to_string()))?;
-        let tags: Vec<String> = input
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let tags: Vec<String> = input.tags.unwrap_or_default();
 
         let store = match RecallStore::for_workspace(&ctx.workspace_root) {
             Ok(s) => s,
@@ -241,5 +240,35 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    /// 知らない項目は拒否する（BUG-164・D-101）。スキーマに `path` が無くても、以前は余分な
+    /// `path` を黙って捨てて書込を続けていた。素直な `search` は読み込みを通る（対照）。
+    #[tokio::test]
+    async fn an_unknown_field_is_refused_but_the_honest_input_passes() {
+        let tool = RecallTool::new(true);
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+
+        let err = tool
+            .call(
+                serde_json::json!({ "action": "remember", "text": "x", "path": "../evil" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::InvalidInput(m) if m.contains("unknown field")),
+            "{err:?}"
+        );
+
+        let r = tool
+            .call(serde_json::json!({ "action": "search", "query": "x" }), &ctx)
+            .await;
+        assert!(
+            !matches!(&r, Err(ToolError::InvalidInput(_))),
+            "honest search must pass deserialization: {:?}",
+            r.err()
+        );
     }
 }

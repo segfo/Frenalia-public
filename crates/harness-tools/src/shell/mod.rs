@@ -73,6 +73,9 @@ pub use net_decision::{should_grant_tier2a_network_capability, NetDecision};
 pub use program::{RunProgramTool, RUN_PROGRAM_TOOL};
 
 #[derive(Deserialize)]
+// 知らない項目は拒否する（BUG-164・D-101）。余分な項目を黙って捨てると、判定だけを騙す細工を
+// 最後まで通す部品になる。
+#[serde(deny_unknown_fields)]
 struct RunShellInput {
     command: String,
     timeout_ms: Option<u64>,

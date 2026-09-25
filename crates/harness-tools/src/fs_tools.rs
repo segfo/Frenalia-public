@@ -17,6 +17,9 @@ use crate::sandbox_error_to_tool_error;
 // --- read_file ---
 
 #[derive(Deserialize)]
+// 知らない項目は拒否する（BUG-164・D-101）。余分な項目を黙って捨てると、判定だけを騙す細工を
+// 最後まで通す部品になる。
+#[serde(deny_unknown_fields)]
 struct ReadFileInput {
     path: String,
     offset: Option<usize>,
@@ -96,6 +99,9 @@ impl Tool for ReadFileTool {
 // --- write_file ---
 
 #[derive(Deserialize)]
+// 知らない項目は拒否する（BUG-164・D-101）。余分な項目を黙って捨てると、判定だけを騙す細工を
+// 最後まで通す部品になる。
+#[serde(deny_unknown_fields)]
 struct WriteFileInput {
     path: String,
     content: String,
@@ -164,6 +170,9 @@ impl Tool for WriteFileTool {
 // --- edit_file ---
 
 #[derive(Deserialize)]
+// 知らない項目は拒否する（BUG-164・D-101）。余分な項目を黙って捨てると、判定だけを騙す細工を
+// 最後まで通す部品になる。
+#[serde(deny_unknown_fields)]
 struct EditFileInput {
     path: String,
     old_string: String,

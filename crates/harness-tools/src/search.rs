@@ -23,6 +23,9 @@ const MAX_OUTPUT_LINES: usize = 500;
 // --- grep ---
 
 #[derive(Deserialize)]
+// 知らない項目は拒否する（BUG-164・D-101）。余分な項目を黙って捨てると、判定だけを騙す細工を
+// 最後まで通す部品になる。
+#[serde(deny_unknown_fields)]
 struct GrepInput {
     pattern: String,
     path: Option<String>,
@@ -269,6 +272,9 @@ fn format_sink_bytes(
 // --- glob ---
 
 #[derive(Deserialize)]
+// 知らない項目は拒否する（BUG-164・D-101）。余分な項目を黙って捨てると、判定だけを騙す細工を
+// 最後まで通す部品になる。
+#[serde(deny_unknown_fields)]
 struct GlobInput {
     pattern: String,
     path: Option<String>,

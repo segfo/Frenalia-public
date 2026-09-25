@@ -20,6 +20,9 @@ const MAX_REDIRECTS: usize = 5;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Deserialize)]
+// 知らない項目は拒否する（BUG-164・D-101）。余分な項目を黙って捨てると、判定だけを騙す細工を
+// 最後まで通す部品になる。
+#[serde(deny_unknown_fields)]
 struct WebFetchInput {
     url: String,
     max_bytes: Option<usize>,
