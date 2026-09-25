@@ -19,6 +19,7 @@
 
 /// [段階6e] モデルが「いま何を起こせるか」を引く読み取り専用ツール（§19.3.8）。
 /// **登録するのは遷移MACが実際に強制されているときだけ**（`harness-cli`の`transition_tool`）。
+pub mod approval_binding;
 mod can_run_program;
 mod dial;
 pub mod fake_dns;

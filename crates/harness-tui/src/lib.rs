@@ -700,7 +700,13 @@ pub async fn run(
                                             app.transcript.push(app::TranscriptItem::Error(reason));
                                         }
                                     }
-                                    SlashCommand::Allow(rule) => engine.gate.add_allow(rule),
+                                    SlashCommand::Allow(rule) => {
+                                        if let Err(reason) = engine.gate.add_allow(rule) {
+                                            app.transcript.push(app::TranscriptItem::Error(
+                                                format!("/allow: {reason}"),
+                                            ));
+                                        }
+                                    }
                                     // BUG-070: 要約はLLM呼び出しなので数秒〜数十秒かかる。
                                     // 進捗を出さないとユーザーは「効いていない」と思って
                                     // 連打し、**その回数だけ要約が直列に走る**。

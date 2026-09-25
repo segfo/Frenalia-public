@@ -239,9 +239,8 @@ pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, Ex
         ("--allow", cli.allow.clone()),
     ] {
         for rule in rules {
-            match parse_allowlist_rule(&rule) {
-                Ok(r) => arbiter.add_rule(r),
-                Err(reason) => eprintln!("ignoring {origin} rule {rule:?}: {reason}"),
+            if let Err(reason) = parse_allowlist_rule(&rule).and_then(|r| arbiter.add_rule(r)) {
+                eprintln!("ignoring {origin} rule {rule:?}: {reason}");
             }
         }
     }

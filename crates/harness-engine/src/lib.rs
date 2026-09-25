@@ -10,6 +10,7 @@
 //! M9で キャンセル整合・コンテキスト圧縮（`compaction`モジュール）・大出力切詰め・
 //! リトライ/リアクティブ圧縮・JSONLセッション永続化（`session`モジュール）を追加した。
 
+pub mod approval_ledger;
 pub mod compaction;
 pub mod degeneracy;
 pub mod permission;
@@ -1234,7 +1235,7 @@ mod tests {
         assert!(content.contains("hello"));
     }
 
-    /// allowlistで`run_shell:echo allowed`（完全一致、D-96）を明示した場合は、Defaultモードのヘッドレス既定拒否を
+    /// allowlistで`run_shell:echo allowed`（完全一致、D-96・D-102）を明示した場合は、Defaultモードのヘッドレス既定拒否を
     /// 上書きして許可される（§パーミッション「allowlist: closed-by-default」）。
     #[tokio::test]
     async fn allowlisted_run_shell_executes() {
@@ -1253,11 +1254,10 @@ mod tests {
         state.push_user_text("run an allowed shell command");
         let tools = harness_tools::ToolRegistry::with_builtin_tools();
         let ctx = ToolCtx::new(dir.path().to_path_buf());
-        let arbiter = PermissionArbiter::new(
-            PermissionMode::Default,
-            vec![AllowlistRule::exact("run_shell", "echo allowed")],
-            "/workspace",
-        );
+        let mut arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], dir.path());
+        arbiter
+            .add_rule(crate::parse_allowlist_rule("run_shell:echo allowed").unwrap())
+            .unwrap();
 
         run_agent_loop(
             &provider,

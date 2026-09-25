@@ -14,7 +14,7 @@
 //! 発行しoneshot応答を待つ（§リッチTUI「承認ダイアログ」）。
 
 use async_trait::async_trait;
-use harness_core::{ArgPattern, PermissionSubject, ProgramRule, RiskClass};
+use harness_core::{ArgPattern, PermissionSubject, ProgramRule, RiskClass, ShellRule};
 use std::path::PathBuf;
 
 /// §パーミッション（承認）システム「モード」。
@@ -123,6 +123,8 @@ impl AllowlistRule {
 pub enum AllowRule {
     Pattern(AllowlistRule),
     Program(ProgramRule),
+    /// `run_shell`の完全一致（D-102）。縛るファイルは[`PermissionArbiter::add_rule`]が決める。
+    Shell(ShellRule),
 }
 
 /// 前方一致（末尾`*`）を受け付けるツール。材料が正規化した書込先パス（`WritePath`）になるものだけ。
@@ -157,7 +159,11 @@ pub fn parse_allowlist_rule(rule: &str) -> Result<AllowRule, String> {
                     .to_string(),
             );
         }
-        return Ok(AllowRule::Pattern(AllowlistRule::exact(tool, pattern)));
+        return Ok(AllowRule::Shell(ShellRule {
+            line: pattern.to_string(),
+            files: Vec::new(),
+            workspace: None,
+        }));
     }
     if pattern != "*" && pattern.ends_with('*') && !PREFIX_TOOLS.contains(&tool) {
         return Err(format!(
@@ -182,18 +188,10 @@ fn parse_program_rule(pattern: &str) -> Result<ProgramRule, String> {
     let args: Vec<ArgPattern> = items
         .map(|a| a.map_or(ArgPattern::Hole, ArgPattern::Exact))
         .collect();
-    let rule = ProgramRule { program, args };
-    if harness_core::is_interpreter_program(&rule.program) {
-        if rule.has_hole() {
-            return Err(format!(
-                "{} runs its arguments as code, so its rules cannot have holes",
-                rule.program
-            ));
-        }
-        // 中身のハッシュで縛る仕組み（段4）が入るまでは、ファイルに依存する規則を作れない。
+    let rule = ProgramRule::unbound(program, args);
+    if harness_core::is_interpreter_program(&rule.program) && rule.has_hole() {
         return Err(format!(
-            "{} runs its arguments as code; rules for it must be bound to file contents, \
-             which is not supported yet — approve it in the approval screen instead",
+            "{} runs its arguments as code, so its rules cannot have holes",
             rule.program
         ));
     }
@@ -221,6 +219,8 @@ pub struct PermissionArbiter {
     /// `run_program`の規則（コマンドライン・設定・承認画面の「常に許可」）。引数の配列を1本の文字列へ
     /// 潰して照合しないために、`allowlist`とは分けて持つ。
     program_rules: Vec<ProgramRule>,
+    /// `run_shell`の規則（完全一致＋字面に出るファイルの中身、D-102）。
+    shell_rules: Vec<ShellRule>,
     /// 実行中に`accept-all`へ切り替えてよいか（TUI の`/mode`）。起動時に1回だけ決める
     /// （`--permission-mode accept-all`を受け付ける条件と同じ値。`DESIGN-CLI-OPTIONS.md`の D-74 が
     /// 実装されたら、この値の決め方だけが変わる）。既定は偽（切り替えさせない）。
@@ -248,6 +248,7 @@ impl PermissionArbiter {
             mode,
             allowlist,
             program_rules: Vec::new(),
+            shell_rules: Vec::new(),
             accept_all_permitted: false,
             workspace_root: workspace_root.into(),
         }
@@ -282,22 +283,32 @@ impl PermissionArbiter {
         if self.mode == PermissionMode::Plan {
             return Classification::Deny;
         }
+        let workspace = self.workspace_root.to_string_lossy();
         match subject {
-            // T-09（`plans/DESIGN-SANDBOX.md` §6.4）: allowlistを無効化する構文
-            // （`-EncodedCommand`・`iex`・`Start-Process`・`cmd /c`・入れ子インタプリタ等）を検出したら
-            // allowlist一致・`AcceptAll`より前に強制的にPromptへ落とす（ヘッドレスは自動拒否）。
-            // これは追加ブロックであり安全の根拠にはしない（`base64`/`$IFS`等で自明に回避可能。§9残存リスク3）。
-            // **聞く方向にしか働かない**ので、検出が漏れても元の規則どおりに扱われるだけである。
-            PermissionSubject::Command(c) if looks_like_allowlist_bypass(&c.line) => {
-                return Classification::Prompt;
+            // `run_shell`は PowerShell / sh というインタプリタに、その場のコードを渡す道具である。
+            // D-102: **`accept-all`を含む全モードで**、人が承認した文字列との完全一致＋字面に出るファイルの
+            // 中身の一致だけを自動で通し、それ以外は聞く。これが無いと、`run_program`で聞かれる
+            // `python build.py`を`run_shell`に書くだけで素通りできる（§4.2）。
+            PermissionSubject::Command(c) => {
+                // T-09（`plans/DESIGN-SANDBOX.md` §6.4）: allowlistを無効化する構文を含む行は、
+                // 記録と一致しても聞く。**聞く方向にしか働かない**ので、検出が漏れても元の照合に戻るだけである。
+                if looks_like_allowlist_bypass(&c.line) {
+                    return Classification::Prompt;
+                }
+                return if self.shell_rules.iter().any(|r| r.matches(c, &workspace)) {
+                    Classification::Allow
+                } else {
+                    Classification::Prompt
+                };
             }
-            // D-99（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §4.2）: `run_program`で起こすプログラムが
-            // **引数やファイルをコードとして実行する**もの（インタプリタ）なら、`AcceptAll`と規則より前に
-            // 人へ回す。綴りの部分一致ではなく、`program`の名前の完全一致で見る。
-            //
-            // 中身のハッシュで縛る記録（段階2）が入るまでは、インタプリタは常にここで止まる。
-            PermissionSubject::Program(p) if harness_core::is_interpreter_program(&p.program) => {
-                return Classification::Prompt;
+            // D-99・D-103: コードを走らせる`run_program`（インタプリタ・ワークスペース内の実行ファイル）は、
+            // 中身で縛った記録と一致するときだけ通し、それ以外は`accept-all`でも聞く。
+            PermissionSubject::Program(p) if p.runs_code => {
+                return if self.program_rules.iter().any(|r| r.matches(p, &workspace)) {
+                    Classification::Allow
+                } else {
+                    Classification::Prompt
+                };
             }
             // D-05（`plans/DESIGN-SANDBOX.md` §7）: 設定注入パス（`.git/config`・`.harness/**`等）への
             // 書込はmode/allowlistに関わらず常に拒否する（層3 hard-deny、Tier1/Tier2b内でも解除しない。
@@ -324,10 +335,14 @@ impl PermissionArbiter {
         Classification::Prompt
     }
 
-    /// 規則のどれかに当たるか。`run_program`は引数の配列のまま照合し、他は材料の文字列で照合する。
+    /// 規則のどれかに当たるか。`run_program`は引数の配列のまま照合し、他は材料の文字列で照合する
+    /// （`run_shell`とコードを走らせる`run_program`は、`classify`がこの手前で決めている）。
     fn matches_a_rule(&self, tool: &str, subject: &PermissionSubject) -> bool {
+        let workspace = self.workspace_root.to_string_lossy();
         match subject {
-            PermissionSubject::Program(p) => self.program_rules.iter().any(|r| r.matches(p)),
+            PermissionSubject::Program(p) => {
+                self.program_rules.iter().any(|r| r.matches(p, &workspace))
+            }
             other => {
                 let prefix_allowed = matches!(other, PermissionSubject::WritePath(_));
                 other.rule_text().is_some_and(|text| {
@@ -352,16 +367,30 @@ impl PermissionArbiter {
     /// §パーミッション「allowlistへの追記」。
     ///
     /// **完全一致の規則として覚える**（[`AllowlistRule::exact`]）。人が見たのはその1件だけである。
-    /// インタプリタの`run_program`を覚えても、`classify`はその手前で聞く（中身で縛る記録が無いため）。
-    pub fn remember_allow(&mut self, tool: impl Into<String>, subject: &PermissionSubject) {
+    /// `run_shell`とコードを走らせる`run_program`は、縛ったファイルごと覚えてワークスペースに縛る。
+    /// **確かめられないものを含む呼び出しは覚えない**（覚えても照合で当たらない形になるが、
+    /// 覚えたように見せない）。覚えたら`true`。
+    pub fn remember_allow(&mut self, tool: impl Into<String>, subject: &PermissionSubject) -> bool {
         let tool = tool.into();
+        let workspace = self.workspace_root.to_string_lossy().into_owned();
         match subject {
-            PermissionSubject::Program(p) => self.program_rules.push(ProgramRule::exact(p)),
-            other => {
-                if let Some(text) = other.rule_text() {
-                    self.allowlist.push(AllowlistRule::exact(tool, text));
-                }
+            PermissionSubject::Command(c) if c.unverifiable => false,
+            PermissionSubject::Command(c) => {
+                self.shell_rules.push(ShellRule::exact(c, &workspace));
+                true
             }
+            PermissionSubject::Program(p) if p.runs_code && p.one_shot_only => false,
+            PermissionSubject::Program(p) => {
+                self.program_rules.push(ProgramRule::exact(p, &workspace));
+                true
+            }
+            other => match other.rule_text() {
+                Some(text) => {
+                    self.allowlist.push(AllowlistRule::exact(tool, text));
+                    true
+                }
+                None => false,
+            },
         }
     }
 
@@ -387,11 +416,56 @@ impl PermissionArbiter {
 
     /// 規則を足す（コマンドライン・ユーザー層設定・M9スラッシュコマンド`/allow`。`remember_allow`と
     /// 異なり承認応答経由でなく、ユーザが明示的に書いた規則。読むのは[`parse_allowlist_rule`]）。
-    pub fn add_rule(&mut self, rule: AllowRule) {
+    ///
+    /// **ファイルに依存する規則（`run_shell`・インタプリタの`run_program`）は、足した時点の中身で縛る**
+    /// （D-104）。ワークスペースのルートを作業ディレクトリとして字面・引数を引き、実ファイルを読む。
+    /// 確かめられないもの（読めないファイル・ファイルでない引数）を含む規則は足さずに`Err(理由)`。
+    pub fn add_rule(&mut self, rule: AllowRule) -> Result<(), String> {
+        use harness_tools::approval_binding::{bind_program_args, bind_shell_line, ChildView};
+
+        let workspace = self.workspace_root.to_string_lossy().into_owned();
         match rule {
             AllowRule::Pattern(r) => self.allowlist.push(r),
+            AllowRule::Program(mut r) if harness_core::is_interpreter_program(&r.program) => {
+                let view = ChildView::real(&self.workspace_root)?;
+                let args: Vec<String> = r
+                    .args
+                    .iter()
+                    .map(|a| match a {
+                        ArgPattern::Exact(v) => v.clone(),
+                        ArgPattern::Hole => String::new(),
+                    })
+                    .collect();
+                let binding = bind_program_args(&view, &self.workspace_root, &args);
+                if binding.one_shot_only {
+                    return Err(format!(
+                        "{} runs its arguments as code, and not every argument is a file inside \
+                         the workspace that can be bound to its contents; approve such calls one \
+                         at a time instead",
+                        r.program
+                    ));
+                }
+                r.files = binding.files;
+                r.workspace = Some(harness_core::fold_path_for_rule(&workspace));
+                self.program_rules.push(r);
+            }
             AllowRule::Program(r) => self.program_rules.push(r),
+            AllowRule::Shell(mut r) => {
+                let view = ChildView::real(&self.workspace_root)?;
+                let binding = bind_shell_line(&view, &self.workspace_root, &r.line);
+                if binding.unverifiable {
+                    return Err(
+                        "the line mentions a file inside the workspace whose contents cannot be \
+                         read, so the rule cannot be bound to it"
+                            .to_string(),
+                    );
+                }
+                r.files = binding.files;
+                r.workspace = Some(harness_core::fold_path_for_rule(&workspace));
+                self.shell_rules.push(r);
+            }
         }
+        Ok(())
     }
 }
 
@@ -480,19 +554,17 @@ mod tests {
     /// `run_shell`は行、`write_file`・`edit_file`は書込先パス、それ以外は代表の文字列。
     fn subj(tool: &str, text: &str) -> PermissionSubject {
         match tool {
-            "run_shell" => PermissionSubject::Command(CommandSubject {
-                line: text.to_string(),
-            }),
+            "run_shell" => PermissionSubject::Command(CommandSubject::line_only(text)),
             "write_file" | "edit_file" => PermissionSubject::WritePath(text.to_string()),
             _ => PermissionSubject::Text(text.to_string()),
         }
     }
 
     fn prog(program: &str, args: &[&str]) -> PermissionSubject {
-        PermissionSubject::Program(ProgramSubject {
-            program: program.to_string(),
-            args: args.iter().map(|a| a.to_string()).collect(),
-        })
+        PermissionSubject::Program(ProgramSubject::plain(
+            program,
+            args.iter().map(|a| a.to_string()).collect(),
+        ))
     }
 
     #[test]
@@ -611,12 +683,168 @@ mod tests {
     }
 
     #[test]
-    fn accept_all_allows_everything() {
+    fn accept_all_allows_everything_except_code_it_has_not_seen() {
         let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", "rm -rf /")),
+            arbiter.decide(
+                "write_file",
+                RiskClass::Write,
+                &subj("write_file", "src/x.rs")
+            ),
             Decision::Allow
         );
+        assert_eq!(
+            arbiter.decide(
+                "web_fetch",
+                RiskClass::Network,
+                &subj("web_fetch", "https://x")
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            arbiter.decide(
+                harness_tools::RUN_PROGRAM_TOOL,
+                RiskClass::Exec,
+                &prog("git", &["status"])
+            ),
+            Decision::Allow
+        );
+        // D-102: run_shell は accept-all でも、承認した文字列と一致しない限り聞く（ヘッドレスは拒否）。
+        assert_eq!(
+            arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", "rm -rf /")),
+            Decision::Deny
+        );
+        assert_eq!(
+            arbiter.classify("run_shell", RiskClass::Exec, &subj("run_shell", "rm -rf /")),
+            Classification::Prompt
+        );
+    }
+
+    /// run_shell の記録は、行と字面に出るファイルの中身が同じときだけ当たる（D-102）。
+    /// 記録した後にファイルを書き換えると、同じ行でも聞く。accept-all でも同じ。
+    #[test]
+    fn a_recorded_shell_line_stops_matching_when_its_script_changes() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("build.py"), "print('v1')").unwrap();
+        let view = harness_tools::approval_binding::ChildView::real(ws.path()).unwrap();
+        let subject_now = || {
+            let b = harness_tools::approval_binding::bind_shell_line(
+                &view,
+                ws.path(),
+                "python build.py",
+            );
+            PermissionSubject::Command(CommandSubject {
+                line: "python build.py".into(),
+                files: b.files,
+                unverifiable: b.unverifiable,
+                previews: b.previews,
+            })
+        };
+        for mode in [PermissionMode::Default, PermissionMode::AcceptAll] {
+            std::fs::write(ws.path().join("build.py"), "print('v1')").unwrap();
+            let mut arbiter = PermissionArbiter::new(mode, vec![], ws.path());
+            assert_eq!(
+                arbiter.classify("run_shell", RiskClass::Exec, &subject_now()),
+                Classification::Prompt,
+                "{mode:?}: not recorded yet"
+            );
+            assert!(arbiter.remember_allow("run_shell", &subject_now()));
+            assert_eq!(
+                arbiter.classify("run_shell", RiskClass::Exec, &subject_now()),
+                Classification::Allow,
+                "{mode:?}: the same line with the same file"
+            );
+            std::fs::write(ws.path().join("build.py"), "print('v2')").unwrap();
+            assert_eq!(
+                arbiter.classify("run_shell", RiskClass::Exec, &subject_now()),
+                Classification::Prompt,
+                "{mode:?}: the script changed"
+            );
+        }
+    }
+
+    /// コマンドラインの run_shell の規則は、足した時点の中身で縛る（D-104）。
+    #[test]
+    fn a_command_line_shell_rule_is_bound_to_the_contents_at_startup() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("deploy.ps1"), "Write-Host v1").unwrap();
+        let mut arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], ws.path());
+        arbiter
+            .add_rule(parse_allowlist_rule("run_shell:./deploy.ps1").unwrap())
+            .unwrap();
+        let view = harness_tools::approval_binding::ChildView::real(ws.path()).unwrap();
+        let subject_now = || {
+            let b =
+                harness_tools::approval_binding::bind_shell_line(&view, ws.path(), "./deploy.ps1");
+            PermissionSubject::Command(CommandSubject {
+                line: "./deploy.ps1".into(),
+                files: b.files,
+                unverifiable: b.unverifiable,
+                previews: b.previews,
+            })
+        };
+        assert_eq!(
+            arbiter.classify("run_shell", RiskClass::Exec, &subject_now()),
+            Classification::Allow
+        );
+        std::fs::write(ws.path().join("deploy.ps1"), "Write-Host v2").unwrap();
+        assert_eq!(
+            arbiter.classify("run_shell", RiskClass::Exec, &subject_now()),
+            Classification::Prompt
+        );
+    }
+
+    /// コマンドラインのインタプリタの規則は、足した時点の中身で縛る（D-104）。
+    /// 引数にファイルでないもの（その場のコード）があれば、規則そのものを足さない。
+    #[test]
+    fn a_command_line_interpreter_rule_is_bound_at_startup_or_refused() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("build.py"), "print('v1')").unwrap();
+        let mut arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], ws.path());
+        arbiter
+            .add_rule(parse_allowlist_rule(r#"run_program:["python","build.py"]"#).unwrap())
+            .unwrap();
+        let err = arbiter
+            .add_rule(parse_allowlist_rule(r#"run_program:["python","-c","print(1)"]"#).unwrap())
+            .unwrap_err();
+        assert!(err.contains("not every argument is a file"), "{err}");
+
+        let view = harness_tools::approval_binding::ChildView::real(ws.path()).unwrap();
+        let subject_now = || {
+            let args = vec!["build.py".to_string()];
+            let b = harness_tools::approval_binding::bind_program_args(&view, ws.path(), &args);
+            PermissionSubject::Program(ProgramSubject {
+                files: b.files,
+                previews: b.previews,
+                one_shot_only: b.one_shot_only,
+                ..ProgramSubject::plain("python", args)
+            })
+        };
+        let tool = harness_tools::RUN_PROGRAM_TOOL;
+        assert_eq!(
+            arbiter.classify(tool, RiskClass::Exec, &subject_now()),
+            Classification::Allow
+        );
+        std::fs::write(ws.path().join("json.py"), "evil").unwrap();
+        assert_eq!(
+            arbiter.classify(tool, RiskClass::Exec, &subject_now()),
+            Classification::Prompt,
+            "a sibling appeared next to the script (accept-all does not help)"
+        );
+    }
+
+    /// 確かめられないものを含む呼び出しは覚えない（覚えたように見せない）。
+    #[test]
+    fn calls_that_cannot_be_bound_are_not_remembered() {
+        let mut arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
+        let mut unverifiable = CommandSubject::line_only("cat secret.bin");
+        unverifiable.unverifiable = true;
+        assert!(!arbiter.remember_allow("run_shell", &PermissionSubject::Command(unverifiable)));
+        // インタプリタにその場のコードを渡す呼び出し（ファイルに縛れない）。
+        assert!(!arbiter.remember_allow(
+            harness_tools::RUN_PROGRAM_TOOL,
+            &prog("pwsh", &["-c", "Get-Date"])
+        ));
     }
 
     #[test]
@@ -876,18 +1104,15 @@ mod tests {
         // run_shell経由の設定書換（T-07）は本チェックの対象外。D-06（gitハードニング）+
         // D-09（overlay apply時の再チェック）が担当する。ここではrun_shellの引数
         // （コマンド文字列）が誤検知でDenyにならないことだけ確認する。
-        let arbiter = PermissionArbiter::new(
-            PermissionMode::AcceptAll,
-            vec![AllowlistRule::new("run_shell", "*")],
-            "/workspace",
-        );
+        // 行に設定注入パスが出ても拒否（Deny）にはならず、記録が無いので聞く（Prompt）。
+        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
         assert_eq!(
             arbiter.classify(
                 "run_shell",
                 RiskClass::Exec,
                 &subj("run_shell", "cat .git/config")
             ),
-            Classification::Allow
+            Classification::Prompt
         );
     }
 
@@ -965,10 +1190,11 @@ mod tests {
         // 受け付ける形。
         assert_eq!(
             parse_allowlist_rule("run_shell:cargo test"),
-            Ok(AllowRule::Pattern(AllowlistRule::exact(
-                "run_shell",
-                "cargo test"
-            )))
+            Ok(AllowRule::Shell(ShellRule {
+                line: "cargo test".into(),
+                files: Vec::new(),
+                workspace: None,
+            }))
         );
         assert_eq!(
             parse_allowlist_rule("write_file:src/*"),
@@ -983,14 +1209,14 @@ mod tests {
         );
         assert_eq!(
             parse_allowlist_rule(r#"run_program:["git","log","-n",null]"#),
-            Ok(AllowRule::Program(ProgramRule {
-                program: "git".into(),
-                args: vec![
+            Ok(AllowRule::Program(ProgramRule::unbound(
+                "git".into(),
+                vec![
                     ArgPattern::Exact("log".into()),
                     ArgPattern::Exact("-n".into()),
                     ArgPattern::Hole
                 ],
-            }))
+            )))
         );
         // 受け付けない形。黙って別の意味に読まない。
         for bad in [
@@ -1006,7 +1232,6 @@ mod tests {
             "run_program:[]",
             "run_program:[null,\"x\"]",
             r#"run_program:["python",null]"#,
-            r#"run_program:["python","build.py"]"#,
         ] {
             assert!(
                 parse_allowlist_rule(bad).is_err(),
@@ -1019,7 +1244,9 @@ mod tests {
     #[test]
     fn a_program_rule_from_the_command_line_matches_by_argument_array() {
         let mut arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
-        arbiter.add_rule(parse_allowlist_rule(r#"run_program:["git","log","-n",null]"#).unwrap());
+        arbiter
+            .add_rule(parse_allowlist_rule(r#"run_program:["git","log","-n",null]"#).unwrap())
+            .unwrap();
         let tool = harness_tools::RUN_PROGRAM_TOOL;
         assert_eq!(
             arbiter.classify(tool, RiskClass::Exec, &prog("git", &["log", "-n", "5"])),

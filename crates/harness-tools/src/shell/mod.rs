@@ -380,15 +380,36 @@ impl Tool for RunShellTool {
         RiskClass::Exec
     }
 
+    /// 判定の材料（D-101）。行に字面で現れるワークスペース内のファイルを、子が読むのと同じ見え方で
+    /// 縛る（D-102）。ファイルを読むので`spawn_blocking`で走らせる（B-31）。
     async fn permission_subject(
         &self,
         input: &serde_json::Value,
-        _ctx: &ToolCtx,
+        ctx: &ToolCtx,
     ) -> Result<PermissionSubject, ToolError> {
         let input: RunShellInput = parse_tool_input(input)?;
-        Ok(PermissionSubject::Command(CommandSubject {
-            line: input.command,
-        }))
+        let cwd = resolve_cwd(input.cwd.as_deref(), ctx)?;
+        let line = input.command;
+        let ctx = ctx.clone();
+        tokio::task::spawn_blocking(move || {
+            let (files, previews, unverifiable) =
+                match crate::approval_binding::ChildView::for_ctx(&ctx) {
+                    Ok(view) => {
+                        let b = crate::approval_binding::bind_shell_line(&view, &cwd, &line);
+                        (b.files, b.previews, b.unverifiable)
+                    }
+                    // 見え方を開けなければ、何も確かめられない。記録と照合しない。
+                    Err(_) => (Vec::new(), Vec::new(), true),
+                };
+            PermissionSubject::Command(CommandSubject {
+                line,
+                files,
+                unverifiable,
+                previews,
+            })
+        })
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("permission subject task failed: {e}")))
     }
 
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {

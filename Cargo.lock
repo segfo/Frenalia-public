@@ -1166,8 +1166,11 @@ name = "harness-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "directories",
  "futures",
+ "harness-change-ledger",
  "harness-core",
+ "harness-grant-ledger",
  "harness-providers",
  "harness-tools",
  "serde",
@@ -1379,6 +1382,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "which",

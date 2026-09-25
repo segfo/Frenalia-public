@@ -7,7 +7,14 @@ edition.workspace = true
 async-trait = "0.1.89"
 futures = "0.3.32"
 harness-core = { version = "0.1.0", path = "../harness-core" }
+# 承認の台帳（`approval_ledger`）。置き場とロックの作法を4台帳と共有する。
+harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
+# 承認の台帳が、記録した相対パスを読む側で検証する（P-01）。
+harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 harness-tools = { version = "0.1.0", path = "../harness-tools" }
+# 差分用の写しの置き場（`%LOCALAPPDATA%\harness\data`。台帳の`%APPDATA%`とは別で、
+# スクリプトの中身をローミングで他の機械へ運ばない）。
+directories = "6"
 serde = "1"
 serde_json = "1"
 tokio = { version = "1.52.3", features = ["sync", "time"] }

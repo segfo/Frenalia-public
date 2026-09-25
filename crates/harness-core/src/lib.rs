@@ -32,8 +32,12 @@ pub use net_policy::{
     domain_match, is_ip_literal, normalize_domain_pattern, validate_domain_pattern, DomainPolicy,
     DomainPolicyDecision,
 };
-pub use permission_subject::{CommandSubject, PermissionSubject, ProgramSubject};
-pub use program_rule::{hole_accepts, is_format_char, ArgPattern, ProgramRule};
+pub use permission_subject::{
+    BoundFile, CommandSubject, FilePreview, PermissionSubject, ProgramSubject,
+};
+pub use program_rule::{
+    fold_path_for_rule, hole_accepts, is_format_char, ArgPattern, ProgramRule, ShellRule,
+};
 pub use prompt::{render as render_environment_prompt, EnvironmentFacts, OsKind};
 pub use provider::{
     BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities, ProviderError,

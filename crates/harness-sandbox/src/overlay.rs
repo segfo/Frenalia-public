@@ -479,6 +479,62 @@ impl SandboxFs {
         Ok(set.into_iter().map(PathBuf::from).collect())
     }
 
+    /// `rel_dir`（空文字列ならワークスペースのルート）の直下にある名前の一覧。
+    /// 実ファイルの名前に、差分層の実効の変更（台帳に載っていない実体を含む）を重ね、削除の記録を引く。
+    ///
+    /// 承認に「スクリプトの隣の名前一覧」を縛るために使う（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` D-104）。
+    /// 差分層の中に新しく作られたサブディレクトリも、その最初の名前として現れる
+    /// （`json/__init__.py`が増えれば`json`が増える）。**子の見え方の上位集合**になるよう作ってあり、
+    /// 名前の増加を見落とさない側に倒れている。
+    pub fn list_dir_names(&self, rel_dir: &str) -> Result<BTreeSet<String>, SandboxError> {
+        let dir = rel_dir.trim_matches('/');
+        let mut names = self.jail.list_dir_names(dir)?;
+        let Some(overlay) = &self.overlay else {
+            return Ok(names);
+        };
+        let prefix = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        for e in effective_changes(&self.jail, overlay) {
+            let c = e.change;
+            if Path::new(&c.path).is_absolute() {
+                continue;
+            }
+            let Some(rest) = c.path.strip_prefix(&prefix) else {
+                continue;
+            };
+            match rest.split_once('/') {
+                // 直下のファイル。削除の記録なら名前を引く。
+                None => {
+                    if c.op == ChangeOp::Delete {
+                        names.remove(rest);
+                    } else {
+                        names.insert(rest.to_string());
+                    }
+                }
+                // もっと深い変更は、直下のサブディレクトリの名前として現れる。
+                Some((first, _)) => {
+                    if c.op != ChangeOp::Delete {
+                        names.insert(first.to_string());
+                    }
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    /// `rel_path`がディレクトリとして見えるか（実ファイルか、差分層に作られたディレクトリ）。
+    pub fn is_dir(&self, rel_path: &str) -> bool {
+        if self.jail.is_dir(rel_path) {
+            return true;
+        }
+        self.overlay
+            .as_ref()
+            .is_some_and(|o| o.jail.is_dir(rel_path.trim_matches('/')))
+    }
+
     /// grep用: read-throughで実効内容を持つファイルハンドルを開く。
     pub fn open_file_for_read(&self, path: &str) -> Result<File, SandboxError> {
         let rel = check_relative_path(path)?;
@@ -1152,6 +1208,52 @@ mod tests {
         // （次回applyやdiscardまで、レビュー対象としてオーバーレイディレクトリ配下に残る）。
         assert!(!dir.path().join(".harness/sandbox/s1/keep.txt").exists());
         assert!(dir.path().join(".harness/sandbox/s1/skip.txt").exists());
+    }
+
+    /// 名前一覧は、実ファイルに差分層の実効の変更を重ねて削除の記録を引いたもの（D-104）。
+    /// 差分層で増えたファイル・増えたサブディレクトリ・台帳に載らずに子が直接置いた実体の
+    /// どれでも名前が増え、削除の記録で名前が消える。差分層の無い直接書くモードでは実ファイルだけ。
+    #[test]
+    fn list_dir_names_merges_the_diff_layer_over_the_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        let diff = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("build.py"), "print(1)").unwrap();
+        std::fs::write(ws.path().join("README"), "r").unwrap();
+        std::fs::create_dir_all(ws.path().join("lib")).unwrap();
+        std::fs::write(ws.path().join("lib/util.py"), "u").unwrap();
+
+        let live = SandboxFs::open(ws.path(), &StagingConfig::default()).unwrap();
+        let names: Vec<String> = live.list_dir_names("").unwrap().into_iter().collect();
+        assert_eq!(names, ["README", "build.py", "lib"]);
+
+        let fs = SandboxFs::open_with_cow(
+            ws.path(),
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(diff.path()),
+        )
+        .unwrap();
+        fs.stage_like_a_child_for_test("json.py", "evil").unwrap();
+        fs.stage_like_a_child_for_test("pkg/__init__.py", "evil")
+            .unwrap();
+        fs.remove("README").unwrap();
+        // 台帳に載らずに差分層へ直接置かれた実体（BUG-066 の形）。
+        std::fs::write(diff.path().join("stray.py"), "x").unwrap();
+
+        let names: Vec<String> = fs.list_dir_names("").unwrap().into_iter().collect();
+        assert!(names.contains(&"json.py".to_string()), "{names:?}");
+        assert!(names.contains(&"pkg".to_string()), "{names:?}");
+        assert!(names.contains(&"stray.py".to_string()), "{names:?}");
+        assert!(names.contains(&"build.py".to_string()), "{names:?}");
+        assert!(!names.contains(&"README".to_string()), "{names:?}");
+
+        let lib: Vec<String> = fs.list_dir_names("lib").unwrap().into_iter().collect();
+        assert_eq!(lib, ["util.py"]);
+        assert!(fs.list_dir_names("no-such-dir").unwrap().is_empty());
+        assert!(
+            fs.is_dir("pkg"),
+            "a directory created in the diff layer is a directory"
+        );
     }
 
     /// 書込口は設定注入パスを拒否する（D-101）。直接書くモード（オーバーレイ無し）と

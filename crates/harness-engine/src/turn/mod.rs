@@ -656,6 +656,28 @@ impl<'a> TurnExecutor<'a> {
                 ToolCallDecision::DeniedByPolicy,
             );
         }
+        // D-106: ファイルの中身や名前の解決先に依存する材料は、**承認の直後に計算し直して比べる**。
+        // 承認画面で待っている間に書き換えられた中身を、承認済みとして走らせない。
+        // （この再計算から子がファイルを開くまでの窓は残る——§8。）
+        if subject.depends_on_files() {
+            let unchanged = match tool.permission_subject(input, self.ctx).await {
+                Ok(again) => again.same_for_approval(&subject),
+                Err(_) => false,
+            };
+            if !unchanged {
+                return (
+                    ToolOutput {
+                        content: format!(
+                            "permission denied by policy: {name} ({risk:?}) — the files it depends \
+                             on or the program it resolves to changed while it was being approved, \
+                             so it was not run"
+                        ),
+                        is_error: true,
+                    },
+                    ToolCallDecision::DeniedByPolicy,
+                );
+            }
+        }
 
         emit(
             self.events,

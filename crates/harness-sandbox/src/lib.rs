@@ -200,6 +200,31 @@ impl WorkspaceJail {
         self.dir.metadata(&rel).map(|m| m.is_dir()).unwrap_or(false)
     }
 
+    /// `rel_dir`（空文字列ならジェイルのルート）の**直下**にある名前（ファイル・ディレクトリの両方）。
+    /// ディレクトリが存在しなければ空。承認に「スクリプトの隣の名前一覧」を縛るために使う
+    /// （`plans/DESIGN-RUNSHELL-ALLOWLIST.md` D-104）。
+    pub fn list_dir_names(
+        &self,
+        rel_dir: &str,
+    ) -> Result<std::collections::BTreeSet<String>, JailError> {
+        let collect = |entries: cap_std::fs::ReadDir| -> Result<_, JailError> {
+            let mut names = std::collections::BTreeSet::new();
+            for entry in entries {
+                names.insert(entry?.file_name().to_string_lossy().into_owned());
+            }
+            Ok(names)
+        };
+        if rel_dir.is_empty() {
+            return collect(self.dir.entries()?);
+        }
+        let rel = check_relative_path(rel_dir)?;
+        match self.dir.open_dir(&rel) {
+            Ok(sub) => collect(sub.entries()?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// ジェイル内に`rel_path`が存在するか（[`Self::is_dir`]と同じく形が不正なら`false`）。
     pub fn exists(&self, rel_path: &str) -> bool {
         let Ok(rel) = check_relative_path(rel_path) else {

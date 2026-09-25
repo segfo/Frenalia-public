@@ -1,14 +1,27 @@
-//! `run_program` の規則と照合（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §3）。
+//! `run_program`・`run_shell` の規則と照合（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §3・§5）。
 //!
-//! 規則はプログラムの綴りと引数の**配列**で書く。1本の文字列へ潰して照合しない——潰すと、どこまでが
-//! 1つの引数かが分からなくなり、前方一致が別の引数まで食う。
+//! `run_program` の規則はプログラムの綴りと引数の**配列**で書く。1本の文字列へ潰して照合しない——潰すと、
+//! どこまでが1つの引数かが分からなくなり、前方一致が別の引数まで食う。
 //!
 //! 照合は外の世界と話さない純粋な関数である（ファイルの中身で縛る部分は、材料を作る側が
-//! 先に計算して渡す）。
+//! 先に計算して渡す）。**毎回、今の中身で計算し直した材料と比べる**——「一度確かめた」を
+//! 持ち越さない（`bug-pattern-rules` B-14: 記録が古いまま検証済みとして通さない）。
 
 use serde::{Deserialize, Serialize};
 
-use crate::{is_interpreter_program, ProgramSubject};
+use crate::{is_interpreter_program, BoundFile, CommandSubject, ProgramSubject};
+
+/// パスを照合のために畳む（区切りを`/`へ、末尾の区切りを落とす。Windows では大小も畳む）。
+/// ワークスペースルートと解決先の絶対パスの比較に使う。
+pub fn fold_path_for_rule(path: &str) -> String {
+    let p = path.replace('\\', "/");
+    let p = p.trim_end_matches('/');
+    if cfg!(windows) {
+        p.to_lowercase()
+    } else {
+        p.to_string()
+    }
+}
 
 /// 引数1つ分の照合。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,11 +39,25 @@ pub struct ProgramRule {
     pub program: String,
     /// 引数の配列。個数も一致しなければならない（穴が引数の個数を増やせない）。
     pub args: Vec<ArgPattern>,
+    /// 解決した絶対パス（D-103）。`Some`なら、呼び出しの解決先もこれと同じでなければ当たらない
+    /// ——承認した`git`が、PATH の先頭に置かれた別の`git.exe`へ解決されても当てない。
+    /// コマンドライン・設定の規則は解決先を書かないので`None`（綴りだけで照合する）。
+    #[serde(default)]
+    pub resolved: Option<String>,
+    /// 縛ったファイル（`rel_path`昇順）。コードを走らせる呼び出しでは、今の中身から計算した集合と
+    /// **完全に同じ**でなければ当たらない（書き換え・削除・承認後の新規作成で外れる）。
+    #[serde(default)]
+    pub files: Vec<BoundFile>,
+    /// 縛ったワークスペースのルート（[`fold_path_for_rule`]で畳んだもの）。コードを走らせる呼び出しでは
+    /// 必須で、別のワークスペースでは当たらない（同じ中身のスクリプトでも、隣に置かれたものが違う）。
+    #[serde(default)]
+    pub workspace: Option<String>,
 }
 
 impl ProgramRule {
-    /// 承認した呼び出しそのものから、穴の無い規則を作る。
-    pub fn exact(subject: &ProgramSubject) -> Self {
+    /// 承認した呼び出しそのものから、穴の無い規則を作る。解決先・縛ったファイルもそのまま写し、
+    /// コードを走らせる呼び出しならワークスペースに縛る。
+    pub fn exact(subject: &ProgramSubject, workspace_root: &str) -> Self {
         Self {
             program: subject.program.clone(),
             args: subject
@@ -39,6 +66,22 @@ impl ProgramRule {
                 .cloned()
                 .map(ArgPattern::Exact)
                 .collect(),
+            resolved: subject.resolved.clone(),
+            files: subject.files.clone(),
+            workspace: subject
+                .runs_code
+                .then(|| fold_path_for_rule(workspace_root)),
+        }
+    }
+
+    /// 縛るものの無い規則（コマンドライン・設定で書いたもの。解決先・ファイル・ワークスペースは後で決める）。
+    pub fn unbound(program: String, args: Vec<ArgPattern>) -> Self {
+        Self {
+            program,
+            args,
+            resolved: None,
+            files: Vec::new(),
+            workspace: None,
         }
     }
 
@@ -47,13 +90,31 @@ impl ProgramRule {
         self.args.iter().any(|a| matches!(a, ArgPattern::Hole))
     }
 
-    /// 呼び出しがこの規則に当たるか。
+    /// 呼び出しがこの規則に当たるか。`workspace_root`は今のワークスペースのルート。
     ///
-    /// **インタプリタの規則が穴を持っていたら、何にも当てない**（§4.2）。規則を作る側でも
-    /// 拒否するが、台帳のように外から読み込むものがあるので、照合の側でも拒否する。
-    pub fn matches(&self, subject: &ProgramSubject) -> bool {
-        if self.has_hole() && is_interpreter_program(&self.program) {
-            return false;
+    /// **コードを走らせる呼び出し（インタプリタ・ワークスペース内の実行ファイル）には、穴を持つ規則を
+    /// 当てない**（§4.2）。規則を作る側でも拒否するが、台帳のように外から読み込むものがあるので、
+    /// 照合の側でも拒否する。さらに、確かめられない引数を含む呼び出し（`one_shot_only`）には何も当てず、
+    /// 縛ったファイルの集合とワークスペースの一致を要求する（D-104）。
+    pub fn matches(&self, subject: &ProgramSubject, workspace_root: &str) -> bool {
+        let runs_code = subject.runs_code || is_interpreter_program(&self.program);
+        if runs_code {
+            if self.has_hole() || subject.one_shot_only {
+                return false;
+            }
+            if subject.files != self.files {
+                return false;
+            }
+            match &self.workspace {
+                Some(ws) if *ws == fold_path_for_rule(workspace_root) => {}
+                _ => return false,
+            }
+        }
+        if let Some(resolved) = &self.resolved {
+            match &subject.resolved {
+                Some(r) if fold_path_for_rule(r) == fold_path_for_rule(resolved) => {}
+                _ => return false,
+            }
         }
         subject.program == self.program
             && subject.args.len() == self.args.len()
@@ -61,6 +122,43 @@ impl ProgramRule {
                 ArgPattern::Exact(v) => a == v,
                 ArgPattern::Hole => hole_accepts(a),
             })
+    }
+}
+
+/// `run_shell` の規則1件（D-102）。人が承認した文字列との完全一致と、字面に出るファイルの中身の一致。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellRule {
+    /// 承認した行そのもの。
+    pub line: String,
+    /// 行に字面で現れたワークスペース内のファイル（`rel_path`昇順）。今の中身から計算した集合と
+    /// 完全に同じでなければ当たらない。
+    #[serde(default)]
+    pub files: Vec<BoundFile>,
+    /// 縛ったワークスペースのルート（[`fold_path_for_rule`]で畳んだもの）。
+    #[serde(default)]
+    pub workspace: Option<String>,
+}
+
+impl ShellRule {
+    /// 承認した行そのものから作る（ワークスペースに縛る）。
+    pub fn exact(subject: &CommandSubject, workspace_root: &str) -> Self {
+        Self {
+            line: subject.line.clone(),
+            files: subject.files.clone(),
+            workspace: Some(fold_path_for_rule(workspace_root)),
+        }
+    }
+
+    /// 行が一致し、縛ったファイルの集合が同じで、ワークスペースが同じか。
+    /// **行に確かめられないファイルが出てきた呼び出しには当てない**。
+    pub fn matches(&self, subject: &CommandSubject, workspace_root: &str) -> bool {
+        if subject.unverifiable || subject.line != self.line || subject.files != self.files {
+            return false;
+        }
+        match &self.workspace {
+            Some(ws) => *ws == fold_path_for_rule(workspace_root),
+            None => true,
+        }
     }
 }
 
@@ -125,23 +223,43 @@ pub fn is_format_char(c: char) -> bool {
 mod tests {
     use super::*;
 
+    const WS: &str = "C:/ws";
+
     fn subject(program: &str, args: &[&str]) -> ProgramSubject {
-        ProgramSubject {
-            program: program.to_string(),
-            args: args.iter().map(|a| a.to_string()).collect(),
-        }
+        ProgramSubject::plain(program, args.iter().map(|a| a.to_string()).collect())
     }
 
     fn rule(program: &str, args: &[Option<&str>]) -> ProgramRule {
-        ProgramRule {
-            program: program.to_string(),
-            args: args
-                .iter()
+        ProgramRule::unbound(
+            program.to_string(),
+            args.iter()
                 .map(|a| match a {
                     Some(v) => ArgPattern::Exact(v.to_string()),
                     None => ArgPattern::Hole,
                 })
                 .collect(),
+        )
+    }
+
+    fn file(rel: &str, sha: &str) -> BoundFile {
+        BoundFile {
+            rel_path: rel.to_string(),
+            sha256: sha.to_string(),
+            dir_listing_sha256: Some("listing".to_string()),
+        }
+    }
+
+    /// 中身を縛った、インタプリタの呼び出しの材料。
+    fn script_call(files: Vec<BoundFile>) -> ProgramSubject {
+        ProgramSubject {
+            program: "python".into(),
+            args: vec!["build.py".into()],
+            resolved: Some("C:/Python/python.exe".into()),
+            runs_code: true,
+            files,
+            one_shot_only: false,
+            previews: Vec::new(),
+            decoded_inline: None,
         }
     }
 
@@ -149,8 +267,8 @@ mod tests {
     #[test]
     fn a_hole_matches_one_element_and_the_count_must_agree() {
         let r = rule("git", &[Some("log"), Some("-n"), None]);
-        assert!(r.matches(&subject("git", &["log", "-n", "5"])));
-        assert!(r.matches(&subject("git", &["log", "-n", "main; rm -rf /"])));
+        assert!(r.matches(&subject("git", &["log", "-n", "5"]), WS));
+        assert!(r.matches(&subject("git", &["log", "-n", "main; rm -rf /"]), WS));
         for s in [
             subject("git", &["log", "-n"]),
             subject("git", &["log", "-n", "5", "extra"]),
@@ -158,7 +276,7 @@ mod tests {
             subject("Git", &["log", "-n", "5"]),
             subject("git.exe", &["log", "-n", "5"]),
         ] {
-            assert!(!r.matches(&s), "{s:?}");
+            assert!(!r.matches(&s, WS), "{s:?}");
         }
     }
 
@@ -198,17 +316,97 @@ mod tests {
     /// インタプリタの規則は穴を持てない。外から読み込んだ規則が穴を持っていても何にも当てない。
     #[test]
     fn an_interpreter_rule_with_a_hole_matches_nothing() {
-        let r = rule("python", &[None]);
-        assert!(!r.matches(&subject("python", &["build.py"])));
+        let mut r = ProgramRule::exact(&script_call(vec![file("build.py", "a")]), WS);
+        r.args = vec![ArgPattern::Hole];
+        assert!(!r.matches(&script_call(vec![file("build.py", "a")]), WS));
+    }
+
+    /// 中身で縛った規則は、中身・隣の名前一覧・ワークスペース・解決先のどれが変わっても当たらない。
+    /// 同じなら当たる（対照）。確かめられない引数を含む呼び出しには当たらない。
+    #[test]
+    fn a_bound_rule_matches_only_the_same_contents_in_the_same_workspace() {
+        let approved = script_call(vec![file("build.py", "a")]);
+        let r = ProgramRule::exact(&approved, WS);
+        assert!(r.matches(&approved, WS));
+        // Windows では大小と区切りを畳む。
+        if cfg!(windows) {
+            assert!(r.matches(&approved, r"c:\WS\"));
+        }
+
+        let mut changed = file("build.py", "b");
+        assert!(
+            !r.matches(&script_call(vec![changed.clone()]), WS),
+            "content changed"
+        );
+        changed = file("build.py", "a");
+        changed.dir_listing_sha256 = Some("json.py appeared".into());
+        assert!(
+            !r.matches(&script_call(vec![changed]), WS),
+            "a sibling appeared"
+        );
+        assert!(!r.matches(&script_call(vec![]), WS), "the file was deleted");
+        assert!(
+            !r.matches(
+                &script_call(vec![file("build.py", "a"), file("x.py", "c")]),
+                WS
+            ),
+            "a file appeared"
+        );
+        assert!(!r.matches(&approved, "C:/other"), "another workspace");
+
+        let mut moved = approved.clone();
+        moved.resolved = Some("C:/ws/.venv/Scripts/python.exe".into());
+        assert!(!r.matches(&moved, WS), "resolves elsewhere");
+
+        let mut one_shot = approved.clone();
+        one_shot.one_shot_only = true;
+        assert!(!r.matches(&one_shot, WS), "an unverifiable argument");
+    }
+
+    /// 縛りの無い規則（コマンドライン由来）は、コードを走らせる呼び出しには当たらない。
+    #[test]
+    fn an_unbound_rule_never_matches_a_call_that_runs_code() {
         let r = rule("python", &[Some("build.py")]);
-        assert!(r.matches(&subject("python", &["build.py"])));
+        assert!(!r.matches(&script_call(vec![file("build.py", "a")]), WS));
+        let mut ws_exe = subject("./tool.exe", &[]);
+        ws_exe.runs_code = true;
+        assert!(!rule("./tool.exe", &[]).matches(&ws_exe, WS));
     }
 
     #[test]
     fn exact_rules_are_built_from_the_approved_call() {
         let s = subject("cargo", &["test", "-p", "x"]);
-        let r = ProgramRule::exact(&s);
+        let r = ProgramRule::exact(&s, WS);
         assert!(!r.has_hole());
-        assert!(r.matches(&s));
+        assert!(
+            r.workspace.is_none(),
+            "code-free calls are not tied to a workspace"
+        );
+        assert!(r.matches(&s, WS));
+        assert!(r.matches(&s, "C:/other"));
+    }
+
+    /// `run_shell` の規則は行の完全一致と縛ったファイルの一致。確かめられない行には当たらない。
+    #[test]
+    fn a_shell_rule_matches_the_exact_line_and_the_same_files() {
+        let approved = CommandSubject {
+            line: "python build.py".into(),
+            files: vec![file("build.py", "a")],
+            unverifiable: false,
+            previews: Vec::new(),
+        };
+        let r = ShellRule::exact(&approved, WS);
+        assert!(r.matches(&approved, WS));
+
+        let mut other = approved.clone();
+        other.line = "python build.py ".into();
+        assert!(!r.matches(&other, WS));
+        let mut other = approved.clone();
+        other.files = vec![file("build.py", "b")];
+        assert!(!r.matches(&other, WS));
+        let mut other = approved.clone();
+        other.unverifiable = true;
+        assert!(!r.matches(&other, WS));
+        assert!(!r.matches(&approved, "C:/other"));
     }
 }

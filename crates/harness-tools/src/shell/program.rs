@@ -149,16 +149,24 @@ impl Tool for RunProgramTool {
         RiskClass::Exec
     }
 
+    /// 判定の材料（D-101）。解決先（D-103）と、コードを走らせる呼び出しなら縛ったファイル（D-104）を含む。
+    /// ファイルを読むので`spawn_blocking`で走らせる（B-31）。**副作用を持たない**——名前の解決には
+    /// 子へ渡す環境だけを使い、プロキシや偽DNSを立てる準備処理（`prepare_run`）は呼ばない。
     async fn permission_subject(
         &self,
         input: &serde_json::Value,
-        _ctx: &ToolCtx,
+        ctx: &ToolCtx,
     ) -> Result<PermissionSubject, ToolError> {
         let input: RunProgramInput = parse_tool_input(input)?;
-        Ok(PermissionSubject::Program(ProgramSubject {
-            program: input.program,
-            args: input.args.unwrap_or_default(),
-        }))
+        let cwd = resolve_cwd(input.cwd.as_deref(), ctx)?;
+        let args = input.args.unwrap_or_default();
+        let program = input.program;
+        let ctx = ctx.clone();
+        tokio::task::spawn_blocking(move || {
+            PermissionSubject::Program(program_subject(program, args, &cwd, &ctx))
+        })
+        .await
+        .map_err(|e| ToolError::ExecutionFailed(format!("permission subject task failed: {e}")))
     }
 
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
@@ -227,6 +235,78 @@ impl Tool for RunProgramTool {
             is_error: code != 0,
         })
     }
+}
+
+/// `run_program`の判定の材料を計算する（[`RunProgramTool::permission_subject`]）。
+fn program_subject(
+    program: String,
+    args: Vec<String>,
+    cwd: &Path,
+    ctx: &ToolCtx,
+) -> ProgramSubject {
+    use crate::approval_binding::{self, ChildView, PathBinding};
+
+    let mut env = harness_sandbox::build_child_env();
+    super::env::append_path_extra(&mut env, &ctx.run_shell_path_extra);
+    let resolved = resolve_program(&program, cwd, &env).ok();
+    let in_workspace = resolved
+        .as_deref()
+        .is_some_and(|r| approval_binding::is_inside_workspace(&ctx.workspace_root, r));
+    // 名前でインタプリタでなくても、実体がそうなら同じ扱い（起動の直前にも断るが、判定もそれに揃える）。
+    let disguised = resolved.as_deref().is_some_and(|r| {
+        let real = std::fs::canonicalize(r).unwrap_or_else(|_| r.to_path_buf());
+        real.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_interpreter_program)
+    });
+    let runs_code = is_interpreter_program(&program) || in_workspace || disguised;
+
+    let mut subject = ProgramSubject {
+        resolved: resolved.as_ref().map(|r| r.to_string_lossy().into_owned()),
+        runs_code,
+        decoded_inline: is_powershell(&program)
+            .then(|| approval_binding::decode_encoded_command(&args))
+            .flatten(),
+        ..ProgramSubject::plain(program, args)
+    };
+    subject.one_shot_only = false;
+    if !runs_code {
+        return subject;
+    }
+    let Ok(view) = ChildView::for_ctx(ctx) else {
+        subject.one_shot_only = true;
+        return subject;
+    };
+    let binding = approval_binding::bind_program_args(&view, cwd, &subject.args);
+    subject.files = binding.files;
+    subject.previews = binding.previews;
+    subject.one_shot_only = binding.one_shot_only;
+    if in_workspace {
+        // ワークスペース内の実行ファイルは、実体そのものも縛る（D-103）。
+        match resolved
+            .as_deref()
+            .and_then(|r| approval_binding::bind_executable(&view, r))
+        {
+            Some(PathBinding::File(f, p)) => {
+                if let Err(pos) = subject
+                    .files
+                    .binary_search_by(|x| x.rel_path.cmp(&f.rel_path))
+                {
+                    subject.files.insert(pos, f);
+                    subject.previews.insert(pos, p);
+                }
+            }
+            _ => subject.one_shot_only = true,
+        }
+    }
+    subject
+}
+
+fn is_powershell(program: &str) -> bool {
+    let name = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    let name = name.to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    name == "pwsh" || name == "powershell"
 }
 
 /// `program`を、起動する実行ファイルのパスへ解決する（D-98）。

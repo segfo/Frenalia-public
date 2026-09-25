@@ -5,7 +5,7 @@
 //! 掛からなくなる**——これは型では守れないので、組み込みツール全件の変種を表で固定する。
 //! 組み込みツールを足すと、この表に載せるまで落ちる。
 
-use harness_core::{CommandSubject, PermissionSubject, ProgramSubject, ToolCtx, ToolError};
+use harness_core::{CommandSubject, PermissionSubject, ToolCtx, ToolError};
 use harness_tools::ToolRegistry;
 
 fn ctx() -> (tempfile::TempDir, ToolCtx) {
@@ -57,22 +57,31 @@ async fn every_builtin_tool_returns_the_expected_kind_of_subject() {
         (
             "run_shell",
             serde_json::json!({ "command": "git status" }),
-            PermissionSubject::Command(CommandSubject {
-                line: "git status".into(),
-            }),
-        ),
-        (
-            "run_program",
-            serde_json::json!({ "program": "git", "args": ["log", "-n", "5"], "cwd": "sub" }),
-            PermissionSubject::Program(ProgramSubject {
-                program: "git".into(),
-                args: vec!["log".into(), "-n".into(), "5".into()],
-            }),
+            PermissionSubject::Command(CommandSubject::line_only("git status")),
         ),
     ];
 
+    // run_program の材料は解決先（この機械の PATH に依存する）を含むので、欄ごとに確かめる。
+    let program = subject_of(
+        "run_program",
+        serde_json::json!({ "program": "harness-no-such-program", "args": ["log", "-n", "5"] }),
+    )
+    .await
+    .unwrap();
+    match program {
+        PermissionSubject::Program(p) => {
+            assert_eq!(p.program, "harness-no-such-program");
+            assert_eq!(p.args, ["log", "-n", "5"]);
+            assert_eq!(p.resolved, None, "an unknown program does not resolve");
+            assert!(!p.runs_code);
+            assert!(p.files.is_empty());
+        }
+        other => panic!("run_program must return a Program subject, got {other:?}"),
+    }
+
     let reg = ToolRegistry::with_builtin_tools();
     let mut listed: Vec<&str> = table.iter().map(|(n, _, _)| *n).collect();
+    listed.push("run_program");
     listed.sort_unstable();
     let mut registered: Vec<String> = reg.iter().map(|t| t.name().to_string()).collect();
     registered.sort_unstable();
@@ -139,4 +148,89 @@ async fn a_run_program_input_without_a_readable_program_never_reaches_the_judge(
             "{input}: {r:?}"
         );
     }
+}
+
+/// インタプリタの`run_program`は、ファイル引数を中身と隣の名前一覧で縛る（D-104）。
+/// その場のコードを渡す呼び出しは恒久承認できない印が立ち、`-EncodedCommand`は解読して添える。
+#[tokio::test]
+async fn an_interpreter_call_binds_its_script_and_flags_inline_code() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("build.py"), "print(1)").unwrap();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let reg = ToolRegistry::with_builtin_tools();
+    let tool = reg.get("run_program").unwrap();
+
+    let s = tool
+        .permission_subject(
+            &serde_json::json!({ "program": "python", "args": ["build.py"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let PermissionSubject::Program(p) = s else {
+        panic!("expected a Program subject")
+    };
+    assert!(p.runs_code);
+    assert!(!p.one_shot_only);
+    assert_eq!(p.files.len(), 1);
+    assert_eq!(p.files[0].rel_path, "build.py");
+    assert!(p.files[0].dir_listing_sha256.is_some());
+    assert_eq!(p.previews[0].text, "print(1)");
+
+    let s = tool
+        .permission_subject(
+            &serde_json::json!({ "program": "pwsh", "args": ["-EncodedCommand", "RwBlAHQALQBEAGEAdABlAA=="] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let PermissionSubject::Program(p) = s else {
+        panic!("expected a Program subject")
+    };
+    assert!(p.runs_code);
+    assert!(
+        p.one_shot_only,
+        "inline code cannot be approved permanently"
+    );
+    assert_eq!(p.decoded_inline.as_deref(), Some("Get-Date"));
+}
+
+/// 解決先がワークスペース内の実行ファイルは、コードを走らせる呼び出しとして扱い、実体を縛る（D-103）。
+#[tokio::test]
+async fn an_executable_inside_the_workspace_runs_code_and_is_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = if cfg!(windows) { "tool.exe" } else { "tool" };
+    std::fs::write(dir.path().join(exe), "not really a program").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir.path().join(exe), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let reg = ToolRegistry::with_builtin_tools();
+    let tool = reg.get("run_program").unwrap();
+    let s = tool
+        .permission_subject(
+            &serde_json::json!({ "program": format!("./{exe}"), "args": [] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let PermissionSubject::Program(p) = s else {
+        panic!("expected a Program subject")
+    };
+    assert!(p.resolved.is_some(), "{p:?}");
+    assert!(
+        p.runs_code,
+        "an executable the model can write runs code: {p:?}"
+    );
+    assert!(!p.one_shot_only, "{p:?}");
+    assert_eq!(
+        p.files
+            .iter()
+            .map(|f| f.rel_path.as_str())
+            .collect::<Vec<_>>(),
+        [exe]
+    );
 }

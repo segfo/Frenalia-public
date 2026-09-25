@@ -53,9 +53,10 @@ impl InteractiveGate {
         self.arbiter.lock().unwrap().mode()
     }
 
-    /// `/allow`スラッシュコマンド（M9）。
-    pub fn add_allow(&self, rule: AllowRule) {
-        self.arbiter.lock().unwrap().add_rule(rule);
+    /// `/allow`スラッシュコマンド（M9）。ファイルに依存する規則は足した時点の中身で縛る（D-104）。
+    /// 縛れない規則は`Err(理由)`（画面へ出す）。
+    pub fn add_allow(&self, rule: AllowRule) -> Result<(), String> {
+        self.arbiter.lock().unwrap().add_rule(rule)
     }
 }
 
@@ -101,9 +102,7 @@ mod tests {
     use harness_engine::PermissionMode;
 
     fn command(line: &str) -> PermissionSubject {
-        PermissionSubject::Command(CommandSubject {
-            line: line.to_string(),
-        })
+        PermissionSubject::Command(CommandSubject::line_only(line))
     }
 
     /// `/mode accept-all`は、起動時に許された場合だけ効く（S1-8）。許されていなければモードは変わらない。

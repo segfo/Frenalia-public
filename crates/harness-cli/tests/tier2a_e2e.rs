@@ -135,6 +135,48 @@ fn run_shell_script_turns(script: &str) -> Vec<Vec<StreamEvent>> {
     ]
 }
 
+/// 台本に出てくる`run_shell`の行を、完全一致の規則（`--allow run_shell:<行>`）の引数にする。
+///
+/// accept-all でも`run_shell`は、承認した文字列と完全に一致し、字面に出るファイルの中身が同じときだけ
+/// 自動で通る（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` D-102）。人のいない E2E は、撃つ行を規則として
+/// 宣言する。**照合は緩めていない**——台本に無い行・T-09 の綴りを含む行は、従来どおり拒否される。
+/// 規則は harness が起動した時点の中身で縛られる（D-104）ので、各ケースが起動直後に撃つ行と一致する。
+fn scripted_shell_rule_args(turns: &[Vec<StreamEvent>]) -> Vec<String> {
+    let mut out = Vec::new();
+    for turn in turns {
+        let mut shell_blocks: std::collections::BTreeMap<usize, String> = Default::default();
+        for ev in turn {
+            match ev {
+                StreamEvent::BlockStart {
+                    index,
+                    kind: BlockKind::ToolUse { name, .. },
+                } if name == "run_shell" => {
+                    shell_blocks.insert(*index, String::new());
+                }
+                StreamEvent::ToolInputDelta {
+                    index,
+                    json_fragment,
+                } => {
+                    if let Some(buf) = shell_blocks.get_mut(index) {
+                        buf.push_str(json_fragment);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for json in shell_blocks.values() {
+            let input: serde_json::Value =
+                serde_json::from_str(json).expect("scripted run_shell input is JSON");
+            let command = input["command"]
+                .as_str()
+                .expect("scripted run_shell input has a command");
+            out.push("--allow".to_string());
+            out.push(format!("run_shell:{command}"));
+        }
+    }
+    out
+}
+
 struct HarnessRun {
     status: std::process::ExitStatus,
     stdout: String,
@@ -256,6 +298,7 @@ fn run_harness_full(
         "-p",
         "(scripted; prompt text is ignored by the mock provider)",
     ]);
+    cmd.args(scripted_shell_rule_args(turns));
     cmd.args(extra_args);
     // Recall（`plans/PLAN-RECALL-MEMORY.md`）の記憶ディレクトリをケース専用のscratchへ逃がす。
     // `--cognition always`で回すケース（`run_cognition_harness`）はゴール完了時に
@@ -2403,7 +2446,10 @@ fn report_proxy_denials(name: &str, audit_entries: &[serde_json::Value]) {
             .get("kind")
             .and_then(|k| k.as_str())
             .unwrap_or("(kindなし)");
-        let reason = e.get("reason").and_then(|r| r.as_str()).unwrap_or("(理由なし)");
+        let reason = e
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("(理由なし)");
         let host = e
             .get("host")
             .and_then(|h| h.as_str())
@@ -5404,6 +5450,7 @@ fn fs_ledger_case_concurrent_startups_do_not_lose_updates(
             "-p",
             "(scripted)",
         ]);
+        cmd.args(scripted_shell_rule_args(&turns));
         children.push(
             cmd.spawn()
                 .map_err(|e| finish(format!("failed to spawn harness.exe: {e}")))?,
@@ -6489,7 +6536,9 @@ fn run_transition_arm(ws: &Path, case_name: &str) -> Result<String, String> {
     assert_prompt_sane(&run, &["can_run_program"])?;
     let outcome = parse_json_stdout(&run)?;
     let text = outcome.first_tool_result()?.to_string();
-    eprintln!("[transition-enforced] --- {case_name} ---\n{text}\n[transition-enforced] --- end ---");
+    eprintln!(
+        "[transition-enforced] --- {case_name} ---\n{text}\n[transition-enforced] --- end ---"
+    );
     Ok(text)
 }
 
@@ -6755,7 +6804,10 @@ fn enforcing_transitions_denies_undeclared_programs_and_tells_the_model_how_to_f
     }
 
     // 待ち行列に残っていること（注記は出たが記録が無い、という状態を作らない）。
-    let queue = ws.join(".harness").join("transitions").join("pending.jsonl");
+    let queue = ws
+        .join(".harness")
+        .join("transitions")
+        .join("pending.jsonl");
     match std::fs::read_to_string(&queue) {
         Ok(text) if text.contains("denied_by_daemon") => {}
         Ok(text) => failures.push(format!(
@@ -6922,7 +6974,8 @@ fn plant_git_config_trap(ws: &Path) -> Result<(), String> {
     std::fs::write(ws.join("a.txt"), "one\n").map_err(|e| format!("a.txtを置けない: {e}"))?;
     plain_git(ws, &["add", "a.txt"])?;
     plain_git(ws, &["commit", "-q", "-m", "a"])?;
-    std::fs::write(ws.join("a.txt"), "two\n").map_err(|e| format!("a.txtを書き換えられない: {e}"))?;
+    std::fs::write(ws.join("a.txt"), "two\n")
+        .map_err(|e| format!("a.txtを書き換えられない: {e}"))?;
 
     let config = ws.join(".git").join("config");
     let mut text = std::fs::read_to_string(&config)
@@ -7062,10 +7115,7 @@ fn run_arm_collecting_denials(
         &run_shell_script_turns(script),
         &args,
         case_name,
-        &[(
-            DAEMON_STDERR_ENV,
-            daemon_log.to_string_lossy().into_owned(),
-        )],
+        &[(DAEMON_STDERR_ENV, daemon_log.to_string_lossy().into_owned())],
     );
     if !run.status.success() {
         return Err(format!(
@@ -7271,9 +7321,7 @@ fn a_git_config_trap_cannot_reach_its_program_when_transitions_are_enforced() {
                 ));
             }
             if !arm.text.contains("can_run_program") {
-                failures.push(
-                    "段0: 注記が窓口（`can_run_program`）を案内していない".to_string(),
-                );
+                failures.push("段0: 注記が窓口（`can_run_program`）を案内していない".to_string());
             }
             if !arm.text.contains("powershell5.1(Tier2a)") {
                 failures.push(format!(
@@ -7549,8 +7597,11 @@ fn seed_survey_workspace(ws: &Path) -> Result<(), String> {
     // 追跡させておく（`git diff --stat`が何も比べないと、その行は子を1つも起こさない）。
     plain_git(ws, &["add", "Cargo.toml", "src/main.rs"])?;
     plain_git(ws, &["commit", "-q", "-m", "survey fixture"])?;
-    std::fs::write(ws.join("src").join("main.rs"), "fn main() {\n    // touched\n}\n")
-        .map_err(|e| format!("main.rsを書き換えられない: {e}"))?;
+    std::fs::write(
+        ws.join("src").join("main.rs"),
+        "fn main() {\n    // touched\n}\n",
+    )
+    .map_err(|e| format!("main.rsを書き換えられない: {e}"))?;
     Ok(())
 }
 
@@ -8250,9 +8301,7 @@ fn what_a_realistic_session_needs_declared() {
     // --- 腕C（壁の向こう）の結論を1行で出す ---
     eprintln!("[survey] ===== 壁の向こう（腕C: 旗なし・道具が見える） =====");
     match &beyond_wall {
-        None => eprintln!(
-            "[survey]     撃っていない（見えるようにする対象がこの機械に無い）"
-        ),
+        None => eprintln!("[survey]     撃っていない（見えるようにする対象がこの機械に無い）"),
         Some((true, _, _)) => eprintln!(
             "[survey]     ビルドは**最後まで通った**。鎖を止めているのは差し込みの1枚だけで、\
              その後ろに別の壁は無い（この台本の範囲では）"

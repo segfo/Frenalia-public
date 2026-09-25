@@ -24,7 +24,7 @@ fn parses_fork_and_sessions_slash_commands() {
 fn slash_allow_uses_the_same_rule_parser_as_the_command_line() {
     assert!(matches!(
         parse_slash_command("/allow run_shell:cargo test"),
-        Ok(SlashCommand::Allow(AllowRule::Pattern(_)))
+        Ok(SlashCommand::Allow(AllowRule::Shell(_)))
     ));
     assert!(matches!(
         parse_slash_command(r#"/allow run_program:["git","log",null]"#),
