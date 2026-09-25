@@ -467,6 +467,24 @@ impl PermissionArbiter {
         }
         Ok(())
     }
+
+    /// 台帳に記録された規則を、**縛り直さずに**そのまま入れる（D-107）。
+    ///
+    /// # なぜ[`Self::add_rule`]を使わないのか
+    ///
+    /// `add_rule`はファイルに依存する規則を**その時点の中身で縛り直す**（D-104）。
+    /// コマンドラインとユーザー層設定の規則はユーザーが「この呼び出しを許す」と書いた宣言なので
+    /// それが正しいが、**台帳の記録は、人が見て承認したその時の中身である**。
+    /// 縛り直すと、承認後に書き換えられたスクリプトが新しいハッシュで登録され、
+    /// **一度も見せずに自動承認される**——段4で塞いだ穴がそのまま戻る。
+    ///
+    /// 記録のハッシュのまま入れれば、中身が変わっていれば照合で当たらず、もう一度聞かれる。
+    pub fn add_recorded_rule(&mut self, rule: crate::approval_ledger::RecordedRule) {
+        match rule {
+            crate::approval_ledger::RecordedRule::RunProgram(r) => self.program_rules.push(r),
+            crate::approval_ledger::RecordedRule::RunShell(r) => self.shell_rules.push(r),
+        }
+    }
 }
 
 /// `/mode`スラッシュコマンド・`settings.json`/CLIの`--permission-mode`と共通の文字列表現。
@@ -1407,6 +1425,78 @@ mod tests {
                 &PermissionSubject::WritePath(".git/config".to_string())
             ),
             Classification::Deny
+        );
+    }
+
+    /// 台帳の記録は**縛り直さずに**入る（D-107）。記録されたハッシュのままなので、
+    /// **承認後に書き換えられたスクリプトには当たらない**——`add_rule`へ通すと、その場の中身で
+    /// 縛り直して当たってしまう（＝人が一度も見ていない中身が自動承認される）。
+    ///
+    /// 対照として、記録どおりの中身には当たることも見る（`bug-pattern-rules` B-35: 禁止と許可を対に）。
+    #[test]
+    fn a_recorded_rule_keeps_the_hashes_it_was_recorded_with() {
+        use crate::approval_ledger::RecordedRule;
+        use harness_core::{ArgPattern, BoundFile, ProgramRule};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("build.py"), "print('approved')").unwrap();
+        let ws = root.to_string_lossy().into_owned();
+
+        // 承認したときの中身（実ファイルから計算したのと同じ形）。
+        let view = harness_tools::approval_binding::ChildView::real(root).unwrap();
+        let bound = harness_tools::approval_binding::bind_program_args(
+            &view,
+            root,
+            &["build.py".to_string()],
+        );
+        assert!(!bound.one_shot_only);
+        let subject = ProgramSubject {
+            program: "python".to_string(),
+            args: vec!["build.py".to_string()],
+            resolved: None,
+            runs_code: true,
+            files: bound.files.clone(),
+            one_shot_only: false,
+            previews: Vec::new(),
+            decoded_inline: None,
+        };
+
+        let recorded = |files: Vec<BoundFile>| {
+            RecordedRule::RunProgram(ProgramRule {
+                program: "python".to_string(),
+                args: vec![ArgPattern::Exact("build.py".to_string())],
+                resolved: None,
+                files,
+                workspace: Some(harness_core::fold_path_for_rule(&ws)),
+            })
+        };
+
+        // 承認したあとに書き換えられた（記録のハッシュは古い）。
+        let mut stale = bound.files.clone();
+        stale[0].sha256 = "0".repeat(64);
+        let mut arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], root);
+        arbiter.add_recorded_rule(recorded(stale));
+        assert_eq!(
+            arbiter.classify(
+                harness_tools::RUN_PROGRAM_TOOL,
+                RiskClass::Exec,
+                &PermissionSubject::Program(subject.clone())
+            ),
+            Classification::Prompt,
+            "a rewritten script must be asked about again, not rebound at startup"
+        );
+
+        // 記録どおりなら当たる。
+        let mut arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], root);
+        arbiter.add_recorded_rule(recorded(bound.files));
+        assert_eq!(
+            arbiter.classify(
+                harness_tools::RUN_PROGRAM_TOOL,
+                RiskClass::Exec,
+                &PermissionSubject::Program(subject)
+            ),
+            Classification::Allow
         );
     }
 }

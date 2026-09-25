@@ -331,6 +331,9 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
         Commands::Mcp { .. } => {
             unreachable!("Commands::Mcp is dispatched before run_sandbox_subcommand")
         }
+        Commands::Approvals { .. } => {
+            unreachable!("Commands::Approvals is dispatched before run_sandbox_subcommand")
+        }
         Commands::Prompt => {
             unreachable!("Commands::Prompt is dispatched before run_sandbox_subcommand")
         }
@@ -649,6 +652,9 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
         }
         Commands::Mcp { .. } => {
             unreachable!("Commands::Mcp is dispatched before run_sandbox_subcommand")
+        }
+        Commands::Approvals { .. } => {
+            unreachable!("Commands::Approvals is dispatched before run_sandbox_subcommand")
         }
         Commands::Prompt => {
             unreachable!("Commands::Prompt is dispatched before run_sandbox_subcommand")

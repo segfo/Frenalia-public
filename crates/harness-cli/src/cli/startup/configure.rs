@@ -252,6 +252,7 @@ pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, Ex
             settings.ignored_project_allow
         );
     }
+    load_recorded_approvals(&mut arbiter, &workspace_root);
 
     Ok(Configured {
         cli,
@@ -269,6 +270,53 @@ pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, Ex
         arbiter,
         cognition,
     })
+}
+
+/// ユーザー層の承認台帳（`run-approval-ledger.json`）を読み、判定器へ入れて件数を告知する（D-107）。
+///
+/// **記録は縛り直さない**（[`PermissionArbiter::add_recorded_rule`]がその理由を持つ）。
+/// 入れるのは、このワークスペースに縛られた記録と、ワークスペースに縛られていない記録
+/// （インタプリタでない、ワークスペース外の実行ファイル。§3.1）だけである。
+/// 他のワークスペースの記録は入れても照合で落ちるだけなので、件数だけ伝える。
+///
+/// 台帳が読めなくても起動は止めない——記録が無い状態と同じで、聞かれる回数が増えるだけである。
+/// その記録を今のワークスペースで使うか。`None`（どのワークスペースでも共通＝インタプリタでない、
+/// ワークスペース外の実行ファイル。§3.1）と、今のワークスペースに縛られたものだけを使う。
+fn recorded_rule_applies_here(rule_workspace: Option<&str>, here: &str) -> bool {
+    match rule_workspace {
+        Some(ws) => ws == here,
+        None => true,
+    }
+}
+
+fn load_recorded_approvals(arbiter: &mut PermissionArbiter, workspace_root: &Path) {
+    let store = harness_engine::approval_ledger::ApprovalStore::open_default();
+    let loaded = store.load_valid();
+    let here = harness_core::fold_path_for_rule(&workspace_root.to_string_lossy());
+    let (mut here_count, mut elsewhere) = (0usize, 0usize);
+    for rule in loaded.rules {
+        if recorded_rule_applies_here(rule.workspace(), &here) {
+            arbiter.add_recorded_rule(rule);
+            here_count += 1;
+        } else {
+            elsewhere += 1;
+        }
+    }
+    if here_count > 0 || elsewhere > 0 {
+        eprintln!(
+            "note: loaded {here_count} recorded approval(s) for this workspace \
+             ({elsewhere} recorded for other workspaces are not loaded); \
+             `harness approvals list` shows them and `harness approvals revoke <n>` removes one"
+        );
+    }
+    if loaded.voided_by_version > 0 || loaded.dropped_invalid > 0 {
+        eprintln!(
+            "note: ignored {} recorded approval(s) written in an older format and {} that did not \
+             pass validation; they are still listed by `harness approvals list` and you will be \
+             asked again for those calls",
+            loaded.voided_by_version, loaded.dropped_invalid
+        );
+    }
 }
 
 /// `settings.json`の`degeneracy`キーを`DegeneracyDetector`へ解決する
@@ -431,5 +479,24 @@ mod tests {
             cfg.ngram.min_hot_sections_suspect,
             default_ngram.min_hot_sections_suspect
         );
+    }
+
+    /// 台帳の記録は、今のワークスペースのものと「どこでも共通」のものだけを使う（D-107）。
+    /// 別のワークスペースの記録は入れない——照合で落ちるだけなので判定は変わらないが、
+    /// 起動時の件数が他のプロジェクトの分まで混ざると読めなくなる。
+    #[test]
+    fn only_this_workspace_and_workspace_independent_records_are_loaded() {
+        let here = harness_core::fold_path_for_rule("C:/ws/project");
+        assert!(recorded_rule_applies_here(Some(&here), &here));
+        assert!(recorded_rule_applies_here(None, &here));
+        assert!(!recorded_rule_applies_here(
+            Some(&harness_core::fold_path_for_rule("C:/ws/other")),
+            &here
+        ));
+        // 区切りと大小は畳んだうえで比べる（Windows）。
+        assert!(recorded_rule_applies_here(
+            Some(&harness_core::fold_path_for_rule(r"C:\ws\project\")),
+            &here
+        ));
     }
 }

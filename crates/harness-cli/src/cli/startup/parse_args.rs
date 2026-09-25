@@ -120,6 +120,8 @@ pub(super) fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
             // `mcp`は`.harness/settings.json`の宣言とユーザグローバルの承認台帳しか触らず、
             // sandboxもプロバイダ資格情報も要らない（`net`/`policy`と同じ位置づけ）。
             Commands::Mcp { action } => run_mcp(action, &workspace_root),
+            // `approvals`はユーザー層の承認台帳しか触らない（`mcp`と同じ位置づけ）。
+            Commands::Approvals { action } => crate::cli::approvals_cmd::run_approvals(action),
             Commands::Prompt => run_prompt_subcommand(&cli, &workspace_root),
             other => run_sandbox_subcommand(other, &workspace_root),
         });

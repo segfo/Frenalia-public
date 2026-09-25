@@ -85,7 +85,8 @@ impl RecordedRule {
         }
     }
 
-    fn files(&self) -> &[BoundFile] {
+    /// 縛ったファイル（一覧・写しの照合が使う）。
+    pub fn files(&self) -> &[BoundFile] {
         match self {
             RecordedRule::RunProgram(r) => &r.files,
             RecordedRule::RunShell(r) => &r.files,

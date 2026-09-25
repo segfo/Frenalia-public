@@ -14,6 +14,7 @@
 //! | [`net_cmd`] | `net`（監査ログ表示）とloopback許可ポート算出 |
 //! | [`tier3_cmd`] | `tier3`（常駐daemonの状態確認とGC） |
 //! | [`cow_cmd`] | `cow`（diff_layer_dir一覧・拒否監査） |
+//! | [`approvals_cmd`] | `approvals`（承認台帳の一覧・取り消し） |
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -347,6 +348,14 @@ pub(crate) enum Commands {
     Mcp {
         #[command(subcommand)]
         action: McpAction,
+    },
+    /// 承認画面で「恒久的に承認」した`run_program`・`run_shell`の記録
+    /// （`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §3.1）を一覧・取り消しする。
+    /// **記録するだけで剥がせない片側を作らない**ためのコマンドで、台帳は
+    /// ユーザー層（`%APPDATA%\harness\config`）にあり、ワークスペースには置かれない。
+    Approvals {
+        #[command(subcommand)]
+        action: crate::cli::approvals_cmd::ApprovalsAction,
     },
     /// 現在のフラグ・`.harness/settings.json`構成から実際に組み立てられるシステムプロンプト
     /// （`harness_core::EnvironmentFacts`のレンダリング結果）をそのまま標準出力へ出して終了する。
@@ -924,6 +933,7 @@ pub(crate) fn misplaced_root_dangerously_allow(cli: &Cli) -> Option<String> {
 #[path = "cli_structure_tests.rs"]
 mod cli_structure_tests;
 
+pub mod approvals_cmd;
 pub mod cow_cmd;
 pub mod mcp_cmd;
 pub mod memory_cmd;
