@@ -60,6 +60,14 @@ use windows::Win32::System::Registry::{
 /// 純減させてマシン全体のFS I/Oを壊した）を再現する。
 const APPCONTAINER_SID_PREFIX: &str = "S-1-15-2-";
 
+/// capability SIDの接頭辞。
+///
+/// **[`APPCONTAINER_SID_PREFIX`]の分類器へは決して渡さないこと。** 上のdocのとおり、
+/// あちらの規則はpackage SID専用で、capability SIDを混ぜると`C:\`のtraverse ACEまで
+/// 巻き込む（BUG-046）。capability SID宛の撤収は
+/// [`revoke_unrecorded_capability_aces`]だけが、**残す側を名指しする**形で行う。
+const CAPABILITY_SID_PREFIX: &str = "S-1-15-3-";
+
 /// **harnessが宛先にすることが決して無い、well-knownのパッケージSID。**
 ///
 /// [`APPCONTAINER_SID_PREFIX`]は`S-1-15-2-<ハッシュ>`という形のプロファイル固有SIDを拾う
@@ -268,13 +276,33 @@ pub fn harness_package_sid_masks() -> Vec<u32> {
 /// `has_deny`は「harnessが書かない形のACEが混じっているか」を意味し、**deny ACEだけでなく
 /// 条件付きACEも立てる**（規則4の指紋は「harnessが書いた形」でしか名乗らない、B-25）。
 pub fn appcontainer_sid_aces(path: &Path) -> Result<Vec<PathAceSubject>, AppContainerError> {
+    sid_aces_with_prefix(path, APPCONTAINER_SID_PREFIX)
+}
+
+/// `path`のDACLに明示ACEを持つ**capability SID**を列挙する（[`appcontainer_sid_aces`]の
+/// capability版。読み方は同じで、拾う接頭辞だけが違う）。
+///
+/// **この列挙は「剥がしてよい」を一切意味しない。** capability SIDには祖先traverse（D-37）・
+/// workspace（D-54）・宣言（`--fs-allow`）・Redirector DLLの許可が同居しており、
+/// 名前へ逆引きできないので**SIDを見ただけでは誰のものか分からない**。剥がす判断は
+/// [`revoke_unrecorded_capability_aces`]が「残す側を名指しする」形でのみ行う。
+pub fn capability_sid_aces(path: &Path) -> Result<Vec<PathAceSubject>, AppContainerError> {
+    sid_aces_with_prefix(path, CAPABILITY_SID_PREFIX)
+}
+
+/// [`appcontainer_sid_aces`]と[`capability_sid_aces`]の本体。**接頭辞だけが違う**ので
+/// 1つにしてある（同じ読み方を2つ書くと、片方だけが継承ACEの扱いを直される）。
+fn sid_aces_with_prefix(
+    path: &Path,
+    prefix: &str,
+) -> Result<Vec<PathAceSubject>, AppContainerError> {
     let mut found: Vec<PathAceSubject> = Vec::new();
     unsafe {
         super::visit_explicit_aces(path, &mut |entry_sid, ace_type, _flags, mask| {
             let Ok(sid_string) = crate::win_common::sid_to_string(entry_sid) else {
                 return;
             };
-            if !sid_string.starts_with(APPCONTAINER_SID_PREFIX) {
+            if !sid_string.starts_with(prefix) {
                 return;
             }
             let harness_shape = ace_type == super::ACCESS_ALLOWED_ACE_TYPE;
@@ -331,6 +359,93 @@ pub fn revoke_stale_appcontainer_aces(
     let mut removed = Vec::new();
     for subject in appcontainer_sid_aces(path)? {
         if keep.contains(&subject.sid) {
+            continue;
+        }
+        revoke_ace(path, subject.psid())?;
+        removed.push(subject.sid);
+    }
+    Ok(removed)
+}
+
+/// `path`に載っているcapability SID宛の明示ACEのうち、**台帳のどの名前にも対応せず、かつ
+/// harnessが書く形をしている**ものを剥がし、剥がしたSID文字列を返す。
+///
+/// # なぜ要るのか（[BUG-165] が残した、届く経路の無いACE）
+///
+/// ACEを書いてから台帳へ記録するまでの間に記録側が失われると、そのACEは**名前を失う**。
+/// 名前→SIDの導出は一方向なので、以後どの撤収経路も到達できない——`harness fs prune`も
+/// `fs revoke-workspace`も台帳を起点にするからである。package SID宛には同じ理由で
+/// [`revoke_stale_appcontainer_aces`]が既に在り、**capability SID宛にだけ無かった**。
+///
+/// # 剥がすのは3つの条件を**すべて**満たすものだけ
+///
+/// | # | 条件 | 外すと何が起きるか |
+/// |---|---|---|
+/// | 1 | 呼び出し側が名指しした既知パス（現状はRedirector DLLの2本） | マシン全体の走査になり、所有していない変更まで巻き込む |
+/// | 2 | `keep_names`のどのcapability名のSIDとも一致しない | 生きている宛先を剥がす（[BUG-046](../../../../docs/bugs/BUG-046.md)） |
+/// | 3 | 拒否ACEが無く、許可マスクが[`harness_package_sid_masks`]の**いずれかと完全一致** | harnessが書いていない形のACEまで剥がす。部分集合（AND）判定にすると`SYNCHRONIZE`を持つだけの無関係なACEを拾う（`B-25`） |
+///
+/// # 名簿が空なら**1本も剥がさない**（fail-closed）
+///
+/// 台帳の読み取りが失敗すると`Ledger::load`は空の台帳へ倒れる。すると名簿が空になり、
+/// **載っているACEが全部「名前を失った」ように見える**——生きている宛先を全部剥がす。
+/// 空は「残すものが無い」と「台帳を読めなかった」を同じ値で表すので、開ける側へ倒せない
+/// （`B-09`/`B-10`）。呼び出し側は**自分の名前を発行した後に**呼ぶこと。そうすれば
+/// 名簿には必ず1件載っており、空は異常だと言い切れる。
+///
+/// **「名前をSIDへ導出できなければ止める」も併せて持っているが、入力からは到達しない。**
+/// `DeriveCapabilitySidsFromName`は名前をハッシュするだけで、実測では空文字列・空白入り・
+/// 日本語・`\0`入り・300文字・`*`のすべてを受け付けた。残してあるのはAPIが本当に失敗した
+/// ときのためで、**歯はテストで確かめられない**（測定は同名のテストのdocにある）。
+///
+/// # 呼ぶ順序（**付与の前に呼ぶこと**）
+///
+/// 付与（`preflight`のRedirector DLLのブロック）の**直前**に置くこと。そうしておくと、
+/// 万一この判断が現役の宛先を誤って剥がしても、**直後の付与が同じ起動のうちに書き戻す**
+/// （付与の冪等スキップはACEが無ければ発火しない）。逆順に置くと、誤りがそのまま
+/// 「毎起動でDLLが読めない＝子が1つも起きない」になる。
+pub fn revoke_unrecorded_capability_aces(
+    path: &Path,
+    keep_names: &[String],
+) -> Result<Vec<String>, AppContainerError> {
+    if keep_names.is_empty() {
+        // 空の名簿では何も判断できない（上のdoc）。DACLも読まずに帰る。
+        return Ok(Vec::new());
+    }
+    let subjects = capability_sid_aces(path)?;
+    if subjects.is_empty() {
+        // 名簿を作る前に帰る。ここが空なら`DeriveCapabilitySidsFromName`を1回も叩かない。
+        return Ok(Vec::new());
+    }
+    let mut keep: Vec<String> = Vec::with_capacity(keep_names.len() + 1);
+    // 祖先traverseの宛先は台帳の`entries`に載らない（well-knownの固定名）ので、明示的に足す。
+    // **これを落とすと`C:\`のtraverse ACEと同じ宛先をDLLから剥がすことになる。**
+    let traverse = super::traverse_capability_sid()?;
+    keep.push(crate::win_common::sid_to_string(traverse.as_psid()).map_err(|e| {
+        AppContainerError::AclRevoke {
+            path: path.to_path_buf(),
+            reason: format!("cannot render the traverse capability SID: {e}"),
+        }
+    })?);
+    for name in keep_names {
+        let sid = super::capability_sid_from_name(name)?;
+        keep.push(crate::win_common::sid_to_string(sid.as_psid()).map_err(|e| {
+            AppContainerError::AclRevoke {
+                path: path.to_path_buf(),
+                reason: format!("cannot render the SID of capability {name}: {e}"),
+            }
+        })?);
+    }
+
+    let harness_masks = harness_package_sid_masks();
+    let mut removed = Vec::new();
+    for subject in subjects {
+        if keep.iter().any(|k| k.eq_ignore_ascii_case(&subject.sid)) {
+            continue;
+        }
+        if subject.has_deny || !harness_masks.contains(&subject.allow_mask) {
+            // 条件3に当たらない＝harnessが書いた形ではない。**報告もしない**——
+            // このパスにはharness以外が書いたACEが載り得るし、載っていてよい。
             continue;
         }
         revoke_ace(path, subject.psid())?;

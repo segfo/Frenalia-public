@@ -164,6 +164,42 @@ fn sweep_stale_redirector_dll_aces() {
     }
 }
 
+/// Redirector DLLに残った、**台帳に名前の無いcapability SID宛のACE**を落とす（[BUG-165]）。
+///
+/// [`sweep_stale_redirector_dll_aces`]の**capability版**。同じファイル・同じ理由
+/// （名前を失ったACEはどの撤収経路からも届かない）で、宛先の種類だけが違う。
+/// package SID側の分類器は意図的にcapability SIDを見ないので、対になる口がここに要る。
+///
+/// 残す側の名簿は台帳から作る——`dll`の祖先か自身を発行元とするcapability名の全部
+/// （`workspace_capability::capability_names_covering`）。判断の3条件と、
+/// 名簿が空なら1本も剥がさないことは[`revoke_unrecorded_capability_aces`]が持つ。
+///
+/// **呼ぶのは、そのDLLのcapability名を発行した後・付与の前**（呼び出し点のコメント）。
+/// ループの外でまとめて撃つと、最後のセッションが名前を捨てた直後に名簿が空になり、
+/// 掃除が恒久的に見送られる。
+///
+/// **失敗しても起動は止めない。** これは後始末であって境界ではない
+/// （[`sweep_stale_redirector_dll_aces`]と同じ理由）。ただし**黙って飛ばさない**——
+/// 剥がしたときも失敗したときも`warnings`へ載せる。`B-10`。
+fn sweep_unrecorded_capability_aces_on(dll: &std::path::Path, warnings: &mut Vec<String>) {
+    let keep = crate::tier2a::workspace_capability::capability_names_covering(dll);
+    match revoke_unrecorded_capability_aces(dll, &keep) {
+        Ok(removed) if !removed.is_empty() => warnings.push(format!(
+            "removed {} orphaned capability ACE(s) from the redirector DLL ({}): {} -- \
+             these had no name left in the capability ledger, so no revoke path could \
+             reach them (see docs/bugs/BUG-165.md)",
+            removed.len(),
+            dll.display(),
+            removed.join(", ")
+        )),
+        Ok(_) => {}
+        Err(e) => warnings.push(format!(
+            "could not sweep orphaned capability ACEs on the redirector DLL ({}): {e}",
+            dll.display()
+        )),
+    }
+}
+
 /// プロセスのカレントディレクトリにできるパスの実測上限（文字数）。
 ///
 /// **`CreateProcessW`が新しいプロセスへ与えるカレントディレクトリは`MAX_PATH`から逃げられません。**
@@ -779,6 +815,18 @@ pub fn preflight_with_privhelper_launcher(
                     }
                 };
                 let (capability_name, capability_sid) = capability;
+                // **発行の後・付与の前に、名前を失ったcapability SID宛のACEを落とす**
+                // （BUG-165の後始末側）。位置に2つの意味がある。
+                //
+                // - **発行の後**: 掃除の名簿は台帳から作るので、いま発行した名前が載っている
+                //   状態で撃つ。名簿が空になるのは台帳を読めなかったときだけになり、
+                //   「空なら1本も剥がさない」という判定が意味を持つ
+                // - **付与の前**: 万一この判断が現役の宛先を誤って剥がしても、すぐ下の付与が
+                //   同じ起動のうちに書き戻す（冪等スキップはACEが無ければ発火しない）。
+                //   逆順に置くと、誤りがそのまま「毎起動でDLLが読めない＝子が1つも起きない」になる
+                //
+                // 錠（`SHARED_CAPABILITY_LOCK`）の中なので、名簿とDACLは一貫した瞬間で読む。
+                sweep_unrecorded_capability_aces_on(dll, &mut warnings);
                 match grant_ace_inheritable_access(
                     dll,
                     capability_sid.as_psid(),

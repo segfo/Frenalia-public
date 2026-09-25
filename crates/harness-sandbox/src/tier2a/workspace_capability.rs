@@ -750,6 +750,84 @@ pub fn declaration_capability_issuers(declared_path: &Path) -> Vec<(String, Stri
     DeclarationIndex::load().issuers(declared_path)
 }
 
+/// `path`のDACLにcapability SID宛のACEを**載せ得る**capability名を、台帳から全部引く。
+///
+/// # 何のために在るのか（[BUG-165] の後始末側）
+///
+/// 撤収側が「このパスに載っているcapability SIDのうち、**台帳にもう名前が無いもの**」を
+/// 見分けるために要る。名前→SIDの導出は一方向なので、SIDから名前へは戻れない——
+/// だから「残す側を名指しして、それ以外を剥がす」向きでしか到達できない
+/// （`revoke_subjects`のpackage SID側と同じ向き）。
+///
+/// # 「載せ得る」の判定は2つあり、**どちらかに当たれば残す**
+///
+/// 1. **発行元workspaceが`path`の祖先か自身**——台帳のACEは発行元の配下にしか書かれない
+/// 2. **宣言パスのファイル名が`path`と同じ**——別のディレクトリの同名ファイルが
+///    **同じ実体のハードリンクであり得る**ため
+///
+/// # 2つ目が要る理由（実測。2026-09-25）
+///
+/// `target\debug\harness_redirector.dll`と`target\debug\deps\harness_redirector.dll`は
+/// cargoが張る**ハードリンクで同じ実体**である（DACLも1つ）。テストバイナリは`deps`から
+/// 走るので、**発行元が`deps`のエントリが`target\debug`側のDACLに現れる**。
+/// 1つ目の条件だけだとこれを名簿から落とし、**2つのディレクトリのharnessが互いのACEを
+/// 剥がし合う**（`B-29`: 前提を1つ測ったら、前提の方が間違っていた）。
+///
+/// **広い側へ倒してある。** 余分に残せば「剥がせたはずのACEを1本見逃す」だけだが、
+/// 落とせば**生きている宛先を剥がす**（[BUG-046](../../../docs/bugs/BUG-046.md)）。
+///
+/// 全件のSIDを導出すると台帳の件数ぶん`DeriveCapabilitySidsFromName`を叩くことになる
+/// （実測で668件12.91秒の前例がある）ので、ここで先に件数を絞る。
+///
+/// # 限界（**これだけでは剥がす判断にしない**）
+///
+/// ここが返すのは「名前が台帳に在る」ことだけで、**そのACEが実際に載っているか**も
+/// **載ってよいか**も言わない。呼び出し側はさらにマスクの完全一致とパスの限定を掛けること
+/// ——ここを唯一の根拠にして剥がすと、この一覧の取りこぼしがそのまま
+/// [BUG-046](../../../docs/bugs/BUG-046.md)（生きている宛先のACEを純減させる）になる。
+pub fn capability_names_covering(path: &Path) -> Vec<String> {
+    capability_names_covering_in(&ledger(), path)
+}
+
+fn capability_names_covering_in(
+    ledger: &Ledger<WorkspaceCapabilityLedger>,
+    path: &Path,
+) -> Vec<String> {
+    let target = workspace_key(path);
+    let same_name = |declaration: &Option<String>| match declaration {
+        Some(d) => Path::new(d).file_name() == path.file_name(),
+        None => false,
+    };
+    let mut names: Vec<String> = ledger
+        .load()
+        .entries
+        .into_iter()
+        .filter(|e| {
+            path_is_at_or_under(&target, &workspace_key(Path::new(&e.workspace)))
+                || same_name(&e.declaration)
+        })
+        .map(|e| e.capability_name)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// 畳み込み済みの鍵どうしで「`target`は`root`自身か、その配下か」。
+///
+/// **末尾の区切りを落としてから比べる。** 落とさないと`C:\ws`と`C:\ws\`が別物になる
+/// （`grant_job::prepare_lock_name`が同じ理由で同じ処理を持つ）。
+/// 区切りの境目も見る——見ないと`C:\ws`が`C:\ws2`の祖先になる。
+fn path_is_at_or_under(target: &str, root: &str) -> bool {
+    let root = root.trim_end_matches('\\');
+    let target = target.trim_end_matches('\\');
+    match target.strip_prefix(root) {
+        Some("") => true,
+        Some(rest) => rest.starts_with('\\'),
+        None => false,
+    }
+}
+
 /// `declared_path`宛に発行済みの宣言capabilityの**導出の前像**（`(秘密, access級)`）。
 ///
 /// # ここだけが秘密を台帳の外へ出す（撤収側）
@@ -1131,6 +1209,121 @@ mod tests {
 
     fn test_ledger(dir: &Path) -> Ledger<WorkspaceCapabilityLedger> {
         Ledger::at_path(dir.join("workspace-capability-ledger.json"), None)
+    }
+
+    /// [BUG-165] 掃除の名簿は、**発行元が祖先か自身のもの**だけを集める。
+    ///
+    /// 広すぎれば台帳の件数ぶん`DeriveCapabilitySidsFromName`を叩くことになり
+    /// （実測で668件12.91秒の前例がある）、狭すぎれば**生きている宛先を名簿から落とす**
+    /// ——落ちたぶんはそのまま「剥がす対象」に化けるので、こちらは実害が重い。
+    #[test]
+    fn the_keep_list_holds_every_issuer_that_covers_the_path_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = test_ledger(tmp.path());
+        ledger.update(|l| {
+            l.entries = vec![
+                // 自身が発行元（Redirector DLLの宣言はこの形）。
+                entry_for("C:\\tools\\bin", "harnessDeclSelf"),
+                // 祖先が発行元（このリポジトリをworkspaceにしたときの形）。
+                entry_for("C:\\tools", "harnessWsAncestor"),
+                // 兄弟。**祖先ではない**——`C:\tools\bin2`が`C:\tools\bin`の配下に
+                // 見えてしまうと、無関係な宛先を残して孤立を見逃す。
+                entry_for("C:\\tools\\bin2", "harnessWsSibling"),
+                // 無関係。
+                entry_for("D:\\other", "harnessWsElsewhere"),
+                // 末尾に区切りが付いた綴り。同じ場所なので載る。
+                entry_for("C:\\tools\\bin\\", "harnessWsTrailingSep"),
+            ];
+        });
+
+        let names = capability_names_covering_in(&ledger, Path::new("C:\\tools\\bin\\x.dll"));
+
+        assert_eq!(
+            names,
+            vec![
+                "harnessDeclSelf".to_string(),
+                "harnessWsAncestor".to_string(),
+                "harnessWsTrailingSep".to_string(),
+            ],
+            "名簿の顔ぶれが違う（狭すぎると生きている宛先を剥がし、広すぎると無駄に導出する）"
+        );
+    }
+
+    /// [BUG-165] **同じファイル名の宣言は、発行元が別のディレクトリでも名簿に残す。**
+    ///
+    /// 実測（2026-09-25）: `target\debug\harness_redirector.dll`と
+    /// `target\debug\deps\harness_redirector.dll`はcargoが張る**ハードリンクで同じ実体**
+    /// なのでDACLも1つしかなく、テストバイナリ（`deps`から走る）が発行したcapabilityの
+    /// ACEが`target\debug`側にも現れる。発行元の祖先関係だけで名簿を作るとこれを落とし、
+    /// **2つのディレクトリのharnessが互いのACEを剥がし合う**。
+    #[test]
+    fn a_declaration_of_the_same_file_name_from_another_directory_stays_in_the_keep_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = test_ledger(tmp.path());
+        ledger.update(|l| {
+            l.entries = vec![
+                // 隣のディレクトリが発行した、同じ名前のファイルの宣言（ハードリンクの相手）。
+                declaration_entry(
+                    "C:\\out\\deps",
+                    "C:\\out\\deps\\harness_redirector.dll",
+                    "harnessDeclFromDeps",
+                ),
+                // 同じ発行元だが別のファイル。祖先でもないので載らない。
+                declaration_entry(
+                    "C:\\out\\deps",
+                    "C:\\out\\deps\\something_else.dll",
+                    "harnessDeclOtherFile",
+                ),
+            ];
+        });
+
+        let names =
+            capability_names_covering_in(&ledger, Path::new("C:\\out\\harness_redirector.dll"));
+
+        assert_eq!(
+            names,
+            vec!["harnessDeclFromDeps".to_string()],
+            "ハードリンクの相手が発行した宛先を名簿から落としている（互いに剥がし合う形）"
+        );
+    }
+
+    /// 上のテストの**歯**: 区切りの境目を見ないと`C:\tools\bin`が`C:\tools\bin2`の
+    /// 祖先になる。`starts_with`だけで書くとこれを踏む。
+    #[test]
+    fn a_sibling_directory_that_shares_a_prefix_is_not_an_ancestor() {
+        assert!(path_is_at_or_under("c:\\tools\\bin", "c:\\tools\\bin"));
+        assert!(path_is_at_or_under("c:\\tools\\bin\\x.dll", "c:\\tools\\bin"));
+        assert!(path_is_at_or_under("c:\\tools\\bin", "c:\\tools\\bin\\"));
+        assert!(!path_is_at_or_under("c:\\tools\\bin2\\x.dll", "c:\\tools\\bin"));
+        assert!(!path_is_at_or_under("c:\\tools", "c:\\tools\\bin"));
+    }
+
+    fn declaration_entry(
+        workspace: &str,
+        declaration: &str,
+        capability_name: &str,
+    ) -> WorkspaceCapabilityEntry {
+        WorkspaceCapabilityEntry {
+            declaration: Some(declaration.to_string()),
+            ..entry_for(workspace, capability_name)
+        }
+    }
+
+    fn entry_for(workspace: &str, capability_name: &str) -> WorkspaceCapabilityEntry {
+        WorkspaceCapabilityEntry {
+            workspace: workspace.to_string(),
+            declaration: None,
+            mode: "rwx".to_string(),
+            secret_hex: "00".to_string(),
+            capability_name: capability_name.to_string(),
+            granted_at_unix_secs: 1,
+            tree_verified_at_unix_secs: None,
+            root_file_id: None,
+            preparation_started_at_unix_secs: None,
+            preparation_root_file_id: None,
+            preparation_failed_at_unix_secs: None,
+            preparation_error: None,
+        }
     }
 
     /// D-54の核: 名前は秘密**だけ**から決まる。同じworkspaceでも秘密が変われば別の名前

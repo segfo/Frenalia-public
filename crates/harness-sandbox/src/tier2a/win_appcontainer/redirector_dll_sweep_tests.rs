@@ -144,11 +144,20 @@ fn the_sweep_takes_a_dead_sessions_ace_off_the_dll_and_leaves_the_live_one() {
     );
 }
 
-/// **測定2**: capability SID宛のACEは掃除の視野に入らない（`APPCONTAINER_SID_PREFIX`の意図）。
+/// **測定2**: capability SID宛のACEは**この掃除の**視野に入らない（`APPCONTAINER_SID_PREFIX`の意図）。
 ///
 /// これは欠陥ではなく**限界**である。祖先traverse（D-37）とworkspace（D-54）の宛先SIDは
 /// capability SIDで、`fs revoke-traverse`／`fs revoke-workspace`という名前の付いた扉が
 /// 担当する。ここで巻き込むと`C:\`のtraverse ACEを純減させる（BUG-046）。
+///
+/// # 「この掃除が見ない」であって「誰も掃除しない」ではない（2026-09-25以降）
+///
+/// 名前を失ったcapability SID宛のACEには、上の3つの扉のどれも届かない——どれも台帳の名前を
+/// 起点にSIDを導くからである。そこだけを担当する口を
+/// [`revoke_unrecorded_capability_aces`]として別に置いた（[BUG-165](../../../../docs/bugs/BUG-165.md)。
+/// このファイルの末尾に対のテストがある）。**この関数の射程は変えていない**——
+/// 混ぜると上のとおりBUG-046を再現するので、2つの口が互いの担当へ手を出さないことを
+/// 両向きで固定してある（`the_capability_sweep_does_not_touch_package_sid_aces`）。
 ///
 /// **測る意味**: 「Redirector DLLの窓は閉じている」と言えるのは**package SID宛だけ**である、
 /// という射程をここで固定する。同じDLLに載るcapability SID宛ACEはこの掃除では回収されない。
@@ -391,5 +400,248 @@ fn the_dll_capability_does_not_depend_on_which_workspace_asks_for_it() {
         first.len(),
         redirector_dll_paths().len(),
         "DLL 1本につき宛先は1つに収束していなければならない"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// [BUG-165] capability SID宛の孤立ACEを落とす口（`revoke_unrecorded_capability_aces`）。
+//
+// 上の測定2が固定しているのは「package SID側の掃除はcapability SIDを見ない」という
+// **射程**であって、「capability SIDは誰も掃除しない」ではない。名前を失ったACEには
+// どの撤収経路も届かないので、**残す側を名指しする**別の口をここで測る。
+//
+// 剥がす側だけを測ってはいけない（`B-35`）——「全部剥がす」実装でも緑になり、それは
+// 毎起動でRedirector DLLが読めなくなる（＝子が1つも起きない）ことを意味する。
+// だから残す側を3通り（台帳に名前がある／祖先traverse／harnessが書かない形）測る。
+// ---------------------------------------------------------------------------
+
+/// テスト用のcapability SIDを名前から作り、SID文字列も返す（`fabricate_subject`のcapability版）。
+fn fabricate_capability(name: &str) -> (crate::win_common::OwnedSid, String) {
+    let sid = capability_sid_from_name(name).expect("derive a capability SID from a name");
+    let text = crate::win_common::sid_to_string(sid.as_psid()).expect("SID to string");
+    (sid, text)
+}
+
+/// **禁止側**: 台帳のどの名前にも対応しないcapability SID宛のACEは落ちる。
+///
+/// これが[BUG-165](../../../../docs/bugs/BUG-165.md)が残した状態そのもので、
+/// この口が無い間は`fs prune`も`fs revoke-workspace`も**定義から到達できなかった**
+/// （どちらも台帳の名前を起点にSIDを導くため）。
+#[test]
+fn an_orphaned_capability_ace_is_taken_off_the_dll_when_no_ledger_name_claims_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dll = dir.path().join("harness_redirector.dll");
+    std::fs::write(&dll, b"not really a dll").expect("write the probe file");
+
+    let (orphan, orphan_text) = fabricate_capability("harnessDecl00000000000000000000000000000165");
+    grant_ace_inheritable_access(&dll, orphan.as_psid(), FsAccess::ReadExec)
+        .expect("grant the orphaned capability ACE");
+    let _cleanup = scopeguard(|| {
+        let _ = revoke_ace(&dll, orphan.as_psid());
+    });
+
+    // 計器: 剥がす前に見えていること。0本は「剥がれた」と「最初から見えない」を同じ値で表す。
+    assert!(
+        capability_sid_aces(&dll)
+            .expect("read the DACL")
+            .iter()
+            .any(|s| s.sid == orphan_text),
+        "the reader must see the capability ACE before the sweep"
+    );
+
+    // 名簿は空にしない——空は「台帳を読めなかった」と区別が付かないので剥がさない側へ倒して
+    // ある（下の`an_empty_keep_list_removes_nothing_...`）。実運用でも空にはならない：
+    // 掃除は自分の名前を発行した**後**に走るので、必ず1件は載っている。
+    let keep = vec!["harnessDecl0000000000000000000000000000f00d".to_string()];
+    let removed = revoke_unrecorded_capability_aces(&dll, &keep).expect("sweep");
+
+    assert_eq!(
+        removed,
+        vec![orphan_text],
+        "名前を失ったACEが落ちていない。これが落ちないと、以後どの経路からも剥がせない"
+    );
+    assert!(
+        sid_ace_mask(&dll, orphan.as_psid())
+            .expect("readable")
+            .is_none(),
+        "戻り値ではなく実DACLで消えたことを確かめる（B-25）"
+    );
+}
+
+/// **許可側**: 台帳に名前が残っている宛先は落ちない。
+///
+/// これが落ちると、**走っている他のセッションの足元を剥がす**（BUG-046の形）。
+/// Redirector DLLの場合は「毎起動でDLLが読めない＝子が1つも起きない」になる。
+#[test]
+fn a_capability_ace_whose_name_is_still_in_the_ledger_survives_the_sweep() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dll = dir.path().join("harness_redirector.dll");
+    std::fs::write(&dll, b"not really a dll").expect("write the probe file");
+
+    let live_name = "harnessDecl0000000000000000000000000000beef";
+    let (live, live_text) = fabricate_capability(live_name);
+    let (orphan, orphan_text) = fabricate_capability("harnessDecl0000000000000000000000000000dead");
+    grant_ace_inheritable_access(&dll, live.as_psid(), FsAccess::ReadExec).expect("grant live");
+    grant_ace_inheritable_access(&dll, orphan.as_psid(), FsAccess::ReadExec).expect("grant orphan");
+    let _cleanup = scopeguard(|| {
+        let _ = revoke_ace(&dll, live.as_psid());
+        let _ = revoke_ace(&dll, orphan.as_psid());
+    });
+
+    let removed = revoke_unrecorded_capability_aces(&dll, &[live_name.to_string()]).expect("sweep");
+
+    assert_eq!(
+        removed,
+        vec![orphan_text],
+        "名簿に載っている宛先まで剥がしている（走行中のセッションから権限を奪う形）"
+    );
+    assert!(
+        sid_ace_mask(&dll, live.as_psid())
+            .expect("readable")
+            .is_some(),
+        "{live_text} は名簿に載っているのに実DACLから消えている"
+    );
+}
+
+/// **許可側**: 祖先traverseの宛先は、名簿が空でも落ちない。
+///
+/// これは台帳の`entries`に載らない**well-knownの固定名**なので、名簿を台帳だけから
+/// 作ると抜ける。抜けたまま剥がすと`C:\`のtraverse ACEと同じ宛先を落とすことになり、
+/// [BUG-046](../../../../docs/bugs/BUG-046.md)をそのまま再現する。
+#[test]
+fn the_traverse_capability_survives_even_when_the_keep_list_is_empty() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dll = dir.path().join("harness_redirector.dll");
+    std::fs::write(&dll, b"not really a dll").expect("write the probe file");
+
+    let cap = traverse_capability_sid().expect("derive the traverse capability SID");
+    grant_ace_inheritable_access(&dll, cap.as_psid(), FsAccess::ReadExec)
+        .expect("grant the traverse capability ACE");
+    let _cleanup = scopeguard(|| {
+        let _ = revoke_ace(&dll, cap.as_psid());
+    });
+
+    // 名簿は空にしない（空だと無条件で剥がさないので、traverseが残る理由が2つになる）。
+    let keep = vec!["harnessDecl0000000000000000000000000000f00d".to_string()];
+    let removed = revoke_unrecorded_capability_aces(&dll, &keep).expect("sweep");
+
+    assert!(
+        removed.is_empty(),
+        "祖先traverseの宛先を剥がそうとしている: {removed:?}"
+    );
+    assert!(
+        sid_ace_mask(&dll, cap.as_psid())
+            .expect("readable")
+            .is_some(),
+        "traverse capabilityのACEが実DACLから消えている"
+    );
+}
+
+/// **許可側**: harnessが書かない形のACEには手を出さない（マスクの**完全一致**、`B-25`）。
+///
+/// 部分集合（AND）判定にすると`SYNCHRONIZE`を持つだけの無関係なACEまで拾う。
+/// このパスにはharness以外が書いたACEが載り得るし、載っていてよい。
+#[test]
+fn a_capability_ace_that_harness_would_never_write_is_left_alone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dll = dir.path().join("harness_redirector.dll");
+    std::fs::write(&dll, b"not really a dll").expect("write the probe file");
+
+    let (foreign, foreign_text) = fabricate_capability("someOtherAppsCapability165");
+    // harnessが書くどのFsAccessとも違うマスク（`WRITE_DAC`単体）。
+    grant_ace_mask(
+        &dll,
+        foreign.as_psid(),
+        0x0004_0000, // WRITE_DAC 単体。harnessはどのFsAccessでもこの形を書かない。
+        windows::Win32::Security::ACE_FLAGS(0),
+    )
+    .expect("grant a mask harness never writes");
+    let _cleanup = scopeguard(|| {
+        let _ = revoke_ace(&dll, foreign.as_psid());
+    });
+
+    // 名簿は空にしない（空だと無条件で剥がさないので、残る理由が2つになる）。
+    let keep = vec!["harnessDecl0000000000000000000000000000f00d".to_string()];
+    let removed = revoke_unrecorded_capability_aces(&dll, &keep).expect("sweep");
+
+    assert!(
+        removed.is_empty(),
+        "harnessが書かない形のACEを剥がしている（{foreign_text}）: {removed:?}"
+    );
+}
+
+/// **fail-closed**: 名簿が空なら1本も剥がさない。
+///
+/// # なぜ「導出に失敗したら止める」ではなくここを測るのか
+///
+/// 当初は「名簿の名前をSIDへ導出できなければ止める」を測ろうとしたが、
+/// **`DeriveCapabilitySidsFromName`は入力を1つも拒まない**——実測で空文字列・空白入り・
+/// 日本語・`\0`入り・300文字・`*`のすべてが`Ok`を返した（名前をハッシュするだけの関数である）。
+/// つまりその分岐は入力からは到達できず、テストで歯を確かめられない。
+///
+/// **危険は別の場所にあった。** 台帳の読み取りが失敗すると`Ledger::load`は
+/// 空の台帳へ倒れる（`.json.bak`も読めなかった場合）。すると名簿が空になり、
+/// **載っているACEが全部「名前を失った」ように見える**——生きている宛先を全部剥がす。
+/// 空は「残すものが無い」と「台帳を読めなかった」を同じ値で表すので、
+/// ここは開ける側へ倒せない（`B-09`/`B-10`）。
+#[test]
+fn an_empty_keep_list_removes_nothing_because_it_cannot_be_told_from_an_unreadable_ledger() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dll = dir.path().join("harness_redirector.dll");
+    std::fs::write(&dll, b"not really a dll").expect("write the probe file");
+
+    let (orphan, _) = fabricate_capability("harnessDecl00000000000000000000000000000abc");
+    grant_ace_inheritable_access(&dll, orphan.as_psid(), FsAccess::ReadExec).expect("grant orphan");
+    let _cleanup = scopeguard(|| {
+        let _ = revoke_ace(&dll, orphan.as_psid());
+    });
+
+    let removed = revoke_unrecorded_capability_aces(&dll, &[]).expect("sweep");
+
+    assert!(
+        removed.is_empty(),
+        "名簿が空の状態で剥がしている（台帳が読めなかっただけかもしれない）: {removed:?}"
+    );
+    assert!(
+        sid_ace_mask(&dll, orphan.as_psid())
+            .expect("readable")
+            .is_some(),
+        "名簿が空の状態でACEを剥がしている"
+    );
+}
+
+/// **対の相手**: capability側の掃除はpackage SID宛のACEを見ない
+/// （測定2「package側はcapability SIDを見ない」の裏返し）。
+///
+/// 2つの口が互いの担当へ手を出さないことを両向きで固定しておかないと、
+/// 片方を直した人がもう片方の射程を広げてしまう。
+#[test]
+fn the_capability_sweep_does_not_touch_package_sid_aces() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dll = dir.path().join("harness_redirector.dll");
+    std::fs::write(&dll, b"not really a dll").expect("write the probe file");
+
+    let (dead_sid, dead_text) = fabricate_subject("harness.shell.sandbox.9004-44444444");
+    grant_ace_inheritable_access(&dll, dead_sid.as_psid(), FsAccess::ReadExec)
+        .expect("grant the package SID ACE");
+    let _cleanup = scopeguard(|| {
+        let _ = revoke_ace(&dll, dead_sid.as_psid());
+    });
+
+    // 計器: package側の読み手には見えている。
+    assert!(package_sids_on(&dll).contains(&dead_text));
+
+    let keep = vec!["harnessDecl0000000000000000000000000000f00d".to_string()];
+    let removed = revoke_unrecorded_capability_aces(&dll, &keep).expect("sweep");
+
+    assert!(
+        removed.is_empty(),
+        "capability側の掃除がpackage SIDを剥がしている: {removed:?}"
+    );
+    assert!(
+        sid_ace_mask(&dll, dead_sid.as_psid())
+            .expect("readable")
+            .is_some(),
+        "package SID宛のACEが消えている。担当は`revoke_stale_appcontainer_aces`である"
     );
 }
