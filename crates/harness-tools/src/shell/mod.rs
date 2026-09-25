@@ -48,6 +48,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::time::Duration;
 
+use harness_core::{parse_tool_input, CommandSubject, PermissionSubject};
 use harness_core::{RiskClass, ShellTier, StagingMode, Tool, ToolCtx, ToolError, ToolOutput};
 use harness_sandbox::check_relative_path;
 
@@ -379,9 +380,19 @@ impl Tool for RunShellTool {
         RiskClass::Exec
     }
 
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        let input: RunShellInput = parse_tool_input(input)?;
+        Ok(PermissionSubject::Command(CommandSubject {
+            line: input.command,
+        }))
+    }
+
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: RunShellInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let input: RunShellInput = parse_tool_input(&input)?;
 
         let cwd = resolve_cwd(input.cwd.as_deref(), ctx)?;
         let dur = Duration::from_millis(input.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));

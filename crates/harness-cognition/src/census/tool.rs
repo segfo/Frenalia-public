@@ -32,18 +32,21 @@
 //!   フェーズコールは外側ターンのキャンセル・イベント表示・M21縮退ガードと接続されない。
 //!   `Tool` trait自体の変更を要するため本タスクの範囲外。
 //! - 内側の`TurnExecutor`は常に`Arc<PermissionArbiter>`（headless相当のポリシー判定）を
-//!   使う。TUIの`InteractiveGate`（モーダル確認）は経由しない。`Phase::Collect`の候補
-//!   ツールが`ToolSelection::ReadOnly`に限定されており、`PermissionArbiter::classify`は
-//!   `risk == RiskClass::ReadOnly`ならgate実装によらず常に`Allow`となるため、現状の設計
-//!   では実害が無い。将来`Phase::Collect`が非ReadOnlyツールを許すよう拡張された場合は
-//!   この前提が崩れるため、再考が必要。
+//!   使う。TUIの`InteractiveGate`（モーダル確認）は経由しない。**そのうえで ReadOnly 以外を
+//!   拒否する包み（[`ReadOnlyOnly`]）を必ず掛ける**。`Phase::Collect`が候補として見せるツールは
+//!   `ToolSelection::ReadOnly`に絞ってあるが、それはモデルへの**申告**で、実行はレジストリ全体から
+//!   引く（`dispatch_one`）——宣伝されていない`run_program`を名指しすれば届く。判定器の複製に
+//!   承認の記録の規則が載ると、画面に何も出ずに走りうる（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §6.2）。
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use harness_core::{LlmProvider, RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
-use harness_engine::{PermissionGate, TurnExecutor};
+use harness_core::{
+    parse_tool_input, LlmProvider, PermissionSubject, RiskClass, Tool, ToolCtx, ToolError,
+    ToolOutput,
+};
+use harness_engine::{Decision, PermissionGate, TurnExecutor};
 use harness_tools::ToolRegistry;
 use serde::Deserialize;
 
@@ -51,6 +54,26 @@ use crate::census::{CensusContext, CensusEngine, CensusLimits, CensusStop};
 use crate::context::ContextAssembler;
 use crate::phase::PhaseBudgets;
 use crate::scratch::ScratchStore;
+
+/// census の内側のゲート。**ReadOnly 以外は、内側のゲートに聞く前に拒否する**（モジュールdoc
+/// 「既知の制約」）。見せていないものは通さない。
+struct ReadOnlyOnly<'g>(&'g dyn PermissionGate);
+
+#[async_trait]
+impl PermissionGate for ReadOnlyOnly<'_> {
+    async fn resolve(
+        &self,
+        tool: &str,
+        risk: RiskClass,
+        subject: &PermissionSubject,
+        input: &serde_json::Value,
+    ) -> Decision {
+        if risk != RiskClass::ReadOnly {
+            return Decision::Deny;
+        }
+        self.0.resolve(tool, risk, subject, input).await
+    }
+}
 
 /// `census`の入力。**知らない項目は拒否する**（BUG-164・D-101）。
 #[derive(Deserialize)]
@@ -119,9 +142,17 @@ impl Tool for CensusTool {
         RiskClass::ReadOnly
     }
 
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        let input: CensusInput = parse_tool_input(input)?;
+        Ok(PermissionSubject::Text(input.goal))
+    }
+
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: CensusInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let input: CensusInput = parse_tool_input(&input)?;
         let goal = input.goal.as_str();
 
         let session_id = format!(
@@ -141,11 +172,12 @@ impl Tool for CensusTool {
 
         // **PermissionGateを通す唯一の場所**（`TurnExecutor::dispatch_one`）を経由する
         // 実行器を、ここで新しく組む。`gate`/`ctx`は外側から渡された本物の値をそのまま使う。
+        let inner_gate = ReadOnlyOnly(self.gate.as_ref());
         let executor = TurnExecutor::new(
             self.provider.as_ref(),
             &self.inner_tools,
             ctx,
-            self.gate.as_ref(),
+            &inner_gate,
             None,
             None,
             None,
@@ -261,11 +293,31 @@ mod tests {
             &self,
             tool: &str,
             risk: RiskClass,
-            _arg_repr: &str,
+            _subject: &PermissionSubject,
             _input: &serde_json::Value,
         ) -> Decision {
             self.resolved.lock().unwrap().push((tool.to_string(), risk));
             Decision::Deny
+        }
+    }
+
+    /// 何でも許可するゲート。内側の包みが、内側のゲートの判断に関わらず ReadOnly 以外を止めることを
+    /// 確かめるために使う（包みが無ければ、このゲートは run_program を通してしまう）。
+    struct AllowAllGate {
+        resolved: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl PermissionGate for AllowAllGate {
+        async fn resolve(
+            &self,
+            tool: &str,
+            _risk: RiskClass,
+            _subject: &PermissionSubject,
+            _input: &serde_json::Value,
+        ) -> Decision {
+            self.resolved.lock().unwrap().push(tool.to_string());
+            Decision::Allow
         }
     }
 
@@ -316,6 +368,56 @@ mod tests {
         );
         // 拒否されたので観測ゼロ→そのitemは失敗として記録され、ツール出力は最終回答に現れない。
         assert!(!output.content.contains("a.txt"), "{}", output.content);
+    }
+
+    /// 内側の包みは ReadOnly 以外を、**内側のゲートに聞く前に**止める。内側のゲートが
+    /// 何でも許可するものでも、宣伝されていない`run_program`は走らない（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §6.2）。
+    /// 対照として、同じ実行の中の`read_file`（ReadOnly）は内側のゲートまで届く。
+    #[tokio::test]
+    async fn the_inner_gate_refuses_anything_but_read_only_before_asking() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let ctx = ToolCtx::new(dir.path().to_path_buf());
+        let provider = Arc::new(MockProvider::new(vec![
+            end_turn(&plan_json(&[("a", "read a")])),
+            tool_use_turn(
+                "call_1",
+                "run_program",
+                serde_json::json!({ "program": "git", "args": ["status"] }),
+            ),
+            tool_use_turn(
+                "call_2",
+                "read_file",
+                serde_json::json!({ "path": "a.txt" }),
+            ),
+            end_turn(&join_json("summary")),
+        ]));
+        let gate = Arc::new(AllowAllGate {
+            resolved: Mutex::new(Vec::new()),
+        });
+        let census = CensusTool::new(
+            provider,
+            gate.clone(),
+            Arc::new(ToolRegistry::with_builtin_tools()),
+            PhaseBudgets::default(),
+            "mock".to_string(),
+            200_000,
+        );
+
+        let _ = census
+            .call(serde_json::json!({ "goal": "aを調べて" }), &ctx)
+            .await
+            .unwrap();
+
+        let resolved = gate.resolved.lock().unwrap().clone();
+        assert!(
+            !resolved.iter().any(|t| t == "run_program"),
+            "run_program must be refused before the inner gate is asked: {resolved:?}"
+        );
+        assert!(
+            resolved.iter().any(|t| t == "read_file"),
+            "read_file (ReadOnly) must still reach the inner gate: {resolved:?}"
+        );
     }
 
     /// 知らない項目は拒否する（BUG-164・D-101）。LLM を1回も呼ばずに止まる

@@ -11,6 +11,7 @@ use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkMatch};
 use serde::Deserialize;
 use serde_json::json;
 
+use harness_core::{parse_tool_input, PermissionSubject};
 use harness_core::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
 use harness_sandbox::SandboxFs;
 
@@ -88,9 +89,19 @@ impl Tool for GrepTool {
         RiskClass::ReadOnly
     }
 
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        let input: GrepInput = parse_tool_input(input)?;
+        Ok(PermissionSubject::Text(
+            input.path.unwrap_or_else(|| ".".to_string()),
+        ))
+    }
+
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: GrepInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let input: GrepInput = parse_tool_input(&input)?;
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
         let read_scope = ctx.read_scope.clone();
@@ -308,9 +319,19 @@ impl Tool for GlobTool {
         RiskClass::ReadOnly
     }
 
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        let input: GlobInput = parse_tool_input(input)?;
+        Ok(PermissionSubject::Text(
+            input.path.unwrap_or_else(|| ".".to_string()),
+        ))
+    }
+
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: GlobInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let input: GlobInput = parse_tool_input(&input)?;
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
         let read_scope = ctx.read_scope.clone();

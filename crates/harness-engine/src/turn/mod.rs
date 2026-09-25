@@ -40,7 +40,7 @@ use harness_core::{
 use harness_tools::ToolRegistry;
 
 use crate::degeneracy::{ladder, CallWatch, DegeneracyDetector, Degenerate};
-use crate::permission::{arg_repr, PermissionGate};
+use crate::permission::PermissionGate;
 use crate::{emit, sanitize, EventSink};
 use harness_core::text::truncate_head_tail;
 use stream::{Attempt, MalformedToolInput};
@@ -99,6 +99,11 @@ impl RawTurnRequest {
     }
 }
 
+/// 判定の材料が作れなかった（ツールの入力として読めなかった）呼び出しへ返す文言の接頭辞。
+/// ヘッドレスの JSON 出力がこれで「実行しなかった」と見分けるので、綴りはここにだけ置く
+/// （別々に持つと片方だけ変わる、B-05）。
+pub const INVALID_TOOL_INPUT_PREFIX: &str = "invalid tool input";
+
 /// そのツール呼び出しが**実際に実行されたか**、されなかったなら何故か。
 ///
 /// `Executed`以外はいずれも「`Tool::call`を呼んでいない」ことを意味し、`output`には
@@ -112,6 +117,9 @@ pub enum ToolCallDecision {
     UnknownTool,
     /// 引数JSONの連結結果がパースできなかった。
     MalformedInput,
+    /// JSONとしては読めたが、ツールの入力として読めなかった（知らない項目・型の違い等）。
+    /// 判定の材料が作れないので、**判定にも実行にも進んでいない**（D-101）。
+    InvalidInput,
     /// 先行するツールの実行中にキャンセルされ、この呼び出しには手を付けていない。
     CancelledBeforeStart,
 }
@@ -623,7 +631,22 @@ impl<'a> TurnExecutor<'a> {
         };
 
         let risk = tool.risk(input);
-        let verdict = self.gate.resolve(name, risk, &arg_repr(input), input).await;
+        // 判定の材料はツールが自分の型で解釈して返す（D-101）。判定器は入力を見ない——入力のキーで
+        // 材料を選ぶと、入力を作るモデルが判定の材料を選べる（BUG-164）。材料を作れない入力は、
+        // 判定にも実行にも進めずにモデルへ差し戻す（`call`も同じ型で読むので、どのみち失敗する）。
+        let subject = match tool.permission_subject(input, self.ctx).await {
+            Ok(subject) => subject,
+            Err(e) => {
+                return (
+                    ToolOutput {
+                        content: format!("{INVALID_TOOL_INPUT_PREFIX} for {name}: {e}"),
+                        is_error: true,
+                    },
+                    ToolCallDecision::InvalidInput,
+                );
+            }
+        };
+        let verdict = self.gate.resolve(name, risk, &subject, input).await;
         if !verdict.is_allow() {
             return (
                 ToolOutput {

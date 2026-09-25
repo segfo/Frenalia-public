@@ -161,5 +161,8 @@ pub(crate) fn sandbox_error_to_tool_error(
         harness_sandbox::SandboxError::ReadScope(e) => {
             ToolError::InvalidInput(format!("read denied by read scope config: {path} ({e})"))
         }
+        harness_sandbox::SandboxError::ConfigInjection(_) => ToolError::InvalidInput(format!(
+            "writing a config-injection path is always refused: {path}"
+        )),
     }
 }

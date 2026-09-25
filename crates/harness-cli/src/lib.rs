@@ -33,7 +33,9 @@ use serde::{Deserialize, Serialize};
 
 use harness_cognition::CognitiveOrchestrator;
 use harness_core::{AgentEvent, LlmProvider, ProviderError, StopReason, ToolCtx, Usage};
-use harness_engine::{AgentLoopConfig, ConversationState, PermissionGate};
+use harness_engine::{
+    AgentLoopConfig, ConversationState, PermissionGate, INVALID_TOOL_INPUT_PREFIX,
+};
 use harness_tools::ToolRegistry;
 
 /// `--output-format`の3値（§非対話モード「出力」）。
@@ -68,9 +70,10 @@ pub struct JsonToolCall {
     pub name: String,
     pub input: serde_json::Value,
     pub result: String,
-    /// `"allowed"` | `"denied"`。`PermissionGate`が拒否した呼び出しは`run_agent_loop`が
+    /// `"allowed"` | `"denied"` | `"invalid"`。`PermissionGate`が拒否した呼び出しは`run_agent_loop`が
     /// 合成するエラー`ToolResult`の文言（`permission denied by policy`接頭辞）で判別する
-    /// （`crates/harness-engine/src/lib.rs`のツールディスパッチ参照）。
+    /// （`crates/harness-engine/src/lib.rs`のツールディスパッチ参照）。`"invalid"`はツールの入力として
+    /// 読めず、**判定にも実行にも進まなかった**呼び出し（知らない項目を含む等、D-101）。
     pub decision: String,
 }
 
@@ -97,6 +100,9 @@ fn record_event(
             if let Some((name, input)) = pending.remove(id) {
                 let decision = if output.content.starts_with(DENIAL_PREFIX) {
                     "denied"
+                } else if output.content.starts_with(INVALID_TOOL_INPUT_PREFIX) {
+                    // 判定にも実行にも進んでいないので、"allowed"と報告しない。
+                    "invalid"
                 } else {
                     "allowed"
                 };

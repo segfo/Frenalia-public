@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use harness_core::{parse_tool_input, PermissionSubject};
 use harness_core::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
 
 const DEFAULT_MAX_BYTES: usize = 1_048_576; // 1 MiB
@@ -56,13 +57,21 @@ impl Tool for WebFetchTool {
         RiskClass::Network
     }
 
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        let input: WebFetchInput = parse_tool_input(input)?;
+        Ok(PermissionSubject::Text(input.url))
+    }
+
     async fn call(
         &self,
         input: serde_json::Value,
         _ctx: &ToolCtx,
     ) -> Result<ToolOutput, ToolError> {
-        let input: WebFetchInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let input: WebFetchInput = parse_tool_input(&input)?;
         let max_bytes = input.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
 
         let mut current_url = reqwest::Url::parse(&input.url)

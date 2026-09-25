@@ -32,6 +32,7 @@ use tokio::time::Duration;
 use harness_core::{
     is_interpreter_program, RiskClass, ShellTier, Tool, ToolCtx, ToolError, ToolOutput,
 };
+use harness_core::{parse_tool_input, PermissionSubject, ProgramSubject};
 
 use super::net_decision::classify_net_program;
 use super::runner::{Launch, TIER3_PROGRAM_UNSUPPORTED};
@@ -148,9 +149,20 @@ impl Tool for RunProgramTool {
         RiskClass::Exec
     }
 
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        let input: RunProgramInput = parse_tool_input(input)?;
+        Ok(PermissionSubject::Program(ProgramSubject {
+            program: input.program,
+            args: input.args.unwrap_or_default(),
+        }))
+    }
+
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: RunProgramInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let input: RunProgramInput = parse_tool_input(&input)?;
         // 起動経路（`run_tier3`）も断るが、ここで先に断る——子を起こす準備（プロキシ等）を
         // 立ててから断ると、使わない部品を立てては捨てることになる。
         if ctx.shell_tier.tier == ShellTier::Tier3 {

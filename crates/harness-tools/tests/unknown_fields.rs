@@ -109,11 +109,17 @@ async fn can_run_program_refuses_an_unknown_field() {
     let ctx = ToolCtx::new(dir.path().to_path_buf());
     let tool = CanRunProgramTool;
 
-    let r = tool.call(serde_json::json!({ "program": "git" }), &ctx).await;
+    let r = tool
+        .call(serde_json::json!({ "program": "git" }), &ctx)
+        .await;
     assert!(!is_deserialization_error(&r), "honest input: {:?}", r.err());
 
     let r = tool
         .call(serde_json::json!({ "program": "git", "path": "x" }), &ctx)
         .await;
-    assert!(is_unknown_field_error(&r), "crafted input: {:?}", r.map(|o| o.content));
+    assert!(
+        is_unknown_field_error(&r),
+        "crafted input: {:?}",
+        r.map(|o| o.content)
+    );
 }

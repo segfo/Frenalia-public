@@ -262,7 +262,8 @@ fn hunk_apply_still_hits_the_d09_hard_deny_gate() {
     std::fs::write(dir.path().join(".git/config"), numbered(0..30)).unwrap();
     let fs = staged_fs(dir.path());
     let tampered = numbered(0..30).replace("line2\n", "[core]\n");
-    fs.write_string(".git/config", &tampered).unwrap();
+    fs.stage_like_a_child_for_test(".git/config", &tampered)
+        .unwrap();
 
     let entry = entry_for(&fs, ".git/config");
     let review = fs.review_file(&entry);

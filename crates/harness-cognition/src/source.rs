@@ -382,6 +382,13 @@ mod tests {
         fn risk(&self, _input: &serde_json::Value) -> RiskClass {
             self.risk
         }
+        async fn permission_subject(
+            &self,
+            input: &serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<harness_core::PermissionSubject, ToolError> {
+            Ok(harness_core::PermissionSubject::Text(input.to_string()))
+        }
         async fn call(
             &self,
             _input: serde_json::Value,

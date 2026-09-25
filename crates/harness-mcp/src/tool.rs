@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use harness_core::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
+use harness_core::{PermissionSubject, RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
 
 use crate::client::McpClient;
 use crate::McpError;
@@ -145,6 +145,19 @@ impl Tool for McpTool {
     /// 宣言された値をそのまま返す（`run_shell`のようにコマンド行で判断する余地が無い）。
     fn risk(&self, _input: &serde_json::Value) -> RiskClass {
         self.risk
+    }
+
+    /// 判定の材料（D-101）は**サーバへ実際に転送するJSON全体**。入力の形を知らないツールなので、
+    /// 特定のキー（`path`・`command`）を選ぶと、そのキーを持つサーバでだけ別の文字列で判定される
+    /// （BUG-164 と同じ形）。転送するのと同じ加工（`strip_explicit_nulls`）を通した値を使う。
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        Ok(PermissionSubject::Text(
+            strip_explicit_nulls(input.clone()).to_string(),
+        ))
     }
 
     async fn call(

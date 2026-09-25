@@ -26,13 +26,13 @@ use harness_core::{
 use harness_tools::ToolRegistry;
 
 pub use permission::{
-    arg_repr, parse_allowlist_rule, AllowlistRule, Classification, Decision, PermissionArbiter,
+    parse_allowlist_rule, AllowlistRule, Classification, Decision, PermissionArbiter,
     PermissionGate, PermissionMode,
 };
 pub use session::{SessionStore, SessionSummary};
 pub use turn::{
     CompletedToolCall, EngineError, Executor, RawTurn, RawTurnRequest, RawTurnResult,
-    ToolCallDecision, TurnExecutor, TurnVisibility,
+    ToolCallDecision, TurnExecutor, TurnVisibility, INVALID_TOOL_INPUT_PREFIX,
 };
 
 /// TUI等のフロントエンドへ`AgentEvent`を流すための送信口。ヘッドレスCLIは`None`を渡し
@@ -1377,6 +1377,13 @@ mod tests {
         }
         fn risk(&self, _input: &serde_json::Value) -> harness_core::RiskClass {
             harness_core::RiskClass::ReadOnly
+        }
+        async fn permission_subject(
+            &self,
+            input: &serde_json::Value,
+            _ctx: &ToolCtx,
+        ) -> Result<harness_core::PermissionSubject, harness_core::ToolError> {
+            Ok(harness_core::PermissionSubject::Text(input.to_string()))
         }
         async fn call(
             &self,

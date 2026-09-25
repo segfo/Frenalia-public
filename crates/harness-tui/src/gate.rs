@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use tokio::sync::oneshot;
 
-use harness_core::{AgentEvent, RiskClass};
+use harness_core::{AgentEvent, PermissionSubject, RiskClass};
 use harness_engine::{
     AllowlistRule, Classification, Decision, PermissionArbiter, PermissionGate, PermissionMode,
 };
@@ -64,14 +64,10 @@ impl PermissionGate for InteractiveGate {
         &self,
         tool: &str,
         risk: RiskClass,
-        arg_repr: &str,
+        subject: &PermissionSubject,
         input: &serde_json::Value,
     ) -> Decision {
-        let classification = self
-            .arbiter
-            .lock()
-            .unwrap()
-            .classify(tool, risk, arg_repr, input);
+        let classification = self.arbiter.lock().unwrap().classify(tool, risk, subject);
         match classification {
             Classification::Allow => Decision::Allow,
             Classification::Deny => Decision::Deny,
@@ -87,7 +83,7 @@ impl PermissionGate for InteractiveGate {
                 });
                 let decision = rx.await.unwrap_or(Decision::Deny);
                 if matches!(decision, Decision::AllowAndRemember) {
-                    self.arbiter.lock().unwrap().remember_allow(tool, arg_repr);
+                    self.arbiter.lock().unwrap().remember_allow(tool, subject);
                 }
                 decision
             }
@@ -100,7 +96,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use harness_core::CommandSubject;
     use harness_engine::PermissionMode;
+
+    fn command(line: &str) -> PermissionSubject {
+        PermissionSubject::Command(CommandSubject {
+            line: line.to_string(),
+        })
+    }
 
     /// read_onlyはallowlist/モードだけで判定できるため、モーダル（`PermissionRequired`）を
     /// 出さずに即座に`Allow`を返す（§パーミッション「ヘッドレス既定」と同じ自動判定経路）。
@@ -116,7 +119,7 @@ mod tests {
             .resolve(
                 "read_file",
                 RiskClass::ReadOnly,
-                "a.txt",
+                &PermissionSubject::Text("a.txt".to_string()),
                 &serde_json::json!({}),
             )
             .await;
@@ -129,7 +132,7 @@ mod tests {
     }
 
     /// allowlist未登録のExecは`Classification::Prompt`となり、`PermissionRequired`を発行して
-    /// oneshot応答を待つ。`AllowAndRemember`で応答すると以降の同じ`arg_repr`はallowlist経由で
+    /// oneshot応答を待つ。`AllowAndRemember`で応答すると以降の同じ判定の材料はallowlist経由で
     /// 自動許可される（§パーミッション「allowlistへの追記」、§リッチTUI「承認ダイアログ」）。
     #[tokio::test]
     async fn prompts_then_remembers_allow() {
@@ -145,7 +148,7 @@ mod tests {
                 .resolve(
                     "run_shell",
                     RiskClass::Exec,
-                    "echo hi",
+                    &command("echo hi"),
                     &serde_json::json!({"command": "echo hi"}),
                 )
                 .await
@@ -167,12 +170,12 @@ mod tests {
         let decision = handle.await.unwrap();
         assert_eq!(decision, Decision::AllowAndRemember);
 
-        // 同じ arg_repr の再呼び出しはallowlist経由で自動許可され、二度目のプロンプトは出ない。
+        // 同じ材料の再呼び出しはallowlist経由で自動許可され、二度目のプロンプトは出ない。
         let decision2 = gate
             .resolve(
                 "run_shell",
                 RiskClass::Exec,
-                "echo hi",
+                &command("echo hi"),
                 &serde_json::json!({"command": "echo hi"}),
             )
             .await;

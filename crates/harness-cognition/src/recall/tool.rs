@@ -10,7 +10,9 @@
 //! そのまま使う）。
 
 use async_trait::async_trait;
-use harness_core::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
+use harness_core::{
+    parse_tool_input, PermissionSubject, RiskClass, Tool, ToolCtx, ToolError, ToolOutput,
+};
 use serde::Deserialize;
 
 use super::checkpoint;
@@ -89,9 +91,19 @@ impl Tool for RecallTool {
         }
     }
 
+    /// 判定の材料（D-101）は`action`の値。入力JSON全体を材料にすると、`recall:{"action":"remember"*`の
+    /// ような前方一致の規則が`action`より後ろのキーを何も縛らない（キーは昇順に並ぶ）。
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        let input: RecallInput = parse_tool_input(input)?;
+        Ok(PermissionSubject::Text(input.action))
+    }
+
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: RecallInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let input: RecallInput = parse_tool_input(&input)?;
 
         match input.action.as_str() {
             "search" => self.call_search(input, ctx).await,
@@ -102,7 +114,11 @@ impl Tool for RecallTool {
 }
 
 impl RecallTool {
-    async fn call_search(&self, input: RecallInput, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
+    async fn call_search(
+        &self,
+        input: RecallInput,
+        ctx: &ToolCtx,
+    ) -> Result<ToolOutput, ToolError> {
         let query = input
             .query
             .as_deref()
@@ -263,7 +279,10 @@ mod tests {
         );
 
         let r = tool
-            .call(serde_json::json!({ "action": "search", "query": "x" }), &ctx)
+            .call(
+                serde_json::json!({ "action": "search", "query": "x" }),
+                &ctx,
+            )
             .await;
         assert!(
             !matches!(&r, Err(ToolError::InvalidInput(_))),

@@ -14,7 +14,7 @@
 //! 発行しoneshot応答を待つ（§リッチTUI「承認ダイアログ」）。
 
 use async_trait::async_trait;
-use harness_core::RiskClass;
+use harness_core::{PermissionSubject, ProgramSubject, RiskClass};
 use std::path::PathBuf;
 
 /// §パーミッション（承認）システム「モード」。
@@ -48,35 +48,66 @@ impl Decision {
 }
 
 /// allowlist の1件。`(tool, pattern)` の順序付きルール
-/// （例 `run_shell:git status*`、`read_file:*`）。§パーミッション「接頭辞はツール名そのもの」。
+/// （例 `run_shell:git status`、`read_file:*`）。§パーミッション「接頭辞はツール名そのもの」。
 ///
-/// M4時点は`*`終端の前方一致・完全一致のみをサポートする素朴な実装。
-/// `run_shell`の実コマンド行を安全に分解するトークナイザ・`write_file`の`src/**`のような
-/// globパターンはM5/M9のスコープ（設計書「危険パターン・ヒューリスティック」節）。
+/// 照合するのは判定の材料の文字列（[`PermissionSubject::rule_text`]）で、ツールの入力ではない（D-101）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowlistRule {
     pub tool: String,
     pub pattern: String,
+    /// `pattern`をどう照合するか。構築時に1回だけ決める。
+    kind: MatchKind,
+}
+
+/// 規則の照合の種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchKind {
+    /// 材料の文字列と完全一致。
+    Exact,
+    /// `pattern`から末尾の`*`を除いたものの前方一致。
+    Prefix,
+    /// そのツールの全呼び出し（`pattern`が`*`）。
+    Any,
 }
 
 impl AllowlistRule {
+    /// コマンドライン・設定・`/allow`の書き方から作る（`*`は全部、末尾`*`は前方一致、他は完全一致）。
     pub fn new(tool: impl Into<String>, pattern: impl Into<String>) -> Self {
+        let pattern = pattern.into();
+        let kind = if pattern == "*" {
+            MatchKind::Any
+        } else if pattern.ends_with('*') {
+            MatchKind::Prefix
+        } else {
+            MatchKind::Exact
+        };
         Self {
             tool: tool.into(),
-            pattern: pattern.into(),
+            pattern,
+            kind,
         }
     }
 
-    fn matches(&self, tool: &str, arg: &str) -> bool {
+    /// 承認画面で承認した材料そのものから作る（**必ず完全一致**）。
+    ///
+    /// `new`を使うと、末尾が`*`の行（`Remove-Item build\*`）を「常に許可」しただけで、
+    /// その接頭辞で始まる任意の行に当たる規則ができてしまう。人が見たのはその1行だけである。
+    pub fn exact(tool: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            tool: tool.into(),
+            pattern: value.into(),
+            kind: MatchKind::Exact,
+        }
+    }
+
+    fn matches(&self, tool: &str, text: &str) -> bool {
         if self.tool != tool {
             return false;
         }
-        if self.pattern == "*" {
-            return true;
-        }
-        match self.pattern.strip_suffix('*') {
-            Some(prefix) => arg.starts_with(prefix),
-            None => arg == self.pattern,
+        match self.kind {
+            MatchKind::Any => true,
+            MatchKind::Prefix => text.starts_with(self.pattern.strip_suffix('*').unwrap_or("")),
+            MatchKind::Exact => text == self.pattern,
         }
     }
 }
@@ -108,6 +139,9 @@ pub enum Classification {
 pub struct PermissionArbiter {
     mode: PermissionMode,
     allowlist: Vec<AllowlistRule>,
+    /// 承認画面で「常に許可」した`run_program`の呼び出し（プログラムの綴りと引数の完全一致）。
+    /// `(ツール名, 材料)`。引数の配列を1本の文字列へ潰して照合しないために、`allowlist`とは分けて持つ。
+    remembered_programs: Vec<(String, ProgramSubject)>,
     /// 層3 hard-denyの判定器が、モデルの書いた**絶対パス**をworkspace相対へ畳むのに使う
     /// （[BUG-126](../../../docs/bugs/BUG-126.md)）。
     ///
@@ -130,23 +164,22 @@ impl PermissionArbiter {
         Self {
             mode,
             allowlist,
+            remembered_programs: Vec::new(),
             workspace_root: workspace_root.into(),
         }
     }
 
-    /// `arg_repr`は許可判定に使う具体入力の文字列表現（`run_shell`ならコマンド行、
-    /// `read_file`/`write_file`ならパス、他は入力全体のcompact JSON。§パーミッション
-    /// 「allowlist: (tool, RiskClass, input)に対する順序付きルール」）。
+    /// `subject`は判定の材料（D-101）。各ツールが自分の入力を型付き構造体で解釈して返したもので、
+    /// **判定器はツールの入力そのものを見ない**——見ると、どのキーを見るかを判定器が選ぶことになり、
+    /// 入力を作るモデルが判定の材料を選べる形に戻る（BUG-164）。
     ///
-    /// `input`はツールへの入力そのもの。**文字列へ潰す前の形で見なければ決められない判定**
-    /// （`run_program`の`program`がインタプリタか）に使う。**省略できる入口は作らない**
-    /// ——「入力なし」で呼べる形を残すと、そこから呼ばれた経路だけが黙って判定を素通りする。
+    /// 変種ごとの判定は**ツール名の文字列ではなく変種で**掛ける（T-09は`Command`、インタプリタは
+    /// `Program`、設定注入パスは`WritePath`）。
     pub fn classify(
         &self,
         tool: &str,
         risk: RiskClass,
-        arg_repr: &str,
-        input: &serde_json::Value,
+        subject: &PermissionSubject,
     ) -> Classification {
         if self.mode == PermissionMode::Deny {
             return Classification::Deny;
@@ -159,45 +192,38 @@ impl PermissionArbiter {
         if self.mode == PermissionMode::Plan {
             return Classification::Deny;
         }
-        // T-09（`plans/DESIGN-SANDBOX.md` §6.4）: allowlistのコマンド分解を無効化する構文
-        // （`-EncodedCommand`・`iex`・`Start-Process`・`cmd /c`・入れ子インタプリタ等）を検出したら
-        // allowlist一致・`AcceptAll`より前に強制的にPromptへ落とす（ヘッドレスは自動拒否）。
-        // これは追加ブロックであり安全の根拠にはしない（本命はallowlistのコマンド分解+隔離Tier、
-        // `base64`/`$IFS`等で自明に回避可能。§9残存リスク3）。
-        if tool == "run_shell" && looks_like_allowlist_bypass(arg_repr) {
-            return Classification::Prompt;
-        }
-        // D-99（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §4.2）: `run_program`で起こすプログラムが
-        // **引数やファイルをコードとして実行する**もの（インタプリタ）なら、`AcceptAll`と規則より前に
-        // 人へ回す。上の`run_shell`の検出と同じ位置——取り消せない構成での最後の歯止めである。
-        //
-        // **綴りの部分一致ではなく、`program`の名前の完全一致で見る**（`harness_core::is_interpreter_program`）。
-        // 名前が取れない（`program`が無い・文字列でない）なら、何が起動されるか分からないので聞く側へ倒す。
-        //
-        // 記録＋穴（段階2）が入るまでは承認の記録が無いので、インタプリタは常にここで止まる。
-        if tool == harness_tools::RUN_PROGRAM_TOOL
-            && input
-                .get("program")
-                .and_then(|v| v.as_str())
-                .is_none_or(harness_core::is_interpreter_program)
-        {
-            return Classification::Prompt;
-        }
-        // D-05（`plans/DESIGN-SANDBOX.md` §7）: 設定注入パス（`.git/config`・
-        // `.harness/**`等）へのwrite_file/edit_fileはmode/allowlistに関わらず常に拒否する
-        // （層3 hard-deny、Tier1/Tier2b内でも解除しない。T-07/T-08対策）。allowlist一致・
-        // AcceptAllより前に評価する（T-09と同じ「強制」パターン）。run_shellは対象外
-        // （arg_reprがコマンド行のため誤爆する。D-06のgitハードニング+overlay apply時の
-        // 再チェックが担当）。
-        if (tool == "write_file" || tool == "edit_file")
-            && harness_core::is_config_injection_path(arg_repr, &self.workspace_root)
-        {
-            return Classification::Deny;
+        match subject {
+            // T-09（`plans/DESIGN-SANDBOX.md` §6.4）: allowlistを無効化する構文
+            // （`-EncodedCommand`・`iex`・`Start-Process`・`cmd /c`・入れ子インタプリタ等）を検出したら
+            // allowlist一致・`AcceptAll`より前に強制的にPromptへ落とす（ヘッドレスは自動拒否）。
+            // これは追加ブロックであり安全の根拠にはしない（`base64`/`$IFS`等で自明に回避可能。§9残存リスク3）。
+            // **聞く方向にしか働かない**ので、検出が漏れても元の規則どおりに扱われるだけである。
+            PermissionSubject::Command(c) if looks_like_allowlist_bypass(&c.line) => {
+                return Classification::Prompt;
+            }
+            // D-99（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §4.2）: `run_program`で起こすプログラムが
+            // **引数やファイルをコードとして実行する**もの（インタプリタ）なら、`AcceptAll`と規則より前に
+            // 人へ回す。綴りの部分一致ではなく、`program`の名前の完全一致で見る。
+            //
+            // 中身のハッシュで縛る記録（段階2）が入るまでは、インタプリタは常にここで止まる。
+            PermissionSubject::Program(p) if harness_core::is_interpreter_program(&p.program) => {
+                return Classification::Prompt;
+            }
+            // D-05（`plans/DESIGN-SANDBOX.md` §7）: 設定注入パス（`.git/config`・`.harness/**`等）への
+            // 書込はmode/allowlistに関わらず常に拒否する（層3 hard-deny、Tier1/Tier2b内でも解除しない。
+            // T-07/T-08対策）。allowlist一致・AcceptAllより前に評価する。書込口
+            // （`SandboxFs::write_string`）でも同じ判定で拒否する（D-101）。
+            PermissionSubject::WritePath(path)
+                if harness_core::is_config_injection_path(path, &self.workspace_root) =>
+            {
+                return Classification::Deny;
+            }
+            _ => {}
         }
         if self.mode == PermissionMode::AcceptAll {
             return Classification::Allow;
         }
-        if self.allowlist.iter().any(|r| r.matches(tool, arg_repr)) {
+        if self.matches_a_rule(tool, subject) {
             return Classification::Allow;
         }
         if self.mode == PermissionMode::AcceptEdits && risk == RiskClass::Write {
@@ -208,25 +234,43 @@ impl PermissionArbiter {
         Classification::Prompt
     }
 
+    /// 規則のどれかに当たるか。`run_program`は引数の配列のまま照合し、他は材料の文字列で照合する。
+    fn matches_a_rule(&self, tool: &str, subject: &PermissionSubject) -> bool {
+        match subject {
+            PermissionSubject::Program(p) => self
+                .remembered_programs
+                .iter()
+                .any(|(t, remembered)| t == tool && remembered == p),
+            other => other
+                .rule_text()
+                .is_some_and(|text| self.allowlist.iter().any(|r| r.matches(tool, text))),
+        }
+    }
+
     /// ヘッドレス（TTY無し前提）向けの決定的判定。`Classification::Prompt`を自動`Deny`に
     /// 畳み込む（§パーミッション「ヘッドレス時: モード+allowlistのみで判定」）。
-    pub fn decide(
-        &self,
-        tool: &str,
-        risk: RiskClass,
-        arg_repr: &str,
-        input: &serde_json::Value,
-    ) -> Decision {
-        match self.classify(tool, risk, arg_repr, input) {
+    pub fn decide(&self, tool: &str, risk: RiskClass, subject: &PermissionSubject) -> Decision {
+        match self.classify(tool, risk, subject) {
             Classification::Allow => Decision::Allow,
             Classification::Deny | Classification::Prompt => Decision::Deny,
         }
     }
 
-    /// 対話ゲートの`AllowAndRemember`応答をallowlistへ追記する（以降の同一`arg_repr`を
-    /// 自動許可にする）。§パーミッション「allowlistへの追記」。
-    pub fn remember_allow(&mut self, tool: impl Into<String>, arg_repr: impl Into<String>) {
-        self.allowlist.push(AllowlistRule::new(tool, arg_repr));
+    /// 対話ゲートの`AllowAndRemember`応答を覚える（以降の**同じ材料**を自動許可にする）。
+    /// §パーミッション「allowlistへの追記」。
+    ///
+    /// **完全一致の規則として覚える**（[`AllowlistRule::exact`]）。人が見たのはその1件だけである。
+    /// インタプリタの`run_program`を覚えても、`classify`はその手前で聞く（中身で縛る記録が無いため）。
+    pub fn remember_allow(&mut self, tool: impl Into<String>, subject: &PermissionSubject) {
+        let tool = tool.into();
+        match subject {
+            PermissionSubject::Program(p) => self.remembered_programs.push((tool, p.clone())),
+            other => {
+                if let Some(text) = other.rule_text() {
+                    self.allowlist.push(AllowlistRule::exact(tool, text));
+                }
+            }
+        }
     }
 
     /// 実行時にモードを切り替える（M9スラッシュコマンド`/mode`）。
@@ -267,13 +311,16 @@ impl std::str::FromStr for PermissionMode {
 /// ヘッドレス（`PermissionArbiter`自身、常に決定的）と対話TUI（`harness-tui`の
 /// interactiveゲート、`Classification::Prompt`でモーダル表示→oneshot応答待ち）を
 /// 差し替えられる（§エージェントループ「唯一の強制点」、M7）。
+///
+/// `subject`は判定の材料（D-101）、`input`は**表示のためだけ**の入力そのもの（TUIのモーダルが見せる）。
+/// 判定に`input`を使う実装を書かないこと——判定の材料を選ぶ自由がモデルへ戻る（BUG-164）。
 #[async_trait]
 pub trait PermissionGate: Send + Sync {
     async fn resolve(
         &self,
         tool: &str,
         risk: RiskClass,
-        arg_repr: &str,
+        subject: &PermissionSubject,
         input: &serde_json::Value,
     ) -> Decision;
 }
@@ -286,10 +333,10 @@ impl PermissionGate for PermissionArbiter {
         &self,
         tool: &str,
         risk: RiskClass,
-        arg_repr: &str,
-        input: &serde_json::Value,
+        subject: &PermissionSubject,
+        _input: &serde_json::Value,
     ) -> Decision {
-        self.decide(tool, risk, arg_repr, input)
+        self.decide(tool, risk, subject)
     }
 }
 
@@ -318,30 +365,39 @@ fn looks_like_allowlist_bypass(command: &str) -> bool {
     MARKERS.iter().any(|m| lower.contains(m))
 }
 
-/// ツール入力から許可判定用の文字列表現を抜き出す。`command`/`path`フィールドがあれば
-/// それを、無ければ入力全体をcompact JSON化したものを使う（§パーミッション補足）。
-pub fn arg_repr(input: &serde_json::Value) -> String {
-    if let Some(s) = input.get("command").and_then(|v| v.as_str()) {
-        return s.to_string();
-    }
-    if let Some(s) = input.get("path").and_then(|v| v.as_str()) {
-        return s.to_string();
-    }
-    input.to_string()
-}
-
 #[cfg(test)]
 mod tests {
-    /// 入力の形で決まる判定（`run_program`のインタプリタ）を使わないテスト用の入力。
-    const NO_INPUT: serde_json::Value = serde_json::Value::Null;
-
     use super::*;
+    use harness_core::CommandSubject;
+
+    /// そのツールが実際に返すのと同じ種類の判定の材料を作る（D-101）。
+    /// `run_shell`は行、`write_file`・`edit_file`は書込先パス、それ以外は代表の文字列。
+    fn subj(tool: &str, text: &str) -> PermissionSubject {
+        match tool {
+            "run_shell" => PermissionSubject::Command(CommandSubject {
+                line: text.to_string(),
+            }),
+            "write_file" | "edit_file" => PermissionSubject::WritePath(text.to_string()),
+            _ => PermissionSubject::Text(text.to_string()),
+        }
+    }
+
+    fn prog(program: &str, args: &[&str]) -> PermissionSubject {
+        PermissionSubject::Program(ProgramSubject {
+            program: program.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+        })
+    }
 
     #[test]
     fn default_mode_allows_read_only_without_allowlist() {
         let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("read_file", RiskClass::ReadOnly, "Cargo.toml", &NO_INPUT),
+            arbiter.decide(
+                "read_file",
+                RiskClass::ReadOnly,
+                &subj("read_file", "Cargo.toml")
+            ),
             Decision::Allow
         );
     }
@@ -350,7 +406,7 @@ mod tests {
     fn default_mode_denies_unallowlisted_exec_headless() {
         let arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, "rm -rf /", &NO_INPUT),
+            arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", "rm -rf /")),
             Decision::Deny
         );
     }
@@ -366,13 +422,12 @@ mod tests {
             arbiter.decide(
                 "run_shell",
                 RiskClass::Exec,
-                "git status --short",
-                &NO_INPUT
+                &subj("run_shell", "git status --short")
             ),
             Decision::Allow
         );
         assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, "git push", &NO_INPUT),
+            arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", "git push")),
             Decision::Deny
         );
     }
@@ -385,11 +440,19 @@ mod tests {
             "/workspace",
         );
         assert_eq!(
-            arbiter.decide("write_file", RiskClass::Write, "src/main.rs", &NO_INPUT),
+            arbiter.decide(
+                "write_file",
+                RiskClass::Write,
+                &subj("write_file", "src/main.rs")
+            ),
             Decision::Deny
         );
         assert_eq!(
-            arbiter.decide("read_file", RiskClass::ReadOnly, "src/main.rs", &NO_INPUT),
+            arbiter.decide(
+                "read_file",
+                RiskClass::ReadOnly,
+                &subj("read_file", "src/main.rs")
+            ),
             Decision::Allow
         );
     }
@@ -398,11 +461,19 @@ mod tests {
     fn accept_edits_allows_write_but_not_exec() {
         let arbiter = PermissionArbiter::new(PermissionMode::AcceptEdits, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("write_file", RiskClass::Write, "src/main.rs", &NO_INPUT),
+            arbiter.decide(
+                "write_file",
+                RiskClass::Write,
+                &subj("write_file", "src/main.rs")
+            ),
             Decision::Allow
         );
         assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, "cargo test", &NO_INPUT),
+            arbiter.decide(
+                "run_shell",
+                RiskClass::Exec,
+                &subj("run_shell", "cargo test")
+            ),
             Decision::Deny
         );
     }
@@ -411,7 +482,7 @@ mod tests {
     fn accept_all_allows_everything() {
         let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("run_shell", RiskClass::Exec, "rm -rf /", &NO_INPUT),
+            arbiter.decide("run_shell", RiskClass::Exec, &subj("run_shell", "rm -rf /")),
             Decision::Allow
         );
     }
@@ -420,7 +491,11 @@ mod tests {
     fn deny_mode_denies_even_read_only() {
         let arbiter = PermissionArbiter::new(PermissionMode::Deny, vec![], "/workspace");
         assert_eq!(
-            arbiter.decide("read_file", RiskClass::ReadOnly, "Cargo.toml", &NO_INPUT),
+            arbiter.decide(
+                "read_file",
+                RiskClass::ReadOnly,
+                &subj("read_file", "Cargo.toml")
+            ),
             Decision::Deny
         );
     }
@@ -437,8 +512,7 @@ mod tests {
             arbiter.classify(
                 "run_shell",
                 RiskClass::Exec,
-                "powershell -EncodedCommand abc",
-                &NO_INPUT
+                &subj("run_shell", "powershell -EncodedCommand abc")
             ),
             Classification::Prompt
         );
@@ -446,13 +520,16 @@ mod tests {
             arbiter.classify(
                 "run_shell",
                 RiskClass::Exec,
-                "git status | Invoke-Expression",
-                &NO_INPUT
+                &subj("run_shell", "git status | Invoke-Expression")
             ),
             Classification::Prompt
         );
         assert_eq!(
-            arbiter.classify("run_shell", RiskClass::Exec, "echo hi | sh", &NO_INPUT),
+            arbiter.classify(
+                "run_shell",
+                RiskClass::Exec,
+                &subj("run_shell", "echo hi | sh")
+            ),
             Classification::Prompt
         );
     }
@@ -465,8 +542,7 @@ mod tests {
             arbiter.classify(
                 "write_file",
                 RiskClass::Write,
-                "notes/-EncodedCommand.md",
-                &NO_INPUT
+                &subj("write_file", "notes/-EncodedCommand.md")
             ),
             Classification::Allow
         );
@@ -480,16 +556,20 @@ mod tests {
             "/workspace",
         );
         assert_eq!(
-            arbiter.classify("write_file", RiskClass::Write, ".git/config", &NO_INPUT),
+            arbiter.classify(
+                "write_file",
+                RiskClass::Write,
+                &subj("write_file", ".git/config")
+            ),
             Classification::Deny
         );
     }
 
     /// **層3 hard-deny（D-05）は表記ゆれで迂回できてはならない。**
     ///
-    /// ここは`apply`の再ゲートではなく**実行前の主ゲート**なので、素の
-    /// `arg_repr`（モデルが書いた文字列そのもの）が渡ってくる。`SandboxFs`側の
-    /// 正規化には頼れない。実測で次の2つが素通りしていた（`docs/bugs/BUG-063.md`）。
+    /// ここは`apply`の再ゲートではなく**実行前の主ゲート**である。書込ツールは材料を正規化して
+    /// 渡すが、判定関数は**それに頼らず自分でも正規化する**（B-20）——ここでは正規化前の綴りを
+    /// そのまま渡して確かめる。実測で次の2つが素通りしていた（`docs/bugs/BUG-063.md`）。
     ///
     /// - `.GIT/config` — 判定が大小を区別するのにNTFS/APFSは区別しない
     /// - `././.git/config` — `strip_prefix("./")`が1回しか剥がさない
@@ -511,7 +591,11 @@ mod tests {
             "x/../.git/config",
         ] {
             assert_eq!(
-                arbiter.classify("write_file", RiskClass::Write, spelling, &NO_INPUT),
+                arbiter.classify(
+                    "write_file",
+                    RiskClass::Write,
+                    &subj("write_file", spelling)
+                ),
                 Classification::Deny,
                 "spelling {spelling:?} bypassed the D-05 hard-deny"
             );
@@ -545,7 +629,11 @@ mod tests {
             "C:/ws/./.vscode/settings.json",
         ] {
             assert_eq!(
-                arbiter.classify("write_file", RiskClass::Write, spelling, &NO_INPUT),
+                arbiter.classify(
+                    "write_file",
+                    RiskClass::Write,
+                    &subj("write_file", spelling)
+                ),
                 Classification::Deny,
                 "absolute spelling {spelling:?} bypassed the D-05 hard-deny"
             );
@@ -571,7 +659,7 @@ mod tests {
             "C:/ws2/.git/config",
         ] {
             assert_eq!(
-                arbiter.classify("write_file", RiskClass::Write, outside, &NO_INPUT),
+                arbiter.classify("write_file", RiskClass::Write, &subj("write_file", outside)),
                 Classification::Allow,
                 "{outside:?} is outside the workspace; --dangerously-allow owns that gate"
             );
@@ -592,13 +680,16 @@ mod tests {
             arbiter.classify(
                 "write_file",
                 RiskClass::Write,
-                ".harness/settings.json",
-                &NO_INPUT
+                &subj("write_file", ".harness/settings.json")
             ),
             Classification::Deny
         );
         assert_eq!(
-            arbiter.classify("edit_file", RiskClass::Write, ".gitattributes", &NO_INPUT),
+            arbiter.classify(
+                "edit_file",
+                RiskClass::Write,
+                &subj("edit_file", ".gitattributes")
+            ),
             Classification::Deny
         );
     }
@@ -619,7 +710,7 @@ mod tests {
             ".devcontainer/devcontainer.json",
         ] {
             assert_eq!(
-                arbiter.classify("write_file", RiskClass::Write, p, &NO_INPUT),
+                arbiter.classify("write_file", RiskClass::Write, &subj("write_file", p)),
                 Classification::Deny,
                 "expected deny for {p}"
             );
@@ -630,7 +721,11 @@ mod tests {
     fn normal_workspace_file_unaffected_by_config_injection_check() {
         let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
         assert_eq!(
-            arbiter.classify("write_file", RiskClass::Write, "src/main.rs", &NO_INPUT),
+            arbiter.classify(
+                "write_file",
+                RiskClass::Write,
+                &subj("write_file", "src/main.rs")
+            ),
             Classification::Allow
         );
         // 似た名前だが対象外のパス（誤検知しないことの確認）。
@@ -638,8 +733,7 @@ mod tests {
             arbiter.classify(
                 "write_file",
                 RiskClass::Write,
-                ".gitattributes-backup.txt",
-                &NO_INPUT
+                &subj("write_file", ".gitattributes-backup.txt")
             ),
             Classification::Allow
         );
@@ -656,7 +750,11 @@ mod tests {
             "/workspace",
         );
         assert_eq!(
-            arbiter.classify("run_shell", RiskClass::Exec, "cat .git/config", &NO_INPUT),
+            arbiter.classify(
+                "run_shell",
+                RiskClass::Exec,
+                &subj("run_shell", "cat .git/config")
+            ),
             Classification::Allow
         );
     }
@@ -674,8 +772,7 @@ mod tests {
             arbiter.classify(
                 "mcp__jira__create_issue",
                 RiskClass::Network,
-                &input,
-                &NO_INPUT
+                &subj("mcp__jira__create_issue", &input)
             ),
             Classification::Prompt
         );
@@ -683,8 +780,7 @@ mod tests {
             arbiter.decide(
                 "mcp__jira__create_issue",
                 RiskClass::Network,
-                &input,
-                &NO_INPUT
+                &subj("mcp__jira__create_issue", &input)
             ),
             Decision::Deny
         );
@@ -698,14 +794,13 @@ mod tests {
             arbiter.decide(
                 "mcp__company-docs__search",
                 RiskClass::ReadOnly,
-                "{}",
-                &NO_INPUT
+                &subj("mcp__company-docs__search", "{}")
             ),
             Decision::Allow
         );
     }
 
-    /// allowlistルールはMCPの名前空間付きツール名でそのまま書ける（登録名・`arg_repr`・
+    /// allowlistルールはMCPの名前空間付きツール名でそのまま書ける（登録名・判定の材料・
     /// ルールが同じ表記であることの担保、`plans/DESIGN.md` §ツールシステム）。
     #[test]
     fn allowlist_rules_can_target_mcp_tools_by_their_namespaced_name() {
@@ -718,8 +813,7 @@ mod tests {
             arbiter.decide(
                 "mcp__jira__create_issue",
                 RiskClass::Network,
-                "{}",
-                &NO_INPUT
+                &subj("mcp__jira__create_issue", "{}")
             ),
             Decision::Allow
         );
@@ -728,8 +822,7 @@ mod tests {
             arbiter.decide(
                 "mcp__other__create_issue",
                 RiskClass::Network,
-                "{}",
-                &NO_INPUT
+                &subj("mcp__other__create_issue", "{}")
             ),
             Decision::Deny
         );
@@ -745,16 +838,10 @@ mod tests {
 
     fn run_program_classification(
         mode: PermissionMode,
-        input: serde_json::Value,
+        subject: PermissionSubject,
     ) -> Classification {
         let arbiter = PermissionArbiter::new(mode, vec![], "/workspace");
-        let repr = arg_repr(&input);
-        arbiter.classify(
-            harness_tools::RUN_PROGRAM_TOOL,
-            RiskClass::Exec,
-            &repr,
-            &input,
-        )
+        arbiter.classify(harness_tools::RUN_PROGRAM_TOOL, RiskClass::Exec, &subject)
     }
 
     /// D-99: インタプリタの`run_program`は**`accept-all`でも**人に聞く。綴りの揺れ（大小・`.exe`・
@@ -771,7 +858,7 @@ mod tests {
             assert_eq!(
                 run_program_classification(
                     PermissionMode::AcceptAll,
-                    serde_json::json!({ "program": program, "args": ["/c", "dir"] })
+                    prog(program, &["/c", "dir"])
                 ),
                 Classification::Prompt,
                 "{program}"
@@ -783,7 +870,7 @@ mod tests {
     /// **引数にインタプリタの綴りが出るだけでは当たらない**（行全体の部分一致ではない）。
     #[test]
     fn run_program_of_an_ordinary_program_follows_the_mode() {
-        let git = serde_json::json!({ "program": "git", "args": ["grep", "cmd /c"] });
+        let git = prog("git", &["grep", "cmd /c"]);
         assert_eq!(
             run_program_classification(PermissionMode::AcceptAll, git.clone()),
             Classification::Allow
@@ -794,30 +881,87 @@ mod tests {
         );
     }
 
-    /// 何が起動されるか分からない入力（`program`が無い・文字列でない）は聞く側へ倒す。
+    /// 「常に許可」は**完全一致**で覚える。末尾が`*`の行を覚えても、その接頭辞で始まる別の行には当たらない。
+    /// `*`そのものを覚えても、全部を通す規則にはならない（人が見たのはその1行だけ）。
     #[test]
-    fn run_program_without_a_readable_program_name_prompts() {
-        for input in [
-            serde_json::json!({ "args": ["x"] }),
-            serde_json::json!({ "program": 42 }),
-        ] {
+    fn remembering_a_line_that_ends_with_a_star_does_not_create_a_prefix_rule() {
+        let mut arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
+        arbiter.remember_allow("run_shell", &subj("run_shell", "echo *"));
+        arbiter.remember_allow("run_shell", &subj("run_shell", "*"));
+        assert_eq!(
+            arbiter.classify("run_shell", RiskClass::Exec, &subj("run_shell", "echo *")),
+            Classification::Allow
+        );
+        for other in ["echo hi", "rm -rf /", "echo "] {
             assert_eq!(
-                run_program_classification(PermissionMode::AcceptAll, input.clone()),
+                arbiter.classify("run_shell", RiskClass::Exec, &subj("run_shell", other)),
                 Classification::Prompt,
-                "{input}"
+                "{other:?} must not match a remembered exact line"
             );
         }
     }
 
-    /// インタプリタの判定は`run_program`にだけ掛かる。`run_shell`の入力に`program`が
-    /// 紛れ込んでいても、`run_shell`の判定（綴りの検出）は変わらない。
+    /// `run_program`の「常に許可」は、プログラムの綴りと引数の配列の完全一致で覚える。
+    /// 引数が1つ違えば聞く。インタプリタは覚えても聞く（中身で縛る記録が無い）。
     #[test]
-    fn the_interpreter_check_is_scoped_to_run_program() {
-        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
-        let input = serde_json::json!({ "command": "git status", "program": "cmd" });
+    fn a_remembered_program_matches_only_the_same_argument_array() {
+        let mut arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
+        let tool = harness_tools::RUN_PROGRAM_TOOL;
+        arbiter.remember_allow(tool, &prog("git", &["status"]));
+        arbiter.remember_allow(tool, &prog("python", &["build.py"]));
+
         assert_eq!(
-            arbiter.classify("run_shell", RiskClass::Exec, "git status", &input),
+            arbiter.classify(tool, RiskClass::Exec, &prog("git", &["status"])),
             Classification::Allow
+        );
+        for other in [
+            prog("git", &["status", "--short"]),
+            prog("git", &["push"]),
+            prog("git", &[]),
+            prog("Git", &["status"]),
+        ] {
+            assert_eq!(
+                arbiter.classify(tool, RiskClass::Exec, &other),
+                Classification::Prompt,
+                "{other:?}"
+            );
+        }
+        assert_eq!(
+            arbiter.classify(tool, RiskClass::Exec, &prog("python", &["build.py"])),
+            Classification::Prompt
+        );
+    }
+
+    /// 判定は材料の**変種**で掛かり、ツール名の文字列では掛からない。
+    /// 書込先パスでない材料（`Text`）に設定注入パスの綴りが出ても拒否されず、
+    /// 行（`Command`）でない材料に T-09 の綴りが出ても聞かれない（誤検知しないことの確認）。
+    #[test]
+    fn checks_are_keyed_on_the_subject_kind_not_on_the_tool_name() {
+        let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], "/workspace");
+        assert_eq!(
+            arbiter.classify(
+                "mcp__notes__append",
+                RiskClass::Write,
+                &PermissionSubject::Text(".git/config".to_string())
+            ),
+            Classification::Allow
+        );
+        assert_eq!(
+            arbiter.classify(
+                "web_fetch",
+                RiskClass::Network,
+                &PermissionSubject::Text("https://example.com/?q=iex(".to_string())
+            ),
+            Classification::Allow
+        );
+        // 同じ文字列でも、書込先パス・行として渡れば掛かる。
+        assert_eq!(
+            arbiter.classify(
+                "write_file",
+                RiskClass::Write,
+                &PermissionSubject::WritePath(".git/config".to_string())
+            ),
+            Classification::Deny
         );
     }
 }

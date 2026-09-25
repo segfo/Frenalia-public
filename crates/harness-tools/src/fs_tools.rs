@@ -9,10 +9,28 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use harness_core::{parse_tool_input, PermissionSubject};
 use harness_core::{RiskClass, Tool, ToolCtx, ToolError, ToolOutput};
 use harness_sandbox::SandboxFs;
 
 use crate::sandbox_error_to_tool_error;
+
+/// `write_file`・`edit_file`の判定の材料（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §6.1・D-101）。
+///
+/// 相対パスは**書込口（`SandboxFs::write_string`）と同じ関数で**正規化する——検査する値と書く先を
+/// 別物にしない（B-21）。書込口が拒否する綴り（`..`・予約名等）はここで`InvalidInput`になり、
+/// 判定にも実行にも進まない。絶対パスは書込口がそのまま扱う（差分層があればワークスペース外を
+/// `_ext`として記録する）ので、材料もそのまま渡す。
+fn write_path_subject(path: &str) -> Result<PermissionSubject, ToolError> {
+    if std::path::Path::new(path).is_absolute() {
+        return Ok(PermissionSubject::WritePath(path.to_string()));
+    }
+    let rel = harness_sandbox::check_relative_path(path)
+        .map_err(|e| crate::jail_error_to_tool_error(path, e))?;
+    Ok(PermissionSubject::WritePath(
+        rel.to_string_lossy().replace('\\', "/"),
+    ))
+}
 
 // --- read_file ---
 
@@ -55,9 +73,17 @@ impl Tool for ReadFileTool {
         RiskClass::ReadOnly
     }
 
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        let input: ReadFileInput = parse_tool_input(input)?;
+        Ok(PermissionSubject::Text(input.path))
+    }
+
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: ReadFileInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let input: ReadFileInput = parse_tool_input(&input)?;
 
         // cap-std の Dir ハンドル経由の同期I/Oはtokioワーカースレッドをブロックしうるため、
         // spawn_blocking へ逃がす（§ツールシステム fsジェイル、cap-stdは非同期非対応）。
@@ -135,9 +161,17 @@ impl Tool for WriteFileTool {
         RiskClass::Write
     }
 
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        let input: WriteFileInput = parse_tool_input(input)?;
+        write_path_subject(&input.path)
+    }
+
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: WriteFileInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let input: WriteFileInput = parse_tool_input(&input)?;
 
         let workspace_root = ctx.workspace_root.clone();
         let staging = ctx.staging.clone();
@@ -211,9 +245,17 @@ impl Tool for EditFileTool {
         RiskClass::Write
     }
 
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        let input: EditFileInput = parse_tool_input(input)?;
+        write_path_subject(&input.path)
+    }
+
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: EditFileInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let input: EditFileInput = parse_tool_input(&input)?;
         let replace_all = input.replace_all.unwrap_or(false);
 
         let workspace_root = ctx.workspace_root.clone();

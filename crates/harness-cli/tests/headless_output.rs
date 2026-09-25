@@ -170,6 +170,52 @@ async fn json_output_records_denied_tool_call() {
     assert_eq!(parsed.tool_calls[0].decision, "denied");
 }
 
+/// ツールの入力として読めない呼び出し（知らない項目を足したもの）は、判定にも実行にも進まない（D-101）。
+/// `"allowed"`とは報告せず`"invalid"`と報告する。accept-all でも同じ（判定より前で止まるため）。
+#[tokio::test]
+async fn json_output_records_an_unreadable_tool_input_as_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use_turn(
+            "call_1",
+            "write_file",
+            serde_json::json!({ "path": "notes.txt", "content": "x", "command": "x" }),
+        ),
+        end_turn("done"),
+    ]);
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text("write a file");
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], dir.path());
+
+    let mut out = Vec::new();
+    let exit = run_headless(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        &CognitiveOrchestrator::new(CognitionLevel::Off, PhaseBudgets::default()).unwrap(),
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            compaction: Default::default(),
+            degeneracy: None,
+        },
+        OutputFormat::Json,
+        &mut out,
+    )
+    .await;
+
+    assert_eq!(exit, std::process::ExitCode::SUCCESS);
+    let parsed: JsonOutcome = serde_json::from_str(String::from_utf8(out).unwrap().trim()).unwrap();
+    assert_eq!(parsed.tool_calls.len(), 1);
+    assert_eq!(parsed.tool_calls[0].decision, "invalid");
+    assert!(!dir.path().join("notes.txt").exists());
+}
+
 /// §非対話モード「`jsonl`: `AgentEvent`を1行1イベントでライブ出力」。各行が単独で
 /// `AgentEvent`としてパース可能であること、`TurnCompleted`が含まれることを確認する。
 #[tokio::test]

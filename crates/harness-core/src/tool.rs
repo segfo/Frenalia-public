@@ -816,7 +816,27 @@ pub trait Tool: Send + Sync {
     }
     /// 実行前ゲート。具体入力（実際のコマンド行/書込先）に基づき申告する。
     fn risk(&self, input: &serde_json::Value) -> RiskClass;
+    /// 判定の材料（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §6.1・D-101）。判定器はツールの入力を見ず、
+    /// これだけを見る。
+    ///
+    /// **既定の実装を持たない**——ツールを足した人が、何を照合させるかを必ず決めるようにするため
+    /// （既定があると、決めなかったツールが黙ってその既定で判定される）。
+    /// **`call`と同じ型付き構造体で入力を解釈すること**（検査する値と実行する値を別物にしない、B-21）。
+    /// 入力が読めなければ`ToolError::InvalidInput`を返す。その呼び出しは判定にも実行にも進まない。
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        ctx: &ToolCtx,
+    ) -> Result<crate::PermissionSubject, ToolError>;
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
+}
+
+/// ツールの入力を型付き構造体へ読む。`permission_subject`と`call`が**同じ関数で**読むための共通の口
+/// （片方だけ別の読み方をすると、検査した値と実行する値がずれる）。
+pub fn parse_tool_input<T: serde::de::DeserializeOwned>(
+    input: &serde_json::Value,
+) -> Result<T, ToolError> {
+    serde_json::from_value(input.clone()).map_err(|e| ToolError::InvalidInput(e.to_string()))
 }
 
 /// [BUG-082フォローアップ] ツール呼び出しが実際の処理に入る**前**、何らかの背景条件で

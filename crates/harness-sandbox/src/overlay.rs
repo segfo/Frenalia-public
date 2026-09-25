@@ -44,6 +44,10 @@ pub enum SandboxError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     ReadScope(#[from] crate::read_scope::ReadScopeError),
+    /// 設定注入パス（`.git/config`・`.harness/**`等）への書込。判定器に加えて書込口でも拒否する
+    /// （`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §6.1・D-101）。
+    #[error("refusing to write a config-injection path: {0}")]
+    ConfigInjection(String),
 }
 
 fn normalize_str(p: &Path) -> String {
@@ -309,7 +313,39 @@ impl SandboxFs {
     /// オーバーレイディレクトリ・操作台帳へ記録する。workspace外の絶対パスはオーバーレイ有効時
     /// のみ`_ext/<key>`（`store::ext_key`）へ記録する（Phase 3）。オーバーレイ無効（純live）
     /// なら既存のLive挙動どおり拒否する。
+    ///
+    /// **設定注入パスへの書込はここでも拒否する**（D-101）。判定器（`PermissionArbiter`）が主ゲートだが、
+    /// 判定に渡す値の選び方が破れると（BUG-164）、差分層の無い直接書くモードでは実ファイルまで届いた。
+    /// 差分層を使うかどうかで防御の有無が変わらないよう、`write_file`・`edit_file`の2経路が通る
+    /// 唯一の書込口に同じ判定を置く。
     pub fn write_string(&self, path: &str, content: &str) -> Result<(), SandboxError> {
+        // 形の崩れた相対パス（`..`で外へ出る等）は、従来どおり形の誤りとして先に返す
+        // （設定注入パスの判定は`..`を拒否側へ倒すので、順序を逆にすると誤りの種類が変わる）。
+        if !Path::new(path).is_absolute() {
+            check_relative_path(path)?;
+        }
+        if harness_core::is_config_injection_path(path, &self.workspace_root) {
+            return Err(SandboxError::ConfigInjection(path.to_string()));
+        }
+        self.write_string_unchecked(path, content)
+    }
+
+    /// テスト専用: 書込口を通らない子プロセスの書込を模して差分層（またはステージング）へ置く。
+    #[cfg(test)]
+    pub(crate) fn stage_like_a_child_for_test(
+        &self,
+        path: &str,
+        content: &str,
+    ) -> Result<(), SandboxError> {
+        self.write_string_unchecked(path, content)
+    }
+
+    /// [`Self::write_string`]から設定注入パスの拒否だけを除いたもの。
+    ///
+    /// 本番で呼ぶのは`write_string`だけ。テストは、**書込口を通らない子プロセスの書込**
+    /// （CoW で Redirector が差分層へ流すもの）を模すためにこれを使う——反映の段（`apply`）の
+    /// 設定注入パスの再検査は、その経路のために残っている。
+    fn write_string_unchecked(&self, path: &str, content: &str) -> Result<(), SandboxError> {
         if Path::new(path).is_absolute() {
             let Some(overlay) = &self.overlay else {
                 return Err(SandboxError::Jail(JailError::Escape(path.to_string())));
@@ -1020,7 +1056,8 @@ mod tests {
         let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
         let target = dir.path().join(".git").join("hooks").join("pre-commit");
         let abs = target.to_string_lossy().replace('\\', "/");
-        fs.write_string(&abs, "#!/bin/sh\necho pwned\n").unwrap();
+        fs.stage_like_a_child_for_test(&abs, "#!/bin/sh\necho pwned\n")
+            .unwrap();
 
         let report = fs
             .apply(&ApplyOptions {
@@ -1117,11 +1154,54 @@ mod tests {
         assert!(dir.path().join(".harness/sandbox/s1/skip.txt").exists());
     }
 
+    /// 書込口は設定注入パスを拒否する（D-101）。直接書くモード（オーバーレイ無し）と
+    /// ステージング（オーバーレイ有り）の両方で、綴りの揺れも含めて拒否し、実ファイルは変わらない。
+    /// 対照として、同じ書込口で普通のファイルは書ける。
+    #[test]
+    fn write_string_refuses_config_injection_paths_in_both_live_and_staged_modes() {
+        for staged in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+            std::fs::write(dir.path().join(".git/config"), "original").unwrap();
+            let config = if staged {
+                staged_config(".harness/sandbox/s1")
+            } else {
+                StagingConfig::default()
+            };
+            let fs = SandboxFs::open(dir.path(), &config).unwrap();
+
+            for spelling in [
+                ".git/config",
+                ".GIT/config",
+                "././.git/config",
+                ".harness/settings.json",
+            ] {
+                let err = fs.write_string(spelling, "evil").unwrap_err();
+                assert!(
+                    matches!(err, SandboxError::ConfigInjection(_)),
+                    "staged={staged} {spelling}: {err:?}"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(".git/config")).unwrap(),
+                "original",
+                "staged={staged}"
+            );
+
+            fs.write_string("src/main.rs", "fn main() {}").unwrap();
+            assert_eq!(
+                fs.read_to_string("src/main.rs").unwrap(),
+                "fn main() {}",
+                "staged={staged}: a normal file must still be writable"
+            );
+        }
+    }
+
     #[test]
     fn apply_hard_denies_staged_git_config_write() {
         let dir = tempfile::tempdir().unwrap();
         let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
-        fs.write_string(".git/config", "[core]\n\thooksPath = /tmp/evil\n")
+        fs.stage_like_a_child_for_test(".git/config", "[core]\n\thooksPath = /tmp/evil\n")
             .unwrap();
 
         let report = fs
@@ -1142,7 +1222,7 @@ mod tests {
     fn apply_hard_denies_staged_harness_settings_write() {
         let dir = tempfile::tempdir().unwrap();
         let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
-        fs.write_string(
+        fs.stage_like_a_child_for_test(
             ".harness/settings.json",
             "{\"allowlist\":[{\"tool\":\"run_shell\",\"pattern\":\"*\"}]}",
         )
@@ -1169,7 +1249,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = SandboxFs::open(dir.path(), &staged_config(".harness/sandbox/s1")).unwrap();
         fs.write_string("src/main.rs", "fn main() {}").unwrap();
-        fs.write_string(".gitattributes", "* text=auto").unwrap();
+        fs.stage_like_a_child_for_test(".gitattributes", "* text=auto")
+            .unwrap();
 
         let report = fs
             .apply(&ApplyOptions {

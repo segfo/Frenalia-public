@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
+use harness_core::{parse_tool_input, PermissionSubject};
 use harness_core::{RiskClass, RunnableProgramFact, Tool, ToolCtx, ToolError, ToolOutput};
 use harness_policy::transition_listing::{match_rank, Rank};
 
@@ -89,9 +90,17 @@ impl Tool for CanRunProgramTool {
         RiskClass::ReadOnly
     }
 
+    async fn permission_subject(
+        &self,
+        input: &serde_json::Value,
+        _ctx: &ToolCtx,
+    ) -> Result<PermissionSubject, ToolError> {
+        let input: CanRunProgramInput = parse_tool_input(input)?;
+        Ok(PermissionSubject::Text(input.program.unwrap_or_default()))
+    }
+
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
-        let input: CanRunProgramInput =
-            serde_json::from_value(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
+        let input: CanRunProgramInput = parse_tool_input(&input)?;
 
         // **黙って空を返さない**（`B-10`）。「起こせるものが無い」と「そもそも強制が
         // 効いていない」は別の事実で、混ぜるとモデルは存在しない制約に合わせて動く。

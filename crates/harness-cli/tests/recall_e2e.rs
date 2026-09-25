@@ -734,8 +734,8 @@ fn case_remember_with_allowlist_writes_only_inside_checkpoints() -> Result<(), S
     let ws = case_dir("remember-allowed");
     let data = case_data_root("remember-allowed");
 
-    // `arg_repr`は入力JSON全体（`serde_json`のオブジェクトはキー昇順）なので、
-    // `{"action":"remember"`が前方一致の接頭辞になる。
+    // `recall`の判定の材料は`action`の値（D-101）。入力JSON全体の前方一致は`action`より後ろの
+    // キーを何も縛らないので使わない。
     let run = run_harness(RunSpec {
         ws: &ws,
         data_root: &data,
@@ -751,12 +751,7 @@ fn case_remember_with_allowlist_writes_only_inside_checkpoints() -> Result<(), S
             ),
             text_turn("記憶した"),
         ],
-        extra_args: &[
-            "--cognition",
-            "off",
-            "--allow",
-            r#"recall:{"action":"remember"*"#,
-        ],
+        extra_args: &["--cognition", "off", "--allow", "recall:remember"],
         case_name: "remember-allowed",
         path_override: None,
         cwd_spelling: None,
