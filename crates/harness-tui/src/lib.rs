@@ -30,7 +30,20 @@ pub use app::{
     Action, AppState, BusyEnd, BusyProgress, CommitSelection, MemoryCommand, PartialFile,
     ReviewPanelState, ReviewRow, ReviewTarget, SlashCommand,
 };
+pub use app::{ApprovalStage, PermissionView, PreviousCopy, SummaryState};
 pub use approvals::ApprovalSummary;
+
+/// 承認画面を1枚描く（`examples/approval-frames.rs`のための入口）。
+///
+/// **端末を持たない場所から画面を文字に起こすため**だけに公開している。実行時に呼ばれるのは
+/// [`run`]の中の描画ループで、そちらは`ui`モジュール内から直接呼ぶ。
+pub fn render_approval_modal_for_example(
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    pending: &PermissionView,
+) -> u16 {
+    ui::render_permission_modal(f, area, pending)
+}
 pub use engine::{spawn_engine, EngineHandle};
 pub use gate::InteractiveGate;
 

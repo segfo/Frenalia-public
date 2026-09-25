@@ -446,7 +446,7 @@ impl PermissionView {
         )];
         for f in files {
             let listing = match f.dir_listing_sha256.is_some() {
-                true => "・隣の名前一覧も",
+                true => "（隣の名前一覧も）",
                 false => "",
             };
             out.push(ApprovalLine::new(

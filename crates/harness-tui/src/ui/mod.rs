@@ -6,6 +6,8 @@
 mod approval;
 mod review;
 
+pub(crate) use approval::render_permission_modal;
+
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};

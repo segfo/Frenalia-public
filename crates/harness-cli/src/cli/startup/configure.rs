@@ -575,4 +575,70 @@ mod tests {
             &here
         ));
     }
+
+    /// 設定→要約のプロバイダ選択（D-100）。**既定は会話と同じものを共有する**——同じで済むときに
+    /// 2本目を建てない（資格情報を二重に要求しない）。切ったら何も作らない。
+    #[test]
+    fn the_approval_summary_follows_the_settings() {
+        let cli = Cli::parse_from(["harness"]);
+        let with = |approval: Option<harness_config::ApprovalSettings>| harness_config::Settings {
+            approval,
+            ..Default::default()
+        };
+
+        // 既定（節なし）: 会話と同じプロバイダ・同じモデル。
+        let chosen = resolve_approval_summary(&with(None), &cli, "conv-model").expect("既定は有効");
+        assert!(chosen.provider.is_none(), "2本目を建てている");
+        assert_eq!(chosen.model, "conv-model");
+
+        // 切った: 何も作らない。
+        assert!(resolve_approval_summary(
+            &with(Some(harness_config::ApprovalSettings {
+                summarize: Some(false),
+                ..Default::default()
+            })),
+            &cli,
+            "conv-model"
+        )
+        .is_none());
+
+        // モデルだけ指定: プロバイダは会話と同じまま、モデルだけ変わる。
+        let chosen = resolve_approval_summary(
+            &with(Some(harness_config::ApprovalSettings {
+                summary_model: Some("small".into()),
+                ..Default::default()
+            })),
+            &cli,
+            "conv-model",
+        )
+        .expect("モデルだけの指定でも有効");
+        assert!(chosen.provider.is_none());
+        assert_eq!(chosen.model, "small");
+
+        // 別プロバイダ＋モデル: 2本目を建てる。
+        let chosen = resolve_approval_summary(
+            &with(Some(harness_config::ApprovalSettings {
+                summary_provider: Some("lmstudio".into()),
+                summary_model: Some("small".into()),
+                ..Default::default()
+            })),
+            &cli,
+            "conv-model",
+        )
+        .expect("別プロバイダの指定が有効");
+        assert!(chosen.provider.is_some());
+        assert_eq!(chosen.model, "small");
+        assert_eq!(chosen.label, "lmstudio");
+
+        // 知らないプロバイダ名: **起動は止めず**、要約だけ切る。
+        assert!(resolve_approval_summary(
+            &with(Some(harness_config::ApprovalSettings {
+                summary_provider: Some("no-such-provider".into()),
+                ..Default::default()
+            })),
+            &cli,
+            "conv-model"
+        )
+        .is_none());
+    }
 }

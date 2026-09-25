@@ -25,5 +25,7 @@ uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 harness-providers = { version = "0.1.0", path = "../harness-providers" }
+# `approval_summary_live`（明示実行）が LMStudio のモデル一覧を引くためだけに使う。
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time"] }
