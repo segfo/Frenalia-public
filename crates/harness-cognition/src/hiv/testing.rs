@@ -152,6 +152,8 @@ impl Executor for PhaseExecutor {
                         is_error: false,
                     },
                     decision: ToolCallDecision::Executed,
+                    // 台本のツール呼び出しは判定器を通らないので材料が無い。出典は道具の名前へ落ちる。
+                    subject: None,
                 };
                 RawTurnResult::Completed(turn(text.unwrap_or_default().to_string(), vec![call]))
             }

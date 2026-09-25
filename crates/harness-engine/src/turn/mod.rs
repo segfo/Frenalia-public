@@ -133,6 +133,12 @@ pub struct CompletedToolCall {
     pub input: serde_json::Value,
     pub output: ToolOutput,
     pub decision: ToolCallDecision,
+    /// 判定器が見た材料（D-101）。実行まで進まなかった呼び出しは`None`。
+    ///
+    /// **入力のキーを探す代わりに、これを見る。** 「入力に`command`があればそれ」という選び方は、
+    /// 入力を作るモデルに材料を選ばせる形であり、BUG-164 そのものである。認知層の出典
+    /// （`harness_cognition::hiv::evidence`）が最後の利用者だった。
+    pub subject: Option<harness_core::PermissionSubject>,
 }
 
 impl CompletedToolCall {
@@ -554,6 +560,7 @@ impl<'a> TurnExecutor<'a> {
                         is_error: true,
                     },
                     decision: ToolCallDecision::CancelledBeforeStart,
+                    subject: None,
                 });
                 continue;
             }
@@ -567,7 +574,7 @@ impl<'a> TurnExecutor<'a> {
                 },
             );
 
-            let (output, decision) = self.dispatch_one(id, name, input, malformed).await;
+            let (output, decision, subject) = self.dispatch_one(id, name, input, malformed).await;
 
             let mut output = output;
             if self.is_tier3() {
@@ -590,6 +597,7 @@ impl<'a> TurnExecutor<'a> {
                 input: input.clone(),
                 output,
                 decision,
+                subject,
             });
         }
 
@@ -603,7 +611,11 @@ impl<'a> TurnExecutor<'a> {
         name: &str,
         input: &serde_json::Value,
         malformed: &std::collections::HashMap<String, MalformedToolInput>,
-    ) -> (ToolOutput, ToolCallDecision) {
+    ) -> (
+        ToolOutput,
+        ToolCallDecision,
+        Option<harness_core::PermissionSubject>,
+    ) {
         if let Some(m) = malformed.get(id) {
             // 引数JSONが壊れていた`tool_use`。ツールは呼ばず、モデルへ差し戻して自己修正させる
             // （`unknown tool`と同じ「エラーの説明を`tool_result`として返す」パターン）。
@@ -617,6 +629,7 @@ impl<'a> TurnExecutor<'a> {
                     is_error: true,
                 },
                 ToolCallDecision::MalformedInput,
+                None,
             );
         }
 
@@ -627,6 +640,7 @@ impl<'a> TurnExecutor<'a> {
                     is_error: true,
                 },
                 ToolCallDecision::UnknownTool,
+                None,
             );
         };
 
@@ -643,6 +657,7 @@ impl<'a> TurnExecutor<'a> {
                         is_error: true,
                     },
                     ToolCallDecision::InvalidInput,
+                    None,
                 );
             }
         };
@@ -654,6 +669,7 @@ impl<'a> TurnExecutor<'a> {
                     is_error: true,
                 },
                 ToolCallDecision::DeniedByPolicy,
+                None,
             );
         }
         // D-106: ファイルの中身や名前の解決先に依存する材料は、**承認の直後に計算し直して比べる**。
@@ -675,6 +691,7 @@ impl<'a> TurnExecutor<'a> {
                         is_error: true,
                     },
                     ToolCallDecision::DeniedByPolicy,
+                    None,
                 );
             }
         }
@@ -687,7 +704,7 @@ impl<'a> TurnExecutor<'a> {
             },
         );
         let output = self.call_with_wait_reasons(id, tool, input).await;
-        (output, ToolCallDecision::Executed)
+        (output, ToolCallDecision::Executed, Some(subject))
     }
 
     /// [BUG-082フォローアップ] `tool.call(...)`を待つ間、`WaitReason`（D-54のworkspace ACL

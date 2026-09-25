@@ -9,7 +9,7 @@
 //! 機械チェックで、その判定材料が自己申告だと、モデルが`source`に`"src/lib.rs"`と
 //! 書くだけでチェックを通せてしまう。
 
-use harness_core::RiskClass;
+use harness_core::{PermissionSubject, RiskClass};
 use harness_engine::{CompletedToolCall, EventSink, ToolCallDecision};
 
 use crate::hiv::parse::resolve_contradicts;
@@ -87,7 +87,7 @@ fn source_ref_for(call: &CompletedToolCall, risk: Option<RiskClass>) -> SourceRe
             fetched_at: unix_seconds(),
         },
         Some(RiskClass::Exec) => SourceRef::Shell {
-            cmd: string_field(input, &["command", "cmd"]).unwrap_or_else(|| call.name.clone()),
+            cmd: executed_command(call),
             // `ToolOutput`は終了コードを持たない（`is_error`だけ）。観測として意味があるのは
             // 「失敗したか」なので、そこだけを1/0で写す。
             exit: i32::from(call.output.is_error),
@@ -98,6 +98,28 @@ fn source_ref_for(call: &CompletedToolCall, risk: Option<RiskClass>) -> SourceRe
                 .unwrap_or_else(|| call.name.clone()),
             lines: line_range(input),
         },
+    }
+}
+
+/// 実行された呼び出しを1行にする。**判定器が見た材料から作る**（`CompletedToolCall::subject`）。
+///
+/// # なぜ入力のキーを探さないのか
+///
+/// 以前はここで `{"command": …}` というキーを探していた。`run_shell` にはそのキーがあるが、
+/// **`run_program` には無い**（`{program, args}` である）ので、どの `run_program` 呼び出しも
+/// `run_program` という同じ文字列に潰れ、`git status` と `git push --force` が**区別できなかった**。
+/// しかも `SourceRef::Shell` は接地の証拠として数えられるので、中身の無い出典が主張を
+/// `Confirmed` まで押し上げうる。これは BUG-164（判定に渡す値を入力のキーで選ぶ）と同じ形で、
+/// 本番に残っていた最後の1箇所である。
+///
+/// **この文字列は記憶へ入り、Recall 経由で将来の入力へ戻りうる**（`bug-pattern-rules` B-28）。
+/// 載るのはモデルが自分で書いたプログラム名と引数で、会話に既にあるものなので新しい環は作らない。
+fn executed_command(call: &CompletedToolCall) -> String {
+    match &call.subject {
+        Some(PermissionSubject::Program(p)) => p.describe(),
+        Some(PermissionSubject::Command(c)) => harness_core::escape_for_display(&c.line),
+        // 材料が無い（実行まで進まなかった・材料を持たないツール）ときだけ道具の名前へ落とす。
+        _ => call.name.clone(),
     }
 }
 
@@ -229,6 +251,15 @@ mod tests {
     }
 
     fn call(name: &str, input: serde_json::Value, content: &str) -> CompletedToolCall {
+        with_subject(name, input, content, None)
+    }
+
+    fn with_subject(
+        name: &str,
+        input: serde_json::Value,
+        content: &str,
+        subject: Option<PermissionSubject>,
+    ) -> CompletedToolCall {
         CompletedToolCall {
             id: format!("call_{name}"),
             name: name.to_string(),
@@ -238,6 +269,7 @@ mod tests {
                 is_error: false,
             },
             decision: ToolCallDecision::Executed,
+            subject,
         }
     }
 
@@ -273,12 +305,60 @@ mod tests {
         );
     }
 
+    /// `run_program` の出典は**プログラム名と引数**から作る（判定器が見た材料そのもの）。
+    ///
+    /// 以前は入力の `command` というキーを探していたので、`run_program` にそのキーが無く、
+    /// **どの呼び出しも同じ文字列に潰れていた**——`git status` と `git push --force` が
+    /// 区別できず、しかもこの出典は接地の証拠として数えられる。
+    #[test]
+    fn run_program_sources_carry_the_program_and_its_arguments() {
+        let prog = |args: &[&str]| {
+            let subject = PermissionSubject::Program(harness_core::ProgramSubject::plain(
+                "git",
+                args.iter().map(|a| a.to_string()).collect(),
+            ));
+            with_subject(
+                "run_program",
+                serde_json::json!({ "program": "git", "args": args }),
+                "ok",
+                Some(subject),
+            )
+        };
+
+        let status = source_ref_for(&prog(&["status"]), Some(RiskClass::Exec));
+        let force = source_ref_for(&prog(&["push", "--force"]), Some(RiskClass::Exec));
+        assert_eq!(
+            status,
+            SourceRef::Shell {
+                cmd: "git status".to_string(),
+                exit: 0
+            }
+        );
+        assert_ne!(status, force, "違う呼び出しが同じ出典になっている");
+
+        // 材料が無い呼び出しは道具の名前へ落ちる（対照。ここだけは以前と同じ）。
+        let bare = source_ref_for(
+            &call("run_program", serde_json::json!({}), "ok"),
+            Some(RiskClass::Exec),
+        );
+        assert_eq!(
+            bare,
+            SourceRef::Shell {
+                cmd: "run_program".to_string(),
+                exit: 0
+            }
+        );
+    }
+
     #[test]
     fn exec_calls_become_shell_sources_carrying_the_failure_bit() {
-        let mut c = call(
+        let mut c = with_subject(
             "run_shell",
             serde_json::json!({ "command": "cargo test" }),
             "failures: 1",
+            Some(PermissionSubject::Command(
+                harness_core::CommandSubject::line_only("cargo test"),
+            )),
         );
         c.output.is_error = true;
         assert_eq!(

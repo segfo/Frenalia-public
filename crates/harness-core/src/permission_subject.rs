@@ -112,6 +112,28 @@ pub struct ProgramSubject {
 }
 
 impl ProgramSubject {
+    /// 人が読む1行（認知層の出典・一覧・画面）。
+    ///
+    /// **空白や引用符を含む引数は引用符で囲む。** 境界が消えると `rm -rf /` と `rm "-rf /"` が
+    /// 同じ文字列になり、出典として何を見たのか分からなくなる。見えない文字は綴りへ置き換える
+    /// （[`crate::escape_for_display`] と同じ表を使う）。
+    ///
+    /// **これはシェルへ渡せる文字列ではない**——`run_program` はシェルを通さないので、
+    /// 引用の規則をどのシェルにも合わせていない。読むためだけのものである。
+    pub fn describe(&self) -> String {
+        let mut out = crate::escape_for_display(&self.program);
+        for arg in &self.args {
+            out.push(' ');
+            let shown = crate::escape_for_display(arg);
+            if shown.is_empty() || shown.chars().any(|c| c.is_whitespace() || c == '"') {
+                out.push_str(&format!("{shown:?}"));
+            } else {
+                out.push_str(&shown);
+            }
+        }
+        out
+    }
+
     /// ファイルを縛らない材料（テスト用。`runs_code`はインタプリタの名前だけで決める）。
     pub fn plain(program: impl Into<String>, args: Vec<String>) -> Self {
         let program = program.into();
@@ -167,5 +189,29 @@ impl PermissionSubject {
             }
             (a, b) => a == b,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 出典と画面に出す1行。**引数の境界を消さない**——消すと `rm -rf /` と `rm "-rf /"` が
+    /// 同じ文字列になり、何を見たのか分からなくなる。見えない文字は綴りへ置き換える。
+    #[test]
+    fn describe_keeps_argument_boundaries_and_shows_invisible_characters() {
+        let p = |args: &[&str]| {
+            ProgramSubject::plain("git", args.iter().map(|a| a.to_string()).collect())
+        };
+        assert_eq!(p(&["status"]).describe(), "git status");
+        assert_eq!(p(&[]).describe(), "git");
+        assert_eq!(
+            p(&["commit", "-m", "a b"]).describe(),
+            r#"git commit -m "a b""#
+        );
+        assert_eq!(p(&[""]).describe(), r#"git """#);
+        assert_eq!(p(&["a\u{202E}b"]).describe(), r"git a\u{202E}b");
+        // 境界が消えていないこと（この2つが同じ文字列にならない）。
+        assert_ne!(p(&["-rf", "/"]).describe(), p(&["-rf /"]).describe());
     }
 }
