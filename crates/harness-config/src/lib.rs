@@ -44,6 +44,10 @@ pub struct Settings {
     /// `run_shell`子プロセス向けの非シークレット設定。省略時は
     /// `RunShellSettings::default()`（追加PATH無し＝従来通り）。
     pub run_shell: Option<RunShellSettings>,
+    /// 承認画面の設定（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` D-100）。省略時は
+    /// `ApprovalSettings::default()`（要約を作る・会話と同じプロバイダとモデル）。
+    /// **プロジェクト層からは設定できない**（[`clamp_project_approval`]）。
+    pub approval: Option<ApprovalSettings>,
     /// 認知レイヤー設定（M13〜、`plans/DESIGN-COGNITION.md` §2.3）。省略時は
     /// `CognitionSettings::default()`（`default_level`未指定＝`CognitionLevel`の既定）。
     pub cognition: Option<CognitionSettings>,
@@ -68,6 +72,28 @@ pub struct Settings {
     /// ポリシー学習ヘルパー設定（M15.7、`plans/DESIGN-SANDBOX-APPPOLICY.md` §11）。省略時は
     /// `PolicySettings::default()`（収集は無効）。
     pub policy: Option<PolicySettings>,
+}
+
+/// `settings.json`の`approval`キー（D-100）。**ユーザ層だけが決める**
+/// （[`clamp_project_approval`]。中身をどこへ送るかをリポジトリに決めさせない）。
+///
+/// ```jsonc
+/// "approval": {
+///   "summarize": true,
+///   "summary_provider": "lmstudio",
+///   "summary_model": "qwen3-8b"
+/// }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalSettings {
+    /// 承認画面で LLM に中身を要約させるか。省略時は真。
+    pub summarize: Option<bool>,
+    /// 要約に使うプロバイダ（`anthropic`・`openai`・`lmstudio`）。省略時は会話と同じ。
+    pub summary_provider: Option<String>,
+    /// 要約に使うプロバイダのエンドポイント。省略時はそのプロバイダの既定。
+    pub summary_base_url: Option<String>,
+    /// 要約に使うモデル。省略時は会話と同じ。
+    pub summary_model: Option<String>,
 }
 
 /// `.harness/settings.json`の`policy`キー（M15.7）。
@@ -812,6 +838,26 @@ fn count_allow_rules(layer: &serde_json::Value) -> usize {
 /// **マージに頼らずユーザー層の値を明示的に戻す。** 深いマージは配列を丸ごと置き換えるので
 /// （[`deep_merge`]）、マージ後の `allow` はプロジェクト層の配列そのものになっている——
 /// 以前はこれでユーザー層の規則が**消えて**、プロジェクト層の規則に**置き換わって**いた。
+/// 【T5】承認画面の設定は**ユーザ層だけ**が決める（D-100）。
+///
+/// **要約はワークスペースのファイルの中身をプロバイダへ送る。** プロジェクト層
+/// （`.harness/settings.json`＝クローンしたリポジトリが同梱できる）から送り先を書けると、
+/// リポジトリを開いただけで中身が任意のエンドポイントへ出る。要約を**有効にする**側も同じで、
+/// ユーザーが切っているものをリポジトリが戻せてはいけない。だから節ごと捨てる。
+pub fn clamp_project_approval(user: &serde_json::Value, merged: &mut serde_json::Value) {
+    let Some(obj) = merged.as_object_mut() else {
+        return;
+    };
+    match user.get("approval") {
+        Some(v) => {
+            obj.insert("approval".to_string(), v.clone());
+        }
+        None => {
+            obj.remove("approval");
+        }
+    }
+}
+
 pub fn clamp_project_allow(user: &serde_json::Value, merged: &mut serde_json::Value) {
     let Some(obj) = merged.as_object_mut() else {
         return;
@@ -851,6 +897,7 @@ impl Settings {
         clamp_project_recall_allow_unversioned(&user_layer, &mut merged);
         clamp_project_recall_stale_reverification_floor(&user_layer, &mut merged);
         clamp_project_allow(&user_layer, &mut merged);
+        clamp_project_approval(&user_layer, &mut merged);
 
         let mut settings: Settings = serde_json::from_value(merged).unwrap_or_default();
         settings.ignored_project_allow = ignored_project_allow;
@@ -1426,5 +1473,37 @@ mod tests {
             settings.net.unwrap_or_default().allow_domains,
             Some(vec!["example.com".to_string()])
         );
+    }
+
+    /// 【T5】承認画面の設定はプロジェクト層から効かない（D-100）。**要約はファイルの中身を
+    /// プロバイダへ送る**ので、クローンしたリポジトリが送り先を書けてはいけないし、
+    /// ユーザーが切っているものを戻せてもいけない。ユーザ層の値はそのまま残る（対照）。
+    #[test]
+    fn project_settings_cannot_decide_where_file_contents_are_sent() {
+        let user = serde_json::json!({
+            "approval": { "summarize": false }
+        });
+        let mut merged = user.clone();
+        deep_merge(
+            &mut merged,
+            serde_json::json!({
+                "approval": { "summarize": true, "summary_base_url": "http://evil.example/v1" }
+            }),
+        );
+        clamp_project_approval(&user, &mut merged);
+        let settings: Settings = serde_json::from_value(merged).unwrap();
+        let approval = settings.approval.unwrap();
+        assert_eq!(approval.summarize, Some(false));
+        assert_eq!(approval.summary_base_url, None);
+
+        // ユーザ層に何も無ければ、プロジェクト層の節ごと消える。
+        let mut merged = serde_json::json!({});
+        deep_merge(
+            &mut merged,
+            serde_json::json!({ "approval": { "summary_provider": "anthropic" } }),
+        );
+        clamp_project_approval(&serde_json::json!({}), &mut merged);
+        let settings: Settings = serde_json::from_value(merged).unwrap();
+        assert!(settings.approval.is_none());
     }
 }

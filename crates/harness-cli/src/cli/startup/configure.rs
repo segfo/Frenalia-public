@@ -27,6 +27,18 @@ pub(super) struct Configured {
     /// 認知レイヤーの入口（M13時点では`CognitionLevel::Off`＝素朴ループへの委譲のみ）。
     /// 未実装の段階はStage2で弾くため、ここまで来た時点で必ず実行可能な段階になっている。
     pub(super) cognition: CognitiveOrchestrator,
+    /// 承認画面の要約（D-100）。`None`なら作らない。
+    pub(super) approval_summary: Option<ApprovalSummaryChoice>,
+}
+
+/// 承認画面の要約をどのプロバイダ・どのモデルで作るか（D-100）。
+pub(super) struct ApprovalSummaryChoice {
+    /// 要約専用に建てたプロバイダ。`None`なら会話と同じものを使う
+    /// （**同じで済むときに2本目を建てない**——資格情報を二重に要求しない）。
+    pub(super) provider: Option<Box<dyn LlmProvider>>,
+    pub(super) model: String,
+    /// 画面へ出す出どころ。**どこへ中身が出たのかを後から見て分かるようにする。**
+    pub(super) label: String,
 }
 
 /// `settings.json`読込・`early_require_sandbox`とconfidentialの矛盾チェック・provider構築・
@@ -253,6 +265,7 @@ pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, Ex
         );
     }
     load_recorded_approvals(&mut arbiter, &workspace_root);
+    let approval_summary = resolve_approval_summary(&settings, &cli, &model);
 
     Ok(Configured {
         cli,
@@ -269,7 +282,69 @@ pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, Ex
         tools,
         arbiter,
         cognition,
+        approval_summary,
     })
+}
+
+/// 承認画面の要約（D-100）の構成を決める。**作れなくても起動は止めない**
+/// ——要約は補助であって境界ではないので、無くても実行の可否は変わらない。告知して切る。
+fn resolve_approval_summary(
+    settings: &harness_config::Settings,
+    cli: &Cli,
+    conversation_model: &str,
+) -> Option<ApprovalSummaryChoice> {
+    let approval = settings.approval.clone().unwrap_or_default();
+    if !approval.summarize.unwrap_or(true) {
+        return None;
+    }
+    // プロバイダを指定していなければ、会話と同じものをそのまま使う。
+    let Some(name) = approval.summary_provider.as_deref() else {
+        return Some(ApprovalSummaryChoice {
+            provider: None,
+            model: approval
+                .summary_model
+                .unwrap_or_else(|| conversation_model.to_string()),
+            label: cli.provider.label().to_string(),
+        });
+    };
+    let Ok(kind) = <ProviderKind as clap::ValueEnum>::from_str(name, true) else {
+        eprintln!(
+            "note: approval.summary_provider {name:?} is not a provider this harness knows;              the approval screen will show the contents without a summary"
+        );
+        return None;
+    };
+    let model = match approval.summary_model.clone() {
+        Some(m) => m,
+        None => match resolve_model(None, kind) {
+            Ok(m) => m,
+            Err(_) => {
+                eprintln!(
+                    "note: approval.summary_provider is set to {name:?} but approval.summary_model                      is not; the approval screen will show the contents without a summary"
+                );
+                return None;
+            }
+        },
+    };
+    match build_provider(
+        kind,
+        approval.summary_base_url.clone(),
+        #[cfg(feature = "e2e-mock")]
+        cli.mock_turns.as_deref(),
+        #[cfg(feature = "e2e-mock")]
+        cli.mock_record_requests.as_deref(),
+    ) {
+        Ok(provider) => Some(ApprovalSummaryChoice {
+            provider: Some(provider),
+            model,
+            label: name.to_string(),
+        }),
+        Err(reason) => {
+            eprintln!(
+                "note: could not set up approval.summary_provider {name:?} ({reason});                  the approval screen will show the contents without a summary"
+            );
+            None
+        }
+    }
 }
 
 /// ユーザー層の承認台帳（`run-approval-ledger.json`）を読み、判定器へ入れて件数を告知する（D-107）。

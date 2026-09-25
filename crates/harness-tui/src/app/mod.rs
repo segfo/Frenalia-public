@@ -61,6 +61,7 @@ mod review;
 pub use approval::MODAL_INPUT_GRACE;
 pub use approval::{
     ApprovalCommand, ApprovalLine, ApprovalStage, LineStyle, PermissionView, PreviousCopy,
+    SummaryState,
 };
 use commands::parse_slash_command;
 pub use commands::{Action, FsStageCommand, MemoryCommand, SlashCommand};

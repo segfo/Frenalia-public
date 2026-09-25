@@ -1,6 +1,7 @@
 //! 承認モーダルの回帰テスト（D-106・D-107）。内部の状態（段・穴・カーソル）へ触れるため
 //! `#[cfg(test)]`のまま別ファイルへ分けている（`docs/CODE-STRUCTURE-RULES.md`規則2）。
 
+use super::SummaryState;
 use super::*;
 use harness_core::{CommandSubject, ProgramSubject};
 
@@ -179,4 +180,29 @@ fn a_tool_without_a_ledger_entry_says_the_approval_is_session_scoped() {
     assert!(v.key_hints().concat().contains("このセッション中は許可"));
     v.on_key(key(KeyCode::Char('a')));
     assert!(body_text(&v).contains("このセッション中だけ許可する"));
+}
+
+/// 要約には**出どころ**を添える（D-100）。中身がどこへ出たのかを後から見て分かるようにする。
+/// 要約は「補助。中身と差分を必ず確認」と一緒にしか出さない。
+#[test]
+fn the_summary_says_where_it_came_from_and_that_it_is_only_an_aid() {
+    let mut v = view(program("python", &["build.py"]));
+    v.summary_source = Some("lmstudio / qwen3-8b".to_string());
+    v.summary = SummaryState::Running;
+    assert!(
+        body_text(&v).contains("要約を作成中…（lmstudio / qwen3-8b へ中身を送っている）")
+            || body_text(&v).contains("lmstudio / qwen3-8b")
+    );
+
+    v.summary = SummaryState::Done("ネットワークへ出る。".to_string());
+    let text = body_text(&v);
+    assert!(
+        text.contains("補助。中身と差分を必ず確認すること"),
+        "{text}"
+    );
+    assert!(text.contains("lmstudio / qwen3-8b"), "{text}");
+    assert!(text.contains("ネットワークへ出る。"), "{text}");
+
+    v.summary = SummaryState::Failed("接続できない".to_string());
+    assert!(body_text(&v).contains("要約を作れなかった: 接続できない"));
 }

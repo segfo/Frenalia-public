@@ -24,6 +24,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         tools,
         arbiter,
         cognition,
+        approval_summary,
         sessions_dir,
         mut session,
         session_messages,
@@ -660,13 +661,12 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     #[cfg(not(windows))]
     mcp_startup.drop_servers_needing_egress_enforcement();
 
-    let (mut mcp_runtime, mcp_facts, _mcp_proxies) =
-        super::mcp::launch_mcp_servers(
-            mcp_startup,
-            &mut tools,
-            #[cfg(windows)]
-            spawn_daemon.as_ref(),
-        );
+    let (mut mcp_runtime, mcp_facts, _mcp_proxies) = super::mcp::launch_mcp_servers(
+        mcp_startup,
+        &mut tools,
+        #[cfg(windows)]
+        spawn_daemon.as_ref(),
+    );
 
     let mut tool_ctx = ToolCtx {
         workspace_root: workspace_root.clone(),
@@ -703,6 +703,13 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     // `Arc<dyn LlmProvider>`を要求するため（内側の`TurnExecutor`をツール呼び出しの
     // たびに新しく組み立てる必要があり、外側のスタックフレームより長生きする必要がある）。
     let provider: Arc<dyn LlmProvider> = Arc::from(provider);
+    // 承認画面の要約（D-100）。**プロバイダを別に建てていなければ会話と同じものを共有する**
+    // ——同じで済むときに2本目を建てない。`None`なら要約を作らない。
+    let approval_summary = approval_summary.map(|choice| harness_tui::ApprovalSummary {
+        provider: choice.provider.map_or_else(|| provider.clone(), Arc::from),
+        model: choice.model,
+        label: choice.label,
+    });
     // `census`自身を含まないスナップショット——このクローンを取った**後**に`census`を
     // 登録することで、内側の`TurnExecutor`が`census`を再帰的に呼び出せる経路を構造的に
     // 作らない（`harness_cognition::census::tool`のモジュールdoc「再帰的自己呼び出しの防止」）。
@@ -770,6 +777,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 enter_submits,
                 resume_wants_picker,
                 sandbox_choice_of(cli.sandbox).wants_warm_tier3(),
+                approval_summary,
                 &mut relaunch_into,
             )
             .await
@@ -978,6 +986,8 @@ async fn tui_branch(
     enter_submits: bool,
     resume_wants_picker: bool,
     tier3_warm: bool,
+    // 承認画面の要約（D-100）。`None`なら作らない。
+    approval_summary: Option<harness_tui::ApprovalSummary>,
     // `/workspace`の移動先。TUIが自分でプロセスを起こすと、呼び出し元（`stage_run_agent`）の
     // teardown順序（MCP停止→WFP撤収→policy-learn撤収→`end_session`）を迂回することになるので、
     // 「どこへ移りたいか」だけを持ち帰らせる。
@@ -1010,6 +1020,7 @@ async fn tui_branch(
         enter_submits,
         resume_wants_picker,
         tier3_warm,
+        approval_summary,
     )
     .await;
 

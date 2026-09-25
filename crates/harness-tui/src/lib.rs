@@ -30,6 +30,7 @@ pub use app::{
     Action, AppState, BusyEnd, BusyProgress, CommitSelection, MemoryCommand, PartialFile,
     ReviewPanelState, ReviewRow, ReviewTarget, SlashCommand,
 };
+pub use approvals::ApprovalSummary;
 pub use engine::{spawn_engine, EngineHandle};
 pub use gate::InteractiveGate;
 
@@ -397,6 +398,8 @@ pub async fn run(
     enter_submits: bool,
     start_with_picker: bool,
     tier3_warm: bool,
+    // 承認画面の要約（D-100）。`None`なら作らない（設定で切った・プロバイダを作れなかった）。
+    approval_summary: Option<ApprovalSummary>,
 ) -> io::Result<RunOutcome> {
     let guard = harness_term::TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -468,6 +471,11 @@ pub async fn run(
     // `SandboxFs`を直接この描画ループから同期的に叩く。ピッカーが`session`を直接触るのと
     // 同じアーキテクチャ上の位置付け）。
     let workspace_root_for_panel = ctx.workspace_root.clone();
+    // 要約に回す前に「読ませない」と書かれた場所を落とすために要る（D-100）。`ctx`は
+    // `spawn_engine`へ移動するので、ここで控えておく（`workspace_root_for_panel`と同じ理由）。
+    let read_scope_for_summary = harness_sandbox::ReadScope::open(&ctx.read_scope);
+    // Tier3ではホストの絶対パスをモデルへ見せない（`harness_engine::sanitize`と同じ扱い）。
+    let redact_host_paths_in_summary = ctx.shell_tier.tier == harness_core::ShellTier::Tier3;
     // このプロセスのオーバーレイ機構（`--live`/`--staged`/`--sandbox tier2a-cow`）。
     // **セッションを切り替えても変わらない**——workspaceツリーのアクセス形状は起動時の
     // `preflight`が確定し、capability・ACE・モードmutexがそれに紐付いているため（D-54）。
@@ -560,9 +568,15 @@ pub async fn run(
     // ファイル操作は待たせずに済ませたい（`InteractiveGate::respond_remember`のdoc）。
     let approval_store =
         std::sync::Arc::new(harness_engine::approval_ledger::ApprovalStore::open_default());
-    // 描画ループの外でやった仕事（台帳への書込）の結果を受ける口。
+    // 描画ループの外でやった仕事（台帳への書込・承認画面の要約）の結果を受ける口。
     let (background_tx, mut background_rx) =
         tokio::sync::mpsc::unbounded_channel::<approvals::BackgroundEvent>();
+    // 同じ中身を2回要約しない（セッション中だけ覚える。B-23 の二重起動の防止）。
+    let mut summary_cache = approvals::SummaryCache::new();
+    // いま走っている要約を落とすための札。モーダルが差し替わる・閉じるたびに落とす。
+    let mut summary_cancel: Option<tokio_util::sync::CancellationToken> = None;
+    // 要約を起こした承認要求のid（同じ要求で2本起こさないため）。
+    let mut summarized_id = String::new();
     app.host_is_vscode = harness_term::host_is_vscode();
     app.workspace_label = workspace_root_for_panel
         .file_name()
@@ -656,6 +670,27 @@ pub async fn run(
                             let previous = approvals::previous_copies(&approval_store, &app);
                             if let Some(view) = app.pending_permission.as_mut() {
                                 view.previous = Some(previous);
+                            }
+                        }
+                        // 承認要求1件につき要約1本（B-23）。前の要約が走っていれば落とす。
+                        if app.pending_permission.as_ref().is_some_and(|v| v.id != summarized_id) {
+                            if let Some(token) = summary_cancel.take() {
+                                token.cancel();
+                            }
+                            summarized_id = app
+                                .pending_permission
+                                .as_ref()
+                                .map(|v| v.id.clone())
+                                .unwrap_or_default();
+                            if let Some(summary) = &approval_summary {
+                                summary_cancel = approvals::start_summary(
+                                    summary,
+                                    &background_tx,
+                                    &mut app,
+                                    &summary_cache,
+                                    &read_scope_for_summary,
+                                    redact_host_paths_in_summary,
+                                );
                             }
                         }
                         if switched {
@@ -1081,7 +1116,7 @@ pub async fn run(
                 }
             }
             Some(background) = background_rx.recv() => {
-                background.apply(&mut app);
+                approvals::on_background(background, &mut app, &mut summary_cache);
             }
             _ = tick.tick() => {
                 app.tick();
@@ -1095,8 +1130,15 @@ pub async fn run(
         let mut ceilings = ui::Ceilings::default();
         term.draw(|f| ceilings = ui::render(f, &app))?;
         app.clamp_scroll(ceilings.transcript);
-        if let Some(pending) = app.pending_permission.as_mut() {
-            pending.clamp_scroll(ceilings.modal);
+        match app.pending_permission.as_mut() {
+            Some(pending) => pending.clamp_scroll(ceilings.modal),
+            // モーダルが閉じた（応答した・拒否した）。要約はもう誰も読まないので落とす（B-23）。
+            None => {
+                if let Some(token) = summary_cancel.take() {
+                    token.cancel();
+                }
+                summarized_id.clear();
+            }
         }
 
         if app.should_quit {

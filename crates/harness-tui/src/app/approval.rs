@@ -142,6 +142,8 @@ pub struct PermissionView {
     /// 前回の承認で残した写し（差分用）。`None`は「まだ読んでいない」。
     pub previous: Option<Vec<PreviousCopy>>,
     pub summary: SummaryState,
+    /// 要約の出どころ（プロバイダ／モデル）。**どこへ中身が出たのかを画面に残す。**
+    pub summary_source: Option<String>,
 }
 
 impl PermissionView {
@@ -174,6 +176,7 @@ impl PermissionView {
             cursor: 0,
             previous: None,
             summary: SummaryState::Off,
+            summary_source: None,
         }
     }
 
@@ -461,7 +464,13 @@ impl PermissionView {
     fn summary_lines(&self) -> Vec<ApprovalLine> {
         match &self.summary {
             SummaryState::Off => Vec::new(),
-            SummaryState::Running => vec![ApprovalLine::new(LineStyle::Dim, "要約を作成中…")],
+            SummaryState::Running => vec![ApprovalLine::new(
+                LineStyle::Dim,
+                match &self.summary_source {
+                    Some(src) => format!("要約を作成中…（{src}へ中身を送っている）"),
+                    None => "要約を作成中…".to_string(),
+                },
+            )],
             SummaryState::Failed(reason) => vec![ApprovalLine::new(
                 LineStyle::Warn,
                 format!("要約を作れなかった: {reason}"),
@@ -469,7 +478,10 @@ impl PermissionView {
             SummaryState::Done(text) => {
                 let mut out = vec![ApprovalLine::new(
                     LineStyle::Heading,
-                    "要約（補助。中身と差分を必ず確認すること）",
+                    match &self.summary_source {
+                        Some(src) => format!("要約（補助。中身と差分を必ず確認すること）［{src}］"),
+                        None => "要約（補助。中身と差分を必ず確認すること）".to_string(),
+                    },
                 )];
                 out.extend(text.lines().map(|l| {
                     ApprovalLine::new(LineStyle::Dim, format!("  {}", escape_for_display(l)))
