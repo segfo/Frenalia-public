@@ -165,5 +165,13 @@ pub(crate) fn sandbox_error_to_tool_error(
         harness_sandbox::SandboxError::ConfigInjection(_) => ToolError::InvalidInput(format!(
             "writing a config-injection path is always refused: {path}"
         )),
+        // **[D-110 (v)] この経路をモデルが踏むことは無い。** 保留が掛かるのは差分層から
+        // 実ワークスペースへ**反映する**段だけで、ツールの書込口（`write_string`）には
+        // 意図的に掛けていない（掛けるとサンドボックス内の`git commit`が壊れる）。
+        // それでも`match`を`_`で閉じない——閉じると、将来この判定を書込口へ広げたときに
+        // **モデルへ何と伝わるかを誰も決めないまま**通ってしまう。
+        harness_sandbox::SandboxError::GitInternalWithheld(_) => ToolError::InvalidInput(format!(
+            "this path is inside `.git` and is reviewed through git, not written as a file: {path}"
+        )),
     }
 }

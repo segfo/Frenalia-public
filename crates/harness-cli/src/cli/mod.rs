@@ -34,7 +34,9 @@ use harness_engine::{
     PermissionMode,
 };
 use harness_providers::{AnthropicProvider, OpenAiProvider};
-use harness_sandbox::{select_tier, ApplyOptions, SandboxFs, WorkspaceWriteMode};
+use harness_sandbox::{
+    select_tier, ApplyOptions, ChangeCategory, SandboxFs, WorkspaceWriteMode,
+};
 use harness_tools::ToolRegistry;
 
 const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-8";

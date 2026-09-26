@@ -30,6 +30,40 @@ struct ApplyReportJson {
     /// オーバーレイに実体はあるが台帳に記録が無く、baselineが不明なため適用を見送った
     /// エントリ（BUG-066）。`--adopt-unledgered`で取り込める。
     unledgered: Vec<String>,
+    /// **[D-110 (v)]** `.git`成分を持つため反映を保留したエントリ。git済みの内容が本物へ
+    /// 入る入口はD-80のgit-fetchの段だけなので、**これが空でないことは失敗ではない**
+    /// （終了コードは0のまま）。ただし差分層は畳まれない。
+    git_withheld: Vec<String>,
+}
+
+/// `harness apply`の結果に**人の手が要る失敗**が含まれるか（＝終了コード4にするか）。
+///
+/// **[D-110 (v)] `git_withheld`は数えない。** 保留は設計どおりの状態であって失敗ではない
+/// ——数えると「gitを使ったセッションは必ず終了コード4」になり、スクリプトから見て
+/// 「本当に困っている回」と区別が付かなくなる。
+///
+/// hard_deniedもconflicts/ext_blocked同様「apply未完了、要注意」の一種として含める
+/// （D-05: 設定注入パスは絶対に解除しない）。
+fn needs_human_attention(report: &harness_sandbox::ApplyReport) -> bool {
+    !report.conflicts.is_empty()
+        || !report.ext_blocked.is_empty()
+        || !report.hard_denied.is_empty()
+        || !report.rejected.is_empty()
+        // BUG-066: 「差分層に実体があるのに適用されなかった」は、黙って成功扱いに
+        // してはいけない代表例（そのまま`discard`されると作業が消える）。
+        || !report.unledgered.is_empty()
+}
+
+/// `harness apply`が**差分層を畳んでよい**ところまで適用し切ったか（D-82の回収条件）。
+///
+/// **[D-110 (v)] `git_withheld`はこちらには数える。** 保留したものは差分層に残っており、
+/// D-80のレビューがそれを読む——畳むと**エージェントのコミットが黙って消える**。
+///
+/// **[`needs_human_attention`]と別の関数にしてあるのが要点である。** 1つの式で兼ねると、
+/// `git_withheld`を数えれば「gitを使うと必ず終了コード4」、数えなければ
+/// 「保留したコミットを抱えた差分層が消える」のどちらかが必ず起きる。
+fn applied_everything(report: &harness_sandbox::ApplyReport) -> bool {
+    !needs_human_attention(report) && report.git_withheld.is_empty()
 }
 
 /// `harness apply --output-format jsonl`の1行（1件1行）。
@@ -381,10 +415,17 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                     }
                 }
                 OutputFormat::Text => {
-                    if changes.is_empty() {
+                    // [D-110 (v)] `.git`配下は**件数1行**へ畳む（合格基準P1）。エージェントが
+                    // 1回コミットするだけでオブジェクトが数十〜数百件出るので、並べると
+                    // **人が読むべき行（普通の変更・hard-denied）がその山に埋もれる**。
+                    // 分類は`ChangeEntry::category`が持つ——ここで綴りから判定し直さない。
+                    let (git_internal, visible): (Vec<_>, Vec<_>) = changes
+                        .iter()
+                        .partition(|c| c.category == ChangeCategory::GitInternal);
+                    if visible.is_empty() && git_internal.is_empty() {
                         println!("(no changes)");
                     }
-                    for c in &changes {
+                    for c in &visible {
                         // BUG-062: applyが拒否する形のパスは、一覧からは消さずに印と理由を
                         // 添えて見せる（D-43「失敗を隠さない」。黙って隠すと、ユーザは
                         // 「何も無かった」と解釈してしまう）。
@@ -401,6 +442,16 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                             "{:<7} {}{marks}",
                             format!("{:?}", c.op).to_lowercase(),
                             c.path
+                        );
+                    }
+                    // **畳んだ件数は必ず出す**（`B-09`: 隠している件数は見出しに出す）。
+                    // 出さないと「gitのコミットが一覧から消えた」と読める。
+                    if !git_internal.is_empty() {
+                        println!(
+                            "({} file(s) under `.git` are git internals -- they are reviewed \
+                             through git, not applied as files. Use `--output-format json` to \
+                             list them.)",
+                            git_internal.len()
                         );
                     }
                     // Phase 4（設計書§19.8）: CoWセッションなら拒否監査ログの件数もフッタに
@@ -431,15 +482,8 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                     return ExitCode::FAILURE;
                 }
             };
-            // hard_deniedもconflicts/ext_blocked同様「apply未完了、要注意」の一種として
-            // 非ゼロ終了コードに含める（D-05: 設定注入パスは絶対に解除しない）。
-            let has_conflicts_or_blocked = !report.conflicts.is_empty()
-                || !report.ext_blocked.is_empty()
-                || !report.hard_denied.is_empty()
-                || !report.rejected.is_empty()
-                // BUG-066: 「差分層に実体があるのに適用されなかった」は、黙って成功扱いに
-                // してはいけない代表例（そのまま`discard`されると作業が消える）。
-                || !report.unledgered.is_empty();
+            let needs_human_attention = needs_human_attention(&report);
+            let applied_everything = applied_everything(&report);
             match output_format_and_kind.unwrap_or_default() {
                 OutputFormat::Json => {
                     let json = ApplyReportJson {
@@ -449,6 +493,7 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                         hard_denied: report.hard_denied,
                         rejected: report.rejected,
                         unledgered: report.unledgered,
+                        git_withheld: report.git_withheld,
                     };
                     if let Ok(s) = serde_json::to_string(&json) {
                         println!("{s}");
@@ -457,14 +502,19 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                 // 1件1行。`changes`（同じ`match`の上）と同じ形にしてある（BUG-132）。
                 OutputFormat::Jsonl => {
                     let mut lines: Vec<ApplyLineJson> = Vec::new();
-                    // **6区分すべてを並べる。** 1つでも落とすと、`json`では見えるものが
+                    // **7区分すべてを並べる。** 1つでも落とすと、`json`では見えるものが
                     // `jsonl`では黙って消える（`--output-format`を変えただけで結果が変わる）。
+                    //
+                    // **機械向けの2形式では`git_withheld`も1件1行で出す**（人向けのテキストだけ
+                    // 件数へ畳む）。機械は「どのオブジェクトが保留されたか」を必要とし得るし、
+                    // 畳むと`json`と`jsonl`の非対称がまた生まれる。
                     for (kind, paths) in [
                         ("applied", &report.applied),
                         ("conflicts", &report.conflicts),
                         ("ext_blocked", &report.ext_blocked),
                         ("hard_denied", &report.hard_denied),
                         ("unledgered", &report.unledgered),
+                        ("git_withheld", &report.git_withheld),
                     ] {
                         for p in paths {
                             lines.push(ApplyLineJson {
@@ -513,24 +563,37 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
                              (see docs/bugs/BUG-066.md)"
                         );
                     }
+                    // **[D-110 (v)] 人向けのテキストでは件数へ畳む。** 個別のパスを並べると
+                    // `.git/objects/ab/cdef…`のハッシュで画面が埋まり、その山に紛れて
+                    // **本当に読むべき行（hard-deniedやconflict）が見えなくなる**
+                    // （合格基準P1: 人が見る一覧に`.git`配下の個別パスを出さない）。
+                    // 機械向けの`json`/`jsonl`には1件1行で出ているので、情報は失われていない。
+                    if !report.git_withheld.is_empty() {
+                        println!(
+                            "withheld: {} file(s) under `.git` were not applied -- git-tracked \
+                             content is reviewed through git, not copied as files. Use \
+                             `--output-format json` to list them.",
+                            report.git_withheld.len()
+                        );
+                    }
                 }
             }
-            if has_conflicts_or_blocked {
+            // D-82: **完全に適用し切ったCoW差分層はここで畳む。** 作る側（起動時）と
+            // 消す側が対になっていないと、CoWを既定にしたときの**最も多い終わり方**
+            // （applyして終わる）が1つずつ置き場を残し続ける。台帳は`apply`が
+            // `prune_cow_ledger`で空にするが、実体ファイルは残るため、起動時スイープの
+            // 安価な空判定（台帳も実体も0）には永久に引っかからない。
+            //
+            // 条件は`applied_everything`——`unledgered`も含まれるので「差分層に実体が
+            // あるのに適用されなかった」ものが1件でもあれば畳まない（BUG-066が守っているもの）。
+            // **`git_withheld`も含む**（D-110 (v)。畳むとD-80のレビューが読む材料が消える）。
+            // 加えて実行中でないこと・D-80のレビュー待ちでないことを`plan_cow_gc`と同じ判定で見る。
+            if applied_everything && !keep_diff_layer {
+                finish_cow_diff_layer_after_apply(cow_diff_layer_dir.as_deref());
+            }
+            if needs_human_attention {
                 ExitCode::from(4)
             } else {
-                // D-82: **完全に適用し切ったCoW差分層はここで畳む。** 作る側（起動時）と
-                // 消す側が対になっていないと、CoWを既定にしたときの**最も多い終わり方**
-                // （applyして終わる）が1つずつ置き場を残し続ける。台帳は`apply`が
-                // `prune_cow_ledger`で空にするが、実体ファイルは残るため、起動時スイープの
-                // 安価な空判定（台帳も実体も0）には永久に引っかからない。
-                //
-                // 条件は上の`has_conflicts_or_blocked`が偽であること——`unledgered`も
-                // 含まれるので、「差分層に実体があるのに適用されなかった」ものが1件でも
-                // あれば畳まない（BUG-066が守っているもの）。加えて実行中でないこと・
-                // D-80のレビュー待ちでないことを`plan_cow_gc`と同じ判定で見る。
-                if !keep_diff_layer {
-                    finish_cow_diff_layer_after_apply(cow_diff_layer_dir.as_deref());
-                }
                 ExitCode::SUCCESS
             }
         }
@@ -544,6 +607,15 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
             };
             for p in &report.applied {
                 println!("applied (no conflict): {p}");
+            }
+            // **`resolve`は内部で`apply`を先に通す**（`prepare_resolve`）。その報告のうち
+            // ここで読んでいるのは`applied`と`conflicts`だけなので、**保留を明示しないと
+            // 「resolveしたら全部片付いた」と読める**。件数だけ出す（テキスト出力なのでP1に従う）。
+            if !report.git_withheld.is_empty() {
+                println!(
+                    "withheld: {} file(s) under `.git` were not applied (reviewed through git)",
+                    report.git_withheld.len()
+                );
             }
             if report.conflicts.is_empty() {
                 println!("no conflicts to resolve");
@@ -731,3 +803,60 @@ fn finish_cow_diff_layer_after_apply(cow_diff_layer_dir: Option<&Path>) {
 
 #[cfg(not(windows))]
 fn finish_cow_diff_layer_after_apply(_cow_diff_layer_dir: Option<&Path>) {}
+
+#[cfg(test)]
+mod apply_outcome_tests {
+    use super::*;
+    use harness_sandbox::ApplyReport;
+
+    fn report_with_git_withheld() -> ApplyReport {
+        ApplyReport {
+            applied: vec!["src/main.rs".to_string()],
+            git_withheld: vec![".git/objects/ab/cdef".to_string()],
+            ..Default::default()
+        }
+    }
+
+    /// **[D-110 (v)] 保留は失敗ではない**——終了コードは0のままにする。
+    /// 数えると「gitを使ったセッションは必ず終了コード4」になり、スクリプトから見て
+    /// 「本当に困っている回」と区別が付かなくなる。
+    #[test]
+    fn withholding_git_internals_is_not_a_failure() {
+        assert!(!needs_human_attention(&report_with_git_withheld()));
+    }
+
+    /// **対になる側**: 保留があるなら「適用し切った」ではない。
+    /// ここを取り違えると、D-82の回収が**エージェントのコミットを抱えた差分層を畳んで消す**。
+    #[test]
+    fn withholding_git_internals_still_blocks_reclaiming_the_diff_layer() {
+        assert!(!applied_everything(&report_with_git_withheld()));
+    }
+
+    /// 何も残っていなければ、両方とも「片付いた」と答える（許可側の対照）。
+    #[test]
+    fn a_fully_applied_report_is_clean_on_both_questions() {
+        let report = ApplyReport {
+            applied: vec!["src/main.rs".to_string()],
+            ..Default::default()
+        };
+        assert!(!needs_human_attention(&report));
+        assert!(applied_everything(&report));
+    }
+
+    /// 人の手が要る失敗は、**両方**に効く（従来の振る舞いを変えていないことの固定）。
+    #[test]
+    fn the_five_pre_existing_categories_still_drive_both_questions() {
+        for mutate in [
+            |r: &mut ApplyReport| r.conflicts.push("a".to_string()),
+            |r: &mut ApplyReport| r.ext_blocked.push("a".to_string()),
+            |r: &mut ApplyReport| r.hard_denied.push("a".to_string()),
+            |r: &mut ApplyReport| r.rejected.push(("a".to_string(), "why".to_string())),
+            |r: &mut ApplyReport| r.unledgered.push("a".to_string()),
+        ] {
+            let mut report = ApplyReport::default();
+            mutate(&mut report);
+            assert!(needs_human_attention(&report), "report={report:?}");
+            assert!(!applied_everything(&report), "report={report:?}");
+        }
+    }
+}

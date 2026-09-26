@@ -200,6 +200,14 @@ impl SandboxFs {
             report.hard_denied.push(path);
             return Ok(report);
         }
+        // **[D-110 (v)] `.git`成分を持つ変更はここでも反映しない（「保留」）。**
+        // 理由と順序（hard-denyを先に評価する）は`overlay.rs::apply_overlay_changes`の
+        // 同じゲートのコメントが持つ。**ハンク単位の口にも要る**——ここを抜くと、
+        // 「ファイル全体は保留されるが、一部だけ選べば通る」という形で同じ穴が残る。
+        if harness_core::is_git_internal_path(&canonical, &self.workspace_root) {
+            report.git_withheld.push(path);
+            return Ok(report);
+        }
 
         let review = self.review_file(entry);
         if let Some(block) = review.hunk_block {

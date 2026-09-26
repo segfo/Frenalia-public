@@ -48,6 +48,13 @@ pub enum SandboxError {
     /// （`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §6.1・D-101）。
     #[error("refusing to write a config-injection path: {0}")]
     ConfigInjection(String),
+    /// **[D-110 (v)]** `.git`成分を持つパスを実ワークスペースへ書こうとした。git済みの内容が
+    /// 本物へ入る入口は、D-80が作るgit-fetchの段だけにする。
+    ///
+    /// **`ConfigInjection`と分けているのは意味が違うため**——あちらは「書いてはいけない場所」、
+    /// こちらは「ここでは書かない（経路が別）」である。文面も「保留」と読める形にする。
+    #[error("withholding a git-internal path from the plain apply path (it is reviewed through git, not as a file): {0}")]
+    GitInternalWithheld(String),
 }
 
 fn normalize_str(p: &Path) -> String {
@@ -134,6 +141,49 @@ pub struct ChangeEntry {
     /// ものが無い）。捏造すると第三者による同時編集の上書き検知が壊れるので`None`のままにし、
     /// `apply`は既定でこの種のエントリを適用しない（`ApplyOptions::adopt_unledgered`）。
     pub unledgered: bool,
+    /// このエントリを**どう扱うか**の分類。表示側がパスの綴りから自分で判定し直さないために
+    /// ここへ持たせる（判定を2つ持つと、一覧と`apply`の扱いがずれる。`B-13`）。
+    pub category: ChangeCategory,
+}
+
+/// [`ChangeEntry`]の扱いの分類。**`apply`が実際に何をするか**で分ける。
+///
+/// 表示側はこれを見て畳むかどうかを決める。**綴りから判定し直さないこと**——
+/// 判定器は`harness-core`側の1組（`is_config_injection_path`・`is_git_internal_path`）だけが持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeCategory {
+    /// 普通の変更。`apply`が実ワークスペースへ書く。
+    SideEffect,
+    /// **[D-110 (v)]** `.git`成分を持つので`apply`は反映を保留する
+    /// （`harness_core::is_git_internal_path`）。git済みの内容が本物へ入る入口は
+    /// D-80のgit-fetchの段だけ。**人が見る一覧では件数へ畳む**（合格基準P1）。
+    GitInternal,
+    /// 設定注入パスなので`apply`が層3 hard-denyで拒否する（D-05）。
+    /// **`GitInternal`と重なるものは、こちらが勝つ**（攻撃の合図を保留に混ぜない）。
+    ConfigInjection,
+    /// ワークスペース外への書込（`_ext/<key>`）。`--dangerously-allow`が要る。
+    Ext,
+}
+
+/// 1件の変更を[`ChangeCategory`]へ割り当てる。
+///
+/// **順序が`apply_overlay_changes`のゲートの順序と一致していることが要点である。**
+/// 一覧が「保留」と言ったものを`apply`が拒否した（またはその逆）という食い違いを作らないため、
+/// 判定は同じ関数・同じ順番で行う。ずれると、画面で見た扱いと実際の扱いが違うことになる。
+fn classify_change(path: &str, workspace_root: &Path) -> ChangeCategory {
+    // `_ext`（絶対パス）は最初に分ける——workspace外なので下の2つの判定はどちらも
+    // 「担当外」として`false`を返し、普通の変更と区別が付かなくなる。
+    if Path::new(path).is_absolute() {
+        return ChangeCategory::Ext;
+    }
+    if harness_core::is_config_injection_path(path, workspace_root) {
+        return ChangeCategory::ConfigInjection;
+    }
+    if harness_core::is_git_internal_path(path, workspace_root) {
+        return ChangeCategory::GitInternal;
+    }
+    ChangeCategory::SideEffect
 }
 
 pub struct ApplyOptions<'a> {
@@ -190,6 +240,18 @@ pub struct ApplyReport {
     /// baselineが不明なので、適用すると人の同時編集を黙って上書きし得る。
     /// `ApplyOptions::adopt_unledgered`で明示的に取り込める。
     pub unledgered: Vec<String>,
+    /// **[D-110 (v)]** `.git`成分を持つため反映を**保留**したパス
+    /// （[`harness_core::is_git_internal_path`]）。git済みの内容が実ワークスペースへ入る入口は、
+    /// D-80が作るgit-fetchの段だけにする。
+    ///
+    /// **`hard_denied`と分けているのは意味が違うため。** あちらは「書いてはいけない場所」＝
+    /// 攻撃の合図で、運用上の対処は「レビューして諦める」。こちらは「ここでは反映しない」＝
+    /// 経路の振り分けで、対処は「gitのレビュー経路を通す」である。混ぜると、
+    /// 設定注入の試みが正常なgit内容の山に埋もれる。
+    ///
+    /// **失敗ではないので終了コード4には数えない**が、**「完全に適用し切った」には数える**
+    /// ——数えないと、保留した内容を抱えた差分層がD-82の回収で畳まれてコミットが消える。
+    pub git_withheld: Vec<String>,
 }
 
 impl ApplyReport {
@@ -203,6 +265,7 @@ impl ApplyReport {
         self.hard_denied.extend(other.hard_denied);
         self.rejected.extend(other.rejected);
         self.unledgered.extend(other.unledgered);
+        self.git_withheld.extend(other.git_withheld);
     }
 }
 
@@ -298,12 +361,14 @@ impl SandboxFs {
                 } else {
                     canonical_ledger_path(&e.change.path).err()
                 };
+                let category = classify_change(&e.change.path, &self.workspace_root);
                 ChangeEntry {
                     op: e.change.op,
                     path: e.change.path,
                     baseline_hash: e.change.baseline_hash,
                     rejected,
                     unledgered: e.unledgered,
+                    category,
                 }
             })
             .collect())
@@ -318,6 +383,14 @@ impl SandboxFs {
     /// 判定に渡す値の選び方が破れると（BUG-164）、差分層の無い直接書くモードでは実ファイルまで届いた。
     /// 差分層を使うかどうかで防御の有無が変わらないよう、`write_file`・`edit_file`の2経路が通る
     /// 唯一の書込口に同じ判定を置く。
+    ///
+    /// **`.git`成分の保留（D-110 (v)・[`harness_core::is_git_internal_path`]）は、ここには
+    /// 意図的に掛けない。** 保留が効くのは**差分層から実ワークスペースへ反映する段**だけである。
+    /// ここへ掛けると差分層への書込そのものが止まり、サンドボックスの中の`git commit`が
+    /// 壊れる（`crates/harness-cli/tests/tier2a_e2e.rs`の
+    /// `tier2a_cow_git_commit_writes_objects_under_the_redirector`がgitの完走を固定している）。
+    /// **エージェントがgitを使えること自体は壊さず、その結果が本物へ入る入口だけを絞る**のが
+    /// D-110 (v)の形である。同じ理由で層1（`harness-engine::permission::classify`）にも掛けない。
     pub fn write_string(&self, path: &str, content: &str) -> Result<(), SandboxError> {
         // 形の崩れた相対パス（`..`で外へ出る等）は、従来どおり形の誤りとして先に返す
         // （設定注入パスの判定は`..`を拒否側へ倒すので、順序を逆にすると誤りの種類が変わる）。
@@ -601,7 +674,20 @@ impl SandboxFs {
 
     /// `resolve`が3-way mergeの結果を確定させる: 実workspaceへ書き、オーバーレイ実体・
     /// 台帳エントリを除去する（`apply()`の該当ステップを単一エントリに適用したもの）。
+    ///
+    /// **実ワークスペースへ書く3つめの口なので、`apply`と同じ2つのゲートを掛ける。**
+    /// 今日ここへ設定注入パスや`.git`が届かないのは、**それらが`report.conflicts`へ
+    /// 一度も入らないから**という**間接的な理由**にすぎない（`apply`が先に弾く）。
+    /// 分類が1つ増えるたびにその理屈は崩れるので、口の側に置く（`B-37`: 不変条件の根拠を
+    /// 別の機構の副作用へ相乗りさせない）。
     pub fn finalize_resolved(&self, path: &str, content: &str) -> Result<(), SandboxError> {
+        if harness_core::is_config_injection_path(path, &self.workspace_root) {
+            return Err(SandboxError::ConfigInjection(path.to_string()));
+        }
+        // **[D-110 (v)]** hard-denyを先に評価する（順序の理由は`apply_overlay_changes`側に書いた）。
+        if harness_core::is_git_internal_path(path, &self.workspace_root) {
+            return Err(SandboxError::GitInternalWithheld(path.to_string()));
+        }
         self.jail.write_string(path, content)?;
         if let Some(overlay) = &self.overlay {
             let overlay_abs = store::diff_layer_path_for(&overlay.dir, path);
@@ -772,6 +858,22 @@ fn apply_overlay_changes(
         };
         if harness_core::is_config_injection_path(&canonical, workspace_root) {
             report.hard_denied.push(c.path.clone());
+            continue;
+        }
+        // **[D-110 (v)] `.git`成分を持つ変更はここでは反映しない（「保留」）。**
+        //
+        // **順序が意味を持つ。** 上のhard-denyを**先に**評価する——`.git/config`・`.git/hooks`・
+        // `.git/info/exclude`は両方に当たるが、あちらは「設定注入の試み」という攻撃の合図なので、
+        // 正常なgit内容と同じ分類へ混ぜない（2026-09-26のユーザー判断）。
+        //
+        // **なぜ前のゲートだけでは足りないのか**: gitは内容のハッシュを名前にしたオブジェクトと
+        // refの移動でファイルを運べるので、`.git/objects/ab/cdef…`というパスには中身の情報が
+        // 1ビットも無い。実測で、拒否対象の追跡ファイルをこの形で運ぶと
+        // **サンドボックス外の普通の`git checkout`で実体化した**（`docs/bugs/BUG-167.md`）。
+        // **危険な実行はharnessのgitではなく、そのあと人やエディタが打つgitである**ので、
+        // 反映してしまえばharnessは経路に居ない——入口で止めるしかない。
+        if harness_core::is_git_internal_path(&canonical, workspace_root) {
+            report.git_withheld.push(c.path.clone());
             continue;
         }
 
@@ -1786,31 +1888,34 @@ mod tests {
         );
     }
 
-    /// **`plans/PLAN-COW-AS-DEFAULT.md`検証タスクの本体（判定層だけを切り出した版）**。
+    /// **[D-110 (v)] コミットに包んだ設定注入ファイルが、普通の`apply`では実体化しないこと。**
+    ///
+    /// **このテストは2026-09-26に意味が反転した。** 元は「迂回が成立する」ことを実証する
+    /// 測定で（`apply_hard_deny_is_bypassed_by_git_objects_carrying_a_config_injection_file`、
+    /// `#[ignore]`付き）、実際に成立していた。その穴を`git_withheld`で塞いだので、
+    /// 同じ手順で**塞がっていること**を固定する側へ書き換えてある。経緯は
+    /// `docs/bugs/BUG-167.md`。
     ///
     /// 問い: 追跡ファイル（`.github/workflows/x.yml`）を「ワークツリー実体」ではなく
-    /// 「コミット・オブジェクト＋ブランチ移動」として運ぶと、apply の層3 hard-deny
-    /// （`is_config_injection_path`の前置詞一致）を迂回できるか。
+    /// **「コミット・オブジェクト＋ブランチ移動」として運ぶ**と、実ワークスペースへ届くか。
+    /// パスの前置詞一致（`is_config_injection_path`）では止まらない——
+    /// `.git/objects/ab/cdef…`というパスには中身の情報が1ビットも無いからである。
     ///
-    /// **なぜ透過層を切り離すのか（2026-08-23の実機測定）**: 生の git は CoW の透過層
-    /// （Redirector DLL）で完走しない——`resolve_relative_object_attributes_path`
-    /// （`crates/harness-redirector/src/ntpath.rs:71`）が git のハンドル相対 open を解決できず
-    /// `.git/objects/pack: Function not implemented` となり、git はオブジェクトを1つも書けない
-    /// （`dev-elevated-run e2e-cow-git-injection` の観測）。よって「生 git で迂回」は
-    /// **透過層で先に落ちて** end-to-end では観測できない。ここでは透過層を外し、
+    /// **なぜ透過層を切り離すのか（2026-08-23の実機測定）**: 生の git は当時 CoW の透過層
+    /// （Redirector DLL）で完走しなかった（BUG-128で修正済み）。ここでは透過層を外し、
     /// **判定層（apply）だけ**を測る: git が書いたであろうオブジェクト＋ref移動を**本物の git**で
-    /// 作って台帳へ載せ、apply の非対称——オブジェクト/refは通し、同内容のワークツリー実体は
-    /// hard-deny する——を確かめる（1差分×1ケース `B-29` / 許可側と拒否側の対 `B-35`）。
+    /// 作って台帳へ載せ、`apply`がそれを保留することを確かめる。
     ///
-    /// **成立の定義**（plan「何が『成立』か」）: apply 後、サンドボックス外の
-    /// `git checkout HEAD -- .github/workflows/x.yml` で拒否対象ファイルが実体化する
-    /// → 現在の hard-deny は追跡ファイル経由の設定注入を止めていない。
+    /// **拒否側と許可側の対**（`B-35`）:
+    /// - 拒否側: apply 後にサンドボックス外で`git checkout`しても、拒否対象ファイルは**出てこない**。
+    /// - 許可側: 同じ台帳に載せた普通のファイルは**反映される**（機構が死んでいれば両方止まる）。
     ///
-    /// 昇格は不要（AppContainer も Redirector も使わない）。外部の`git`に依存し実FS I/Oを行う
-    /// ため`#[ignore]`とし、`cargo test -p harness-sandbox --lib -- --ignored <name>`で回す。
+    /// 昇格は不要（AppContainer も Redirector も使わない）。**`#[ignore]`は外した**——
+    /// 塞いだ穴の回帰テストなので、明示的に撃たない限り走らない形では守りにならない
+    /// （`B-12`: 走っていないことと通ったことが外形上区別できない）。外部の`git`に依存するが、
+    /// **無ければスキップせず失敗させる**。
     #[test]
-    #[ignore]
-    fn apply_hard_deny_is_bypassed_by_git_objects_carrying_a_config_injection_file() {
+    fn apply_withholds_git_internals_so_an_object_carried_injection_never_materializes() {
         const INJECTED: &str = "name: evil-injected-via-git";
 
         // ハードニングなしの素の git（テスト足場。サンドボックス内でモデルが起動する git とは別）。
@@ -1887,6 +1992,8 @@ mod tests {
             "seed must leave a loose master ref (not packed); found none at {master_ref:?}"
         );
         let c0_ref_bytes = std::fs::read(&master_ref).unwrap();
+        // 注入前のHEAD。**保留が効いていれば apply 後もここから動かない。**
+        let c0 = git(&workspace_root, &["rev-parse", "HEAD"]);
         let loose_before = loose_objects(&workspace_root.join(".git").join("objects"));
 
         // 2) workspaceのコピー側で注入コミットを作る（本物の git、サンドボックス外）。
@@ -1966,6 +2073,12 @@ mod tests {
             ".github/workflows/x.yml",
             None,
         );
+        // 許可側の対照（`B-35`）: **同じ台帳に載せた普通のファイル**。
+        // これが反映されないなら、止まった理由は「保留が効いた」ではなく「applyが死んでいる」。
+        const ORDINARY: &str = "fn main() {}";
+        std::fs::create_dir_all(diff_layer_dir.join("src")).unwrap();
+        std::fs::write(diff_layer_dir.join("src").join("main.rs"), ORDINARY).unwrap();
+        store::append_entry(&diff_layer_dir, ChangeOp::Create, "src/main.rs", None);
 
         // 4) apply。
         let fs = SandboxFs::open_with_cow(
@@ -1994,33 +2107,58 @@ mod tests {
             .map(|p| p.replace('\\', "/"))
             .collect();
 
-        // 拒否側（機構が生きている証拠）: ワークツリーの設定注入パスは hard_denied。
+        let git_withheld: Vec<String> = report
+            .git_withheld
+            .iter()
+            .map(|p| p.replace('\\', "/"))
+            .collect();
+
+        // 対照その1（機構が生きている証拠）: ワークツリーの設定注入パスは hard_denied のまま。
+        // **`git_withheld`へ移っていないこと**も見る——D-110 (v)は「拒否が勝つ」と定めており、
+        // 攻撃の合図を保留に混ぜない（混ざると`.git/objects`の山に埋もれる）。
         assert!(
             hard_denied.iter().any(|p| p == ".github/workflows/x.yml"),
-            "control: the working-tree config-injection path must be hard-denied, otherwise this \
-             test cannot distinguish a live deny mechanism from a dead one (B-35). report={report:?}"
+            "control: the working-tree config-injection path must stay hard-denied (not merely \
+             withheld), otherwise this test cannot distinguish a live deny mechanism from a dead \
+             one (B-35). report={report:?}"
         );
-        // 許可側（迂回）: オブジェクトは全件 applied、hard_denied されていない。
-        let objects_applied = applied
+        assert!(
+            !git_withheld.iter().any(|p| p == ".github/workflows/x.yml"),
+            "hard-deny must win over withholding for config-injection paths (D-110 (v)): \
+             report={report:?}"
+        );
+        // 対照その2（許可側）: 同じ台帳の普通のファイルは反映される。
+        assert!(
+            applied.iter().any(|p| p == "src/main.rs"),
+            "an ordinary file in the same ledger must still be applied, otherwise apply is simply \
+             dead (B-35): report={report:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("src").join("main.rs")).unwrap(),
+            ORDINARY
+        );
+
+        // 本題（拒否側）: オブジェクトと ref は **1件も反映されず、全件が保留**になる。
+        assert!(
+            !applied.iter().any(|p| p.starts_with(".git/")),
+            "no path under .git may be applied as a plain file (D-110 (v)): report={report:?}"
+        );
+        let objects_withheld = git_withheld
             .iter()
             .filter(|p| p.starts_with(".git/objects/"))
             .count();
         assert_eq!(
-            objects_applied,
+            objects_withheld,
             new_objects.len(),
-            "every injected git object must be applied (they carry the payload): report={report:?}"
+            "every injected git object must be withheld: report={report:?}"
         );
         assert!(
-            !hard_denied.iter().any(|p| p.starts_with(".git/objects/")),
-            "git objects must NOT be hard-denied — their content-hash paths carry no config-\
-             injection signal: report={report:?}"
-        );
-        assert!(
-            applied.iter().any(|p| p == ".git/refs/heads/master"),
-            "the moved branch ref must be applied: report={report:?}"
+            git_withheld.iter().any(|p| p == ".git/refs/heads/master"),
+            "the moved branch ref must be withheld too — withholding only the objects would still \
+             let a later `git checkout` see the new tip: report={report:?}"
         );
 
-        // 実FS: apply 直後はワークツリー実体はまだ無い（hard_denied されたので）。
+        // 実FS: ワークツリー実体も、gitの内部ファイルも、1つも実ワークスペースへ現れない。
         let wt = workspace_root
             .join(".github")
             .join("workflows")
@@ -2029,26 +2167,254 @@ mod tests {
             !wt.exists(),
             "the working-tree file must NOT be materialized by apply itself (it was hard-denied)"
         );
-
-        // 5) サンドボックス外で checkout → 迂回で運んだオブジェクトから拒否対象が実体化する。
-        git(
-            &workspace_root,
-            &["checkout", "HEAD", "--", ".github/workflows/x.yml"],
-        );
+        let real_objects = loose_objects(&workspace_root.join(".git").join("objects"));
         assert!(
-            wt.exists(),
-            "BYPASS成立: サンドボックス外の`git checkout`が、密輸したオブジェクトから hard-deny \
-             対象ファイルを実体化させた"
+            new_objects.iter().all(|o| !real_objects.contains(o)),
+            "none of the injected objects may reach the real object store: \
+             real={real_objects:?} injected={new_objects:?}"
         );
-        assert_eq!(
-            std::fs::read_to_string(&wt).unwrap(),
-            INJECTED,
-            "materialized content must be the injected payload"
-        );
+
+        // 5) **穴が塞がったことの本体**: サンドボックス外で checkout しても、
+        //    運べなかったオブジェクトからは何も出てこない。実HEADも動いていない。
         assert_eq!(
             git(&workspace_root, &["rev-parse", "HEAD"]),
-            c1,
-            "実HEADが注入コミットを指していること（refも運ばれた）"
+            c0,
+            "the real HEAD must still point at the pre-existing commit (the ref was withheld)"
+        );
+        let out = std::process::Command::new("git")
+            .current_dir(&workspace_root)
+            .args(["-c", "safe.directory=*"])
+            .args(["checkout", "HEAD", "--", ".github/workflows/x.yml"])
+            .output()
+            .unwrap_or_else(|e| panic!("git checkout: {e} (is git installed and on PATH?)"));
+        assert!(
+            !out.status.success(),
+            "`git checkout` must fail because the injected path is not in the real HEAD; \
+             it succeeded, which means the bypass is open again"
+        );
+        assert!(
+            !wt.exists(),
+            "BYPASSが再び開いている: サンドボックス外の`git checkout`が、密輸した\
+             オブジェクトから hard-deny 対象ファイルを実体化させた"
+        );
+        // `c1`（注入コミット）は差分層の中にだけ在り、実リポジトリには無い。
+        let rev_parse_c1 = std::process::Command::new("git")
+            .current_dir(&workspace_root)
+            .args(["-c", "safe.directory=*"])
+            .args(["cat-file", "-e", &c1])
+            .output()
+            .unwrap();
+        assert!(
+            !rev_parse_c1.status.success(),
+            "the injected commit object {c1} must not exist in the real repository"
+        );
+    }
+
+    /// **[D-110 (v)]** 前置詞一致の拒否リストでは止まらない形が、成分単位の保留で止まること。
+    ///
+    /// ここに並べたものは**どれも`CONFIG_INJECTION_PREFIXES`に載っていない**
+    /// （載っているのは`.git/config`・`.git/hooks`・`.git/info/exclude`の3つだけ）。
+    /// つまり保留が無ければ全件が普通のファイルとして実ワークスペースへ書かれる。
+    ///
+    /// **入れ子の`.git`が入っているのが要点である**——前置詞一致は先頭しか見ないので、
+    /// `vendor/x/.git/config`は原理的に当たらない。
+    #[test]
+    fn apply_withholds_git_internals_that_the_prefix_list_cannot_see() {
+        let withheld_forms = [
+            ".git/objects/ab/cdef1234567890",
+            ".git/refs/heads/topic",
+            ".git/HEAD",
+            ".git/packed-refs",
+            ".git/objects/info/alternates",
+            ".git/refs/replace/deadbeef",
+            ".git/logs/HEAD",
+            ".git/shallow",
+            ".git/info/grafts",
+            ".git/config.worktree",
+            ".git/modules/sub/config",
+            // 入れ子のリポジトリ（前置詞一致では絶対に当たらない）
+            "vendor/x/.git/config",
+            "vendor/x/.git/objects/ab/cdef",
+        ];
+        let (_ws, _diff_layer_tmp, workspace_root, diff_layer_dir) = tampered_ledger_fixture();
+        for form in withheld_forms {
+            let src = diff_layer_dir.join(form);
+            std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+            std::fs::write(&src, "payload").unwrap();
+            store::append_entry(&diff_layer_dir, ChangeOp::Create, form, None);
+        }
+        // 許可側の対照（`B-35`）: `.git`成分を持たない、名前が似ているだけのもの。
+        // **これらは保留ではなく hard-deny が受け持つ**（分担がずれていないことを見る）。
+        for form in [".gitattributes", ".gitlab-ci.yml"] {
+            std::fs::write(diff_layer_dir.join(form), "payload").unwrap();
+            store::append_entry(&diff_layer_dir, ChangeOp::Create, form, None);
+        }
+        // 許可側の対照その2: 普通のファイルは反映される。
+        std::fs::create_dir_all(diff_layer_dir.join("src")).unwrap();
+        std::fs::write(diff_layer_dir.join("src").join("lib.rs"), "ok").unwrap();
+        store::append_entry(&diff_layer_dir, ChangeOp::Create, "src/lib.rs", None);
+
+        let fs = SandboxFs::open_with_cow(
+            &workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(&diff_layer_dir),
+        )
+        .unwrap();
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+                adopt_unledgered: false,
+            })
+            .unwrap();
+        let norm = |v: &Vec<String>| -> Vec<String> {
+            v.iter().map(|p| p.replace('\\', "/")).collect()
+        };
+        let withheld = norm(&report.git_withheld);
+        let denied = norm(&report.hard_denied);
+        let applied = norm(&report.applied);
+
+        for form in withheld_forms {
+            assert!(
+                withheld.iter().any(|p| p == form),
+                "{form} must be withheld (the prefix list cannot see it): report={report:?}"
+            );
+            assert!(
+                !workspace_root.join(form).exists(),
+                "{form} must not reach the real workspace"
+            );
+        }
+        for form in [".gitattributes", ".gitlab-ci.yml"] {
+            assert!(
+                denied.iter().any(|p| p == form),
+                "{form} is not a `.git` component — the prefix list must keep hard-denying it: \
+                 report={report:?}"
+            );
+        }
+        assert_eq!(
+            applied,
+            vec!["src/lib.rs".to_string()],
+            "exactly the ordinary file must be applied: report={report:?}"
+        );
+    }
+
+    /// **[D-110 (v)]** ハンク単位の口（`apply_hunks`）にも同じ保留が掛かること。
+    ///
+    /// ここを抜くと「ファイル全体は保留されるが、一部だけ選べば通る」という形で同じ穴が残る。
+    #[test]
+    fn applying_hunks_withholds_git_internals_too() {
+        let (_ws, _diff_layer_tmp, workspace_root, diff_layer_dir) = tampered_ledger_fixture();
+        std::fs::create_dir_all(workspace_root.join(".git")).unwrap();
+        std::fs::write(workspace_root.join(".git/HEAD"), "ref: refs/heads/master\n").unwrap();
+        std::fs::create_dir_all(diff_layer_dir.join(".git")).unwrap();
+        std::fs::write(diff_layer_dir.join(".git/HEAD"), "ref: refs/heads/evil\n").unwrap();
+        store::append_entry(&diff_layer_dir, ChangeOp::Modify, ".git/HEAD", None);
+
+        let fs = SandboxFs::open_with_cow(
+            &workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(&diff_layer_dir),
+        )
+        .unwrap();
+        let report = fs
+            .apply_hunks(&crate::overlay_hunks::HunkSelection {
+                path: ".git/HEAD",
+                // ハッシュの中身は問わない——**保留はハッシュ照合より前に掛かる**
+                // （掛からなければ、ここが不一致でも`conflicts`として素通りしてしまう）。
+                workspace_hash: String::new(),
+                overlay_hash: String::new(),
+                accepted: &[0],
+            })
+            .unwrap();
+        assert_eq!(
+            report.git_withheld.len(),
+            1,
+            "the hunk-level mouth must withhold it too: report={report:?}"
+        );
+        assert!(report.applied.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join(".git/HEAD")).unwrap(),
+            "ref: refs/heads/master\n",
+            "the real .git/HEAD must be untouched"
+        );
+    }
+
+    /// **[D-110 (v)]** `finalize_resolved`（実ワークスペースへ書く3つめの口）も保留すること。
+    ///
+    /// 今日ここへ`.git`が届かないのは「保留されたものは`conflicts`へ入らない」という
+    /// **間接的な理由**にすぎない。分類が1つ増えるたびにその理屈は崩れるので、口の側で見る
+    /// （`B-37`: 不変条件の根拠を別の機構の副作用へ相乗りさせない）。
+    #[test]
+    fn finalizing_a_resolved_merge_refuses_git_internals_and_config_injection() {
+        let (_ws, _diff_layer_tmp, workspace_root, diff_layer_dir) = tampered_ledger_fixture();
+        let fs = SandboxFs::open_with_cow(
+            &workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(&diff_layer_dir),
+        )
+        .unwrap();
+        let err = fs
+            .finalize_resolved(".git/refs/heads/master", "deadbeef\n")
+            .unwrap_err();
+        assert!(
+            matches!(err, SandboxError::GitInternalWithheld(_)),
+            "expected a withholding error, got {err:?}"
+        );
+        let err = fs.finalize_resolved(".git/config", "[core]\n").unwrap_err();
+        assert!(
+            matches!(err, SandboxError::ConfigInjection(_)),
+            "hard-deny must win for config-injection paths, got {err:?}"
+        );
+        // 許可側（`B-35`）: 普通のパスは書ける。
+        fs.finalize_resolved("src/main.rs", "fn main() {}").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace_root.join("src").join("main.rs")).unwrap(),
+            "fn main() {}"
+        );
+    }
+
+    /// **[D-110 (v)]** 一覧の分類が、`apply`の実際の扱いと一致すること。
+    ///
+    /// 表示側は`ChangeEntry::category`を見て畳むので、**ここがずれると画面で見た扱いと
+    /// 実際の扱いが違う**ことになる。
+    #[test]
+    fn change_entries_are_categorized_the_same_way_apply_treats_them() {
+        let (_ws, _diff_layer_tmp, workspace_root, diff_layer_dir) = tampered_ledger_fixture();
+        for form in [".git/objects/ab/cdef", ".git/config", "src/main.rs"] {
+            let src = diff_layer_dir.join(form);
+            std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+            std::fs::write(&src, "x").unwrap();
+            store::append_entry(&diff_layer_dir, ChangeOp::Create, form, None);
+        }
+        let fs = SandboxFs::open_with_cow(
+            &workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(&diff_layer_dir),
+        )
+        .unwrap();
+        let by_path: std::collections::HashMap<String, ChangeCategory> = fs
+            .change_set()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.path.replace('\\', "/"), e.category))
+            .collect();
+        assert_eq!(
+            by_path.get(".git/objects/ab/cdef"),
+            Some(&ChangeCategory::GitInternal)
+        );
+        assert_eq!(
+            by_path.get(".git/config"),
+            Some(&ChangeCategory::ConfigInjection),
+            "hard-deny wins over withholding, and the listing must say the same thing"
+        );
+        assert_eq!(
+            by_path.get("src/main.rs"),
+            Some(&ChangeCategory::SideEffect)
         );
     }
 

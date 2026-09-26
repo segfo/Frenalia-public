@@ -96,7 +96,9 @@ pub mod tier2a;
 pub mod tier2b;
 
 pub use manifest::ManifestOp;
-pub use overlay::{ApplyOptions, ApplyReport, ChangeEntry, SandboxError, SandboxFs};
+pub use overlay::{
+    ApplyOptions, ApplyReport, ChangeCategory, ChangeEntry, SandboxError, SandboxFs,
+};
 pub use overlay_hunks::{FileReview, HunkBlock, HunkSelection};
 pub use read_scope::{ReadScope, ReadScopeError};
 pub use secret_env::{build_child_env, git_hardening_env};

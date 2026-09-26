@@ -24,7 +24,7 @@ pub mod wire_log;
 mod tool_tests;
 
 pub use cognition::{CognitionLevel, Phase, TokenBudget};
-pub use config_injection::is_config_injection_path;
+pub use config_injection::{is_config_injection_path, is_git_internal_path};
 pub use event::{discarded_marker, AgentEvent, DegenerateKind, CANCELLED_REASON};
 pub use interpreter::{is_interpreter_program, INTERPRETER_PROGRAMS};
 pub use message::{ContentBlock, Message, Role};

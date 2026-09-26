@@ -51,11 +51,83 @@ const CONFIG_INJECTION_PREFIXES: &[&str] = &[
 /// `..`を含むパスは**着地点を静的に決められないので拒否側へ倒す**（P-05 fail-closed）。
 /// 正当な`..`付き書込は`check_relative_path`が別途どのみち弾くため、実害のある過剰拒否は無い。
 pub fn is_config_injection_path(path: &str, workspace_root: &std::path::Path) -> bool {
+    let normalized = match fold_to_workspace_relative(path, workspace_root) {
+        // workspace外（またはroot自身）。**外への書込はこのゲートの担当ではない**
+        // ——`--dangerously-allow`（`ApplyOptions::allow_ext`）が受け持つ。
+        // ここで拒否すると`--fs-allow`で外部リポジトリを扱う運用を壊す（過剰拒否）。
+        Folded::Outside => return false,
+        // 着地点が静的に決まらない（`..`・8.3短縮名）ので拒否側へ倒す（P-05）。
+        Folded::Undeterminable => return true,
+        Folded::Relative(rel) => rel,
+    };
+    CONFIG_INJECTION_PREFIXES.iter().any(|prefix| {
+        let prefix = prefix.to_ascii_lowercase();
+        normalized == prefix || normalized.starts_with(&format!("{prefix}/"))
+    })
+}
+
+/// `path`が**git自身の管理領域**（`.git`成分をどこかに含む）かどうかを判定する。
+///
+/// **[D-110 (v)]** 差分層の変更を実ワークスペースへ反映する段は、この判定に当たるものを
+/// **反映せず「保留」として報告する**。git済みの内容が本物へ入る入口は、D-80が作る
+/// git-fetchの段だけにする。
+///
+/// **なぜ前方一致の拒否リストでは足りないのか。** [`is_config_injection_path`]は
+/// `.git/config`・`.git/hooks`・`.git/info/exclude`の3つを名指しで拒否するが、git は
+/// **内容のハッシュを名前にしたオブジェクト**とrefの移動でファイルを運べる
+/// ——`.git/objects/ab/cdef…`というパスには中身の情報が1ビットも無い。実測で、
+/// 追跡ファイル`.github/workflows/x.yml`をオブジェクト＋ブランチ移動として運ぶと、
+/// ワークツリー実体だけが拒否され、オブジェクトとrefは反映され、**サンドボックス外の
+/// 普通の`git checkout`で拒否対象が実体化した**（`docs/bugs/BUG-167.md`）。
+/// 同じ経路は`refs/replace`・`objects/info/alternates`・`packed-refs`・入れ子の`.git`でも成立する。
+///
+/// **危険な実行はharnessのgitではなく、そのあと人やエディタが打つgitである。** 反映して
+/// しまえばharnessは経路に居ないので、**入口で止めるしかない**。
+///
+/// **[D-110 (v)・2026-09-26のユーザー判断] 設定注入パスの拒否が勝つ。** `.git/config`等は
+/// 両方に当たるが、呼び出し側は[`is_config_injection_path`]を**先に**評価すること
+/// ——「設定注入の試み」という攻撃の合図を、正常なgit内容と同じ分類へ混ぜないためである。
+///
+/// 判定は**成分単位**で行う。したがって`.gitattributes`・`.gitlab-ci.yml`・`.gitmodules`は
+/// **対象外**（ファイル名が`.git`で始まるだけで、`.git`という成分ではない）。それらは
+/// 従来どおり[`is_config_injection_path`]が拒否する。
+///
+/// 正規化・大小の扱い・`..`と8.3短縮名の扱いは[`is_config_injection_path`]と共有する
+/// （同じ`fold_to_workspace_relative`を通る）。workspace外は`false`——**外のリポジトリの
+/// `.git`をこのゲートが判断してはいけない**（`--fs-allow`で外部リポジトリを扱う運用を壊す）。
+pub fn is_git_internal_path(path: &str, workspace_root: &std::path::Path) -> bool {
+    match fold_to_workspace_relative(path, workspace_root) {
+        Folded::Outside => false,
+        // `..`・8.3短縮名は着地点が決まらない。**保留側へ倒す**
+        // （反映しないだけなので、拒否より弱い側でも安全側である）。
+        Folded::Undeterminable => true,
+        Folded::Relative(rel) => rel.split('/').any(|c| c == ".git"),
+    }
+}
+
+/// [`fold_to_workspace_relative`]の結果。**3値にするのが要点**——「外」と「判定不能」は
+/// 呼び出し側にとって正反対の意味を持つ（前者は対象外、後者は拒否/保留）ので、
+/// `Option`へ潰すと片方を取り違える。
+enum Folded {
+    /// workspace配下の相対パス（照合用の正規形）。
+    Relative(String),
+    /// workspace外、またはroot自身。このゲートの担当ではない。
+    Outside,
+    /// 着地点が綴りから静的に決まらない（`..`・8.3短縮名）。
+    Undeterminable,
+}
+
+/// 絶対でも相対でもよい`path`を、workspace相対の照合用正規形へ畳む。
+///
+/// **2つの判定関数（[`is_config_injection_path`]・[`is_git_internal_path`]）が
+/// 同じ前段を通ることを保証するために切り出してある。** 片方だけに正規化が入ると、
+/// 同じ綴りが一方では畳まれ他方では畳まれない状態になる（`docs/CODE-STRUCTURE-RULES.md`§5.0）。
+fn fold_to_workspace_relative(path: &str, workspace_root: &std::path::Path) -> Folded {
     let relative = if std::path::Path::new(path).is_absolute() {
-        // `..`を含む絶対パスは畳んだ先が静的に決まらないので、rootとの照合をせずに拒否側へ倒す
+        // `..`を含む絶対パスは畳んだ先が静的に決まらないので、rootとの照合をせずに倒す
         // （P-05 fail-closed）。相対パス側の`..`は下の`fold_components`が同じ向きで拾う。
         if contains_parent_component(path) {
-            return true;
+            return Folded::Undeterminable;
         }
         // **配下判定と相対部分の算出を1つの規則で行う**——別々にすると
         // 「配下と判定したのに相対パスを作れない」状態が生まれ、呼び出し側からは
@@ -66,21 +138,15 @@ pub fn is_config_injection_path(path: &str, workspace_root: &std::path::Path) ->
             &workspace_root.to_string_lossy(),
         ) {
             Some(rel) if !rel.is_empty() => rel,
-            // workspace外（またはroot自身）。**外への書込はこのゲートの担当ではない**
-            // ——`--dangerously-allow`（`ApplyOptions::allow_ext`）が受け持つ。
-            // ここで拒否すると`--fs-allow`で外部リポジトリを扱う運用を壊す（過剰拒否）。
-            _ => return false,
+            _ => return Folded::Outside,
         }
     } else {
         path.to_string()
     };
-    let Some(normalized) = fold_components(&relative) else {
-        return true;
-    };
-    CONFIG_INJECTION_PREFIXES.iter().any(|prefix| {
-        let prefix = prefix.to_ascii_lowercase();
-        normalized == prefix || normalized.starts_with(&format!("{prefix}/"))
-    })
+    match fold_components(&relative) {
+        Some(normalized) => Folded::Relative(normalized),
+        None => Folded::Undeterminable,
+    }
 }
 
 /// `..`成分を含むか。区切りの混在だけ吸収する（畳みはしない）。
@@ -343,6 +409,120 @@ mod tests {
             assert!(
                 !is_config_injection_path(p, std::path::Path::new("/workspace")),
                 "unexpected match for {p}"
+            );
+        }
+    }
+
+    /// **[D-110 (v)]** `.git`成分を持つパスは、反映の段で保留にする対象である。
+    ///
+    /// 前方一致の拒否リストが名指ししているのは`.git/config`・`.git/hooks`・
+    /// `.git/info/exclude`の3つだけで、**オブジェクトとrefの移動でファイルを運ぶ経路**は
+    /// そこに入っていない。だから成分単位の別の判定が要る。
+    #[test]
+    fn git_internal_paths_are_recognized_by_component_not_by_prefix() {
+        let root = std::path::Path::new("/workspace");
+        for p in [
+            // 前方一致の拒否リストに**無い**もの（これが本題）
+            ".git/objects/ab/cdef1234567890",
+            ".git/refs/heads/master",
+            ".git/HEAD",
+            ".git/packed-refs",
+            ".git/objects/info/alternates",
+            ".git/refs/replace/deadbeef",
+            ".git/logs/HEAD",
+            ".git/index",
+            ".git/shallow",
+            ".git/info/grafts",
+            ".git/config.worktree",
+            ".git/modules/sub/config",
+            // 入れ子のリポジトリ（前方一致では絶対に当たらない）
+            "vendor/x/.git/config",
+            "vendor/x/.git/objects/ab/cdef",
+            // 拒否リストにも在るもの（両方に当たる。呼び出し側は拒否を先に評価する）
+            ".git/config",
+            ".git/hooks/pre-commit",
+            // 大小と区切りの混在を吸収する
+            ".GIT/objects/ab/cdef",
+            ".git\\refs\\heads\\master",
+            // `.git`自身
+            ".git",
+            // 絶対パスでも同じ
+            "/workspace/.git/objects/ab/cdef",
+        ] {
+            assert!(
+                is_git_internal_path(p, root),
+                "expected {p} to be recognized as git-internal"
+            );
+        }
+    }
+
+    /// 上の拒否と**対**にする許可側（`B-35`）。判定は**成分単位**なので、
+    /// 名前が`.git`で始まるだけのファイルは対象外である——それらは
+    /// [`is_config_injection_path`]が従来どおり受け持つ（分担がずれていないことを固定する）。
+    #[test]
+    fn names_that_merely_start_with_dot_git_are_not_git_internal() {
+        let root = std::path::Path::new("/workspace");
+        for p in [
+            ".gitattributes",
+            ".gitlab-ci.yml",
+            ".gitmodules",
+            ".gitignore",
+            ".github/workflows/ci.yml",
+            ".githooks/pre-commit",
+            "src/main.rs",
+            "Cargo.toml",
+        ] {
+            assert!(
+                !is_git_internal_path(p, root),
+                "unexpected git-internal match for {p}"
+            );
+        }
+        // 分担の確認: 上の3つは拒否リスト側が受け持つ（どちらのゲートからも漏れない）。
+        for p in [".gitattributes", ".gitlab-ci.yml", ".github/workflows/ci.yml"] {
+            assert!(
+                is_config_injection_path(p, root),
+                "{p} must still be hard-denied by the prefix list"
+            );
+        }
+    }
+
+    /// **workspace外の`.git`は担当外である。** 外部リポジトリを`--fs-allow`で扱う運用を
+    /// 壊さないため——外への書込は`--dangerously-allow`という別目的のゲートが受け持つ。
+    ///
+    /// **絶対パスの綴りはプラットフォームで違う**ので、Windowsのドライブレター付きで書く
+    /// （`/elsewhere/...`はWindowsでは絶対パスではなく、相対パスとして畳まれてしまう）。
+    #[cfg(windows)]
+    #[test]
+    fn git_internal_paths_outside_the_workspace_are_not_this_gates_business() {
+        let root = std::path::Path::new(r"C:\ws");
+        for p in [
+            "D:/other-repo/.git/config",
+            "C:/elsewhere/.git/objects/ab/cdef",
+            // 文字列としては`C:\ws`で始まるが、区切り境界が違うので配下ではない
+            "C:/ws2/.git/HEAD",
+        ] {
+            assert!(
+                !is_git_internal_path(p, root),
+                "unexpected git-internal match for {p} (it is outside the workspace)"
+            );
+        }
+        // 対照: 同じ綴りでもworkspace配下なら当たる。
+        assert!(is_git_internal_path("C:/ws/.git/objects/ab/cdef", root));
+    }
+
+    /// 着地点が綴りから静的に決まらないもの（`..`・8.3短縮名）は、
+    /// **どちらのゲートも安全側へ倒す**。2つの判定が同じ前段を共有していることの検算でもある。
+    #[test]
+    fn undeterminable_spellings_fall_to_the_safe_side_in_both_gates() {
+        let root = std::path::Path::new("/workspace");
+        for p in ["x/../.git/objects/ab", "GIT~1/objects/ab", "../anything"] {
+            assert!(
+                is_git_internal_path(p, root),
+                "{p}: an undeterminable spelling must be withheld"
+            );
+            assert!(
+                is_config_injection_path(p, root),
+                "{p}: an undeterminable spelling must be hard-denied"
             );
         }
     }

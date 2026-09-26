@@ -112,9 +112,14 @@ pub fn init_file_logging(log_dir: &std::path::Path) -> tracing_appender::non_blo
 /// 差分（ハンク）と両側のハッシュの計算は`SandboxFs::review_file`が持つ——**部分適用が
 /// 同じ計算を再実行する**ため、表示側で別に計算してはならない
 /// （`plans/PLAN-VSCODE-REVIEW.md`「ハンク計算は表示側と適用側で同一実装を使う」）。
+/// **[D-110 (v)] `.git`配下は行にしない。** `apply`が反映しない（保留する）ものを行として
+/// 出すと、選んで`c`を押しても何も起きない行がパネルを埋める——しかもエージェントが1回
+/// コミットするだけでオブジェクトが数十〜数百件出るので、**選ぶべき行がその山に埋もれる**
+/// （合格基準P1）。件数は`push_apply_report`と`/fsstage list`が出すので、隠したことは分かる。
 fn build_change_rows(fs: &SandboxFs, entries: Vec<harness_sandbox::ChangeEntry>) -> Vec<ReviewRow> {
     entries
         .into_iter()
+        .filter(|entry| entry.category != harness_sandbox::ChangeCategory::GitInternal)
         .map(|entry| {
             let badge = match entry.op {
                 ManifestOp::Create => 'A',
@@ -233,7 +238,7 @@ fn run_memory_slash_command(workspace_root: &std::path::Path, cmd: MemoryCommand
 /// `/fsstage commit <file>`、`/fsstage commit_all`の3経路で共通のため関数化した。
 fn push_apply_report(app: &mut AppState, report: &harness_sandbox::ApplyReport) {
     app.transcript.push(app::TranscriptItem::Info(format!(
-        "applied {} change(s){}{}{}{}",
+        "applied {} change(s){}{}{}{}{}",
         report.applied.len(),
         if report.conflicts.is_empty() {
             String::new()
@@ -266,6 +271,17 @@ fn push_apply_report(app: &mut AppState, report: &harness_sandbox::ApplyReport) 
                 ", {} change(s) rejected as malformed ledger paths (the operations ledger may \
                  have been tampered with, see docs/bugs/BUG-062.md)",
                 report.rejected.len()
+            )
+        },
+        // [D-110 (v)] `.git`配下は**件数だけ**にする（合格基準P1）。パスを1件ずつ出すと
+        // オブジェクトのハッシュでtranscriptが埋まり、上の読むべき件数が流れて見えなくなる。
+        // **これは失敗ではない**ので、文面も「保留」と読める形にする。
+        if report.git_withheld.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", {} file(s) under `.git` withheld (git-tracked content is reviewed through git)",
+                report.git_withheld.len()
             )
         }
     )));
@@ -915,11 +931,28 @@ pub async fn run(
                                                 ));
                                             }
                                             Ok(entries) => {
+                                                // [D-110 (v)] `.git`配下は件数へ畳む（合格基準P1）。
+                                                // **この経路は`build_change_rows`を通らない**ので、
+                                                // 同じ畳みをここにも置く必要がある——片方だけ畳むと、
+                                                // パネルと`/fsstage list`が違うものを見せる。
+                                                let mut git_internal = 0usize;
                                                 for e in &entries {
+                                                    if e.category
+                                                        == harness_sandbox::ChangeCategory::GitInternal
+                                                    {
+                                                        git_internal += 1;
+                                                        continue;
+                                                    }
                                                     app.transcript.push(app::TranscriptItem::Info(format!(
                                                         "{:<7} {}",
                                                         format!("{:?}", e.op).to_lowercase(),
                                                         e.path
+                                                    )));
+                                                }
+                                                if git_internal > 0 {
+                                                    app.transcript.push(app::TranscriptItem::Info(format!(
+                                                        "({git_internal} file(s) under `.git` are git internals -- \
+                                                         reviewed through git, not applied as files)"
                                                     )));
                                                 }
                                             }
