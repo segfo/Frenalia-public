@@ -155,9 +155,14 @@ pub fn render(facts: &EnvironmentFacts) -> String {
          解決されます。",
         visible_workspace_root
     ));
-    lines.push(render_staging(staging, *shell_sees_staged_writes));
-    if let Some(line) = render_cow(cow_diff_layer_dir) {
-        lines.push(line);
+    // **書込の捕まえ方は1回だけ宣言する。** CoWのとき`StagingMode`は常に`Live`になる
+    // （`session_scope::scope_for`）ので、両方出すとモデルへ
+    // 「書込モード: live。即座に実ファイルシステムへ反映されます」と
+    // 「ワークスペース本体はread-onlyで、書込は差分層へ誘導されます」を**同時に**送っていた
+    // （`docs/bugs/BUG-168.md`）。CoWのほうが実態なので、そちらだけを出す。
+    match render_cow(cow_diff_layer_dir) {
+        Some(line) => lines.push(line),
+        None => lines.push(render_staging(staging, *shell_sees_staged_writes)),
     }
     lines.push(render_git_hardening());
     lines.push(render_read_scope(read_scope));
@@ -357,6 +362,14 @@ fn render_staging(staging: &StagingConfig, shell_sees_staged_writes: bool) -> St
 /// 「run_shell内の直接書込は成功しない前提で組み立てよ」という事実を明示する
 /// （Redirector DLLが実際に誘導できるかはベストエフォートで、モデルの計画自体はACLの
 /// 保証だけを頼りにすべきという意図、フックは境界にしない=D-01）。
+///
+/// **この行を出すときは[`render_staging`]を出さない**（呼び出し側の`match`）。CoWでは
+/// `StagingMode`が常に`Live`なので、両方出すと「即座に実ファイルへ反映される」と
+/// 「本体はread-only」が同時に並ぶ（`docs/bugs/BUG-168.md`）。
+///
+/// **[D-110 (v)] `.git`配下の扱いも同じ場所で言う。** 「書けた」と「本物へ入った」が
+/// 別であることは、gitを使うモデルにとって計画の前提になる——保留されたコミットを
+/// 「反映済み」と思い込むと、次の手順を誤る。
 fn render_cow(cow_diff_layer_dir: &Option<PathBuf>) -> Option<String> {
     cow_diff_layer_dir.as_ref().map(|diff_layer| {
         format!(
@@ -365,9 +378,15 @@ fn render_cow(cow_diff_layer_dir: &Option<PathBuf>) -> Option<String> {
              透過リダイレクト機構が{}へ誘導しようと試みますが、誘導自体はベストエフォートの\
              利便性機構であり、境界（保護）はワークスペース本体がread-onlyであること自体に\
              依存します。run_shellでの書込が拒否される場合は、write_file/edit_fileツールを\
-             使ってください（これらはリダイレクト機構に依存せず常に反映されます）。なお、\
-             上記ディレクトリへ直接書いた場合も、ワークスペース内の同じ相対パスに対する変更\
-             として記録されます。",
+             使ってください（これらはリダイレクト機構に依存せず、差分層へ確実に記録されます）。\
+             なお、上記ディレクトリへ直接書いた場合も、ワークスペース内の同じ相対パスに対する\
+             変更として記録されます。\
+             **このモードでは、どのツールで書いても実ファイルシステムへは即座に反映されません**\
+             ——変更は差分層に溜まり、人がレビューして承認したときに初めて実体へ入ります。\
+             したがって「書けた」は「提案した」という意味で、完了報告にはその旨を含めてください。\
+             また、gitでコミットしても、そのコミットは今は実リポジトリへ取り込まれません\
+             （`.git`配下の変更は反映の対象から外してあり、gitを経由したレビュー機構は未実装です）。\
+             コミット自体は差分層に保持されるので失われません。",
             diff_layer.display()
         )
     })
@@ -714,6 +733,90 @@ mod tests {
         ctx.staging.mode = staging_mode;
         ctx.shell_tier = ShellTierSelection::direct(tier);
         EnvironmentFacts::from_tool_ctx(&ctx)
+    }
+
+    /// **[BUG-168]** 書込の捕まえ方の宣言は**ちょうど1つ**である。
+    ///
+    /// CoWでは`StagingMode`が常に`Live`になるので、両方出すとモデルへ
+    /// 「即座に実ファイルシステムへ反映されます」と「本体はread-only」を**同時に**送る
+    /// ——一方は他方の正反対で、どちらを信じても片方に反する計画になる。
+    ///
+    /// 全Tier×全StagingMode×差分層の有無で見る（`B-08`: 1経路の確認を網羅の証明にしない）。
+    #[test]
+    fn exactly_one_write_capture_statement_is_declared() {
+        const LIVE_CLAIM: &str = "即座に実ファイルシステムへ反映されます";
+        const COW_CLAIM: &str = "Copy-on-Writeモード: 有効";
+        for tier in [
+            ShellTier::Tier0,
+            ShellTier::Tier1,
+            ShellTier::Tier2a,
+            ShellTier::Tier2b,
+            ShellTier::Tier3,
+        ] {
+            for mode in [
+                StagingMode::Live,
+                StagingMode::Staged,
+                StagingMode::WorkspaceCommit,
+            ] {
+                for cow in [None, Some(PathBuf::from("/diff-layer"))] {
+                    let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+                    ctx.staging.mode = mode;
+                    ctx.shell_tier = ShellTierSelection::direct(tier);
+                    ctx.cow_diff_layer_dir = cow.clone();
+                    let rendered = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+                    let says_live = rendered.contains(LIVE_CLAIM);
+                    let says_cow = rendered.contains(COW_CLAIM);
+                    // 拒否側: 正反対の2文が共存しない。
+                    assert!(
+                        !(says_live && says_cow),
+                        "tier={tier:?} mode={mode:?} cow={cow:?}: the prompt declares both \
+                         \"reflected immediately\" and \"Copy-on-Write\"; they contradict each \
+                         other: {rendered}"
+                    );
+                    // 許可側: CoWの行は差分層があるときちょうど1回、無いときは0回。
+                    assert_eq!(
+                        rendered.matches(COW_CLAIM).count(),
+                        usize::from(cow.is_some()),
+                        "tier={tier:?} mode={mode:?} cow={cow:?}: {rendered}"
+                    );
+                    // 書込の捕まえ方について、何かは必ず言う（黙るのは駄目）。
+                    assert!(
+                        says_cow || rendered.contains("書込モード:"),
+                        "tier={tier:?} mode={mode:?} cow={cow:?}: the prompt must say something \
+                         about how writes are captured: {rendered}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **[D-110 (v)]** CoWのときは「gitのコミットも今は実リポジトリへ入らない」を宣言する。
+    ///
+    /// 保留されたコミットを「反映済み」と思い込むと、モデルは次の手順を誤る
+    /// （例: コミットしたつもりで枝を切り替える）。**差分層が無いときは言わない**
+    /// ——その構成では嘘になる。
+    #[test]
+    fn the_cow_statement_tells_the_model_that_commits_are_not_reflected_yet() {
+        let mut ctx = ToolCtx::new(PathBuf::from("/workspace"));
+        ctx.shell_tier = ShellTierSelection::direct(ShellTier::Tier2a);
+        ctx.cow_diff_layer_dir = Some(PathBuf::from("/diff-layer"));
+        let with_cow = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+        assert!(
+            with_cow.contains("実リポジトリへ取り込まれません"),
+            "the CoW statement must say that commits are not reflected yet: {with_cow}"
+        );
+        assert!(
+            with_cow.contains("失われません"),
+            "it must also say the commits are not lost (otherwise the model may redo the work): \
+             {with_cow}"
+        );
+
+        ctx.cow_diff_layer_dir = None;
+        let without_cow = render(&EnvironmentFacts::from_tool_ctx(&ctx));
+        assert!(
+            !without_cow.contains("実リポジトリへ取り込まれません"),
+            "without a diff layer this statement would be false: {without_cow}"
+        );
     }
 
     /// 全Tier×全StagingModeの組み合わせで、Tier行が**ちょうど1本**出ることを固定する。
