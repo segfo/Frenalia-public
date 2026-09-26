@@ -2,11 +2,15 @@
 //!
 //! # 何のためにあるか
 //!
-//! `--sandbox tier2a-cow`（ワークスペースを読み取り専用にし、書込を差分層へ横流しする方式）では、
-//! 透過役の DLL が 64bit の子と 32bit（WOW64）の孫の**両方**へ注入される。x64 の DLL は
-//! `cargo build --workspace` が必ず作り直すが、x86 の DLL は別ターゲットの手動ビルドでしか
-//! 生まれない（ワークスペースに `build.rs` も `.cargo/config.toml` も無く、通常ビルドの経路に
-//! 乗っていない）。つまり **x86 だけが古いまま残り得る**。
+//! Tier2a（Windows の AppContainer 隔離）では、透過役の DLL が 64bit の子と 32bit（WOW64）の
+//! 孫の**両方**へ注入される。この 2 本は**別々の cargo 呼び出し**で作られる——cargo は 1 回の
+//! 呼び出しで別アーキテクチャをビルドしないためである。つまり **x86 だけが古いまま残り得る**。
+//!
+//! そこを塞ぐのが [`x86_deploy`] で、`harness-sandbox` の build script から入れ子の
+//! `cargo build --target i686-pc-windows-msvc` を起こし、配置したうえで**刻印を検算する**。
+//! それでも「古いまま残る」経路は原理的に残る（別のブランチで作った成果物が `target` に
+//! 居るなど）ので、実行時のゲート（`harness-sandbox` の `tier2a::redirector_identity`）は
+//! 撤去しない。
 //!
 //! 古い方が「無い」なら注入が失敗し、読み取り専用 ACL が書込を拒んで安全側に倒れる。
 //! 厄介なのは「**古いが在る**」で、この場合は注入に成功してしまう。しかも親から子へ渡す設定
@@ -27,6 +31,13 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+mod marker;
+pub mod x86_deploy;
+
+// 刻印の**綴りと走査**は `marker` が唯一持つ。ここから再公開するのは、利用側の綴り
+// （`harness_build_id::BUILD_ID_MARKER`）を変えないためである。
+pub use marker::{extract_build_id, IdError, BUILD_ID_HEX_LEN, BUILD_ID_MARKER};
+
 /// 刻印に含めるディレクトリ（配下の `.rs` を再帰的に拾う）。ワークスペースルートからの相対。
 ///
 /// `harness-change-ledger` を含めるのは、**DLL と apply 側が共有する台帳の書式**だからである。
@@ -40,12 +51,6 @@ const HASHED_DIRS: &[&str] = &[
 /// 刻印に含める単独ファイル。依存クレートのバージョンが変われば DLL の中身も変わり得るので
 /// `Cargo.toml` も対象にする。
 const HASHED_FILES: &[&str] = &["crates/harness-redirector/Cargo.toml"];
-
-/// 刻印を DLL のバイト列から探すためのマーカー。この後に 64 桁の 16 進と NUL が続く。
-pub const BUILD_ID_MARKER: &str = "HRBUILDID:";
-
-/// 刻印（16 進）の桁数。SHA-256 なので 64。
-pub const BUILD_ID_HEX_LEN: usize = 64;
 
 /// build script から呼ぶ入口。刻印を返し、あわせて `cargo:rerun-if-changed` を出す。
 ///
@@ -103,7 +108,7 @@ pub fn hash_sources(files: &[(String, Vec<u8>)]) -> String {
 /// `CARGO_MANIFEST_DIR` から上へ辿り、`[workspace]` を持つ `Cargo.toml` のあるディレクトリを返す。
 ///
 /// 親を固定段数で辿らないのは、呼び出し元のクレートがどの深さに居ても正しく効くようにするため。
-fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect(
         "harness-build-id: CARGO_MANIFEST_DIR is only set by cargo; call this from build.rs",
     );

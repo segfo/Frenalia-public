@@ -388,8 +388,8 @@ pub fn preflight_with_privhelper_launcher(
     // 掃除は`harness-cli`の起動経路（`startup::sandbox`）が持つ——TUIもheadlessもそこを通り、
     // テストは通らない。
 
-    // [T-B] CoWのときだけ、注入され得るRedirector DLL 2本（x64・WOW64用x86）の版がそろって
-    // いるかを検算する。**そろっていなければセッションを起こさない**（D-75: 隔離が取れないとき
+    // [T-B] 注入され得るRedirector DLL 2本（x64・WOW64用x86）の版がそろっているかを検算する。
+    // **そろっていなければセッションを起こさない**（D-75: 隔離が取れないとき
     // 自動降格せず拒否する。弱い器が要るなら`--sandbox`の値で明示選択する）。
     //
     // **位置がこの行である理由**は2つある。
@@ -400,14 +400,23 @@ pub fn preflight_with_privhelper_launcher(
     //   途中で落ちると撤収経路の無い孤立ACEを残す（BUG-101/B-05と同型）。**副作用を1つも
     //   起こしていない地点で落とす。**
     //
-    // CoW以外（`DirectRw`）では検算しない——x86 DLLは32bit孫への透過注入にしか使わないので、
-    // CoWでないセッションの起動条件にすると、無関係な理由でTier2aが使えなくなる。
-    if matches!(write_mode, WorkspaceWriteMode::Cow { .. }) {
-        let x64 = super::redirector_dll_path()?;
-        let x86 = x64.with_file_name(crate::tier2a::redirector_identity::X86_DLL_FILENAME);
-        crate::tier2a::redirector_identity::verify_redirector_set(&x64, &x86)
-            .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
-    }
+    // **書込モードで条件を分けない（D-90、段3）。** かつてここは`Cow`のときだけ検算していた
+    // ——「x86 DLLは32bit孫への透過注入にしか使わないので、CoWでないセッションの起動条件に
+    // すると無関係な理由でTier2aが使えなくなる」という理由だった。**その前提が消えている**:
+    // 段階5b以降、Tier2aの**全**spawnがRedirector DLLを注入する（`launch.rs`の
+    // `RedirectorInject::for_tier2a`、および下の`issue_redirector_dll_capabilities`の注）。
+    // つまり32bitの孫は`DirectRw`のセッションでも現れ、そのとき古いx86 DLLが黙って載る。
+    //
+    // **同じ問題のACE付与側は先に条件が外れていた**（下の「条件そのものが消えた」の注。
+    // D-88の受入E2Eがその形で一度落ちている）。検算側だけが取り残されていたので、
+    // 同じファイルの中に正反対の理由が並んでいた——`B-06`の「1箇所直した」である。
+    //
+    // 32bit版は`harness-sandbox`のbuild scriptが通常ビルドで作って置く
+    // （`harness_build_id::x86_deploy`）ので、これを起動条件にしても手順が増えることはない。
+    let x64 = super::redirector_dll_path()?;
+    let x86 = x64.with_file_name(crate::tier2a::redirector_identity::X86_DLL_FILENAME);
+    crate::tier2a::redirector_identity::verify_redirector_set(&x64, &x86)
+        .map_err(|e| AppContainerError::Preflight(e.to_string()))?;
     timing.mark("verify_redirector_set");
 
     let profile_name =

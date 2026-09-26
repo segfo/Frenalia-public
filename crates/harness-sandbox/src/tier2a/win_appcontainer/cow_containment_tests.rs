@@ -44,9 +44,16 @@ use std::sync::Mutex;
 /// `cargo test`は既定で`#[test]`関数を並行実行するため、この2つを直列化しないと片方が
 /// リネーム中にもう片方が「ファイルが見つからない」で誤って失敗し得る（実機で確認済み）。
 ///
-/// **[T-B] リネームはCoWセッションの開始判定にも影響する。** 版の検算
+/// **[T-B] リネームはセッションの開始判定にも影響する。** 版の検算
 /// （`crate::tier2a::redirector_identity`）は`preflight`の中で走るので、退避中に別のテストが
 /// `preflight`を呼ぶと「x86が無い」で拒否される。この直列化はその取り合いも同時に防いでいる。
+///
+/// **D-90の段3で影響範囲が広がった。** 検算はもう書込モードで分岐しないので、
+/// **`preflight`を呼ぶ実機テストすべて**（`DirectRw`で呼ぶものを含め、この木で約30箇所）が
+/// 退避の窓に当たり得る。それらはこのロックを取らないので、成立の根拠は
+/// `KNOWN_TARGETS`の`cow-diagnostics`が`--test-threads=1`を渡していること
+/// ——つまり**同じテストバイナリの中では直列である**ことに依っている。
+/// 並列で回すと「x86が無い」で無関係なテストが落ちるが、**落ち方は赤で、無言ではない。**
 static WOW64_DLL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 const COW_WRITE_PROBE_COMMAND: &str = "\
@@ -859,11 +866,66 @@ fn cow_write_from_wow64_grandchild_process_is_redirected_to_diff_layer() {
     );
 }
 
+/// **[D-90 段3] 版一致ゲートは書込モードで分岐しない。** `DirectRw`（ワークスペースへ直接
+/// 書くモード）のセッションでも、x86 DLLが無ければ起動を拒否すること。
+///
+/// # なぜこれを測るのか
+///
+/// このゲートは当初`Cow`のときだけ走っていた。しかし**注入はTier2aの全spawnで起きる**ので、
+/// 32bitの孫は`DirectRw`のセッションにも現れ、そこで古いx86 DLLが黙って載る。
+/// 条件を外したことを固定するテストが無いと、**条件を戻しても全部緑のまま**になる。
+///
+/// 許可側と拒否側を対で測る（`B-35`）——拒否側だけだと、`preflight`が別の理由で常に
+/// 失敗する状態でも通ってしまう。
+#[test]
+#[ignore]
+fn preflight_refuses_a_directrw_session_when_the_x86_redirector_is_missing() {
+    let _lock = WOW64_DLL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // ---- 許可側: 2本そろっていれば`DirectRw`でも通る ----
+    let allow_ws = tempfile::tempdir().expect("workspace tempdir (allow side)");
+    preflight(allow_ws.path(), &[], None, &WorkspaceWriteMode::DirectRw)
+        .expect("preflight (DirectRw) must pass while both redirector DLLs are in place");
+
+    // ---- 拒否側: x86を退避すると同じ呼び出しが落ちる ----
+    let current = std::env::current_exe().expect("current_exe");
+    let dir = current.parent().expect("current_exe has parent");
+    let x86_dll = dir.join(crate::tier2a::redirector_identity::X86_DLL_FILENAME);
+    let x86_dll_backup = dir.join("harness_redirector_x86.dll.disabled-for-directrw-gate-test");
+    assert!(
+        x86_dll.exists(),
+        "this test needs the x86 redirector DLL to exist so it can take it away; build the \
+         workspace (the harness-sandbox build script places it)"
+    );
+    std::fs::rename(&x86_dll, &x86_dll_backup).expect("temporarily rename x86 dll");
+    let restore = scopeguard(|| {
+        let _ = std::fs::rename(&x86_dll_backup, &x86_dll);
+    });
+
+    let deny_ws = tempfile::tempdir().expect("workspace tempdir (deny side)");
+    let err = preflight(deny_ws.path(), &[], None, &WorkspaceWriteMode::DirectRw)
+        .expect_err("preflight (DirectRw) must refuse while the x86 redirector DLL is missing");
+    let msg = err.to_string();
+    // 「無い」ことと「次に何を打つか」の両方が出ること。
+    assert!(
+        msg.contains(crate::tier2a::redirector_identity::X86_DLL_FILENAME),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(crate::tier2a::redirector_identity::REBUILD_HINT),
+        "{msg}"
+    );
+
+    drop(restore);
+}
+
 /// Phase 4b失敗系: x86版Redirector DLL（`harness_redirector_x86.dll`）が**注入の時点で**
 /// 存在しない場合、WOW64孫プロセスへの注入は失敗するが、孫プロセスの生成自体は拒否されず（Q6）、
 /// 書込みはworkspaceのACLでfail-closeし（transparent性の欠如のみ）、警告台帳に理由が記録されること。
 ///
-/// **[T-B] リネームの窓は`preflight`より後**である。CoWセッションの開始時に2本の版がそろって
+/// **[T-B] リネームの窓は`preflight`より後**である。Tier2aセッションの開始時に2本の版がそろって
 /// いるかを検算するゲートが入ったため（`crate::tier2a::redirector_identity`）、開始前に退避すると
 /// `preflight`自身が拒否してこのテストの本題（孫の注入が失敗したときの振る舞い）まで到達しない。
 ///
@@ -895,7 +957,7 @@ fn cow_wow64_grandchild_without_x86_dll_at_injection_time_fails_closed_with_warn
     assert!(
         had_x86_dll,
         "this test needs the x86 redirector DLL to exist so it can take it away *after* the \
-         session starts; build it with tools/build-redirector-x86.ps1"
+         session starts; build the workspace (the harness-sandbox build script places it)"
     );
     std::fs::rename(&x86_dll, &x86_dll_backup).expect("temporarily rename x86 dll");
     // パニックしても必ずリネームを戻す。
@@ -1596,26 +1658,36 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
 fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: bool) {
     use serde_json::Value;
 
+    /// プローブ実行ファイル2本（x64・x86）の在り処。
+    ///
+    /// **x64だけ探す場所が2つある。** 32bit版は`harness-sandbox`のbuild scriptが
+    /// テストバイナリの隣（`<profile>/deps/`）へ固定名で置くが、**x64版はcargo自身の成果物**で、
+    /// 素の名前で置かれるのは`<profile>/`（1つ上）だけである
+    /// （`deps/`に居るのは`<name>-<hash>.exe`というハッシュ付きの名前）。
+    /// かつては手引きが「`deps/`へコピーせよ」と案内していたが、**コピーを増やすより
+    /// 探す側を直す**方が、手順の漏れが起きない。
     fn proc_probe_exe_paths() -> (PathBuf, PathBuf) {
         let current = std::env::current_exe().expect("current_exe");
         let dir = current
             .parent()
             .expect("current_exe has parent")
             .to_path_buf();
-        let x64 = dir.join("tier2a_proc_probe.exe");
+        let x64 = [dir.join("tier2a_proc_probe.exe")]
+            .into_iter()
+            .chain(dir.parent().map(|up| up.join("tier2a_proc_probe.exe")))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| {
+                panic!(
+                    "tier2a_proc_probe.exe not found next to {} nor one level up (build the \
+                     workspace; that binary is an ordinary cargo artifact)",
+                    dir.display()
+                )
+            });
         let x86 = dir.join("tier2a_proc_probe_x86.exe");
         assert!(
-            x64.exists(),
-            "tier2a_proc_probe.exe not found at {} (build with `cargo build -p \
-             tier2a-proc-probe` and copy next to the test binary per \
-             docs/DEV-ENVIRONMENT.md)",
-            x64.display()
-        );
-        assert!(
             x86.exists(),
-            "tier2a_proc_probe_x86.exe not found at {} (build with `cargo build -p \
-             tier2a-proc-probe --target i686-pc-windows-msvc` and copy next to the test \
-             binary per docs/DEV-ENVIRONMENT.md)",
+            "tier2a_proc_probe_x86.exe not found at {} — the harness-sandbox build script is \
+             supposed to place it there (harness_build_id::x86_deploy). Build the workspace.",
             x86.display()
         );
         (x64, x86)

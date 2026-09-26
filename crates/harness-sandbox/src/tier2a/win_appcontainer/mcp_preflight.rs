@@ -101,6 +101,17 @@ pub fn preflight_mcp_server(
     //
     // 付与と撤収は既存の対をそのまま使う（`record_mcp_granted_path`がこのプロファイルの
     // エントリへぶら下げ、`end_session`が剥がす）。**新しい撤収経路を作らない。**
+    //
+    // # ここに版一致ゲートを置かないのは、漏れではなく「別の場所が覆っている」からである
+    //
+    // 注入の準備経路は2つ（`run_shell`側の`preflight`と、このMCP版）で、**2つのうち2つ**が
+    // 覆われている。ここに無いのは、MCPサーバの起動が**必ず`preflight`の後**に来るからである
+    // ——`harness-cli`の`prepare_mcp_servers`は`shell_tier`（`select_tier`の戻り値）を
+    // 引数で受け取るので、`select_tier`→`preflight`→版一致ゲートを既に通っている。
+    // ここで2度目を撃つと、同じ事実を2箇所で判定することになる（`B-13`）。
+    //
+    // **この前提が崩れる変更に注意**: MCPサーバを`select_tier`を通らない経路から起こすように
+    // したら、そのときはこちらにもゲートが要る（Tier2aの隔離に載せる以上、注入は起きる）。
     for dll in redirector_dll_paths() {
         match grant_ace_inheritable_access(&dll, sid.as_psid(), FsAccess::ReadExec) {
             Ok(()) => {
