@@ -1299,6 +1299,147 @@ mod tests {
         }
     }
 
+    /// `.git`のような成分に対してOSが自動生成する8.3短縮名（この機では`GIT~1`）を、
+    /// 実際にOSへ聞いて返す。8.3が無効なボリュームでは長い名前がそのまま返るので`None`。
+    ///
+    /// **綴りを推測しない。** 別名は衝突順で決まる（`~1`とは限らない）ので、
+    /// テストが自分で組み立てると「この機では別名が違うので迂回が再現しなかった」ことと
+    /// 「迂回が塞がっている」ことが区別できなくなる。
+    #[cfg(windows)]
+    fn os_short_name_of(path: &Path) -> Option<String> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+        let wide = crate::win_common::wide(&path.to_string_lossy());
+        let mut buf = vec![0u16; 32768];
+        let len = unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf)) } as usize;
+        if len == 0 || len > buf.len() {
+            return None;
+        }
+        let shortened = String::from_utf16_lossy(&buf[..len]);
+        let last = Path::new(&shortened)
+            .file_name()?
+            .to_string_lossy()
+            .into_owned();
+        // 8.3が無効なら長い名前がそのまま返る。その場合は別名が存在しない。
+        let long = path.file_name()?.to_string_lossy().into_owned();
+        if last.eq_ignore_ascii_case(&long) {
+            None
+        } else {
+            Some(last)
+        }
+    }
+
+    /// **8.3短縮名の別名で、書込口（D-101）と`apply`（層3）の両方を迂回できるか。**
+    ///
+    /// NTFSは`.git`のような成分に短い別名を自動生成し、**OSはそれを実体へ解決する**。
+    /// 判定器（`is_config_injection_path`）は綴りの前方一致で見るので、別名は素通りし得る
+    /// ——`.GIT/config`（大小）や`.git./config`（末尾ドット）と同じクラスである。
+    ///
+    /// **別名はOSに聞く**（上の`os_short_name_of`）。8.3が無効なボリュームでは
+    /// 別名が存在しないので、**測れなかったことを出力に明記してから**その部分だけ飛ばす
+    /// ——黙って緑にすると「塞がっている」と読めてしまう（`B-12`）。
+    ///
+    /// 拒否側と許可側を対にする（`B-35`）: 別名経由の書込が拒否され、
+    /// 同じ書込口で普通のファイルは書けること。
+    #[cfg(windows)]
+    #[test]
+    fn hard_deny_is_not_bypassable_by_an_8dot3_short_name_alias() {
+        // (1) 書込口（D-101）。直接書くモードとステージングの両方。
+        // **反復ごとに置き場を作り直す**——共有すると、前の反復が作った実体を
+        // 次の反復の着地として読んでしまう（実際に一度そう出た）。
+        // **観測を全部出してから判定する**——「拒否されたか」と「実体へ着地したか」は
+        // 別の事実で、前者で止めると後者が記録に残らない。
+        let mut observations = Vec::new();
+        let mut alias_seen = None;
+        for staged in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            // 別名を生成させるために実体を先に作る（存在しないパスには別名が付かない）。
+            std::fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+            let Some(alias) = os_short_name_of(&dir.path().join(".git")) else {
+                println!(
+                    "MEASUREMENT: 8.3 short names are disabled on this volume, so the alias \
+                     bypass could NOT be measured here (this is not evidence that it is closed)"
+                );
+                return;
+            };
+            let via_alias = format!("{alias}/hooks/pre-commit");
+            let real = dir.path().join(".git/hooks/pre-commit");
+            alias_seen = Some(alias.clone());
+
+            let config = if staged {
+                staged_config(".harness/sandbox/s1")
+            } else {
+                StagingConfig::default()
+            };
+            let fs = SandboxFs::open(dir.path(), &config).unwrap();
+            let result = fs.write_string(&via_alias, "#!/bin/sh\nevil\n");
+            let landed = real.exists();
+            println!(
+                "MEASUREMENT: alias=[{alias}] write_string(staged={staged}) -> {result:?} \
+                 landed_on_real_.git/hooks/pre-commit={landed}"
+            );
+            observations.push((
+                staged,
+                matches!(result, Err(SandboxError::ConfigInjection(_))),
+                landed,
+                format!("{result:?}"),
+            ));
+            // 対照: 同じ書込口で普通のファイルは書ける。
+            fs.write_string("src/main.rs", "fn main() {}").unwrap();
+        }
+        for (staged, refused, landed, shown) in &observations {
+            assert!(
+                refused,
+                "staged={staged}: the alias spelling must be refused at the write entry point, \
+                 got {shown}"
+            );
+            assert!(
+                !landed,
+                "staged={staged}: the write landed on the real .git/hooks/pre-commit \
+                 through the alias"
+            );
+        }
+        let alias = alias_seen.expect("at least one iteration ran");
+        let via_alias = format!("{alias}/hooks/pre-commit");
+
+        // (2) `apply`（層3）。差分層に実体を置き、台帳へ別名の綴りで載せる。
+        let (_ws, _diff_layer_tmp, workspace_root, diff_layer_dir) = tampered_ledger_fixture();
+        std::fs::create_dir_all(workspace_root.join(".git/hooks")).unwrap();
+        let staged_src = diff_layer_dir.join(&via_alias);
+        std::fs::create_dir_all(staged_src.parent().unwrap()).unwrap();
+        std::fs::write(&staged_src, "#!/bin/sh\nevil\n").unwrap();
+        store::append_entry(&diff_layer_dir, ChangeOp::Create, &via_alias, None);
+
+        let fs = SandboxFs::open_with_cow(
+            &workspace_root,
+            &StagingConfig::default(),
+            &ReadScopeConfig::default(),
+            Some(&diff_layer_dir),
+        )
+        .unwrap();
+        let report = fs
+            .apply(&ApplyOptions {
+                only_glob: None,
+                only_paths: None,
+                allow_ext: false,
+                adopt_unledgered: false,
+            })
+            .unwrap();
+        println!(
+            "MEASUREMENT: apply -> applied={:?} hard_denied={:?} rejected={:?}",
+            report.applied, report.hard_denied, report.rejected
+        );
+        assert!(
+            !workspace_root.join(".git/hooks/pre-commit").exists(),
+            "apply wrote the real .git/hooks/pre-commit through the alias spelling"
+        );
+        assert_eq!(
+            report.hard_denied,
+            vec![via_alias.clone()],
+            "the alias spelling must be reported as hard-denied, not silently skipped"
+        );
+    }
+
     #[test]
     fn apply_hard_denies_staged_git_config_write() {
         let dir = tempfile::tempdir().unwrap();

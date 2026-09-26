@@ -1069,6 +1069,53 @@ mod tests {
         }
     }
 
+    /// **8.3短縮名の別名（`.git`→`GIT~1`）で綴っても層1のhard-denyが掛かること。**
+    ///
+    /// NTFSは`.git`のような成分に短い別名を自動生成し、**OSはそれを実体へ解決する**ので、
+    /// `GIT~1/hooks/pre-commit`への`write_file`は`.git/hooks/pre-commit`へ着地する
+    /// （この機で実測。判定器は綴りの前方一致で見るため素通りしていた）。
+    /// `.GIT/config`（大小）と同じ「文字列としては別物だが同じ場所へ着地する」クラスである。
+    ///
+    /// **層1と層3は同じ判定器を共有している**ので、判定器に開いた穴は
+    /// 二重防御の冗長性として働かない（BUG-126と同じ形）。
+    #[test]
+    fn config_injection_hard_deny_is_not_bypassable_by_an_8dot3_short_name_alias() {
+        let arbiter = PermissionArbiter::new(
+            PermissionMode::AcceptAll,
+            vec![AllowlistRule::new("write_file", "*")],
+            "/workspace",
+        );
+        for spelling in [
+            "GIT~1/hooks/pre-commit",
+            "git~1/config",
+            "HARNES~1/settings.json",
+            "VSCODE~1/settings.json",
+            "GITHUB~1/WORKFL~1/ci.yml",
+        ] {
+            assert_eq!(
+                arbiter.classify(
+                    "write_file",
+                    RiskClass::Write,
+                    &subj("write_file", spelling)
+                ),
+                Classification::Deny,
+                "spelling {spelling:?} bypassed the D-05 hard-deny"
+            );
+        }
+        // 対照（`B-35`）: 8.3短縮名の形をしていない`~`入りの名前は通る。
+        for spelling in ["src/main.rs~", "mybackup~1.txt", "notes~.md"] {
+            assert_ne!(
+                arbiter.classify(
+                    "write_file",
+                    RiskClass::Write,
+                    &subj("write_file", spelling)
+                ),
+                Classification::Deny,
+                "spelling {spelling:?} is not an 8.3 alias and must stay writable"
+            );
+        }
+    }
+
     /// **[BUG-126] 絶対パスで綴っても層1のhard-denyが掛かること。**
     ///
     /// 判定器はworkspace相対の**前方一致**しか見ていなかったので、

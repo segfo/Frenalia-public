@@ -88,10 +88,11 @@ fn contains_parent_component(path: &str) -> bool {
     path.replace('\\', "/").split('/').any(|p| p == "..")
 }
 
-/// 照合用の正規形へ畳む。`..`を含むなら`None`（＝着地点が静的に決まらないので拒否側へ）。
+/// 照合用の正規形へ畳む。**着地点が綴りから静的に決まらないものは`None`**
+/// （＝呼び出し側は拒否側へ倒す）。該当するのは`..`と、8.3短縮名の別名の2つである。
 fn fold_components(path: &str) -> Option<String> {
     let lowered = path.replace('\\', "/").to_ascii_lowercase();
-    let mut components: Vec<&str> = Vec::new();
+    let mut components: Vec<String> = Vec::new();
     for part in lowered.split('/') {
         match part {
             // 空成分（`a//b`）と`.`は落とす。`./`を1回だけ剥がす実装だと`././`で欺ける。
@@ -100,10 +101,59 @@ fn fold_components(path: &str) -> Option<String> {
             ".." => return None,
             // 末尾のドット・スペースはWin32が落とすので、落とした形で照合する
             // （`.git./config`が`.git/config`へ着地するため）。
-            other => components.push(other.trim_end_matches(['.', ' '])),
+            other => {
+                let trimmed = other.trim_end_matches(['.', ' ']);
+                // 8.3短縮名の別名も`..`と同じ「着地点が静的に決まらない」形である。
+                if looks_like_an_8dot3_alias(trimmed) {
+                    return None;
+                }
+                components.push(trimmed.to_string());
+            }
         }
     }
     Some(components.join("/"))
+}
+
+/// 成分が**8.3短縮名**（NTFSが互換のために自動生成する短い別名）の形をしているか。
+///
+/// **なぜ形で判定し、別名の一覧で判定しないのか。** 別名の綴りは**衝突順で決まる**
+/// ——`.git`は普通`GIT~1`になるが、先に似た名前があれば`GIT~2`…になり、衝突が多いと
+/// ハッシュを含む形（`GI1B79~1`）になる。つまり`.git`の別名がどう綴られるかは
+/// ディレクトリの作成履歴に依存し、**判定する側からは決められない**。
+/// したがって`..`と同じ扱いにする——着地点が静的に決まらないので拒否側へ倒す（`P-05`）。
+///
+/// **この機での実測**（2026-09-26）: `.git`→`GIT~1`・`.harness`→`HARNES~1`・
+/// `.vscode`→`VSCODE~1`。`GIT~1/hooks/pre-commit`への書込は実体の`.git/hooks/pre-commit`へ
+/// 着地し、層1・層3・書込口（D-101）の3つとも素通りしていた。
+///
+/// **形は次の3つをすべて満たすものに絞る**（8.3短縮名の構造そのもの）。
+///
+/// 1. 幹（最後のドットより前）が**8文字以内**で空でない
+/// 2. 幹に`~`があり、**その後ろが数字だけで終わる**
+/// 3. 拡張子があるなら**3文字以内**
+///
+/// **過剰に拒否する側へ倒れることを承知で採っている。** 8.3短縮名の形をした名前は、
+/// 実際には別名でなくても拒否される（`a~1/x`等）。deny listでは安全な向きであり、
+/// 大小の判定が`.GIT`をLinuxでも拒否するのと同じ割り切りである。
+/// 逆に`~`を含むだけの名前（`main.rs~`・`mybackup~1.txt`・`~$report.xlsx`）は
+/// 上の3条件を満たさないので通る——対のテストで固定してある。
+fn looks_like_an_8dot3_alias(component: &str) -> bool {
+    // 拡張子は最後のドットで割る（8.3の拡張子は3文字以内）。
+    let (stem, ext) = match component.rsplit_once('.') {
+        Some((stem, ext)) => (stem, Some(ext)),
+        None => (component, None),
+    };
+    if ext.is_some_and(|ext| ext.len() > 3) {
+        return false;
+    }
+    if stem.is_empty() || stem.len() > 8 {
+        return false;
+    }
+    let Some((head, tail)) = stem.split_once('~') else {
+        return false;
+    };
+    // `~`の後ろが数字だけである条件が、`~`がちょうど1つであることも保証する。
+    !head.is_empty() && !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -145,6 +195,72 @@ mod tests {
             assert!(
                 is_config_injection_path(p, std::path::Path::new("/workspace")),
                 "expected {p} to be hard-denied (the filesystem does not distinguish case)"
+            );
+        }
+    }
+
+    /// **8.3短縮名の別名（`.git`→`GIT~1`）でも同じ場所へ着地する。**
+    ///
+    /// NTFSは互換のため、長い名前やドットで始まる名前の成分に短い別名を自動生成する。
+    /// **別名はOSが実体へ解決する**ので、`GIT~1/hooks/pre-commit`への書込は
+    /// `.git/hooks/pre-commit`へ着地する。`.GIT/config`（大小）と同じ
+    /// 「文字列としては別物だが同じ場所へ着地する」クラスである。
+    ///
+    /// **この開発機で実測した**（2026-09-26）: `.git`→`GIT~1`・`.harness`→`HARNES~1`・
+    /// `.vscode`→`VSCODE~1`。別名経由の書込が実体へ着地することも確認済み。
+    ///
+    /// 別名は**いつでもこの綴りになるとは限らない**——`~`の後の数は衝突順で決まり、
+    /// 衝突が多いとハッシュを含む形（`GI1B79~1`）になる。つまり
+    /// **着地点を綴りから静的に決められない**ので、`..`と同じく拒否側へ倒す（P-05）。
+    #[test]
+    fn matching_is_not_bypassable_by_an_8dot3_short_name_alias() {
+        for p in [
+            // この機で実測した実際の別名
+            "GIT~1/hooks/pre-commit",
+            "GIT~1/config",
+            "HARNES~1/settings.json",
+            "VSCODE~1/settings.json",
+            // 別名は大小を区別せず解決する
+            "git~1/hooks/pre-commit",
+            // 衝突が増えた場合の形（数は1桁に限らない）
+            "GIT~12/config",
+            // 衝突が多いときのハッシュを含む形
+            "GI1B79~1/hooks/pre-commit",
+            // 深い位置の成分にも別名が付く（`.github/workflows`の`workflows`は9文字）
+            "GITHUB~1/WORKFL~1/ci.yml",
+            ".github/WORKFL~1/ci.yml",
+            // 拡張子付き（`.gitlab-ci.yml`）
+            "GITLAB~1.YML",
+        ] {
+            assert!(
+                is_config_injection_path(p, std::path::Path::new("/workspace")),
+                "expected {p} to be hard-denied: the OS resolves 8.3 aliases to the real name, \
+                 so this spelling lands on a protected path"
+            );
+        }
+    }
+
+    /// 上の拒否と**対**にする許可側（`B-35`）。8.3短縮名の形をしていないものは通す——
+    /// 拒否の形（成分の幹が8文字以内で`~`のあと数字で終わる）を広く採ったので、
+    /// **どこまで過剰に拒否するか**をここで固定する。
+    #[test]
+    fn names_that_merely_contain_a_tilde_are_not_treated_as_8dot3_aliases() {
+        for p in [
+            // `~`のあとに数字が無い（Emacs等のバックアップ）
+            "src/main.rs~",
+            "notes~.txt",
+            // Officeのロックファイル
+            "~$report.xlsx",
+            // 幹が8文字を超える（8.3の別名は幹が8文字以内）
+            "mybackup~1.txt",
+            "verylongname~1/x",
+            // 数字で終わっていない
+            "abc~1x/y",
+            "src/foo~1bar.rs",
+        ] {
+            assert!(
+                !is_config_injection_path(p, std::path::Path::new("/workspace")),
+                "unexpected match for {p}: this is not shaped like an 8.3 alias"
             );
         }
     }
