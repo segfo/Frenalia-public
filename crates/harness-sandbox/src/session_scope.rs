@@ -8,6 +8,10 @@
 //! | `--staged` / `--workspace-commit` | workspace内 `.harness/sandbox/<session-id>/` |
 //! | `--sandbox tier2a-cow`（D-30、Windows） | workspace外 `%LOCALAPPDATA%\harness\data\cow\<session-id>\` |
 //!
+//! **監査ログの置き場はオーバーレイとは別で、モードに関係なく全セッションが持つ**
+//! （workspace内 `.harness/sandbox/audit-<session-id>/`、[`session_audit_dir`]）。
+//! かつては`--staged`の置き場を兼ねていた（D-90 反転の前提(3)で切り離した）。
+//!
 //! この対応は起動時（`harness-cli`の`startup::sandbox`）だけでなく、**セッション切替
 //! （`/sessions`・`/fork`）のたびにTUIからも引かれる**。以前は`harness-cli`の中にあったため
 //! `harness-tui`（`harness-cli`へは依存できない）から引けず、同じ`ProjectDirs::…join("cow")`が
@@ -49,6 +53,55 @@ pub fn normalize_workspace_root(raw: &Path) -> PathBuf {
 /// `--staged`/`--workspace-commit`のオーバーレイを置くworkspace内ディレクトリ（workspace相対）。
 pub fn sandbox_dir_for_session(session_id: &str) -> PathBuf {
     PathBuf::from(".harness").join("sandbox").join(session_id)
+}
+
+/// 監査ログの置き場の名前の接頭辞（`.harness/sandbox/audit-<session-id>/`）。
+pub const SESSION_AUDIT_DIR_PREFIX: &str = "audit-";
+
+/// このセッションの監査ログ（`net-audit.jsonl`・`fs-audit.jsonl`）の置き場（workspace相対）。
+/// **書込の捕まえ方に関係なく、全セッションで作る**（D-90 反転の前提(3)）。
+///
+/// # なぜ`--staged`の置き場（[`sandbox_dir_for_session`]）と別の名前なのか
+///
+/// かつては同じフォルダを兼ねていた。`harness changes/apply/discard`は
+/// 「`.harness/sandbox/session-<id>/`がある＝`--staged`のセッション」と判定しているので、
+/// 同じ名前を全セッションに作ると、CoWやLiveのセッションまで`--staged`と読まれる——一覧は空、
+/// `apply`は0件、`discard`は**監査ログを消して**差分層を残す。名前を分ければ
+/// 「`session-<id>/`がある＝`--staged`」がそのまま正しく、目印や推定が要らない
+/// （2026-09-27、ユーザー判断）。あわせて、`--staged`の置き場を破棄しても監査ログは消えない。
+///
+/// 段4より前の`--staged`のセッションは、監査ログを`session-<id>/`に持っている。読む側は
+/// こちらを先に探し、無ければそちらを見る（`harness-cli`の`resolve_session_audit_dir`）。
+pub fn session_audit_dir(session_id: &str) -> PathBuf {
+    PathBuf::from(".harness")
+        .join("sandbox")
+        .join(format!("{SESSION_AUDIT_DIR_PREFIX}{session_id}"))
+}
+
+/// [`session_audit_dir`]を実際に作り、workspace相対のパスを返す。
+///
+/// 作れなかったら`Err`（理由）。**呼び出し側は`Err`のとき監査の置き場を渡さないこと**
+/// ——`harness-netfilterd`は存在しないシンクを渡されると規則の適用ごと失敗し
+/// （`tier2a::netfilterd`の`handle_apply_rules`）、通信が全部止まる。
+pub fn prepare_session_audit_dir(workspace_root: &Path, session_id: &str) -> Result<PathBuf, String> {
+    let rel = session_audit_dir(session_id);
+    let abs = workspace_root.join(&rel);
+    std::fs::create_dir_all(&abs).map_err(|e| {
+        format!(
+            "could not create the session audit directory {}: {e}",
+            abs.display()
+        )
+    })?;
+    Ok(rel)
+}
+
+/// [`prepare_session_audit_dir`]の対。**空のときだけ**消す（中身があれば何もしない）。
+///
+/// 何も書かれなかった置き場を残すと、起動のたびに空のフォルダが1つずつ増える。
+/// 消すのは`remove_dir`（空でなければ失敗する）なので、監査ログを消すことは無い。
+/// 失敗（空でない・既に無い・消せない）はどれも黙って見送る——残っても害が無いからである。
+pub fn remove_session_audit_dir_if_empty(workspace_root: &Path, rel: &Path) {
+    let _ = std::fs::remove_dir(workspace_root.join(rel));
 }
 
 /// ワークスペースと同じボリュームへ差分層を置くときの、そのボリューム上の根の名前（D-81）。

@@ -107,8 +107,9 @@ pub(crate) struct OverlayBackend {
     /// 子が直接置いたファイルを取りこぼすと黙って失われる（[BUG-066](../../docs/bugs/BUG-066.md)）。
     ///
     /// `--staged`のオーバーレイはworkspace内（`<workspace_root>/<sandbox_dir>`）にあり、
-    /// **harness自身が同じディレクトリを監査ログの置き場として使う**（`net-audit.jsonl`・
-    /// `fs-audit.jsonl`、`cli/startup/sandbox.rs`）。ここを走査すると、その監査ログが
+    /// **段4より前のセッションでは、harness自身が同じディレクトリを監査ログの置き場として
+    /// 使っていた**（`net-audit.jsonl`・`fs-audit.jsonl`。いまは別の`audit-<id>/`、
+    /// `session_scope::session_audit_dir`）。ここを走査すると、その監査ログが
     /// 「台帳に無い変更」として一覧に出て`apply`でworkspaceルートへコピーされてしまう。
     /// またstagedではオーバーレイ外の書込はそのまま実workspaceへ落ちる（＝失われない）ので、
     /// 走査が守るべきものが無い。

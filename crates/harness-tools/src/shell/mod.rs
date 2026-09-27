@@ -218,13 +218,12 @@ async fn prepare_run(ctx: &ToolCtx) -> PreparedRun {
     // `ctx.net_proxy.domain_policy_enabled`なら、`allow_domains`が空でも全拒否ポリシーとして
     // Proxy/Fake DNS監査経路を起動する。SOCKS5 remote DNSを主経路とする`ALL_PROXY`と、
     // 既存HTTP(S)ツール互換の`HTTP_PROXY`/`HTTPS_PROXY`を子envへ足す。
-    let mut net_proxy = ctx.net_proxy.clone();
-    if net_proxy.audit_log_path.is_none() {
-        if let Some(sandbox_dir) = &ctx.staging.sandbox_dir {
-            net_proxy.audit_log_path =
-                Some(ctx.workspace_root.join(sandbox_dir).join("net-audit.jsonl"));
-        }
-    }
+    //
+    // 監査ログの置き場（`net_proxy.audit_log_path`）は**起動時に1度だけ決まる**
+    // （`harness-cli`の`startup::sandbox`。書込の捕まえ方に関係なく全セッションで作る）。
+    // かつてはここで`--staged`の置き場から導き直していたが、それは監査ログを書込の捕まえ方へ
+    // 結び付ける2つ目の点だった（D-90 反転の前提(3)）。
+    let net_proxy = ctx.net_proxy.clone();
     let proxy = if net_proxy.proxy_addr.is_some() {
         None
     } else {

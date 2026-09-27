@@ -199,35 +199,80 @@ pub(crate) fn resolve_staging_mode_checked(
     Ok(staging_mode)
 }
 
-/// `--session <id>`指定が無い場合に`.harness/sandbox/`直下で最も更新日時の新しいものを選ぶ
-/// （`apply`/`changes`/`discard`の既定対象）。
-pub(crate) fn resolve_sandbox_dir(workspace_root: &Path, session: Option<&str>) -> Option<PathBuf> {
-    if let Some(id) = session {
-        let stem = id.strip_prefix("session-").unwrap_or(id);
-        return Some(sandbox_dir_for_session(&format!("session-{stem}")));
-    }
+/// `--session`に渡された綴り（`session-<stem>`／`<stem>`）を、セッションIDの正規形
+/// `session-<stem>`へ揃える。**揃えるのはここ1箇所**（staged・CoW・監査ログの全部が使う）。
+pub(crate) fn normalize_session_id(id: &str) -> String {
+    let stem = id.strip_prefix("session-").unwrap_or(id);
+    format!("session-{stem}")
+}
+
+/// `.harness/sandbox/`直下のフォルダのうち、名前が`prefix`で始まるものを（名前, 更新時刻）で返す。
+///
+/// **名前で絞ること自体が要点である。** ここには会話セッションの置き場（`session-*`）・
+/// 監査ログの置き場（`audit-*`）のほかに、ポリシーエディタの記録（`policy-editor-*`）・
+/// Tier2bの差分層（`tier2b`）・`Tier2a-tmp`も並ぶ。名前を問わず最新を選ぶと、
+/// `harness discard`がポリシーエディタの記録を`--staged`の置き場として消していた。
+pub(crate) fn sandbox_subdirs_named(
+    workspace_root: &Path,
+    prefix: &str,
+) -> Vec<(String, std::time::SystemTime)> {
     let base = workspace_root.join(".harness").join("sandbox");
-    let mut newest: Option<(String, std::time::SystemTime)> = None;
-    let entries = std::fs::read_dir(&base).ok()?;
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
+        if !metadata.is_dir() {
+            continue;
+        }
         let Ok(modified) = metadata.modified() else {
             continue;
         };
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if newest.as_ref().is_none_or(|(_, t)| modified > *t) {
-            newest = Some((name.to_string(), modified));
+        if name.starts_with(prefix) {
+            out.push((name, modified));
         }
     }
-    newest.map(|(name, _)| sandbox_dir_for_session(&name))
+    out
+}
+
+/// このセッションの監査ログの置き場（workspace相対）。`harness net audit`・`harness policy`が使う。
+///
+/// - `--session <id>`: `audit-<id>/`（段4以降）があればそれ、無ければ`session-<id>/`
+///   （段4より前の`--staged`のセッションは監査ログをそこに持っている）。どちらも無ければ
+///   `audit-<id>/`を返す——読む側は「そのセッションのログは無い」と報告でき、
+///   `harness policy learn`はそこへ収集先を作れる。
+/// - 省略: `audit-*`と`session-*`からセッションIDを集め、更新時刻が最新のものを上と同じ規則で解く。
+///   `policy-editor-*`などは拾わない（[`sandbox_subdirs_named`]）。無ければ`None`。
+pub(crate) fn resolve_session_audit_dir(
+    workspace_root: &Path,
+    session: Option<&str>,
+) -> Option<PathBuf> {
+    let session_id = match session {
+        Some(id) => normalize_session_id(id),
+        None => {
+            let audit_prefix = harness_sandbox::session_scope::SESSION_AUDIT_DIR_PREFIX;
+            let from_audit = sandbox_subdirs_named(workspace_root, audit_prefix)
+                .into_iter()
+                .filter_map(|(name, t)| Some((name.strip_prefix(audit_prefix)?.to_string(), t)));
+            let from_legacy = sandbox_subdirs_named(workspace_root, "session-");
+            from_audit
+                .chain(from_legacy)
+                .max_by_key(|(_, t)| *t)?
+                .0
+        }
+    };
+    let current = harness_sandbox::session_scope::session_audit_dir(&session_id);
+    let legacy = sandbox_dir_for_session(&session_id);
+    if !workspace_root.join(&current).is_dir() && workspace_root.join(&legacy).is_dir() {
+        return Some(legacy);
+    }
+    Some(current)
 }
 
 #[cfg(feature = "e2e-mock")]

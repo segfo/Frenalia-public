@@ -2061,9 +2061,10 @@ fn net_case_ws(name: &str) -> PathBuf {
 
 /// case-matrixバイナリを`run_shell`経由でサンドボックス内から実行し、全プローブが期待通り
 /// (allow/deny)だったときだけ`Ok`にする。監査ログ(`net-audit.jsonl`)にも当該ホストの
-/// `allowed:false`エントリがあることを二重証拠として要求する(Q4)。`--staged`を付けて
-/// `sandbox_dir`を確保するのは、それが無いと`net-audit.jsonl`自体が書かれないため
-/// (`crates/harness-tools/src/shell.rs`の`audit_log_path`はstaging有効時のみ設定される)。
+/// `allowed:false`エントリがあることを二重証拠として要求する(Q4)。監査ログの置き場は
+/// 書込の捕まえ方に関係なく全セッションで作られる（`.harness/sandbox/audit-<id>/`、D-90 反転の
+/// 前提(3)）ので、**`--staged`を付けない既定のモードで**測る。かつては`--staged`でしか
+/// `net-audit.jsonl`が書かれず、ここでも`--staged`を付けていた。
 /// `expect_proxy_denials`は「層1（プロキシ）が、この理由でこの件数だけ断つこと」
 /// （[`assert_proxy_denials`]）。**WFPの拒否0件を「正しい0」と読むケースはここを埋める**
 /// ——そうしないと、層1が断たなくなった日に0が取りこぼしと見分けられなくなる（[BUG-094]）。
@@ -2117,7 +2118,7 @@ fn run_net_case_with_exe_and_stderr_check(
     expect_proxy_denials: &[(&str, usize)],
 ) -> Result<(), String> {
     let ws = net_case_ws(name);
-    let mut extra_args = vec!["--staged"];
+    let mut extra_args: Vec<&str> = Vec::new();
     for d in allow_domains {
         extra_args.push("--net-allow-domain");
         extra_args.push(d);
@@ -2820,7 +2821,8 @@ fn run_net_probe_script(
     script: &str,
 ) -> Result<(PathBuf, serde_json::Value), String> {
     let ws = net_case_ws(name);
-    let mut extra_args = vec!["--staged"];
+    // 監査ログの置き場は全セッションで作られるので`--staged`は要らない（`run_net_case`のdoc）。
+    let mut extra_args: Vec<&str> = Vec::new();
     for d in allow_domains {
         extra_args.push("--net-allow-domain");
         extra_args.push(d);
@@ -4680,20 +4682,41 @@ const CHAIN_LAUNCH_GIVE_UP_MARKERS: &[&str] = &[
     "falling back to launching it directly",
 ];
 
+/// 既定の書込モード（Live）で経路(A)を通す。
 fn chain_launch_case_no_extra_uac_path_is_taken() -> Result<(), String> {
     let ws = case_dir("chain-launch");
-    // 3つとも必要な条件である。
+    chain_launch_case_in(&ws, &[], "chain-launch")?;
+    cleanup_on_success(&ws, &[], "chain-launch");
+    Ok(())
+}
+
+/// **CoWでも同じ**（D-90でTier2aは常にCoWになる）。監査ログの置き場は書込の捕まえ方に
+/// 関係なく作られるので、CoWでも収集器が収集先を持てること。かつてCoWでは置き場が作られず、
+/// `--policy-learn`は黙って無効になっていた（D-90 反転の前提(3)）。
+fn chain_launch_case_under_cow() -> Result<(), String> {
+    let ex = cow_exclusive();
+    let ws = case_dir("chain-launch-cow");
+    let before = ex.list_cow_sessions();
+    chain_launch_case_in(&ws, &["--sandbox", "tier2a-cow"], "chain-launch-cow")?;
+    let session = ex.new_cow_session(&before)?;
+    cleanup_on_success(&ws, &[&session], "chain-launch-cow");
+    Ok(())
+}
+
+fn chain_launch_case_in(ws: &Path, mode_args: &[&str], case_name: &str) -> Result<(), String> {
+    // 2つとも必要な条件である。
     // - `--net-allow-domain`: ドメインポリシーが無いと`netfilterd`自体が起動せず、
     //   連鎖の**親**が存在しない（経路(A)が原理的に成立しない）
-    // - `--staged`: 既定のLive staging modeでは`sandbox_dir`が`None`になり、
-    //   `fs-audit.jsonl`の置き場が決まらないので収集器はそもそも起動しない
-    //   （`run_agent.rs`が「could not resolve a sandbox session directory」と警告して無効化する）
     // - `--policy-learn true`: 収集器を有効にする
+    // **`--staged`は付けない。** かつては既定とCoWで`fs-audit.jsonl`の置き場が決まらず、
+    // 収集器がそもそも起動しなかったので付けていた。いまは全セッションに置き場がある。
+    let mut args = mode_args.to_vec();
+    args.extend(["--policy-learn", "true", "--net-allow-domain", "example.com"]);
     let run = run_harness(
-        &ws,
+        ws,
         &run_shell_script_turns("Get-Content -LiteralPath 'C:/Windows/System32/config/SAM' -ErrorAction SilentlyContinue; Write-Output 'ran'"),
-        &["--staged", "--policy-learn", "true", "--net-allow-domain", "example.com"],
-        "chain-launch",
+        &args,
+        case_name,
     );
     parse_json_stdout(&run)?;
 
@@ -4708,7 +4731,9 @@ fn chain_launch_case_no_extra_uac_path_is_taken() -> Result<(), String> {
         }
     }
 
-    // 収集器が実際に動いた証拠。`.harness/sandbox/session-*/fs-audit.jsonl`。
+    // 収集器が実際に動いた証拠。`.harness/sandbox/audit-<session-id>/fs-audit.jsonl`。
+    // **置き場の名前まで見る**——`audit-`以外（`--staged`の`session-*`など）に書かれていたら、
+    // 監査ログがまだ書込の捕まえ方に結び付いている。
     let sandbox_dir = ws.join(".harness").join("sandbox");
     let audit = std::fs::read_dir(&sandbox_dir)
         .map_err(|e| {
@@ -4729,20 +4754,32 @@ fn chain_launch_case_no_extra_uac_path_is_taken() -> Result<(), String> {
             run.stderr
         ));
     };
+    let parent = audit
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    if !parent.starts_with("audit-") {
+        return Err(format!(
+            "fs-audit.jsonl was written into {parent:?}, not the session audit directory \
+             (audit-<session-id>)"
+        ));
+    }
+    // 空のファイルは依頼する側が先に作る（BUG-109）ので、在るだけでは収集器が動いた証拠にならない。
     let body = std::fs::read_to_string(&audit).map_err(|e| e.to_string())?;
     if body.trim().is_empty() {
         return Err(format!("{} exists but is empty", audit.display()));
     }
-
-    cleanup_on_success(&ws, &[], "chain-launch");
     Ok(())
 }
 
 #[test]
 #[ignore]
 fn tier2a_chain_launch_uses_the_no_extra_uac_path() {
-    let cases: Vec<(&str, CaseFn)> =
-        vec![("no-extra-uac", chain_launch_case_no_extra_uac_path_is_taken)];
+    let cases: Vec<(&str, CaseFn)> = vec![
+        ("no-extra-uac", chain_launch_case_no_extra_uac_path_is_taken),
+        ("no-extra-uac-under-cow", chain_launch_case_under_cow),
+    ];
     let mut passed = 0;
     let total = cases.len();
     for (name, f) in cases {
@@ -5625,7 +5662,7 @@ fn tier2a_smb445_layer2() {
         &harness_exe(),
         &ws,
         &run_shell_script_turns(&script),
-        &["--staged", "--net-allow-domain", "example.com"],
+        &["--net-allow-domain", "example.com"],
         name,
     );
     assert!(

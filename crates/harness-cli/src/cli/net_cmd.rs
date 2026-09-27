@@ -11,7 +11,7 @@ pub(crate) fn net_audit_path(
     if let Some(path) = explicit_path {
         return Some(path.to_path_buf());
     }
-    resolve_sandbox_dir(workspace_root, session)
+    resolve_session_audit_dir(workspace_root, session)
         .map(|dir| workspace_root.join(dir).join("net-audit.jsonl"))
 }
 
@@ -191,29 +191,72 @@ mod net_audit_tests {
         );
     }
 
+    /// `--session`は`<stem>`でも`session-<stem>`でも同じ置き場（監査ログの置き場）を指す。
     #[test]
-    fn session_net_audit_path_resolves_under_sandbox_dir() {
+    fn session_net_audit_path_resolves_under_the_session_audit_dir() {
         let workspace = Path::new(r"C:\workspace");
-
-        assert_eq!(
-            net_audit_path(workspace, Some("abc123"), None),
-            Some(
-                workspace
-                    .join(".harness")
-                    .join("sandbox")
-                    .join("session-abc123")
-                    .join("net-audit.jsonl")
-            )
+        let expected = Some(
+            workspace
+                .join(".harness")
+                .join("sandbox")
+                .join("audit-session-abc123")
+                .join("net-audit.jsonl"),
         );
+
+        assert_eq!(net_audit_path(workspace, Some("abc123"), None), expected);
         assert_eq!(
             net_audit_path(workspace, Some("session-abc123"), None),
-            Some(
-                workspace
-                    .join(".harness")
-                    .join("sandbox")
-                    .join("session-abc123")
-                    .join("net-audit.jsonl")
-            )
+            expected
+        );
+    }
+
+    fn sandbox_subdir(ws: &Path, name: &str) -> std::path::PathBuf {
+        let dir = ws.join(".harness").join("sandbox").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// **段4より前の`--staged`のセッションのログも読める。** 当時は`session-<id>/`が
+    /// 監査ログの置き場を兼ねていた。新しい置き場が無いときだけそちらを見る。
+    #[test]
+    fn a_session_from_before_the_audit_dir_split_is_read_from_its_old_place() {
+        let ws = tempfile::tempdir().unwrap();
+        let legacy = sandbox_subdir(ws.path(), "session-old");
+
+        assert_eq!(
+            net_audit_path(ws.path(), Some("old"), None),
+            Some(legacy.join("net-audit.jsonl"))
+        );
+    }
+
+    /// 両方あるなら新しい置き場を読む（段4以降の`--staged`のセッションは両方を持つ）。
+    #[test]
+    fn the_audit_dir_wins_over_the_staging_dir_of_the_same_session() {
+        let ws = tempfile::tempdir().unwrap();
+        sandbox_subdir(ws.path(), "session-x");
+        let audit = sandbox_subdir(ws.path(), "audit-session-x");
+
+        assert_eq!(
+            net_audit_path(ws.path(), Some("x"), None),
+            Some(audit.join("net-audit.jsonl"))
+        );
+    }
+
+    /// **省略時は最新のセッションを選び、ポリシーエディタの記録は拾わない。**
+    /// 名前を問わず最新のフォルダを選んでいた頃は、`policy-editor-*`のログを
+    /// 会話セッションのものとして出していた。
+    #[test]
+    fn the_latest_session_is_chosen_and_policy_editor_recordings_are_skipped() {
+        let ws = tempfile::tempdir().unwrap();
+        sandbox_subdir(ws.path(), "audit-session-older");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let newer = sandbox_subdir(ws.path(), "audit-session-newer");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        sandbox_subdir(ws.path(), "policy-editor-4242-1700000000-1");
+
+        assert_eq!(
+            net_audit_path(ws.path(), None, None),
+            Some(newer.join("net-audit.jsonl"))
         );
     }
 

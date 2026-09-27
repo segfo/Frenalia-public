@@ -114,7 +114,7 @@ pub(crate) fn fs_audit_path(
     if let Some(path) = explicit_path {
         return Some(path.to_path_buf());
     }
-    resolve_sandbox_dir(workspace_root, session)
+    resolve_session_audit_dir(workspace_root, session)
         .map(|dir| workspace_root.join(dir).join("fs-audit.jsonl"))
 }
 

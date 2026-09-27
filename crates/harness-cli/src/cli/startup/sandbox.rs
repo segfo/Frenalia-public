@@ -25,7 +25,12 @@ pub(super) struct SandboxPrepared {
     pub(super) session: harness_engine::SessionStore,
     pub(super) session_messages: Vec<harness_core::Message>,
     pub(super) staging_mode: StagingMode,
+    /// `--staged`/`--workspace-commit`の置き場（workspace相対）。`ToolCtx.staging`へ入る。
     pub(super) sandbox_dir: Option<PathBuf>,
+    /// 監査ログの置き場（workspace相対）。**全セッションで作り、作れなかったときだけ`None`**。
+    /// `ToolCtx.staging`へは入れない——TUIと`SessionScope::is_live`が`staging.sandbox_dir`の
+    /// 有無で`Live`を判定しているので、混ぜると`Live`のセッションがステージングに見える。
+    pub(super) session_audit_dir: Option<PathBuf>,
     pub(super) read_scope: harness_core::ReadScopeConfig,
     pub(super) net_proxy: NetProxyConfig,
     pub(super) net_app: harness_core::NetAppPolicy,
@@ -134,26 +139,19 @@ pub(super) fn stage_prepare_sandbox(
     if let Some(reason) = diff_layer_root_fell_back {
         eprintln!("warning: {reason}");
     }
+    // `--staged`/`--workspace-commit`の置き場（承認待ちの変更）。`Live`とCoWでは使わない。
     let sandbox_dir = if staging_mode == StagingMode::Live {
         None
     } else {
         Some(sandbox_dir_for_session(&session.id()))
     };
-    // **ここで実際に作る。** このディレクトリは`net-audit.jsonl`/`fs-audit.jsonl`の置き場として
-    // 昇格ヘルパー（`harness-netfilterd`・`harness-policy-learnd`）へ渡され、受け取った側は
-    // D-44の検証で`canonicalize`する——存在しないパスは正規化できないので**起動が失敗する**。
-    // 監査ログの書き手はどちらも「最初の1件を書くときに親を`create_dir_all`する」遅延作成
-    // （`net_proxy.rs`の`push`）なので、新規ワークスペースでは検証の時点でまだ存在しない。
-    // その結果`--net-allow-domain`はWFPを起動できずfail-closed（通信が一切できない）になり、
-    // `--policy-learn`は収集器を起動できずに黙って無効化されていた。
-    // 遅延作成に頼れるのは書き手が1人のときだけで、**パスを他プロセスへ渡す瞬間から
-    // 「存在すること」が契約になる**。
+    // 起動時に作っておくのは、書込が1件も無いまま終わったセッションでも
+    // `harness changes --session <id>`が「変更なし」と答えられるようにするため。
     if let Some(dir) = &sandbox_dir {
         let path = workspace_root.join(dir);
         if let Err(e) = std::fs::create_dir_all(&path) {
             eprintln!(
-                "warning: could not create the sandbox session directory {} ({e}); \
-                 network/FS audit sinks that depend on it will be unavailable this session",
+                "warning: could not create the staging directory {} ({e})",
                 path.display()
             );
         }
@@ -222,11 +220,7 @@ pub(super) fn stage_prepare_sandbox(
         eprintln!("error: invalid network domain policy: {e}");
         return Err(ExitCode::FAILURE);
     }
-    if net_proxy.audit_log_path.is_none() {
-        if let Some(dir) = &sandbox_dir {
-            net_proxy.audit_log_path = Some(workspace_root.join(dir).join("net-audit.jsonl"));
-        }
-    }
+    let session_audit_dir = prepare_audit_sinks(&workspace_root, &session.id(), &mut net_proxy);
 
     // アプリ単位network制御（軸1、D-10/D-11）。CLI `--net-allow-app`（繰り返し）と
     // `.harness/settings.json`の`net.allow_apps`を和集合でマージする（重複除去、net_proxyと同形）。
@@ -509,6 +503,7 @@ pub(super) fn stage_prepare_sandbox(
         session_messages,
         staging_mode,
         sandbox_dir,
+        session_audit_dir,
         read_scope,
         net_proxy,
         net_app,
@@ -522,6 +517,49 @@ pub(super) fn stage_prepare_sandbox(
         mcp_decls,
         mcp_gates,
     })
+}
+
+/// このセッションの監査ログの置き場を作り、通信の監査ログの書込先をそこへ向ける。
+/// 戻り値は置き場（workspace相対）で、`--policy-learn`の収集先もここから導く。
+///
+/// **書込の捕まえ方（`StagingMode`・`WorkspaceWriteMode`）を引数に取らない**——それが
+/// D-90 反転の前提(3)の中身である。かつては`--staged`の置き場を兼ねていたため、既定とCoWでは
+/// 作られず、`--policy-learn`は収集先を持てずに無効になり、通信の監査ログも残らなかった。
+///
+/// **ここで実際に作る。** このディレクトリは`net-audit.jsonl`/`fs-audit.jsonl`の置き場として
+/// 昇格ヘルパー（`harness-netfilterd`・`harness-policy-learnd`）へ渡され、受け取った側は
+/// D-44の検証で`canonicalize`する——存在しないパスは正規化できないので**起動が失敗する**。
+/// 遅延作成に頼れるのは書き手が1人のときだけで、**パスを他プロセスへ渡す瞬間から
+/// 「存在すること」が契約になる**。
+///
+/// **作れなかったら`None`を返し、書込先も設定しない。** 設定すると`netfilterd`が規則の適用ごと
+/// 失敗して通信が全部止まる（監査ログが無いだけで済んでいたものが、通信の遮断になる）。
+///
+/// 名前は**起動時のセッションID**で決まる。起動時のピッカー・`/sessions`・`/fork`の後では
+/// 会話のセッションIDと一致しない——監査ログはプロセスの持ち物で、会話の持ち物ではない
+/// （`session_scope`の`is_excluded_from_overlay_copy`のdoc）。
+fn prepare_audit_sinks(
+    workspace_root: &Path,
+    session_id: &str,
+    net_proxy: &mut NetProxyConfig,
+) -> Option<PathBuf> {
+    let dir = match harness_sandbox::session_scope::prepare_session_audit_dir(
+        workspace_root,
+        session_id,
+    ) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!(
+                "warning: {e}; network/FS audit logs (and --policy-learn) are unavailable this \
+                 session"
+            );
+            return None;
+        }
+    };
+    if net_proxy.audit_log_path.is_none() {
+        net_proxy.audit_log_path = Some(workspace_root.join(&dir).join("net-audit.jsonl"));
+    }
+    Some(dir)
 }
 
 /// [D-63] 宣言値から**ACEを実際に付けるオブジェクト**を求め、workspace基準で絶対化する。
@@ -662,5 +700,68 @@ fn cow_gc_policy() -> harness_sandbox::tier2a::workspace_ledger::CowGcPolicy {
     let settings = harness_config::user_cow_gc_settings();
     harness_sandbox::tier2a::workspace_ledger::CowGcPolicy {
         protect_network_volumes: settings.protect_network_volumes(),
+    }
+}
+
+#[cfg(test)]
+mod audit_sink_tests {
+    use super::*;
+
+    /// **監査の置き場は、書込の捕まえ方に関係なく`audit-<id>`に作られ、通信の監査ログはそこへ向く。**
+    /// `prepare_audit_sinks`は書込モードを引数に取らないので、Live・CoW・stagedの3通りで
+    /// 同じ結果になる（その3通りを1本で覆えるのは、分岐が無いからである）。
+    #[test]
+    fn the_audit_dir_is_created_and_the_net_audit_log_points_into_it() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut net_proxy = NetProxyConfig::default();
+
+        let dir = prepare_audit_sinks(ws.path(), "session-1", &mut net_proxy)
+            .expect("the audit dir is created");
+
+        assert_eq!(
+            dir,
+            PathBuf::from(".harness")
+                .join("sandbox")
+                .join("audit-session-1")
+        );
+        assert!(ws.path().join(&dir).is_dir());
+        assert_eq!(
+            net_proxy.audit_log_path,
+            Some(ws.path().join(&dir).join("net-audit.jsonl"))
+        );
+    }
+
+    /// **作れなかったら、どこへも渡さない。** 存在しないシンクを`netfilterd`へ渡すと、
+    /// 規則の適用ごと失敗して通信が全部止まる。
+    #[test]
+    fn when_the_audit_dir_cannot_be_created_no_sink_is_handed_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        // ワークスペースの場所にファイルを置くと、その下にはフォルダを作れない。
+        let not_a_dir = tmp.path().join("ws");
+        std::fs::write(&not_a_dir, "").unwrap();
+        let mut net_proxy = NetProxyConfig::default();
+
+        assert_eq!(
+            prepare_audit_sinks(&not_a_dir, "session-1", &mut net_proxy),
+            None
+        );
+        assert_eq!(net_proxy.audit_log_path, None);
+    }
+
+    /// **空なら後始末で消え、何か書かれていれば残る**（作る関数と対）。
+    #[test]
+    fn an_empty_audit_dir_is_removed_and_a_used_one_is_kept() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut net_proxy = NetProxyConfig::default();
+        let empty = prepare_audit_sinks(ws.path(), "session-empty", &mut net_proxy).unwrap();
+        let used = prepare_audit_sinks(ws.path(), "session-used", &mut net_proxy).unwrap();
+        let log = ws.path().join(&used).join("net-audit.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+
+        harness_sandbox::session_scope::remove_session_audit_dir_if_empty(ws.path(), &empty);
+        harness_sandbox::session_scope::remove_session_audit_dir_if_empty(ws.path(), &used);
+
+        assert!(!ws.path().join(&empty).exists());
+        assert!(log.is_file(), "書かれた監査ログを消した");
     }
 }

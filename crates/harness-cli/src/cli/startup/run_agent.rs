@@ -30,6 +30,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         session_messages,
         staging_mode,
         sandbox_dir,
+        session_audit_dir,
         read_scope,
         mut net_proxy,
         net_app,
@@ -547,12 +548,15 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
             Some(String::new()) // 明示的に無効。警告は出さない
         } else if shell_tier.tier != harness_core::ShellTier::Tier2a {
             Some(format!(
-                "--policy-learn only collects denials from Tier2a (AppContainer) child                  processes; this session is running at {}, so nothing will be collected",
+                "--policy-learn only collects denials from Tier2a (AppContainer) child \
+                 processes; this session is running at {}, so nothing will be collected",
                 shell_tier.tier.label()
             ))
-        } else if sandbox_dir.is_none() {
+        } else if session_audit_dir.is_none() {
+            // 置き場を作れなかった理由は起動時（`stage_prepare_sandbox`）に出してある。
             Some(
-                "--policy-learn could not resolve a sandbox session directory to write                  fs-audit.jsonl into; collection is disabled this session"
+                "--policy-learn has no session audit directory to write fs-audit.jsonl into \
+                 (see the warning above); collection is disabled this session"
                     .to_string(),
             )
         } else {
@@ -567,7 +571,11 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
             None
         } else {
             let sink = workspace_root
-                .join(sandbox_dir.as_ref().expect("checked in disabled_reason"))
+                .join(
+                    session_audit_dir
+                        .as_ref()
+                        .expect("checked in disabled_reason"),
+                )
                 .join("fs-audit.jsonl");
             let policy = LearnPolicy {
                 session_profile: harness_sandbox::tier2a::session_profile::current_profile_name(),
@@ -832,6 +840,15 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 eprintln!("warning: failed to cleanly tear down the policy-learning collector: {e}")
             }
         }
+    }
+
+    // 監査ログの置き場は全セッションで作る（`stage_prepare_sandbox`）。**何も書かれなかったら
+    // ここで消す**——通信の方針も`--policy-learn`も無い普段のセッションでは空のまま終わるので、
+    // 残すと起動のたびに空のフォルダが1つずつ増え、Tier2aの起動ごとに走る`.harness/**`の
+    // 保護の対象も増え続ける。書き手（WFP・収集器）を全部止めた後でなければならない。
+    // ここへ到達せずに落ちた回は空のまま残るが、中身が無いので害は無い。
+    if let Some(dir) = &session_audit_dir {
+        harness_sandbox::session_scope::remove_session_audit_dir_if_empty(&workspace_root, dir);
     }
 
     // D-37: このセッションのAppContainerプロファイルと、それ宛に付けたACEを撤収する。

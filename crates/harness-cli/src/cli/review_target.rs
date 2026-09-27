@@ -26,18 +26,20 @@ pub(crate) fn production_cow_roots() -> Vec<PathBuf> {
 }
 
 /// `--session <id>`（省略時は最新）から、そのセッションが使ったオーバーレイ置き場を解決する。
-/// `--staged`置き場（workspace内`.harness/sandbox/<id>`）を先に試し、無ければ`--sandbox tier2a-cow`置き場
-/// （workspace外CoW 差分層ディレクトリ、Windows専用）を試す——1セッションは常にどちらか
-/// 一方でしか起動されないため、両方見つかることはない。**その保証はclapの`conflicts_with_all`
-/// ではなく`setup::resolve_staging_mode_checked`の実行時拒否が持つ**（値依存の排他はclapでは
-/// 宣言できないので実行時へ移した）。正しさの論証を、もう存在しない宣言に預けないこと。
+/// `--staged`置き場（workspace内`.harness/sandbox/session-<id>`）を先に試し、無ければ
+/// `--sandbox tier2a-cow`置き場（workspace外CoW 差分層ディレクトリ、Windows専用）を試す。
+///
+/// **「`session-<id>/`がある＝`--staged`のセッション」が成り立つのは、そこを作るのが
+/// `--staged`だけだからである。** 監査ログの置き場は全セッションで作るが、名前が違う
+/// （`audit-<id>/`、`session_scope::session_audit_dir`）。同じ名前にすると、CoWやLiveの
+/// セッションまで`--staged`と読まれる。
 /// どちらも見つからなければ`None`。
 pub(crate) fn resolve_session_overlay_in(
     workspace_root: &Path,
     session: Option<&str>,
     cow_roots: &[PathBuf],
 ) -> Option<(StagingConfig, Option<PathBuf>)> {
-    if let Some(sandbox_dir) = resolve_sandbox_dir(workspace_root, session) {
+    if let Some(sandbox_dir) = resolve_staged_overlay_dir(workspace_root, session) {
         if workspace_root.join(&sandbox_dir).exists() {
             return Some((
                 StagingConfig {
@@ -53,3 +55,21 @@ pub(crate) fn resolve_session_overlay_in(
     }
     None
 }
+
+/// `--staged`の置き場（workspace相対）。省略時は`session-*`の中で更新時刻が最新のもの。
+///
+/// **名前で絞る。** `.harness/sandbox/`には監査ログの置き場（`audit-*`）やポリシーエディタの
+/// 記録（`policy-editor-*`）も並ぶ（`setup::sandbox_subdirs_named`のdoc）。
+fn resolve_staged_overlay_dir(workspace_root: &Path, session: Option<&str>) -> Option<PathBuf> {
+    if let Some(id) = session {
+        return Some(sandbox_dir_for_session(&normalize_session_id(id)));
+    }
+    sandbox_subdirs_named(workspace_root, "session-")
+        .into_iter()
+        .max_by_key(|(_, t)| *t)
+        .map(|(name, _)| sandbox_dir_for_session(&name))
+}
+
+#[cfg(test)]
+#[path = "review_target_tests.rs"]
+mod tests;
