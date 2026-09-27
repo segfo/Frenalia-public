@@ -155,6 +155,38 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "the_git_config_trap_chain_is_judged_across_domains",
         ],
     ),
+    // [段5（T-D）] いまの`--sandbox tier2a-cow`で1セッション回したとき、変更一覧に何が何件出るかを
+    // 分類ごとに数える（`plans/PLAN-COW-AS-DEFAULT.md` 段5・合格基準P1〜P6。段7が同じ的を撃ち直す）。
+    // mockの腕と実プロバイダの腕を**別の的**にしてある（1要素＝1測定）——実プロバイダの腕は
+    // LMStudioの起動が前提で、`e2e-live` featureを立てたときしかコンパイルされない。
+    (
+        "e2e-cow-change-census",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "tier2a_cow_change_census_mock",
+        ],
+    ),
+    (
+        "e2e-cow-change-census-live",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-live",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "tier2a_cow_change_census_lmstudio",
+        ],
+    ),
     // [§S73の宿題] 遷移先ドメインが呼び出し元より**狭い**ことを測る。§S73が測れたのは
     // 「別のドメインとして判定された」までで、**権限が狭いことは1度も測っていなかった**
     // ——遷移先は宣言を持たないので、積まれるのはセッション共通の土台だけだからである。

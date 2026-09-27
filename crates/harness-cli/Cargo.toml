@@ -18,6 +18,12 @@ path = "src/main.rs"
 # Recall E2Eが記憶の置き場を実`%APPDATA%`から一時ディレクトリへ逃がすため
 # （`HARNESS_TEST_RECALL_DATA_ROOT`）。
 e2e-mock = ["harness-cognition/e2e-test-hooks"]
+# 実プロバイダ（ローカルのLMStudio）を呼ぶ試験（`tests/tier2a_e2e.rs`の
+# `tier2a_cow_change_census_lmstudio`、段5の測定の実モデルの腕）専用。**試験だけが参照し、
+# `src/`からは参照しない**ので、立てても`harness.exe`は1ビットも変わらない。
+# `e2e-mock`と分けてあるのは、`e2e-all`（`e2e-mock`だけを立てる全件実行）を
+# LMStudioが無い機でも回せるようにするため。
+e2e-live = ["e2e-mock"]
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }

@@ -1,7 +1,9 @@
 //! Tier2a（AppContainer）のout-of-process E2E回帰テスト。CoWコミット粒度とネットワーク
 //! ドメインポリシーの強制機構を、実`harness.exe`（`env!(CARGO_BIN_EXE_harness)`）を起動して
-//! 検証する。LLM推論は一切使わない（`--provider mock`、`harness_providers::MockProvider`が
-//! 台本化された`run_shell`呼び出しを返す）。
+//! 検証する。LLM推論は使わない（`--provider mock`、`harness_providers::MockProvider`が
+//! 台本化された道具呼び出しを返す）。**例外は1本だけ**——段5の測定の実プロバイダの腕
+//! （`tier2a_cow_change_census_lmstudio`）がローカルのLMStudioを呼ぶ。これは`e2e-live`
+//! featureの下でしかコンパイルされず、`e2e-all`（`e2e-mock`だけを立てる）には入らない。
 //!
 //! 実行方法・前提条件は`docs/DEV-ENVIRONMENT.md`「Tier2a E2Eテストの実行方法」参照。
 //! 実AppContainer・実CoW 差分層ディレクトリ・（ネット側は）実インターネット到達性を使う
@@ -182,6 +184,10 @@ struct HarnessRun {
     stdout: String,
     stderr: String,
     record_path: PathBuf,
+    /// 起動の期限（[`Driver::Lmstudio`]の`deadline`）を過ぎて、こちらから止めたか。
+    /// **止めた回の`status`は失敗だが、製品が失敗したのではない**——読む側が取り違えないよう
+    /// 別の欄にしてある。mock の起動は期限を持たないので常に`false`。
+    timed_out: bool,
 }
 
 /// 実`harness.exe`を`--provider mock`で起動する（Q1〜Q2: out-of-process統一、
@@ -265,9 +271,53 @@ fn run_harness_full(
     // **既定は`&[]`で、渡さない呼び出しの挙動は1ビットも変わらない。**
     env: &[(&str, String)],
 ) -> HarnessRun {
-    // **CoWセッションを作る唯一の入口**（BUG-135）。この関数が唯一であることは数えてある
-    // ——このファイルで`--sandbox`を渡すのは16箇所で、16箇所すべてが`run_harness`／
-    // `run_harness_with_exe`経由でここへ来る。`harness.exe`を直に起動している他の箇所は
+    run_harness_driven(
+        exe,
+        cwd_arg,
+        cwd_for_process,
+        Driver::Mock(turns),
+        extra_args,
+        case_name,
+        env,
+    )
+}
+
+/// 起こす`harness.exe`の**モデル側**。台本（mock）か、実プロバイダ（LMStudio）か。
+///
+/// 実プロバイダの腕は段5の測定（[`tier2a_cow_change_census_lmstudio`]）の1本だけが使う。
+/// このファイルの他のテストは全部`Mock`で、LLM推論を使わない。
+enum Driver<'a> {
+    Mock(&'a [Vec<StreamEvent>]),
+    /// **呼び出し側の環境変数は昇格デーモン配下の試験へ届かない**ので、接続先とモデル名は
+    /// 引数で渡す（`OPENAI_BASE_URL`等に頼らない）。
+    Lmstudio {
+        base_url: &'a str,
+        model: &'a str,
+        prompt: &'a str,
+        /// 期限を過ぎたら子を止めて[`HarnessRun::timed_out`]を立てる。`dev-elevated-run`の
+        /// クライアントは応答を20分しか待たず、しかも cargo が終わるまで何も返さないので、
+        /// 期限が無いと**途中までの結果ごと失う**。
+        deadline: std::time::Duration,
+    },
+}
+
+/// **CoWセッションを作る唯一の入口**（BUG-135）。[`run_harness_full`]も[`Driver`]を
+/// 足しただけの包みで、ゲートはここにしか無い。
+fn run_harness_driven(
+    exe: &Path,
+    cwd_arg: &str,
+    cwd_for_process: Option<&Path>,
+    driver: Driver<'_>,
+    extra_args: &[&str],
+    case_name: &str,
+    env: &[(&str, String)],
+) -> HarnessRun {
+    // この関数が唯一であることは数えてある——このファイルで`"--sandbox"`を含む行は22行で、
+    // 22行すべてが`run_harness`系（→[`run_harness_full`]）か段5の測定（[`run_census`]）を
+    // 経由してここへ来る（数え方: `grep -n '"--sandbox"' tier2a_e2e.rs`からこのコメントの2行を
+    // 除く。22行のうち2行はゲートの歯のテスト自身——mockの入口と[`Driver::Lmstudio`]の入口）。
+    // 2026-09-27に数え直した（分割前のこのコメントは「16箇所」で、既に古くなっていた）。
+    // `harness.exe`を直に起動している他の箇所は
     // 既存セッションを操作するサブコマンド（`apply`・`changes`・`discard`等）で、
     // `--sandbox`を渡さない＝差分層を新規に作らない。
     if extra_args.iter().any(|a| a.contains("tier2a-cow")) {
@@ -275,19 +325,37 @@ fn run_harness_full(
     }
 
     let scratch = scratch_dir();
-    let turns_path = scratch.join(format!("{case_name}-turns.json"));
     let record_path = scratch.join(format!("{case_name}-requests.jsonl"));
     let _ = std::fs::remove_file(&record_path);
-    std::fs::write(&turns_path, serde_json::to_string(turns).unwrap()).expect("write turns file");
 
     let mut cmd = Command::new(exe);
+    let turns_path = scratch.join(format!("{case_name}-turns.json"));
+    // 引数の並びは`Mock`について分割前と1つも変えていない（プロバイダ → 共通 → `-p` → 規則 → 呼び出し側）。
+    match &driver {
+        Driver::Mock(_) => {
+            cmd.args([
+                "--provider",
+                "mock",
+                "--mock-turns",
+                turns_path.to_str().unwrap(),
+                "--mock-record-requests",
+                record_path.to_str().unwrap(),
+            ]);
+        }
+        Driver::Lmstudio {
+            base_url, model, ..
+        } => {
+            cmd.args([
+                "--provider",
+                "lmstudio",
+                "--base-url",
+                *base_url,
+                "--model",
+                *model,
+            ]);
+        }
+    }
     cmd.args([
-        "--provider",
-        "mock",
-        "--mock-turns",
-        turns_path.to_str().unwrap(),
-        "--mock-record-requests",
-        record_path.to_str().unwrap(),
         "--cwd",
         cwd_arg,
         "--permission-mode",
@@ -295,10 +363,25 @@ fn run_harness_full(
         "--dangerously-allow",
         "--output-format",
         "json",
-        "-p",
-        "(scripted; prompt text is ignored by the mock provider)",
     ]);
-    cmd.args(scripted_shell_rule_args(turns));
+    let deadline = match &driver {
+        Driver::Mock(turns) => {
+            std::fs::write(&turns_path, serde_json::to_string(turns).unwrap())
+                .expect("write turns file");
+            cmd.args([
+                "-p",
+                "(scripted; prompt text is ignored by the mock provider)",
+            ]);
+            cmd.args(scripted_shell_rule_args(turns));
+            None
+        }
+        Driver::Lmstudio {
+            prompt, deadline, ..
+        } => {
+            cmd.args(["-p", *prompt]);
+            Some(*deadline)
+        }
+    };
     cmd.args(extra_args);
     // Recall（`plans/PLAN-RECALL-MEMORY.md`）の記憶ディレクトリをケース専用のscratchへ逃がす。
     // `--cognition always`で回すケース（`run_cognition_harness`）はゴール完了時に
@@ -316,13 +399,66 @@ fn run_harness_full(
     if let Some(dir) = cwd_for_process {
         cmd.current_dir(dir);
     }
-    let output = cmd.output().expect("failed to spawn harness.exe");
+    let Some(deadline) = deadline else {
+        let output = cmd.output().expect("failed to spawn harness.exe");
+        return HarnessRun {
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            record_path,
+            timed_out: false,
+        };
+    };
+    let (status, stdout, stderr, timed_out) = wait_with_deadline(cmd, deadline);
     HarnessRun {
-        status: output.status,
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        status,
+        stdout,
+        stderr,
         record_path,
+        timed_out,
     }
+}
+
+/// 子を起こし、期限までに終わらなければ止める。**stdout と stderr は別スレッドで読み切る**
+/// ——片方の管が詰まると子が書込で止まり、期限まで「終わらない」ように見えるため。
+fn wait_with_deadline(
+    mut cmd: Command,
+    deadline: std::time::Duration,
+) -> (std::process::ExitStatus, String, String, bool) {
+    use std::io::Read;
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn harness.exe");
+    let mut out_pipe = child.stdout.take().expect("piped stdout");
+    let mut err_pipe = child.stderr.take().expect("piped stderr");
+    let out_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = out_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = err_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let started = std::time::Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll harness.exe") {
+            break status;
+        }
+        if started.elapsed() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait().expect("reap harness.exe after kill");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    };
+    let stdout = String::from_utf8_lossy(&out_reader.join().unwrap_or_default()).to_string();
+    let stderr = String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).to_string();
+    (status, stdout, stderr, timed_out)
 }
 
 /// モックへ実際に送信された`CompletionRequest`を読み、BUG-030型
@@ -392,9 +528,63 @@ impl Outcome {
         self.0["result"].as_str().unwrap_or_default()
     }
 
+    /// 道具呼び出しを**1件ずつ、欄を分けたまま**返す（段5の測定が、手順の各段が踏まれたかを
+    /// 照合するのに使う）。入力（`input`）と子の出力（`result`）を**別の欄のまま**渡すので、
+    /// 片方を探したつもりでもう片方に当たる形（BUG-137）にならない。
+    fn tool_call_views(&self) -> Vec<ToolCallView> {
+        self.0["tool_calls"]
+            .as_array()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .map(|c| ToolCallView {
+                        name: c["name"].as_str().unwrap_or_default().to_string(),
+                        input: c["input"].clone(),
+                        decision: c["decision"].as_str().unwrap_or_default().to_string(),
+                        result: c["result"].as_str().unwrap_or_default().to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 縮退ガードが捨てたLLMコールの数（`JsonOutcome::discarded_turns`）。
+    fn discarded_turns(&self) -> u64 {
+        self.0["discarded_turns"].as_u64().unwrap_or(0)
+    }
+
     // 生JSONを返すメソッドは**置かない**。いま誰も要らないうえ、置けば
     // `raw().to_string().contains(..)`でBUG-137がそのまま復活する口になる。
     // 必要になった時点で、用途を限定した名前のメソッドとして足すこと。
+}
+
+/// [`Outcome::tool_call_views`]の1件。
+struct ToolCallView {
+    name: String,
+    input: serde_json::Value,
+    /// `"allowed"`・`"denied"`・`"invalid"`（`JsonToolCall::decision`）。
+    decision: String,
+    result: String,
+}
+
+impl ToolCallView {
+    /// 道具が成功したか。`run_program`は結果末尾の`[exit code: N]`（**最後に出たもの**——
+    /// 子が同じ綴りを印字しても、ハーネスのフッタは必ずその後ろに付く）、`write_file`は
+    /// `wrote `で始まること。判定に進まなかった・拒否された呼び出しは成功ではない。
+    fn succeeded(&self) -> bool {
+        if self.decision != "allowed" {
+            return false;
+        }
+        match self.name.as_str() {
+            "run_program" => self
+                .result
+                .rfind("[exit code: ")
+                .map(|i| self.result[i..].starts_with("[exit code: 0]"))
+                .unwrap_or(false),
+            "write_file" => self.result.starts_with("wrote "),
+            _ => false,
+        }
+    }
 }
 
 fn parse_json_stdout(run: &HarnessRun) -> Result<Outcome, String> {
@@ -551,6 +741,28 @@ fn starting_a_cow_session_without_the_exclusive_guard_fails_before_spawning() {
         &[],
         &["--sandbox", "tier2a-cow"],
         "guard-probe-must-never-spawn",
+        &[],
+    );
+}
+
+/// 上と同じ歯を、**実プロバイダの腕**（[`Driver::Lmstudio`]）でも立てる。入口を割ったので、
+/// 「mock の包みを通ったときだけゲートが効く」形に戻っていないことを固定する（B-06）。
+/// 検査は起動より前にあるので、LMStudio も`harness.exe`も要らない。
+#[test]
+#[should_panic(expected = "BUG-135")]
+fn starting_a_live_cow_session_without_the_exclusive_guard_fails_before_spawning() {
+    let _ = run_harness_driven(
+        &harness_exe(),
+        CASE_ROOT,
+        None,
+        Driver::Lmstudio {
+            base_url: LMSTUDIO_BASE_URL,
+            model: "guard-probe-model",
+            prompt: "guard probe",
+            deadline: std::time::Duration::from_secs(1),
+        },
+        &["--sandbox", "tier2a-cow"],
+        "guard-probe-live-must-never-spawn",
         &[],
     );
 }
@@ -2017,6 +2229,1343 @@ fn git_commit_under_cow_probe(ex: &CowExclusive) -> Result<(), String> {
     println!("{evidence:#}\n--- diff_layer/_git-log.txt ---\n{git_log}");
     cleanup_on_success(&ws, &[&session], "cow-git-injection");
     Ok(())
+}
+
+// ============================================================================
+// 段5: CoWセッション1本の変更一覧を、分類ごとに数える
+// （`plans/PLAN-COW-AS-DEFAULT.md` 段5・合格基準P1〜P6、`plans/handoff/cow-followup/INDEX.md` T-D）
+// ============================================================================
+//
+// **何のための測定か。** CoWを既定にする前に、段6で「一覧のまとめ方」と「ignoreの扱い」を
+// 決める。その入力は「いまCoWセッションを1本回すと、変更一覧（`harness changes`）に何が何件出るか」
+// で、これは一度も測られていなかった。段7は**この試験を撃ち直して**合格基準P1〜P6を判定する。
+//
+// **数える軸は合格基準P1〜P6が見る軸**——`.git`成分を含むパス（P1）／中身の変わらないコピー（P2）／
+// ignoreされた生成物（P6）／それ以外。**製品の分類（`ChangeEntry::category`）は使わない**:
+// 製品は`.git/config`・`.git/hooks/**`を`config_injection`へ入れるので、`git_internal`だけを
+// 数えると`.git`成分を数え漏らす。計器は製品から独立に作る（同じ源から出た2つを突き合わせても
+// 検算にならない）。
+//
+// **手順は[`CENSUS_STEPS`]の1つの表にだけ書く。** mockの台本・実モデルへの指示文・
+// 「その段を踏んだか」の照合は、全部この表から作る——2本の腕が同じ手順であることを、
+// 書き写しではなく作りで保証するため。手順が`run_shell`を使わないのは、人のいない`accept-all`
+// では完全一致の規則が無い`run_shell`が全部拒否され（D-102）、実モデルが自分で書く行は
+// 1本も通らないから。`run_program`（gitを直接起動）と`write_file`は規則無しで通る。
+//
+// **限界（同じ場所で言う）**: 小さなリポジトリで1コミットだけの手順なので、件数の絶対値は
+// 実際のセッション（ビルドで何千件の生成物が出る等）を代表しない。読むのは「どの分類が出るか」と
+// 分類どうしの関係である。人が見る一覧のうち測るのはCLI（JSONとテキスト）だけで、TUIの変更パネルは
+// 測らない。ワークスペース外への書込（`_ext`）と`run_shell`経由の書込は手順に入れていない。
+
+/// LMStudio（`docs/DEV-ENVIRONMENT.md`「手動E2E用ローカルLMStudioサーバ」）。
+#[cfg(feature = "e2e-live")]
+const LMSTUDIO_ORIGIN: &str = "http://localhost:1234";
+const LMSTUDIO_BASE_URL: &str = "http://localhost:1234/v1";
+
+/// 実モデルの腕の既定モデル。`docs/DEV-ENVIRONMENT.md`が手動E2E用に名指しするモデル
+/// （`qwen3.6-35b-a3b-uncensored-genesis-v2-apex-mtp`）の、LMStudio上の現在のid。
+#[cfg(feature = "e2e-live")]
+const CENSUS_LIVE_DEFAULT_MODEL: &str = "luffythefox/qwen3.6-35b-a3b-uncensored-genesis-v2-apex-mtp-gguf/qwen3.6-35b-a3b-uncensored-genesis-mtp-apex.gguf";
+
+/// 実モデルの腕のモデルを差し替えるファイル（1行にモデルid）。**環境変数は昇格デーモン配下の
+/// 試験へ届かない**ので、ファイルで渡す（`n8-smb445-layer2`の`n8-smb-host.txt`と同じ形）。
+#[cfg(feature = "e2e-live")]
+const CENSUS_LIVE_MODEL_FILE: &str = r"C:\harness-e2e\cow-census-live-model.txt";
+
+/// 実モデルの腕の期限。`dev-elevated-run`のクライアントは20分しか待たない。
+const CENSUS_LIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(14 * 60);
+
+/// 段9で**同じ中身のまま**書き直すファイルの中身。種付けと段9の両方がこの1つの定数を使う
+/// ——片方だけ書き換えると「中身の変わらないコピー」の対照が黙って崩れるため。
+const CENSUS_GUIDE_TXT: &str = "guide: the agent rewrites this file with identical bytes\n";
+
+/// 種付けするファイル（改行はLFだけ。`core.autocrlf`で中身が変わらないように）。
+const CENSUS_SEED: &[(&str, &str)] = &[
+    ("README.md", "census seed\n"),
+    ("notes.txt", "this file is deleted by the agent\n"),
+    ("src/lib.txt", "fn original() {}\n"),
+    ("docs/guide.txt", CENSUS_GUIDE_TXT),
+    (".gitignore", "target/\n"),
+];
+
+/// 手順の1段。
+enum CensusStep {
+    /// `git -c safe.directory=* <args…>`を`run_program`で起こす。`safe.directory`は計器側の都合
+    /// ——昇格した試験が作ったワークスペースは所有者がAdministratorsになり、サンドボックスの子の
+    /// gitが「dubious ownership」で止まる（`plans/net-spike/RESULTS.md` N8-M1-iと同じ）。
+    Git(&'static [&'static str]),
+    /// `write_file`で書く。
+    Write {
+        path: &'static str,
+        content: &'static str,
+    },
+}
+
+/// 手順。**mockの台本・実モデルへの指示文・踏んだかの照合の3つを、ここからだけ作る。**
+/// 右の注記は、その段が変更一覧のどの分類を作るつもりか。
+const CENSUS_STEPS: &[CensusStep] = &[
+    // 1: .git（HEAD・refs・reflog）
+    CensusStep::Git(&["switch", "-c", "feature"]),
+    // 2・3: それ以外（この後コミットする作業ツリーの変更）
+    CensusStep::Write {
+        path: "src/lib.txt",
+        content: "fn original() {}\nfn added_by_agent() {}\n",
+    },
+    CensusStep::Write {
+        path: "src/new.txt",
+        content: "new file committed by the agent\n",
+    },
+    // 4: .git（index）。`add -A`は使わない——ハーネスは起動のたびに本物のワークスペースへ
+    // `.harness/`を作り、サンドボックスからの読み書きを剥がすので、全体を拾うと当たる。
+    CensusStep::Git(&["add", "--", "src/lib.txt", "src/new.txt"]),
+    // 5: .git（ゆるいオブジェクト・ref）。種付けで全部packへ畳んであるので、gitがpackの
+    // 時刻だけを更新しに来れば「中身の変わらないコピー」が.gitの中に出る（出るかは観測）。
+    CensusStep::Git(&[
+        "-c",
+        "user.name=e2e",
+        "-c",
+        "user.email=e2e@example.com",
+        "commit",
+        "-q",
+        "-m",
+        "census: agent commit",
+    ]),
+    // 6・7・8: それ以外（コミットしない変更: 変更・未追跡の新規・削除）
+    CensusStep::Write {
+        path: "README.md",
+        content: "census seed\nedited but not committed\n",
+    },
+    CensusStep::Write {
+        path: "scratch.txt",
+        content: "untracked scratch file\n",
+    },
+    CensusStep::Git(&["rm", "-q", "notes.txt"]),
+    // 9: 中身の変わらないコピー（何も変えなかった整形器の模擬）
+    CensusStep::Write {
+        path: "docs/guide.txt",
+        content: CENSUS_GUIDE_TXT,
+    },
+    // 10・11: ignoreされた生成物（ホスト側の書込と、子プロセスの書込の両方）
+    CensusStep::Write {
+        path: "target/debug/build.log",
+        content: "build output (ignored)\n",
+    },
+    CensusStep::Git(&["archive", "--format=tar", "-o", "target/debug/app.tar", "HEAD"]),
+];
+
+/// 段の道具呼び出し（道具名と入力）。台本・指示文・照合の3つが共有する。
+fn census_step_call(step: &CensusStep) -> (&'static str, serde_json::Value) {
+    match step {
+        CensusStep::Git(args) => {
+            let mut argv = vec!["-c".to_string(), "safe.directory=*".to_string()];
+            argv.extend(args.iter().map(|a| a.to_string()));
+            (
+                "run_program",
+                serde_json::json!({ "program": "git", "args": argv }),
+            )
+        }
+        CensusStep::Write { path, content } => (
+            "write_file",
+            serde_json::json!({ "path": path, "content": content }),
+        ),
+    }
+}
+
+/// gitの引数列から副コマンドを取り出す（`-c <値>`を読み飛ばした最初の、`-`で始まらない語）。
+fn git_subcommand(args: &[String]) -> Option<&str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "-c" || a == "-C" {
+            it.next();
+            continue;
+        }
+        if !a.starts_with('-') {
+            return Some(a.as_str());
+        }
+    }
+    None
+}
+
+fn census_mock_turns() -> Vec<Vec<StreamEvent>> {
+    let mut turns: Vec<Vec<StreamEvent>> = CENSUS_STEPS
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let (tool, input) = census_step_call(step);
+            tool_use_turn(&format!("call_{}", i + 1), tool, input)
+        })
+        .collect();
+    turns.push(end_turn("done"));
+    turns
+}
+
+/// 実モデルへ渡す指示文。**各段の道具と入力を、台本と同じJSONのまま**並べる。
+fn census_live_prompt() -> String {
+    let mut prompt = format!(
+        "This is a scripted measurement of the sandbox, not a coding task. Perform exactly the \
+         following {} steps, in order, one tool call per step, using exactly the tool and the \
+         arguments given as JSON. Do not call any other tool, do not use run_shell, do not read or \
+         verify anything between steps, and do not retry a step that fails. After the last step, \
+         reply with the single word DONE.\n\n",
+        CENSUS_STEPS.len()
+    );
+    for (i, step) in CENSUS_STEPS.iter().enumerate() {
+        let (tool, input) = census_step_call(step);
+        prompt.push_str(&format!("Step {}: call `{tool}` with {input}\n", i + 1));
+    }
+    prompt
+}
+
+/// 道具呼び出しが手順の段に当たるか。**厳密**（mock）は道具名と入力の完全一致、
+/// **緩い**（実モデル）は道具名と、gitなら副コマンド・書込ならパスの一致。
+fn census_call_matches(step: &CensusStep, call: &ToolCallView, strict: bool) -> bool {
+    let (tool, input) = census_step_call(step);
+    if call.name != tool {
+        return false;
+    }
+    if strict {
+        return call.input == input;
+    }
+    match step {
+        CensusStep::Git(_) => {
+            let program = call.input["program"].as_str().unwrap_or_default();
+            let program_is_git = Path::new(program)
+                .file_stem()
+                .is_some_and(|s| s.eq_ignore_ascii_case("git"));
+            let args: Vec<String> = call.input["args"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            let expected: Vec<String> = input["args"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            program_is_git && git_subcommand(&args) == git_subcommand(&expected)
+        }
+        CensusStep::Write { path, .. } => {
+            call.input["path"].as_str().map(|p| p.replace('\\', "/")).as_deref() == Some(*path)
+        }
+    }
+}
+
+/// 手順の各段に、それを踏んだ呼び出しの添字を割り当てる（順序を保って前から探す）。
+/// 返り値の2つ目は、どの段にも当たらなかった呼び出しの添字。
+fn match_census_steps(
+    calls: &[ToolCallView],
+    strict: bool,
+) -> (Vec<Option<usize>>, Vec<usize>) {
+    let mut assigned = Vec::with_capacity(CENSUS_STEPS.len());
+    let mut used = vec![false; calls.len()];
+    let mut cursor = 0;
+    for step in CENSUS_STEPS {
+        let found = (cursor..calls.len()).find(|&i| census_call_matches(step, &calls[i], strict));
+        if let Some(i) = found {
+            used[i] = true;
+            cursor = i + 1;
+        }
+        assigned.push(found);
+    }
+    let extras = (0..calls.len()).filter(|&i| !used[i]).collect();
+    (assigned, extras)
+}
+
+/// 種付け: 全部をpackへ畳み、本体層のゆるいオブジェクトを0にする。そうしておくと、差分層に
+/// 出たゆるいオブジェクトはエージェントのものだと読め、packの時刻更新も観測できる（N8-M1-i）。
+fn census_seed_repo(ws: &Path) -> Result<(), String> {
+    for (rel, content) in CENSUS_SEED {
+        let path = ws.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("seed mkdir {rel}: {e}"))?;
+        }
+        std::fs::write(&path, content).map_err(|e| format!("seed write {rel}: {e}"))?;
+    }
+    plain_git(ws, &["init", "-q", "-b", "main"])?;
+    plain_git(ws, &["-c", "core.autocrlf=false", "add", "-A"])?;
+    plain_git(ws, &["-c", "core.autocrlf=false", "commit", "-q", "-m", "seed"])?;
+    plain_git(ws, &["repack", "-adq"])?;
+    plain_git(ws, &["prune"])?;
+    let loose = count_loose_git_objects(ws);
+    if loose != 0 {
+        return Err(format!(
+            "seed left {loose} loose object(s) in the real repository, so loose objects in the diff \
+             layer can no longer be read as the agent's own"
+        ));
+    }
+    Ok(())
+}
+
+/// 本物のワークスペースで、どのパスがignoreされるかを素の`git check-ignore`で判定する。
+///
+/// - **利用者全体のignore（`core.excludesFile`）は切る**——この機には`~/.config/git/ignore`が
+///   あり、混ざると「リポジトリの`.gitignore`が何を捨てるか」ではなくなる。
+///   出所が`.gitignore`以外なら誤りとして返す。
+/// - 渡すのは`.git`でない**相対**パスだけにすること（絶対パスが混ざるとgitは全体を128で落とす）。
+///   差分層でディレクトリのものは末尾`/`を付けて渡す（`target/`は「ディレクトリだけ」の規則で、
+///   本物のワークスペースにはそのディレクトリが無いため）。
+/// - 終了コードは0（1つ以上ignore）と1（1つも無い）が正常。
+fn git_check_ignore(ws: &Path, paths: &[String]) -> Result<HashSet<String>, String> {
+    use std::io::Write;
+    if paths.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut child = Command::new("git")
+        .current_dir(ws)
+        .args([
+            "-c",
+            "safe.directory=*",
+            "-c",
+            r"core.excludesFile=C:/harness-e2e/_no-such-global-excludes-file",
+            "check-ignore",
+            "-v",
+            "-n",
+            "-z",
+            "--stdin",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn git check-ignore: {e}"))?;
+    {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        let mut input = Vec::new();
+        for p in paths {
+            input.extend_from_slice(p.as_bytes());
+            input.push(0);
+        }
+        stdin
+            .write_all(&input)
+            .map_err(|e| format!("failed to feed git check-ignore: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("git check-ignore did not finish: {e}"))?;
+    match output.status.code() {
+        Some(0) | Some(1) => {}
+        other => {
+            return Err(format!(
+                "git check-ignore failed ({other:?}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+    // `-v -n -z`: 入力1件ごとに、**入力の順で** `<出所>\0<行番号>\0<パターン>\0<パス>\0`。
+    // 一致しないものは出所が空。答えは**順番で**入力へ対応付ける——gitが返すパスの綴り
+    // （末尾`/`の有無など）に頼ると、綴りが1文字違っただけで無言で取りこぼす。
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let fields: Vec<&str> = stdout.split('\0').collect();
+    let records: Vec<&[&str]> = fields.chunks(4).filter(|r| r.len() == 4).collect();
+    if records.len() != paths.len() {
+        return Err(format!(
+            "git check-ignore answered {} record(s) for {} path(s) — cannot tell which path an \
+             answer belongs to. stdout={stdout:?}",
+            records.len(),
+            paths.len()
+        ));
+    }
+    let mut ignored = HashSet::new();
+    for (asked, rec) in paths.iter().zip(records) {
+        let source = rec[0];
+        if source.is_empty() {
+            continue;
+        }
+        if source != ".gitignore" {
+            return Err(format!(
+                "{asked:?} was ignored by {source:?}, not by the repository's .gitignore — the \
+                 census would be counting a rule that is not part of the repository"
+            ));
+        }
+        ignored.insert(asked.clone());
+    }
+    Ok(ignored)
+}
+
+/// 変更一覧1件を分けた先。**排他の順序は INDEX の軸の順**（`.git` → 同一コピー → ignore → それ以外）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CensusClass {
+    GitComponent,
+    ByteIdentical,
+    Ignored,
+    Other,
+}
+
+impl CensusClass {
+    const ALL: [CensusClass; 4] = [
+        CensusClass::GitComponent,
+        CensusClass::ByteIdentical,
+        CensusClass::Ignored,
+        CensusClass::Other,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            CensusClass::GitComponent => "git_component",
+            CensusClass::ByteIdentical => "byte_identical",
+            CensusClass::Ignored => "ignored",
+            CensusClass::Other => "other",
+        }
+    }
+}
+
+/// 変更一覧1件に、製品の分類とは独立に付けた印。
+#[derive(Debug)]
+struct CensusEntry {
+    op: String,
+    path: String,
+    product_category: String,
+    unledgered: bool,
+    rejected: bool,
+    ext: bool,
+    is_dir: bool,
+    /// `modify`/`create`なのに差分層に実体が無い（copy-upの失敗は製品側で捨てられるので、
+    /// 一覧に載っているのに中身が無い、が起き得る）。
+    missing_in_diff_layer: bool,
+    git_component: bool,
+    byte_identical: bool,
+    /// `modify`のファイルについて、バイト比較の結果と「`baseline_hash`＝差分層の中身のハッシュ」が
+    /// 同じ答えを出したか。**2つの独立した計器の突き合わせ**で、`false`なら計器のどちらかが壊れている。
+    baseline_agrees: Option<bool>,
+    ignored: bool,
+    class: CensusClass,
+}
+
+/// `harness changes --output-format json`の配列を分類する。
+fn classify_census(
+    ws: &Path,
+    diff_layer: &Path,
+    changes: &serde_json::Value,
+) -> Result<Vec<CensusEntry>, String> {
+    let items = changes
+        .as_array()
+        .ok_or("changes json is not an array")?;
+    let mut entries = Vec::with_capacity(items.len());
+    for item in items {
+        let op = item["op"].as_str().unwrap_or_default().to_string();
+        let path = item["path"]
+            .as_str()
+            .ok_or_else(|| format!("change entry without a path: {item}"))?
+            .to_string();
+        let ext = Path::new(&path).is_absolute();
+        let git_component = harness_core::is_git_internal_path(&path, ws);
+        let (is_dir, exists, diff_file) = if ext {
+            (false, false, None)
+        } else {
+            let f = diff_layer.join(path.replace('/', "\\"));
+            (f.is_dir(), f.exists(), Some(f))
+        };
+        let missing_in_diff_layer =
+            !ext && (op == "modify" || op == "create") && !exists;
+        let (byte_identical, baseline_agrees) = match &diff_file {
+            Some(f) if op == "modify" && exists && !is_dir => {
+                let diff_bytes =
+                    std::fs::read(f).map_err(|e| format!("read {}: {e}", f.display()))?;
+                let real = ws.join(path.replace('/', "\\"));
+                let identical = real.is_file()
+                    && std::fs::read(&real).map_err(|e| format!("read {}: {e}", real.display()))?
+                        == diff_bytes;
+                let by_hash = item["baseline_hash"].as_str()
+                    == Some(harness_change_ledger::hash_bytes(&diff_bytes).as_str());
+                (identical, Some(by_hash == identical))
+            }
+            _ => (false, None),
+        };
+        entries.push(CensusEntry {
+            op,
+            path,
+            product_category: item["category"].as_str().unwrap_or_default().to_string(),
+            unledgered: item["unledgered"].as_bool().unwrap_or(false),
+            rejected: item.get("rejected").is_some_and(|r| !r.is_null()),
+            ext,
+            is_dir,
+            missing_in_diff_layer,
+            git_component,
+            byte_identical,
+            baseline_agrees,
+            ignored: false,
+            class: CensusClass::Other,
+        });
+    }
+    // ignoreの判定は、`.git`でも`_ext`でもないものをまとめて1回で問う。
+    let asked: Vec<(usize, String)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.ext && !e.git_component)
+        .map(|(i, e)| {
+            let p = if e.is_dir {
+                format!("{}/", e.path.trim_end_matches('/'))
+            } else {
+                e.path.clone()
+            };
+            (i, p)
+        })
+        .collect();
+    let ignored = git_check_ignore(ws, &asked.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>())?;
+    for (i, p) in &asked {
+        entries[*i].ignored = ignored.contains(p);
+    }
+    for e in &mut entries {
+        e.class = if e.git_component {
+            CensusClass::GitComponent
+        } else if e.byte_identical {
+            CensusClass::ByteIdentical
+        } else if e.ignored {
+            CensusClass::Ignored
+        } else {
+            CensusClass::Other
+        };
+    }
+    Ok(entries)
+}
+
+/// `harness changes`（テキスト）のうち、人に見えている行。
+#[derive(Debug, PartialEq)]
+struct ChangesText {
+    /// `(op, path)`。`^(create|modify|delete) +`の行だけ。
+    visible: Vec<(String, String)>,
+    /// `(N file(s) under `.git` ...)`の N。畳み込み行が無ければ0。
+    folded_git: usize,
+}
+
+/// テキスト出力（`workspace_cmd.rs`の`Commands::Changes`の`Text`分岐）を読む。
+/// **変更の行として数えるのは`^(create|modify|delete) +`だけ**——畳み込み行・`(no changes)`・
+/// 拒否の要約（`WARNING: ...`）は行として数えない。
+fn parse_changes_text(text: &str) -> ChangesText {
+    let mut visible = Vec::new();
+    let mut folded_git = 0;
+    for line in text.lines() {
+        let op = ["create", "modify", "delete"]
+            .into_iter()
+            .find(|op| line.starts_with(op) && line[op.len()..].starts_with(' '));
+        if let Some(op) = op {
+            let mut path = line[op.len()..].trim_start();
+            for mark in [" [unledgered: ", " [rejected: "] {
+                if let Some(i) = path.find(mark) {
+                    path = &path[..i];
+                }
+            }
+            visible.push((op.to_string(), path.to_string()));
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('(') {
+            if rest.contains("file(s) under `.git`") {
+                if let Some(n) = rest.split_whitespace().next().and_then(|n| n.parse().ok()) {
+                    folded_git = n;
+                }
+            }
+        }
+    }
+    ChangesText {
+        visible,
+        folded_git,
+    }
+}
+
+/// `harness changes --session <id>`（テキスト）の標準出力。
+fn list_changes_text(ws: &Path, session_id: &str) -> Result<String, String> {
+    let output = Command::new(harness_exe())
+        .args([
+            "--cwd",
+            ws.to_str().unwrap(),
+            "changes",
+            "--session",
+            session_id,
+        ])
+        .output()
+        .map_err(|e| format!("failed to spawn harness changes (text): {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "harness changes (text) failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// 差分層の中身とメタデータの量（P7、記録のみ）。copy-upは基準の写し（`.harness-cow-baseline`）も
+/// 作るので、**中身と写しを分けて**数える（pack 1つのコピーは容量を2倍食う）。
+fn diff_layer_inventory(diff_layer: &Path) -> serde_json::Value {
+    fn walk(dir: &Path, files: &mut u64, bytes: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, files, bytes);
+            } else if let Ok(m) = e.metadata() {
+                *files += 1;
+                *bytes += m.len();
+            }
+        }
+    }
+    let (mut content_files, mut content_bytes) = (0u64, 0u64);
+    let (mut meta_files, mut meta_bytes) = (0u64, 0u64);
+    let (mut ext_files, mut ext_bytes) = (0u64, 0u64);
+    if let Ok(rd) = std::fs::read_dir(diff_layer) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let (files, bytes) = if name.starts_with(".harness-cow-") {
+                (&mut meta_files, &mut meta_bytes)
+            } else if name == "_ext" {
+                (&mut ext_files, &mut ext_bytes)
+            } else {
+                (&mut content_files, &mut content_bytes)
+            };
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, files, bytes);
+            } else if let Ok(m) = e.metadata() {
+                *files += 1;
+                *bytes += m.len();
+            }
+        }
+    }
+    serde_json::json!({
+        "content_files": content_files,
+        "content_bytes": content_bytes,
+        "metadata_files": meta_files,
+        "metadata_bytes": meta_bytes,
+        "ext_files": ext_files,
+        "ext_bytes": ext_bytes,
+    })
+}
+
+/// 数えた結果を分類ごと・重なりごとに畳む。
+fn census_counts(entries: &[CensusEntry]) -> serde_json::Value {
+    let mut by_class = serde_json::Map::new();
+    for class in CensusClass::ALL {
+        let of: Vec<&CensusEntry> = entries.iter().filter(|e| e.class == class).collect();
+        let mut ops: std::collections::BTreeMap<&str, usize> = Default::default();
+        let mut cats: std::collections::BTreeMap<&str, usize> = Default::default();
+        for e in &of {
+            *ops.entry(e.op.as_str()).or_default() += 1;
+            *cats.entry(e.product_category.as_str()).or_default() += 1;
+        }
+        by_class.insert(
+            class.key().to_string(),
+            serde_json::json!({
+                "count": of.len(),
+                "directories": of.iter().filter(|e| e.is_dir).count(),
+                "unledgered": of.iter().filter(|e| e.unledgered).count(),
+                "ops": ops,
+                "product_category": cats,
+            }),
+        );
+    }
+    serde_json::json!({
+        "total": entries.len(),
+        "by_class": by_class,
+        "overlaps": {
+            // .git の中の、中身が変わらないコピー（packの時刻更新など）。
+            "git_and_byte_identical": entries.iter().filter(|e| e.git_component && e.byte_identical).count(),
+            "ext": entries.iter().filter(|e| e.ext).count(),
+        },
+    })
+}
+
+/// 分類ごとのパス（`.git`は多いので先頭だけ）。
+fn census_paths(entries: &[CensusEntry]) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for class in CensusClass::ALL {
+        let paths: Vec<String> = entries
+            .iter()
+            .filter(|e| e.class == class)
+            .map(|e| {
+                let mut s = format!("{} {}", e.op, e.path);
+                if e.is_dir {
+                    s.push_str(" (dir)");
+                }
+                if e.git_component && e.byte_identical {
+                    s.push_str(" (identical)");
+                }
+                s
+            })
+            .collect();
+        let shown: Vec<String> = if class == CensusClass::GitComponent {
+            paths.into_iter().take(60).collect()
+        } else {
+            paths
+        };
+        out.insert(class.key().to_string(), serde_json::json!(shown));
+    }
+    serde_json::Value::Object(out)
+}
+
+/// 段5の腕。
+enum CensusArm {
+    Mock,
+    /// 実プロバイダ（LMStudio）。`e2e-live`でだけ作られる。
+    #[cfg_attr(not(feature = "e2e-live"), allow(dead_code))]
+    Lmstudio { model: String },
+}
+
+impl CensusArm {
+    fn key(&self) -> &'static str {
+        match self {
+            CensusArm::Mock => "mock",
+            CensusArm::Lmstudio { .. } => "lmstudio",
+        }
+    }
+}
+
+/// 段5の測定を1本撃つ。結果のJSONを印字し、`C:\harness-e2e\_scratch\cow-census-<腕>.json`へ
+/// 書く（**assertより先に書く**——落ちた回・時間切れの回の数字も残す）。
+///
+/// assertするのは2種類だけ。(1) **計器の検算**——崩れたら数字そのものが無意味になるもの。
+/// (2) **手順が踏まれたか**——踏まれていない回の数字は、測りたいものの数字ではない。
+/// **分類ごとの件数そのもの（合格基準P1〜P6の判定）はここではassertしない**——段5は現状を測る段で、
+/// 判定は段7がこの試験に足す。
+fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, String> {
+    let case_name = format!("cow-census-{}", arm.key());
+    let ws = case_dir(&case_name);
+    census_seed_repo(&ws)?;
+
+    let extra: &[&str] = &[
+        "--sandbox",
+        "tier2a-cow",
+        "--max-turns",
+        "40",
+        "--cognition",
+        "off",
+    ];
+    let mock_turns = census_mock_turns();
+    let live_prompt = census_live_prompt();
+    let before = ex.list_cow_sessions();
+    let started = std::time::Instant::now();
+    let driver = match &arm {
+        CensusArm::Mock => Driver::Mock(&mock_turns),
+        CensusArm::Lmstudio { model } => Driver::Lmstudio {
+            base_url: LMSTUDIO_BASE_URL,
+            model,
+            prompt: &live_prompt,
+            deadline: CENSUS_LIVE_DEADLINE,
+        },
+    };
+    let run = run_harness_driven(
+        &harness_exe(),
+        &ws.to_string_lossy(),
+        None,
+        driver,
+        extra,
+        &case_name,
+        &[],
+    );
+    let harness_secs = started.elapsed().as_secs_f64();
+    if run.timed_out {
+        return Err(format!(
+            "判定不能（時間切れ）: harness did not finish within the deadline and was stopped. \
+             stdout={} stderr={}",
+            run.stdout, run.stderr
+        ));
+    }
+    let outcome = parse_json_stdout(&run)?;
+    let session = ex.new_cow_session(&before)?;
+    let diff_layer = cow_diff_layer_dir(&session);
+
+    // --- 手順が踏まれたか ---
+    let calls = outcome.tool_call_views();
+    let strict = matches!(arm, CensusArm::Mock);
+    let (assigned, extras) = match_census_steps(&calls, strict);
+    let steps_json: Vec<serde_json::Value> = CENSUS_STEPS
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let (tool, expected) = census_step_call(step);
+            let call = assigned[i].map(|c| &calls[c]);
+            serde_json::json!({
+                "step": i + 1,
+                "tool": tool,
+                "expected_input": expected,
+                "matched_call": assigned[i],
+                "actual_input": call.map(|c| c.input.clone()),
+                "decision": call.map(|c| c.decision.clone()),
+                "succeeded": call.is_some_and(|c| c.succeeded()),
+            })
+        })
+        .collect();
+    let extras_json: Vec<serde_json::Value> = extras
+        .iter()
+        .map(|&i| {
+            serde_json::json!({
+                "call": i,
+                "tool": calls[i].name,
+                "input": calls[i].input,
+                "decision": calls[i].decision,
+                "succeeded": calls[i].succeeded(),
+            })
+        })
+        .collect();
+    let steps_not_done: Vec<usize> = (0..CENSUS_STEPS.len())
+        .filter(|&i| !assigned[i].is_some_and(|c| calls[c].succeeded()))
+        .map(|i| i + 1)
+        .collect();
+
+    // --- 数える ---
+    let t = std::time::Instant::now();
+    let changes = list_changes_json(&ws, &session)?;
+    let changes_json_ms = t.elapsed().as_millis();
+    let t = std::time::Instant::now();
+    let text = list_changes_text(&ws, &session)?;
+    let changes_text_ms = t.elapsed().as_millis();
+    let entries = classify_census(&ws, &diff_layer, &changes)?;
+    let shown = parse_changes_text(&text);
+    let by_path: std::collections::HashMap<&str, &CensusEntry> =
+        entries.iter().map(|e| (e.path.as_str(), e)).collect();
+    let mut visible_by_class = serde_json::Map::new();
+    for class in CensusClass::ALL {
+        let n = shown
+            .visible
+            .iter()
+            .filter(|(_, p)| by_path.get(p.as_str()).is_some_and(|e| e.class == class))
+            .count();
+        visible_by_class.insert(class.key().to_string(), n.into());
+    }
+    let visible_unmatched: Vec<&String> = shown
+        .visible
+        .iter()
+        .map(|(_, p)| p)
+        .filter(|p| !by_path.contains_key(p.as_str()))
+        .collect();
+
+    // --- 計器の検算 ---
+    let ws_str = ws.to_string_lossy().to_string();
+    let denied = harness_change_ledger::store::read_denied_log(&diff_layer);
+    let denied_inside: Vec<&str> = denied
+        .iter()
+        .filter(|e| {
+            harness_change_ledger::path_rules::relative_under_root(&e.path, &ws_str).is_some()
+        })
+        .map(|e| e.path.as_str())
+        .collect();
+    let rejected: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.rejected)
+        .map(|e| e.path.as_str())
+        .collect();
+    let missing: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.missing_in_diff_layer)
+        .map(|e| e.path.as_str())
+        .collect();
+    let disagreements: Vec<&str> = entries
+        .iter()
+        .filter(|e| e.baseline_agrees == Some(false))
+        .map(|e| e.path.as_str())
+        .collect();
+    let visible_plus_folded = shown.visible.len() + shown.folded_git;
+    let class_of = |p: &str| by_path.get(p).map(|e| e.class);
+    // 陽性対照「同じ中身で書き直したものは同一コピーに入る」が使えるのは、段9で実際に同じ中身を
+    // 書いたときだけ（実モデルが1文字でも変えたら、その回ではこの対照は適用できない）。
+    let guide_step = CENSUS_STEPS
+        .iter()
+        .position(|s| matches!(s, CensusStep::Write { path, .. } if *path == "docs/guide.txt"))
+        .expect("the procedure rewrites docs/guide.txt");
+    let guide_written_identically = assigned[guide_step]
+        .is_some_and(|c| calls[c].input["content"].as_str() == Some(CENSUS_GUIDE_TXT));
+
+    let evidence = serde_json::json!({
+        "arm": arm.key(),
+        "model": match &arm { CensusArm::Mock => None, CensusArm::Lmstudio { model } => Some(model.clone()) },
+        "session": session,
+        "harness": {
+            "exit_code": run.status.code(),
+            "seconds": harness_secs,
+            "discarded_turns": outcome.discarded_turns(),
+            "answer": outcome.answer(),
+        },
+        "steps": steps_json,
+        "steps_not_done": steps_not_done,
+        "extra_calls": extras_json,
+        "counts": census_counts(&entries),
+        "visible_list": {
+            "lines": shown.visible.len(),
+            "by_class": visible_by_class,
+            "folded_git": shown.folded_git,
+            "unmatched_paths": visible_unmatched,
+        },
+        "paths": census_paths(&entries),
+        "git": {
+            "diff_layer_loose_objects": count_loose_git_objects(&diff_layer),
+            "feature_ref": std::fs::read_to_string(diff_layer.join(r".git\refs\heads\feature")).ok().map(|s| s.trim().to_string()),
+        },
+        "p7": {
+            "changes_json_ms": changes_json_ms,
+            "changes_text_ms": changes_text_ms,
+            "diff_layer": diff_layer_inventory(&diff_layer),
+        },
+        "instrument_checks": {
+            "rejected_entries": rejected,
+            "visible_plus_folded": visible_plus_folded,
+            "json_total": entries.len(),
+            "baseline_hash_disagreements": disagreements,
+            "missing_in_diff_layer": missing,
+            "denied_inside_workspace": denied_inside,
+            "denied_outside_workspace": denied.len() - denied_inside.len(),
+            "control_guide_is_byte_identical": class_of("docs/guide.txt").map(|c| c.key()),
+            "control_guide_applicable": guide_written_identically,
+            "control_build_log_is_ignored": class_of("target/debug/build.log").map(|c| c.key()),
+            "control_lib_is_other": class_of("src/lib.txt").map(|c| c.key()),
+        },
+    });
+    let rendered = serde_json::to_string_pretty(&evidence).unwrap_or_default();
+    println!("[cow-census] {rendered}");
+    let record = scratch_dir().join(format!("{case_name}.json"));
+    std::fs::write(&record, &rendered)
+        .map_err(|e| format!("failed to write {}: {e}", record.display()))?;
+
+    // --- (2) 手順が踏まれたか。踏まれていない回の数字は使えない ---
+    if !steps_not_done.is_empty() {
+        let per_step: Vec<String> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("  call {i}: {} {} -> {} / {}", c.name, c.input, c.decision, c.result))
+            .collect();
+        return Err(format!(
+            "判定不能: 手順の段 {steps_not_done:?} が踏まれなかった（または失敗した）ので、この回の数字は \
+             測りたいもの（手順どおりのセッションの一覧）の数字ではない。record={}\n{}",
+            record.display(),
+            per_step.join("\n")
+        ));
+    }
+    if strict && !extras.is_empty() {
+        return Err(format!(
+            "mock が台本に無い呼び出しをした（{extras:?}）——台本と照合器の食い違い。record={}",
+            record.display()
+        ));
+    }
+
+    // --- (1) 計器の検算 ---
+    let mut broken = Vec::new();
+    if !rejected.is_empty() {
+        broken.push(format!("形の崩れたパスが一覧にある（.git 側へ数えられ得る）: {rejected:?}"));
+    }
+    if visible_plus_folded != entries.len() {
+        broken.push(format!(
+            "テキストの見える行 {} + 畳み込み {} ≠ JSON の {} 件（どちらかの読み方が壊れている）",
+            shown.visible.len(),
+            shown.folded_git,
+            entries.len()
+        ));
+    }
+    if !visible_unmatched.is_empty() {
+        broken.push(format!("テキストの行が JSON のどのパスとも一致しない: {visible_unmatched:?}"));
+    }
+    if !disagreements.is_empty() {
+        broken.push(format!(
+            "バイト比較と baseline_hash が逆の答えを出した（計器のどちらかが壊れている）: {disagreements:?}"
+        ));
+    }
+    if !missing.is_empty() {
+        broken.push(format!("一覧にあるのに差分層に実体が無い（copy-up の失敗）: {missing:?}"));
+    }
+    if !denied_inside.is_empty() {
+        broken.push(format!(
+            "ワークスペース内への書込が ACL に拒否された＝その書込は一覧から漏れている: {denied_inside:?}"
+        ));
+    }
+    if guide_written_identically && class_of("docs/guide.txt") != Some(CensusClass::ByteIdentical) {
+        broken.push(format!(
+            "陽性対照: 同じ中身で書き直した docs/guide.txt が「中身の変わらないコピー」に入らない（{:?}）",
+            class_of("docs/guide.txt")
+        ));
+    }
+    if class_of("target/debug/build.log") != Some(CensusClass::Ignored) {
+        broken.push(format!(
+            "陽性対照: target/debug/build.log が ignore に入らない（{:?}）",
+            class_of("target/debug/build.log")
+        ));
+    }
+    if class_of("src/lib.txt") != Some(CensusClass::Other) {
+        broken.push(format!(
+            "陰性対照: 中身を変えた追跡ファイル src/lib.txt が「それ以外」に入らない（{:?}）",
+            class_of("src/lib.txt")
+        ));
+    }
+    // mock は手順が決まっているので、「それ以外」と「.git 以外の同一コピー」は集合ごと一致するはず。
+    if strict {
+        let other: std::collections::BTreeSet<(String, String)> = entries
+            .iter()
+            .filter(|e| e.class == CensusClass::Other)
+            .map(|e| (e.op.clone(), e.path.clone()))
+            .collect();
+        let expected_other: std::collections::BTreeSet<(String, String)> = [
+            ("modify", "src/lib.txt"),
+            ("create", "src/new.txt"),
+            ("modify", "README.md"),
+            ("create", "scratch.txt"),
+            ("delete", "notes.txt"),
+        ]
+        .iter()
+        .map(|(o, p)| (o.to_string(), p.to_string()))
+        .collect();
+        if other != expected_other {
+            broken.push(format!(
+                "「それ以外」が手順で作った変更（段2・3・6・7・8）と一致しない: got={other:?} expected={expected_other:?}"
+            ));
+        }
+        let identical: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.class == CensusClass::ByteIdentical)
+            .map(|e| e.path.as_str())
+            .collect();
+        if identical != ["docs/guide.txt"] {
+            broken.push(format!(
+                "「.git 以外の中身の変わらないコピー」が段9の docs/guide.txt だけでない: {identical:?}"
+            ));
+        }
+        let ignored: HashSet<&str> = entries
+            .iter()
+            .filter(|e| e.class == CensusClass::Ignored)
+            .map(|e| e.path.as_str())
+            .collect();
+        for p in ["target/debug/build.log", "target/debug/app.tar"] {
+            if !ignored.contains(p) {
+                broken.push(format!("段10・11の生成物 {p} が ignore に入らない"));
+            }
+        }
+        if !entries.iter().any(|e| e.class == CensusClass::GitComponent) {
+            broken.push("段1・4・5の git 操作が .git 成分のエントリを1件も作らなかった".to_string());
+        }
+    }
+    if !broken.is_empty() {
+        return Err(format!(
+            "計器の検算が崩れた（この回の数字は読めない）。record={}\n- {}",
+            record.display(),
+            broken.join("\n- ")
+        ));
+    }
+
+    // 成功した回だけ後始末する。**消えたことを読み返す**——`cleanup_on_success`は削除の失敗を
+    // 捨てるので、残ったまま次の回の前後差へ混ざることがある（B-10）。
+    cleanup_on_success(&ws, &[&session], &case_name);
+    let _ = std::fs::remove_file(scratch_dir().join(format!("{case_name}-turns.json")));
+    let leftovers: Vec<String> = [&ws, &diff_layer]
+        .iter()
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
+    if !leftovers.is_empty() {
+        return Err(format!(
+            "測定は通ったが後始末が残った（次の回の交絡になる）: {leftovers:?}。record={}",
+            record.display()
+        ));
+    }
+    Ok(evidence)
+}
+
+/// **段5の固定の試験（mock の腕）**。`dev-elevated-run e2e-cow-change-census`。
+#[test]
+#[ignore]
+fn tier2a_cow_change_census_mock() {
+    let ex = cow_exclusive();
+    if let Err(e) = run_census(&ex, CensusArm::Mock) {
+        panic!("{e}");
+    }
+}
+
+/// LMStudioが答えるモデルの一覧（`id`と`state`）。`curl.exe`を使う（Windows標準）。
+#[cfg(feature = "e2e-live")]
+fn lmstudio_models() -> Result<Vec<(String, String)>, String> {
+    let url = format!("{LMSTUDIO_ORIGIN}/api/v0/models");
+    let output = Command::new("curl.exe")
+        .args(["-s", "-m", "10", &url])
+        .output()
+        .map_err(|e| format!("failed to run curl.exe: {e}"))?;
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+        format!(
+            "判定不能: LMStudio が {url} で答えない（起動していない？）: {e} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
+    Ok(parsed["data"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(|m| {
+                    (
+                        m["id"].as_str().unwrap_or_default().to_string(),
+                        m["state"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// **段5の固定の試験（実プロバイダの腕）**。`dev-elevated-run e2e-cow-change-census-live`。
+///
+/// LMStudio が起動していることが前提。**居なければ赤にする**（飛ばして緑にすると、
+/// 走っていないことが見えなくなる）。モデルは[`CENSUS_LIVE_DEFAULT_MODEL`]、
+/// [`CENSUS_LIVE_MODEL_FILE`]があればその1行。読み込まれていなければ LMStudio が読み込む
+/// （その時間も期限に含まれる）。
+#[cfg(feature = "e2e-live")]
+#[test]
+#[ignore]
+fn tier2a_cow_change_census_lmstudio() {
+    let model = std::fs::read_to_string(CENSUS_LIVE_MODEL_FILE)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| CENSUS_LIVE_DEFAULT_MODEL.to_string());
+    let models = lmstudio_models().unwrap_or_else(|e| panic!("{e}"));
+    if !models.iter().any(|(id, _)| *id == model) {
+        panic!(
+            "判定不能: モデル {model:?} が LMStudio に無い。{CENSUS_LIVE_MODEL_FILE} に id を1行書いて \
+             差し替えられる。LMStudio が答えたモデル: {models:?}"
+        );
+    }
+    let ex = cow_exclusive();
+    if let Err(e) = run_census(&ex, CensusArm::Lmstudio { model }) {
+        panic!("{e}");
+    }
+}
+
+// --- 段5の計器の単体テスト（管理者権限・実機・LMStudioのどれも要らない） ---------------
+//
+// `cargo test -p harness-cli --features e2e-mock` で走る。計器（分類器・ignore判定・テキスト解析）が
+// **正しいものを正しく分け、分けてはいけないものを分けない**ことを、実機で撃つ前に固定する。
+
+/// 一時フォルダに、種付けと同じ形のリポジトリ（`.gitignore`は`target/`）と、差分層に見立てた
+/// フォルダを作る。
+fn census_unit_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let root = tempfile::tempdir().expect("tempdir");
+    let ws = root.path().join("ws");
+    let diff = root.path().join("diff");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&diff).unwrap();
+    for (rel, content) in CENSUS_SEED {
+        let p = ws.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, content).unwrap();
+    }
+    plain_git(&ws, &["init", "-q", "-b", "main"]).unwrap();
+    plain_git(&ws, &["-c", "core.autocrlf=false", "add", "-A"]).unwrap();
+    plain_git(&ws, &["-c", "core.autocrlf=false", "commit", "-q", "-m", "seed"]).unwrap();
+    (root, ws, diff)
+}
+
+fn put(dir: &Path, rel: &str, content: &[u8]) {
+    let p = dir.join(rel.replace('/', "\\"));
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(p, content).unwrap();
+}
+
+fn entry(op: &str, path: &str, baseline: Option<&[u8]>, category: &str) -> serde_json::Value {
+    serde_json::json!({
+        "op": op,
+        "path": path,
+        "baseline_hash": baseline.map(harness_change_ledger::hash_bytes),
+        "unledgered": false,
+        "category": category,
+    })
+}
+
+/// 分類器の両側。**分けるべきものを分け、分けてはいけないものを分けない**（test-logic-rules 問4）。
+#[test]
+fn census_classifier_separates_each_axis_and_leaves_lookalikes_alone() {
+    let (_root, ws, diff) = census_unit_fixture();
+    let guide = CENSUS_GUIDE_TXT.as_bytes();
+    let lib = b"fn original() {}\n";
+    // 差分層に見立てたフォルダへ、各分類の代表を置く。
+    put(&diff, "docs/guide.txt", guide); // 同じ中身の書き直し
+    put(&diff, "src/lib.txt", b"changed\n"); // 中身を変えた追跡ファイル
+    put(&diff, ".git/objects/pack/p.pack", b"pack"); // .git（中身は本物側に無い）
+    put(&diff, ".git/HEAD", b"ref: refs/heads/feature\n");
+    put(&diff, "sub/.git/HEAD", b"x"); // 入れ子の .git も成分で当たる
+    put(&diff, ".gitignore", b"target/\nextra/\n"); // .git に見えて違う
+    put(&diff, ".github/workflows/x.yml", b"on: push\n"); // .git に見えて違う
+    put(&diff, "target/debug/build.log", b"out"); // ignore
+    std::fs::create_dir_all(diff.join(r"target\debug")).unwrap();
+    put(&diff, "targets.txt", b"not ignored"); // 名前が似ているだけ
+    put(&diff, "scratch.txt", b"new"); // 新規（同一にならない）
+    let changes = serde_json::json!([
+        entry("modify", "docs/guide.txt", Some(guide), "side_effect"),
+        entry("modify", "src/lib.txt", Some(lib), "side_effect"),
+        entry("create", ".git/objects/pack/p.pack", None, "git_internal"),
+        entry("modify", ".git/HEAD", Some(b"ref: refs/heads/main\n"), "git_internal"),
+        entry("create", "sub/.git/HEAD", None, "git_internal"),
+        entry("modify", ".gitignore", Some(b"target/\n"), "config_injection"),
+        entry("create", ".github/workflows/x.yml", None, "config_injection"),
+        entry("create", "target/debug/build.log", None, "side_effect"),
+        entry("create", "target/debug", None, "side_effect"),
+        entry("create", "target", None, "side_effect"),
+        entry("create", "targets.txt", None, "side_effect"),
+        entry("create", "scratch.txt", None, "side_effect"),
+        entry("delete", "notes.txt", Some(b"this file is deleted by the agent\n"), "side_effect"),
+    ]);
+
+    let entries = classify_census(&ws, &diff, &changes).expect("classify");
+    let class = |p: &str| entries.iter().find(|e| e.path == p).map(|e| e.class);
+
+    assert_eq!(class("docs/guide.txt"), Some(CensusClass::ByteIdentical));
+    assert_eq!(class("src/lib.txt"), Some(CensusClass::Other));
+    assert_eq!(class(".git/objects/pack/p.pack"), Some(CensusClass::GitComponent));
+    assert_eq!(class(".git/HEAD"), Some(CensusClass::GitComponent));
+    assert_eq!(class("sub/.git/HEAD"), Some(CensusClass::GitComponent));
+    assert_eq!(class(".gitignore"), Some(CensusClass::Other), ".gitignore is not a .git component");
+    assert_eq!(class(".github/workflows/x.yml"), Some(CensusClass::Other));
+    assert_eq!(class("target/debug/build.log"), Some(CensusClass::Ignored));
+    assert_eq!(class("target/debug"), Some(CensusClass::Ignored));
+    // **末尾`/`が効くのはここだけ**——`target/debug`は親の`target`がディレクトリとして読まれるので
+    // 末尾`/`が無くても一致するが、`target`そのものは本物のワークスペースに無いので、
+    // ディレクトリだと教えないと規則`target/`（ディレクトリだけ）に一致しない（2026-09-27 実測）。
+    assert_eq!(
+        class("target"),
+        Some(CensusClass::Ignored),
+        "a directory entry that exists only in the diff layer must be asked with a trailing /"
+    );
+    assert_eq!(class("targets.txt"), Some(CensusClass::Other));
+    assert_eq!(class("scratch.txt"), Some(CensusClass::Other), "create is never byte-identical");
+    assert_eq!(class("notes.txt"), Some(CensusClass::Other), "delete is never byte-identical");
+
+    // 2つの計器（バイト比較と baseline_hash）が、modify の全件で同じ答えを出している。
+    for e in entries.iter().filter(|e| e.op == "modify") {
+        assert_eq!(e.baseline_agrees, Some(true), "{}", e.path);
+    }
+    // 追跡されている src/lib.txt は ignore に入らない（check-ignore の既定）。
+    assert!(!entries.iter().find(|e| e.path == "src/lib.txt").unwrap().ignored);
+    // 差分層に実体の無い create は印が付く（copy-up の失敗を見逃さない）。
+    let with_missing = serde_json::json!([entry("create", "ghost.txt", None, "side_effect")]);
+    let ghost = classify_census(&ws, &diff, &with_missing).expect("classify");
+    assert!(ghost[0].missing_in_diff_layer);
+}
+
+/// `.git`の中でも、中身の変わらないコピーは「重なり」として数えられ、分類は`.git`が勝つ。
+#[test]
+fn census_git_component_wins_over_byte_identical_and_the_overlap_is_counted() {
+    let (_root, ws, diff) = census_unit_fixture();
+    let real_pack_dir = ws.join(r".git\objects\pack");
+    std::fs::create_dir_all(&real_pack_dir).unwrap();
+    std::fs::write(real_pack_dir.join("same.pack"), b"PACKDATA").unwrap();
+    put(&diff, ".git/objects/pack/same.pack", b"PACKDATA");
+    let changes = serde_json::json!([entry(
+        "modify",
+        ".git/objects/pack/same.pack",
+        Some(b"PACKDATA"),
+        "git_internal"
+    )]);
+    let entries = classify_census(&ws, &diff, &changes).expect("classify");
+    assert_eq!(entries[0].class, CensusClass::GitComponent);
+    assert!(entries[0].byte_identical);
+    assert_eq!(census_counts(&entries)["overlaps"]["git_and_byte_identical"], 1);
+}
+
+/// 利用者全体の ignore（`core.excludesFile`）は判定に混ざらない。混ざると「リポジトリの
+/// `.gitignore`が何を捨てるか」を数えたことにならない。
+#[test]
+fn census_ignore_check_does_not_use_the_global_excludes_file() {
+    let (_root, ws, _diff) = census_unit_fixture();
+    // ワークスペース内の設定で excludesFile を立てても、判定側の `-c` が上書きする。
+    let global = ws.join("global-excludes");
+    std::fs::write(&global, "*.log\n").unwrap();
+    plain_git(&ws, &["config", "core.excludesFile", &global.to_string_lossy().replace('\\', "/")])
+        .unwrap();
+    let ignored =
+        git_check_ignore(&ws, &["x.log".to_string(), "target/y.o".to_string()]).expect("check");
+    assert!(!ignored.contains("x.log"), "the excludes file leaked into the census");
+    assert!(ignored.contains("target/y.o"));
+}
+
+/// テキストの読み方。変更の行だけを数え、畳み込み行の件数を拾い、要約の行を数えない。
+#[test]
+fn census_text_parser_counts_only_change_lines_and_reads_the_fold_count() {
+    let text = "create  src/new.txt\n\
+                modify  README.md [unledgered: present in the overlay but not recorded]\n\
+                delete  notes.txt [rejected: bad]\n\
+                (12 file(s) under `.git` are git internals -- they are reviewed through git, not applied as files. Use `--output-format json` to list them.)\n\
+                (3 workspace-external write attempt(s) were denied by ACL; see `harness cow audit`)\n\
+                WARNING: 1 write attempt(s) INSIDE the workspace were denied by ACL.\n";
+    let parsed = parse_changes_text(text);
+    assert_eq!(
+        parsed.visible,
+        vec![
+            ("create".to_string(), "src/new.txt".to_string()),
+            ("modify".to_string(), "README.md".to_string()),
+            ("delete".to_string(), "notes.txt".to_string()),
+        ]
+    );
+    assert_eq!(parsed.folded_git, 12);
+    assert_eq!(
+        parse_changes_text("(no changes)\n"),
+        ChangesText {
+            visible: vec![],
+            folded_git: 0
+        }
+    );
+}
+
+/// **2本の腕が同じ手順であること**を作りで固定する。mock の台本の各段と、実モデルへの指示文の
+/// 各段が、同じ表（[`CENSUS_STEPS`]）の同じ道具・同じ入力を指している。
+#[test]
+fn census_mock_script_and_live_prompt_describe_the_same_steps() {
+    let turns = census_mock_turns();
+    assert_eq!(turns.len(), CENSUS_STEPS.len() + 1, "one turn per step, then end_turn");
+    let prompt = census_live_prompt();
+    for (i, step) in CENSUS_STEPS.iter().enumerate() {
+        let (tool, input) = census_step_call(step);
+        let line = format!("Step {}: call `{tool}` with {input}", i + 1);
+        assert!(prompt.contains(&line), "prompt is missing {line:?}");
+    }
+    // 台本の呼び出しを照合器へ通すと、全段が厳密一致で踏まれ、余りが出ない。
+    let calls: Vec<ToolCallView> = CENSUS_STEPS
+        .iter()
+        .map(|s| {
+            let (tool, input) = census_step_call(s);
+            let result = if tool == "run_program" {
+                "ok\n[exit code: 0]\n[program: git]".to_string()
+            } else {
+                "wrote 1 bytes to x".to_string()
+            };
+            ToolCallView {
+                name: tool.to_string(),
+                input,
+                decision: "allowed".to_string(),
+                result,
+            }
+        })
+        .collect();
+    let (assigned, extras) = match_census_steps(&calls, true);
+    assert!(assigned.iter().all(Option::is_some) && extras.is_empty());
+    assert!(calls.iter().all(ToolCallView::succeeded));
+}
+
+/// 段の照合の両側: 緩い照合は副コマンドとパスで当て、失敗した段・拒否された段は「踏んだ」に
+/// 数えない（test-logic-rules 問2: 許可側と対にする）。
+#[test]
+fn census_step_matching_accepts_loose_variants_and_rejects_failures() {
+    let view = |name: &str, input: serde_json::Value, decision: &str, result: &str| ToolCallView {
+        name: name.to_string(),
+        input,
+        decision: decision.to_string(),
+        result: result.to_string(),
+    };
+    // 実モデルが git を絶対パスで呼び、引数の並びを変えても、副コマンドが同じなら段1に当たる。
+    let loose = view(
+        "run_program",
+        serde_json::json!({"program": r"C:\Program Files\Git\cmd\git.exe", "args": ["-c", "safe.directory=*", "switch", "-c", "feature"]}),
+        "allowed",
+        "Switched\n[exit code: 0]",
+    );
+    assert!(census_call_matches(&CENSUS_STEPS[0], &loose, false));
+    assert!(!census_call_matches(&CENSUS_STEPS[0], &loose, true), "strict needs the exact input");
+    // 副コマンドが違えば当たらない。
+    let other = view(
+        "run_program",
+        serde_json::json!({"program": "git", "args": ["status"]}),
+        "allowed",
+        "[exit code: 0]",
+    );
+    assert!(!census_call_matches(&CENSUS_STEPS[0], &other, false));
+    // 失敗・拒否は成功ではない。子が同じ綴りを印字しても、最後のフッタで判定する。
+    assert!(!view("run_program", serde_json::json!({}), "allowed", "[exit code: 1]").succeeded());
+    assert!(!view(
+        "run_program",
+        serde_json::json!({}),
+        "allowed",
+        "[exit code: 0] printed by child\n[exit code: 128]"
+    )
+    .succeeded());
+    assert!(!view("write_file", serde_json::json!({}), "denied", "wrote 1 bytes").succeeded());
 }
 
 // ============================================================================
