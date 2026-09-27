@@ -2617,7 +2617,7 @@ struct CensusEntry {
     rejected: bool,
     ext: bool,
     is_dir: bool,
-    /// `create`なのに差分層にも本物にも実体が無い——**中身の無い作成**。
+    /// `create`として一覧に載っているのに、差分層にも本物にも実体が無い（**実体の無い`create`**）。
     ///
     /// 2026-09-27の初回の測定で見つかった（`plans/cow-default-spike/RESULTS.md`）。gitは
     /// `switch`・`commit`のたびに`MERGE_HEAD`等の後始末で**存在しないファイルを消しに行き**、
@@ -2625,7 +2625,7 @@ struct CensusEntry {
     /// **計器の故障ではなく、いまの一覧が実際に持っているもの**なので、数えて出す。
     phantom_create: bool,
     /// `modify`なのに差分層に実体が無い（copy-upの失敗は製品側で捨てられる）。**その書込は
-    /// 失われている**ので、これは計器の検算に使う（中身の無い作成とは別の事実）。
+    /// 失われている**ので、これは計器の検算に使う（実体の無い `create` とは別の事実）。
     lost_in_diff_layer: bool,
     git_component: bool,
     byte_identical: bool,
@@ -3443,8 +3443,8 @@ fn census_classifier_separates_each_axis_and_leaves_lookalikes_alone() {
     }
     // 追跡されている src/lib.txt は ignore に入らない（check-ignore の既定）。
     assert!(!entries.iter().find(|e| e.path == "src/lib.txt").unwrap().ignored);
-    // 差分層にも本物にも実体の無い create は「中身の無い作成」、実体の無い modify は
-    // 「失われた書込」。**2つを取り違えない**（前者は一覧の性質、後者は計器の検算）。
+    // 差分層にも本物にも実体の無い create と、差分層に実体の無い modify（失われた書込）を
+    // **取り違えない**（前者は一覧の性質として数え、後者は計器の検算に使う）。
     let without_entity = serde_json::json!([
         entry("create", "ghost.txt", None, "side_effect"),
         entry("modify", "README.md", Some(b"census seed\n"), "side_effect"),
@@ -3452,7 +3452,7 @@ fn census_classifier_separates_each_axis_and_leaves_lookalikes_alone() {
     let ghosts = classify_census(&ws, &diff, &without_entity).expect("classify");
     assert!(ghosts[0].phantom_create && !ghosts[0].lost_in_diff_layer);
     assert!(ghosts[1].lost_in_diff_layer && !ghosts[1].phantom_create);
-    // 実体のある create は中身の無い作成ではない。
+    // 実体のある create は実体の無い `create` ではない。
     assert!(!entries.iter().find(|e| e.path == "scratch.txt").unwrap().phantom_create);
 }
 
