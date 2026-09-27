@@ -1,0 +1,6 @@
+# このクレートで git を起動してよいのは `launcher.rs` だけである（D-110 (vi) の不変条件——
+# エージェントの `.git` を git に一度も渡さない——を、起動の口を1つにすることで守る）。
+# 他の場所で `Command::new` を書くと `cargo clippy -- -D warnings` が落ちる。
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "spawn git only through launcher::GitLauncher (D-110 vi)" },
+]
