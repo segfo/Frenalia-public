@@ -228,15 +228,14 @@ impl From<PermissionModeArg> for PermissionMode {
 /// ステージ済み変更（`harness_sandbox::SandboxFs`のオーバーレイ）・CoW操作台帳を操作する
 /// サブコマンド（§オーバーレイFS「レビュー＆コミット」、M10）。CoW一本化（Phase 2）により
 /// `--staged`/`--sandbox tier2a-cow`は同じ`SandboxFs`バックエンドを使うため、以前あった`--source
-/// staged|cow|all`は廃止した——`--session <id>`（省略時は最新）が指すセッションを
-/// `--staged`用の置き場・`--sandbox tier2a-cow`用の置き場の順で自動的に探す（1セッションは常にどちらか
-/// 一方でしか起動されない——**根拠はclapの`conflicts_with_all`ではなく**、
-/// `setup::resolve_staging_mode_checked`の実行時拒否である。値依存の排他はclapでは宣言できない）。
+/// staged|cow|all`は廃止した——`--session <id>`が指すセッションの置き場を、`--staged`用・
+/// CoW用の両方から自動的に探す。`--session`を省くと、**今のワークスペースの**セッションから
+/// 最新のものを選ぶ。選び方の正本は`review_target::resolve_session_overlay_in`のdoc。
 #[derive(Subcommand)]
 pub(crate) enum Commands {
     /// 変更を一覧表示する。
     Changes {
-        /// 対象セッションID（省略時は最も新しいもの）。
+        /// 対象セッションID（省略時は、今のワークスペースで最も新しいセッション）。
         #[arg(long)]
         session: Option<String>,
         #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text)]

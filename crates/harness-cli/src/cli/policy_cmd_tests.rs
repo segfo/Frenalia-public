@@ -722,3 +722,39 @@ fn audit_listing_is_untouched_by_the_breadth_guard() {
         "the observation itself must stay visible: {text}"
     );
 }
+
+/// **CoWの拒否ログは、今のワークスペースの差分層から読む。**
+///
+/// かつては全ワークスペースを通して最新の差分層を読んでいたので、別のリポジトリで拒否された
+/// 書込が、こちらの提案に混ざった（`policy apply`でこちらの設定へ書かれ得た）。
+#[cfg(windows)]
+#[test]
+fn the_cow_denial_log_comes_from_this_workspaces_diff_layer() {
+    use harness_sandbox::tier2a::workspace_ledger::write_cow_session_meta;
+
+    let ws = tempfile::tempdir().unwrap();
+    let other_ws = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let diff_layer = |workspace: &Path, id: &str| {
+        let dir = harness_sandbox::session_scope::cow_diff_layer_dir_in(root.path(), id);
+        std::fs::create_dir_all(&dir).unwrap();
+        write_cow_session_meta(&dir, workspace, id);
+        dir
+    };
+    let mine = diff_layer(ws.path(), "session-1");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    diff_layer(other_ws.path(), "session-2");
+
+    assert_eq!(
+        cow_denied_path_in(ws.path(), None, &[root.path().to_path_buf()]),
+        Some(mine.join(harness_change_ledger::COW_DENIED_LEDGER_FILENAME))
+    );
+    // 許可側: `--session`で指定すれば（`session-`抜きでも）そのセッションのログを読む。
+    assert_eq!(
+        cow_denied_path_in(ws.path(), Some("2"), &[root.path().to_path_buf()]),
+        Some(
+            harness_sandbox::session_scope::cow_diff_layer_dir_in(root.path(), "session-2")
+                .join(harness_change_ledger::COW_DENIED_LEDGER_FILENAME)
+        )
+    );
+}

@@ -348,9 +348,52 @@ pub(crate) fn run_sandbox_subcommand_in(
     let Some((staging, cow_diff_layer_dir)) =
         resolve_session_overlay_in(workspace_root, session.as_deref(), cow_roots)
     else {
-        eprintln!("no staged sandbox or CoW diff layer directory found (nothing to show)");
+        match &session {
+            Some(id) => eprintln!(
+                "session {id} has no staged changes and no CoW diff layer (nothing to show)"
+            ),
+            None => eprintln!(
+                "no staged changes or CoW diff layer found for this workspace (nothing to show)"
+            ),
+        }
         return ExitCode::FAILURE;
     };
+    // **別のワークスペースの差分層を、ここへ書き込まない。** `--session`を省いたときは
+    // 今のワークスペースのものしか選ばれない（`review_target`）が、`--session`で指定すると
+    // 他のワークスペースのものも見つかる。見る（`changes`）・捨てる（`discard`）は指定した
+    // 本人の意図として通すが、**書く（`apply`/`resolve`）は拒否する**——通すと、別の
+    // リポジトリの新規ファイルがここへ書かれる（新規作成には比べる元の姿が無いので、
+    // 上書き検知にも掛からない）。記録されたワークスペースがもう無い（移動・削除した）ときは、
+    // ここへ持ってくるしか取り出す道が無いので、警告して通す。
+    if let Some(dir) = &cow_diff_layer_dir {
+        match diff_layer_origin(dir, workspace_root) {
+            DiffLayerOrigin::ThisWorkspace => {}
+            DiffLayerOrigin::Other { recorded } => {
+                let writes_here = matches!(cmd, Commands::Apply { .. } | Commands::Resolve { .. });
+                if writes_here && Path::new(&recorded).is_dir() {
+                    eprintln!(
+                        "error: the CoW diff layer {} belongs to another workspace ({recorded}); \
+                         applying it here would write that workspace's changes into {}. Run the \
+                         command there instead: `harness --cwd \"{recorded}\" ...`",
+                        dir.display(),
+                        workspace_root.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+                eprintln!(
+                    "warning: the CoW diff layer {} was recorded for another workspace \
+                     ({recorded}), not {}",
+                    dir.display(),
+                    workspace_root.display()
+                );
+            }
+            DiffLayerOrigin::Unknown => eprintln!(
+                "warning: could not confirm which workspace the CoW diff layer {} belongs to \
+                 (its .harness-cow-session.json is missing or unreadable)",
+                dir.display()
+            ),
+        }
+    }
     let fs = match SandboxFs::open_with_cow(
         workspace_root,
         &staging,

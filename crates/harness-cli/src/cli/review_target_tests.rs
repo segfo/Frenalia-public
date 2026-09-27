@@ -134,3 +134,185 @@ fn a_staged_session_is_still_reviewed_through_its_overlay() {
     );
     assert_eq!(resolve_session_overlay_in(ws.path(), None, &[]), expected);
 }
+
+// --- 段4以前からの穴: 変更一覧の対象の選び方 ---
+
+/// 差分層に承認待ちの新規ファイルを1件置く（実体＋操作台帳）。
+#[cfg(windows)]
+fn stage_created_file_in_diff_layer(diff_layer: &Path, rel: &str, content: &str) {
+    let path = diff_layer.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, content).unwrap();
+    let entry = harness_change_ledger::CowOpEntry {
+        op: harness_change_ledger::ChangeOp::Create,
+        path: rel.to_string(),
+        baseline_hash: None,
+        ts_unix_millis: 1_700_000_000_000,
+    };
+    let mut line = serde_json::to_string(&entry).unwrap();
+    line.push('\n');
+    std::fs::write(
+        diff_layer.join(harness_change_ledger::COW_OPS_LEDGER_FILENAME),
+        line,
+    )
+    .unwrap();
+}
+
+/// 更新時刻の順序をはっきりさせる（同じ時刻に並ぶと「最新」の判定が運任せになる）。
+fn tick() {
+    std::thread::sleep(std::time::Duration::from_millis(50));
+}
+
+/// **`--session`を省いたら、このワークスペースの差分層だけを候補にする。**
+///
+/// かつては全ワークスペースを通して最新の差分層を選んでいた。別のリポジトリで後から
+/// 作業すると、こちらで打った`harness apply`がそのリポジトリの変更をこちらへ書き、
+/// `harness discard`がそちらの作業を消した。
+#[cfg(windows)]
+#[test]
+fn without_a_session_only_this_workspaces_diff_layers_are_candidates() {
+    let (ws, root) = workspace_and_cow_root();
+    let other_ws = tempfile::tempdir().unwrap();
+    let mine = cow_diff_layer(root.path(), ws.path(), "session-1700000000001");
+    tick();
+    cow_diff_layer(root.path(), other_ws.path(), "session-1700000000002");
+
+    assert_eq!(
+        resolve_session_overlay_in(ws.path(), None, &[root.path().to_path_buf()]),
+        cow_target(&mine)
+    );
+}
+
+/// **由来が分からない差分層は、`--session`を省いたときの候補にしない。**
+/// どのワークスペースのものか確かめられないものへ、黙って`apply`/`discard`を向けない。
+#[cfg(windows)]
+#[test]
+fn a_diff_layer_of_unknown_origin_is_not_picked_by_default() {
+    let (ws, root) = workspace_and_cow_root();
+    std::fs::create_dir_all(harness_sandbox::session_scope::cow_diff_layer_dir_in(
+        root.path(),
+        SESSION,
+    ))
+    .unwrap();
+
+    assert_eq!(
+        resolve_session_overlay_in(ws.path(), None, &[root.path().to_path_buf()]),
+        None
+    );
+}
+
+/// **古い`--staged`のセッションより、新しいCoWのセッションを選ぶ。**
+/// かつてはstagedを先に探すだけだったので、放置されたstagedの置き場が1つあると
+/// その後のCoWのセッションが`--session`無しでは一度も選ばれなかった。
+#[cfg(windows)]
+#[test]
+fn the_newest_session_wins_across_staged_and_cow() {
+    let (ws, root) = workspace_and_cow_root();
+    staged_overlay_with_one_change(ws.path(), "session-1700000000001");
+    tick();
+    let newer_cow = cow_diff_layer(root.path(), ws.path(), "session-1700000000002");
+
+    assert_eq!(
+        resolve_session_overlay_in(ws.path(), None, &[root.path().to_path_buf()]),
+        cow_target(&newer_cow)
+    );
+}
+
+/// **`--session <stem>`（`session-`抜き）はCoWでも通る。** stagedでは元から通っていた。
+#[cfg(windows)]
+#[test]
+fn a_session_stem_finds_a_cow_diff_layer() {
+    let (ws, root) = workspace_and_cow_root();
+    let diff_layer = cow_diff_layer(root.path(), ws.path(), SESSION);
+
+    assert_eq!(
+        resolve_session_overlay_in(ws.path(), Some("1700000000001"), &[root.path().to_path_buf()]),
+        cow_target(&diff_layer)
+    );
+}
+
+/// **同じセッションIDにstagedの置き場とCoWの差分層の両方があるとき**（別のモードで再開した）、
+/// stagedに承認待ちが無ければCoWを選ぶ。常にstagedを選ぶと、空のstagedの置き場の陰で
+/// CoWの変更に`--session`からは一度も届かない。
+#[cfg(windows)]
+#[test]
+fn an_empty_staged_overlay_does_not_hide_the_cow_diff_layer_of_the_same_session() {
+    let (ws, root) = workspace_and_cow_root();
+    std::fs::create_dir_all(
+        ws.path()
+            .join(harness_sandbox::session_scope::sandbox_dir_for_session(SESSION)),
+    )
+    .unwrap();
+    let diff_layer = cow_diff_layer(root.path(), ws.path(), SESSION);
+
+    assert_eq!(
+        resolve_session_overlay_in(ws.path(), Some(SESSION), &[root.path().to_path_buf()]),
+        cow_target(&diff_layer)
+    );
+}
+
+/// 対の側: stagedに承認待ちがあるなら、そちらを先に見せる（両方とも失われない）。
+#[cfg(windows)]
+#[test]
+fn a_pending_staged_overlay_is_shown_before_the_cow_diff_layer_of_the_same_session() {
+    let (ws, root) = workspace_and_cow_root();
+    staged_overlay_with_one_change(ws.path(), SESSION);
+    cow_diff_layer(root.path(), ws.path(), SESSION);
+
+    let (staging, cow) =
+        resolve_session_overlay_in(ws.path(), Some(SESSION), &[root.path().to_path_buf()])
+            .expect("the staged overlay is found");
+    assert_eq!(staging.mode, StagingMode::Staged);
+    assert_eq!(cow, None);
+}
+
+/// **別のワークスペースの差分層を、今のワークスペースへ`apply`しない。**
+///
+/// `--session`で明示しても、記録されたワークスペースが今も在るなら拒否する（そちらで
+/// `--cwd`を付けて打てばよい）。通すと、別のリポジトリの新規ファイルがこちらに書かれる
+/// ——新規作成には比べる元の姿が無いので、ずれを検出する仕組みにも掛からない。
+#[cfg(windows)]
+#[test]
+fn applying_another_workspaces_diff_layer_is_refused() {
+    let (ws, root) = workspace_and_cow_root();
+    let other_ws = tempfile::tempdir().unwrap();
+    let theirs = cow_diff_layer(root.path(), other_ws.path(), SESSION);
+    stage_created_file_in_diff_layer(&theirs, "from-the-other-repo.txt", "x");
+
+    let code = run_sandbox_subcommand_in(
+        Commands::Apply {
+            session: Some(SESSION.to_string()),
+            only: None,
+            dangerously_allow: false,
+            adopt_unledgered: false,
+            keep_diff_layer: true,
+            output_format: OutputFormat::Text,
+        },
+        ws.path(),
+        &[root.path().to_path_buf()],
+    );
+
+    assert_eq!(code, ExitCode::FAILURE);
+    assert!(
+        !ws.path().join("from-the-other-repo.txt").exists(),
+        "別のワークスペースの変更が今のワークスペースへ書かれた"
+    );
+    assert!(
+        theirs.join("from-the-other-repo.txt").is_file(),
+        "拒否したのに差分層の中身が消えた"
+    );
+}
+
+/// 許可側の対照: 見るだけ（`changes`）なら、別のワークスペースの差分層も`--session`で指定できる。
+#[cfg(windows)]
+#[test]
+fn another_workspaces_diff_layer_can_still_be_listed_by_session() {
+    let (ws, root) = workspace_and_cow_root();
+    let other_ws = tempfile::tempdir().unwrap();
+    let theirs = cow_diff_layer(root.path(), other_ws.path(), SESSION);
+
+    assert_eq!(
+        resolve_session_overlay_in(ws.path(), Some(SESSION), &[root.path().to_path_buf()]),
+        cow_target(&theirs)
+    );
+}

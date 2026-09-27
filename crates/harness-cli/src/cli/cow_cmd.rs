@@ -253,26 +253,31 @@ pub(crate) fn cow_gc(dry_run: bool, with_changes: bool, older_than_days: u64) ->
     }
 }
 
-/// `resolve_session_overlay`のCoW側解決に使う。セッションIDまたは「最も新しいCoW
-/// 置き場」からdiff_layer_dirを解決する。`resolve_sandbox_dir`のstaged版と同じ
-/// 「最新セッションを選ぶ」考え方をCoW側にも適用する。
+/// `harness cow audit`用: セッションIDから、省略時は**全ワークスペースを通して**最も新しい
+/// 差分層を引く。
+///
+/// **変更一覧（`harness changes/apply/discard/resolve`）と`harness policy`はこれを使わない**
+/// ——あちらは今のワークスペースの差分層だけを候補にする（`review_target`）。ここが
+/// 全ワークスペースを見るのは、`harness cow`が差分層の棚卸しの道具（`cow list`/`gc`と
+/// 同じ視野）で、表示するだけだからである。
 #[cfg(windows)]
 pub(crate) fn resolve_cow_diff_layer_dir(session: Option<&str>) -> Option<PathBuf> {
     let (roots, _unreachable) = harness_sandbox::session_scope::cow_diff_layer_roots();
-    resolve_cow_diff_layer_dir_in(&roots, session)
+    if let Some(id) = session {
+        return cow_diff_layer_dir_for_in(&roots, &normalize_session_id(id));
+    }
+    diff_layers_in(&roots)
+        .into_iter()
+        .max_by_key(|(_, modified)| *modified)
+        .map(|(dir, _)| dir)
 }
 
-/// [`resolve_cow_diff_layer_dir`]の本体（根を引数で受ける理由は[`cow_diff_layer_dir_for_in`]と同じ）。
-pub(crate) fn resolve_cow_diff_layer_dir_in(
-    roots: &[PathBuf],
-    session: Option<&str>,
-) -> Option<PathBuf> {
-    if let Some(id) = session {
-        return cow_diff_layer_dir_for_in(roots, id);
-    }
-    // D-81で根が複数になったので、**全部の根を横断して**最新を選ぶ。1つの根だけを見ると、
-    // 別ボリュームのワークスペースで作った差分層が「無い」ことにされる。
-    let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
+/// 渡された根の直下にある差分層を、（場所, 更新時刻）で全部返す。
+///
+/// D-81で根が複数になったので、**全部の根を横断する**。1つの根だけを見ると、
+/// 別ボリュームのワークスペースで作った差分層が「無い」ことにされる。
+pub(crate) fn diff_layers_in(roots: &[PathBuf]) -> Vec<(PathBuf, std::time::SystemTime)> {
+    let mut out = Vec::new();
     for root in roots {
         let Ok(entries) = std::fs::read_dir(root) else {
             continue;
@@ -288,10 +293,8 @@ pub(crate) fn resolve_cow_diff_layer_dir_in(
             let Ok(modified) = metadata.modified() else {
                 continue;
             };
-            if newest.as_ref().is_none_or(|(_, t)| modified > *t) {
-                newest = Some((path, modified));
-            }
+            out.push((path, modified));
         }
     }
-    newest.map(|(p, _)| p)
+    out
 }

@@ -49,7 +49,10 @@ fn collect_input(workspace_root: &Path, session: Option<&str>, sources: &[Source
                 Source::Network,
                 net_audit_path(workspace_root, session, None),
             ),
-            Source::Cow => collect_jsonl(Source::Cow, cow_denied_path(session)),
+            Source::Cow => collect_jsonl(
+                Source::Cow,
+                cow_denied_path_in(workspace_root, session, &production_cow_roots()),
+            ),
             Source::Etw => collect_jsonl(Source::Etw, fs_audit_path(workspace_root, session, None)),
         };
         reports.push(report);
@@ -118,15 +121,27 @@ pub(crate) fn fs_audit_path(
         .map(|dir| workspace_root.join(dir).join("fs-audit.jsonl"))
 }
 
-#[cfg(windows)]
-fn cow_denied_path(session: Option<&str>) -> Option<PathBuf> {
-    resolve_cow_diff_layer_dir(session)
-        .map(|dir| dir.join(harness_change_ledger::COW_DENIED_LEDGER_FILENAME))
-}
-
-#[cfg(not(windows))]
-fn cow_denied_path(_session: Option<&str>) -> Option<PathBuf> {
-    None
+/// CoWの拒否監査台帳（`.harness-cow-denied.jsonl`）の場所。
+///
+/// `--session`を省いたときは**今のワークスペースの差分層から**最新を選ぶ（変更一覧と同じ候補、
+/// `review_target::this_workspaces_diff_layers`）。かつては全ワークスペースを通して最新の
+/// 差分層を読んでいたので、別のリポジトリで拒否された書込が、こちらの
+/// `harness policy suggest`の提案に混ざり、`policy apply`でこちらの設定へ書かれ得た。
+///
+/// CoWの根を引数で受ける理由は`review_target`のモジュールdoc（テストが実機の差分層を読まない）。
+fn cow_denied_path_in(
+    workspace_root: &Path,
+    session: Option<&str>,
+    cow_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    let diff_layer = match session {
+        Some(id) => cow_diff_layer_dir_for_in(cow_roots, &normalize_session_id(id)),
+        None => this_workspaces_diff_layers(workspace_root, cow_roots)
+            .into_iter()
+            .max_by_key(|(_, modified)| *modified)
+            .map(|(dir, _)| dir),
+    }?;
+    Some(diff_layer.join(harness_change_ledger::COW_DENIED_LEDGER_FILENAME))
 }
 
 /// `.harness/settings.json`のパス（`harness policy apply`の書込先）。
