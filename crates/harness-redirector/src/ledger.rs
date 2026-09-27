@@ -115,6 +115,18 @@ pub(crate) struct CopyUp {
     copied: Option<PathBuf>,
 }
 
+/// copy-upでworkspaceの元の中身を写すか。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CopySource {
+    /// 写す（通常）。既存ファイルを書込で開くには、差分層に同じ中身が要る。
+    Workspace,
+    /// 写さない。**このセッションで論理削除したパスを作り直す**とき（[BUG-172](../../../docs/bugs/BUG-172.md)）
+    /// ——論理的にはファイルは無いので、作り直したファイルは空から始まる。写すと、追記で作り直せば
+    /// 「元の中身＋追記」、`CreateNew`で作り直せば写したばかりのコピーとぶつかって失敗し、
+    /// 消したはずのファイルが生き返る。
+    Nothing,
+}
+
 /// copy-up（設計書§18の最小サブセット、一時ファイル+原子renameは省略——初期実装として
 /// 単純上書きコピーを採用する。並行copy-upの競合は許容し、後勝ちで構わない
 /// スコープに留める）。
@@ -127,6 +139,7 @@ pub(crate) fn copy_up(
     rel: &str,
     workspace_path: &Path,
     diff_layer_path: &Path,
+    source: CopySource,
 ) -> Option<CopyUp> {
     if diff_layer_path.exists() {
         return None;
@@ -135,10 +148,17 @@ pub(crate) fn copy_up(
     if let Some(parent) = diff_layer_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let copied = (workspace_path.is_file()
+    let copied = (source == CopySource::Workspace
+        && workspace_path.is_file()
         && std::fs::copy(workspace_path, diff_layer_path).is_ok())
     .then(|| diff_layer_path.to_path_buf());
     Some(CopyUp { record, copied })
+}
+
+/// `rel`がこのセッションで論理削除されているか（削除済み集合に入っているか）。
+/// 読むだけで、集合は変えない。直前に[`check_deleted`]が台帳の増分を取り込んでいる前提で使う。
+pub(crate) fn is_logically_deleted(rel: &str) -> bool {
+    deleted_paths_state().lock().unwrap().contains(rel)
 }
 
 /// [`copy_up`]の後始末。本当のopenが成功したときだけ台帳へ書く（設計書§19.6）。
@@ -357,20 +377,22 @@ pub(crate) fn refresh_deleted_set(cfg: &Config) {
 }
 
 /// 論理削除済み集合を確認し、必要なら書換後の`NTSTATUS`を返す（`Some`なら即returnすべき）。
-/// 作成可能なdispositionでの再作成は集合から除去して`None`（通常処理へ継続）を返す。
+/// 作成可能なdispositionでの再作成は`None`（通常処理へ継続）を返す。
+///
+/// **再作成でも、ここでは集合から外さない**（[BUG-172](../../../docs/bugs/BUG-172.md)、BUG-171と同じ形）。
+/// 外れるのは、作り直しのopenが成功して台帳へ`Create`/`Modify`が書かれたとき
+/// （[`append_ledger_entry`]）である。先に外していた頃は、作り直しのopenが失敗しても
+/// 削除済みの印だけが消え、以後セッションの中からworkspaceの元のファイルが見えていた
+/// （台帳は「削除済み」のまま＝一覧と見え方が食い違う）。呼び出し側は[`is_logically_deleted`]で
+/// 「作り直しか」を知り、元の中身を写さない（[`CopySource::Nothing`]）。
 pub(crate) fn check_deleted(cfg: &Config, rel: &str, allow_recreate: bool) -> Option<NTSTATUS> {
     refresh_deleted_set(cfg);
     let deleted = deleted_paths_state();
-    let mut g = deleted.lock().unwrap();
-    if !g.contains(rel) {
+    let g = deleted.lock().unwrap();
+    if !g.contains(rel) || allow_recreate {
         return None;
     }
-    if allow_recreate {
-        g.remove(rel);
-        None
-    } else {
-        Some(STATUS_OBJECT_NAME_NOT_FOUND)
-    }
+    Some(STATUS_OBJECT_NAME_NOT_FOUND)
 }
 
 /// BUG-171: 台帳へ書くのは本当の操作が成功した後。フックは実プロセスへ注入しないと動かないので、
@@ -420,7 +442,7 @@ mod tests {
         let ws_path = cfg.workspace_root.join(rel);
         let diff_path = cfg.diff_layer_dir.join(rel);
 
-        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path);
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
         assert!(prepared.is_some(), "the first touch must prepare a record");
         finish_copy_up(&cfg, prepared, false);
         assert!(
@@ -429,7 +451,7 @@ mod tests {
         );
         assert!(!diff_path.exists());
 
-        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path);
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
         std::fs::write(&diff_path, "created by the real open").unwrap();
         finish_copy_up(&cfg, prepared, true);
         assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Create]);
@@ -445,7 +467,7 @@ mod tests {
         let diff_path = cfg.diff_layer_dir.join(rel);
         std::fs::write(&ws_path, "base").unwrap();
 
-        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path);
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
         assert!(
             diff_path.is_file(),
             "copy_up must copy the existing file before the open (the open needs it)"
@@ -460,7 +482,7 @@ mod tests {
             "the copy made for the failed open must be removed"
         );
 
-        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path);
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
         assert!(
             prepared.is_some(),
             "after the rollback, the next write must count as the first touch again"
@@ -468,6 +490,28 @@ mod tests {
         finish_copy_up(&cfg, prepared, true);
         assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Modify]);
         assert_eq!(std::fs::read_to_string(&diff_path).unwrap(), "base");
+    }
+
+    /// BUG-172: このセッションで消したパスを作り直すときは、workspaceに元のファイルが在っても
+    /// 写さない（作り直したファイルは空から始まる）。記録は元が在ったので`Modify`（元の中身の指紋つき）
+    /// ——`apply`はその指紋で本物が変わっていないことを確かめてから、新しい中身で置き換える。
+    #[test]
+    fn recreating_a_deleted_path_does_not_copy_the_original_back() {
+        let (_ws, _diff_layer, cfg) = fixture();
+        let rel = "bug172-recreated.txt";
+        let ws_path = cfg.workspace_root.join(rel);
+        let diff_path = cfg.diff_layer_dir.join(rel);
+        std::fs::write(&ws_path, "original").unwrap();
+
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Nothing);
+        assert!(
+            !diff_path.exists(),
+            "BUG-172: the original must not be copied back for a recreate"
+        );
+        std::fs::write(&diff_path, "new").unwrap(); // 作り直しのopenが作ったもの
+        finish_copy_up(&cfg, prepared, true);
+        assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Modify]);
+        assert_eq!(std::fs::read_to_string(&diff_path).unwrap(), "new");
     }
 
     /// 差分層を直接開く経路も同じ組。失敗した回は書かず、**記録済みの印も付けない**

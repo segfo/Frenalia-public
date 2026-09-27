@@ -199,7 +199,14 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
                     let diff_layer_path = cfg.diff_layer_dir.join(&rel);
                     // BUG-171: 写すのはopenの前（写さないと既存ファイルを開けない）、
                     // 台帳へ書くのはopenが成功した後。
-                    let copied = copy_up(cfg, &rel_str, &path, &diff_layer_path);
+                    // BUG-172: このセッションで消したパスの作り直しなら、元の中身は写さない
+                    // （`check_deleted`が作成できる開き方だけを通しているので、ここへ来るのはそれ）。
+                    let source = if is_logically_deleted(&rel_str) {
+                        CopySource::Nothing
+                    } else {
+                        CopySource::Workspace
+                    };
+                    let copied = copy_up(cfg, &rel_str, &path, &diff_layer_path, source);
                     let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
                     let (mut redirected_oa, mut redirected_name) =
                         unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
@@ -493,7 +500,15 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
                 {
                     let diff_layer_path = cfg.diff_layer_dir.join(&rel);
                     // BUG-171: `hooked_nt_create_file`と同じ組（写すのは前、書くのは成功の後）。
-                    let copied = copy_up(cfg, &rel_str, &path, &diff_layer_path);
+                    // `NtOpenFile`は作り直せない（削除済みなら直前の`check_deleted`が断る）ので、
+                    // 常に元の中身を写す。
+                    let copied = copy_up(
+                        cfg,
+                        &rel_str,
+                        &path,
+                        &diff_layer_path,
+                        CopySource::Workspace,
+                    );
                     let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
                     let (mut redirected_oa, mut redirected_name) =
                         unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
