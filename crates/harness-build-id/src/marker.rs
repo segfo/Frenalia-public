@@ -3,12 +3,14 @@
 //! # なぜ計算側と同じクレートに居るのか
 //!
 //! 刻印は「焼く」「配置後に検算する」「実行時にゲートで照合する」の 3 箇所で読まれる。
-//! マーカーの綴りと受け付ける形（64 桁の小文字 16 進 + NUL）を複数箇所で書くと、
-//! **ずれた側が何も見つけられなくなる**——見つからないことは「刻印が無い古い DLL」と
+//! 探すときの目印になる文字列（`HRBUILDID:` の 10 文字）と、その後ろに何が続けば正当と
+//! 認めるか（64 桁の小文字 16 進 + NUL）を複数箇所へ書き写すと、**書き写した側が
+//! 1 文字ずれただけで何も見つけられなくなる**——見つからないことは「刻印が無い古い DLL」と
 //! 区別が付かないので、ゲートが形だけ残って中身が死ぬ。
 //!
-//! そこで綴りと走査はこのモジュールだけが持ち、build script（[`crate::x86_deploy`]）と
-//! 実行時のゲート（`harness-sandbox` の `tier2a::redirector_identity`）は**同じ関数**を呼ぶ。
+//! そこで「目印の 10 文字」と「探し方」はこのモジュールだけが持ち、
+//! build script（[`crate::x86_deploy`]）と実行時のゲート
+//! （`harness-sandbox` の `tier2a::redirector_identity`）は**同じ関数**を呼ぶ。
 
 /// 刻印を DLL のバイト列から探すためのマーカー。この後に 64 桁の 16 進と NUL が続く。
 pub const BUILD_ID_MARKER: &str = "HRBUILDID:";
@@ -53,7 +55,7 @@ impl std::error::Error for IdError {}
 /// 扱える（エクスポートテーブルの構造は 32bit と 64bit で違う）。
 ///
 /// マーカーの後ろが「64 桁の小文字 16 進」＋「NUL」になっているものだけを正当とみなす。
-/// マーカーの綴りだけが偶然含まれていても刻印としては拾わない。
+/// `HRBUILDID:` の 10 文字がたまたま含まれているだけの場所は、刻印として拾わない。
 pub fn extract_build_id(bytes: &[u8]) -> Result<String, IdError> {
     let marker = BUILD_ID_MARKER.as_bytes();
     let payload = BUILD_ID_HEX_LEN;
@@ -161,7 +163,8 @@ mod tests {
         assert_eq!(extract_build_id(&blob), Err(IdError::Missing));
     }
 
-    /// **D2c**: 16 進でない文字が混ざる（大文字は不可＝綴りを 1 つに固定する）。
+    /// **D2c**: 16 進でない文字が混ざる（大文字は不可。1 つの刻印を表す文字の並びを
+    /// 1 通りだけに固定する——大小を許すと同じ値が 2 通りで書けてしまう）。
     #[test]
     fn a_marker_with_non_lowercase_hex_is_rejected() {
         let upper = ID_A.to_uppercase();
@@ -183,7 +186,8 @@ mod tests {
         }
     }
 
-    /// **A3（誤検知側）**: マーカーの綴りだけが在って中身が無い。**刻印をでっち上げない**こと。
+    /// **A3（誤検知側）**: `HRBUILDID:` の 10 文字はあるが、その後ろが刻印の形になっていない。
+    /// **刻印をでっち上げない**こと。
     /// でっち上げると、壊れた DLL が偶然期待値と一致して素通りし得る。
     #[test]
     fn the_marker_spelling_alone_does_not_fabricate_an_id() {

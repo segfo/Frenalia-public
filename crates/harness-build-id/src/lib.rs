@@ -34,7 +34,8 @@ use sha2::{Digest, Sha256};
 mod marker;
 pub mod x86_deploy;
 
-// 刻印の**綴りと走査**は `marker` が唯一持つ。ここから再公開するのは、利用側の綴り
+// **刻印を探す目印の文字列（`HRBUILDID:`）と、その探し方**は `marker` が唯一持つ。
+// ここから再公開しているのは、**利用側が書く import のパス**
 // （`harness_build_id::BUILD_ID_MARKER`）を変えないためである。
 pub use marker::{extract_build_id, IdError, BUILD_ID_HEX_LEN, BUILD_ID_MARKER};
 

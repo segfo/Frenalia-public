@@ -39,8 +39,9 @@
 
 use std::path::{Path, PathBuf};
 
-// 刻印の綴りと、バイト列からの取り出しは `harness-build-id` が唯一持つ。**build script も
-// 同じ関数を呼ぶ**——配置直後の検算と実行時のゲートで判定が分かれると、片方だけが通る。
+// 刻印を探す目印の文字列（`HRBUILDID:`）と、バイト列からの取り出しは
+// `harness-build-id` が唯一持つ。**build script も同じ関数を呼ぶ**
+// ——配置直後の検算と実行時のゲートで判定が分かれると、片方だけが通る。
 pub use harness_build_id::{extract_build_id, IdError, BUILD_ID_HEX_LEN, BUILD_ID_MARKER};
 
 /// この harness 本体が期待する刻印。build script が `harness-build-id` に計算させた値で、
@@ -48,7 +49,7 @@ pub use harness_build_id::{extract_build_id, IdError, BUILD_ID_HEX_LEN, BUILD_ID
 pub const EXPECTED_BUILD_ID: &str = env!("HARNESS_REDIRECTOR_BUILD_ID");
 
 /// x86（WOW64 用）Redirector DLL の固定ファイル名。x64 の隣に置く規約
-/// （`harness-redirector` 側の `x86_sibling_dll_path` と同じ綴り）。
+/// （`harness-redirector` 側の `x86_sibling_dll_path` が組み立てるのと**同じファイル名**）。
 pub const X86_DLL_FILENAME: &str = "harness_redirector_x86.dll";
 
 /// 作り直すためのコマンド。**エラー文にそのまま出す**——「そろっていない」とだけ言われても
@@ -211,10 +212,11 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("x64.dll") && msg.contains("x86.dll"), "{msg}");
         assert!(msg.contains(ID_A) && msg.contains(ID_B), "{msg}");
-        // **次に何を打てばよいかが出ること。** 以前はここで `i686-pc-windows-msvc` という
-        // 綴りを測っていた——32bit 版を手で作る手順を案内していた頃の文面である。
-        // 通常ビルドが作るようになったので綴りは変わったが、**測りたい性質は変わっていない**
-        // ので、文面に assert を合わせるのではなく「打つコマンドが入っていること」を測る。
+        // **次に何を打てばよいかが出ること。** 以前はここで、エラー文に
+        // `i686-pc-windows-msvc` という文字列が含まれることを測っていた——32bit 版を手で作る
+        // 手順を案内していた頃の文面である。通常ビルドが作るようになってエラー文は書き替えたが、
+        // **測りたい性質は変わっていない**ので、新しい文面に合わせて assert を書き直すのではなく
+        // 「打つコマンドが入っていること」を測る。
         assert!(msg.contains(REBUILD_HINT), "{msg}");
         assert!(REBUILD_HINT.contains("cargo build"), "{REBUILD_HINT}");
     }
