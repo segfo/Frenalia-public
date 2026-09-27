@@ -2202,6 +2202,47 @@ $content = if (Test-Path test3.txt) { Get-Content test3.txt -Raw } else { $null 
     Ok(session2)
 }
 
+/// X: セッションの中で消したファイルを同じ名前で作り直すと、**新しい中身だけ**になること。
+///
+/// BUG-171の横展開で見つけた形。論理削除（台帳の`Delete`とメモリ上の削除済み集合）の後に
+/// 作成できる開き方で開くと、Redirectorは削除済みの印を**本当のopenの前に**外し、`copy_up`が
+/// workspaceの**元の中身**を差分層へ写してから開いていた。追記で作り直すと「元の中身＋追記」になり、
+/// 「新規のみ」で作り直すと写したばかりのコピーとぶつかって失敗する——どちらも、消したはずの
+/// ファイルが生き返る。2通りの作り直し方を1本の行で並べる。
+fn case_x_recreating_a_deleted_file_starts_empty(ex: &CowExclusive) -> Result<(), String> {
+    let ws = case_dir("cow-x-recreate-deleted");
+    let session1 = setup_baseline(ex, &ws, "cow-x")?;
+    let script = "Remove-Item test.txt; Add-Content test.txt 'x' -NoNewline; \
+$appended = Get-Content test.txt -Raw; \
+Remove-Item test1.txt; \
+try { [System.IO.File]::Open('test1.txt', 'CreateNew').Dispose(); $createdNew = $true } \
+catch { $createdNew = $false }; \
+$fresh = if (Test-Path test1.txt) { [System.IO.File]::ReadAllText('test1.txt') } else { $null }; \
+[pscustomobject]@{ appended = $appended; createdNew = $createdNew; fresh = $fresh } \
+| ConvertTo-Json -Compress";
+    let (session2, report) = run_round2_with_report(ex, &ws, script, "cow-x-r2", "createdNew")?;
+    if report["appended"].as_str() != Some("x") {
+        return Err(format!(
+            "appending to a deleted-then-recreated test.txt must give only the new content 'x' \
+             (the original was copied back before the open): {report}"
+        ));
+    }
+    if report["createdNew"].as_bool() != Some(true) || report["fresh"].as_str() != Some("") {
+        return Err(format!(
+            "CreateNew on a deleted test1.txt must succeed and give an empty file (it collided \
+             with the original copied back before the open): {report}"
+        ));
+    }
+
+    let applied = apply_cow(&ws, &session2, None)?;
+    expect_apply_clean("X", &applied)?;
+    expect_eq("test.txt after apply", &read_file(&ws.join("test.txt"))?, "x")?;
+    expect_eq("test1.txt after apply", &read_file(&ws.join("test1.txt"))?, "")?;
+
+    cleanup_on_success(&ws, &[&session1, &session2], "cow-x");
+    Ok(())
+}
+
 #[test]
 #[ignore]
 fn tier2a_cow_commit_matrix() {
@@ -2268,6 +2309,11 @@ fn tier2a_cow_commit_matrix() {
         (
             "W-a-refused-delete-keeps-the-file",
             case_w_a_refused_delete_keeps_the_file,
+        ),
+        // X: BUG-171の横展開。消したファイルを作り直すと新しい中身だけになること。
+        (
+            "X-recreating-a-deleted-file-starts-empty",
+            case_x_recreating_a_deleted_file_starts_empty,
         ),
     ];
     let mut passed = 0;
