@@ -2706,12 +2706,18 @@ fn wfp_fail_closed_launcher_exe_with_mode(dir_name: &str, mode: Option<&str>) ->
         .expect("copy mock netfilterd exe into launcher dir as harness-netfilterd.exe");
     // **本物をそのまま持ってくる**——ここで差し替えたいのはnetfilterdだけである。
     // 一覧にしてあるのは、**次に増えたときに足す場所を1箇所にする**ため。
-    // 増えた順に: Spawn Daemon（遷移MACの強制点）、Redirector DLL（透過層の注入元）。
+    // 増えた順に: Spawn Daemon（遷移MACの強制点）、Redirector DLL（透過層の注入元）、
+    // 32bit版のRedirector DLL（D-90の段3で版一致のゲートが全Tier2aへ広がり、無ければ
+    // Tier2aの起動前確認で止まるようになった。名前は起動前確認と同じ定数から取る）。
     let real_dir = harness_exe()
         .parent()
         .expect("harness exe has a parent dir")
         .to_path_buf();
-    for sibling in ["harness-spawnd.exe", "harness_redirector.dll"] {
+    for sibling in [
+        "harness-spawnd.exe",
+        "harness_redirector.dll",
+        harness_sandbox::tier2a::redirector_identity::X86_DLL_FILENAME,
+    ] {
         let src = real_dir.join(sibling);
         std::fs::copy(&src, dir.join(sibling)).unwrap_or_else(|e| {
             panic!(
