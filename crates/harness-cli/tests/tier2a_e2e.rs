@@ -2617,9 +2617,16 @@ struct CensusEntry {
     rejected: bool,
     ext: bool,
     is_dir: bool,
-    /// `modify`/`create`なのに差分層に実体が無い（copy-upの失敗は製品側で捨てられるので、
-    /// 一覧に載っているのに中身が無い、が起き得る）。
-    missing_in_diff_layer: bool,
+    /// `create`なのに差分層にも本物にも実体が無い——**中身の無い作成**。
+    ///
+    /// 2026-09-27の初回の測定で見つかった（`plans/cow-default-spike/RESULTS.md`）。gitは
+    /// `switch`・`commit`のたびに`MERGE_HEAD`等の後始末で**存在しないファイルを消しに行き**、
+    /// Redirectorはその削除のためのopenを`create`として台帳へ載せ、対になる削除を載せない。
+    /// **計器の故障ではなく、いまの一覧が実際に持っているもの**なので、数えて出す。
+    phantom_create: bool,
+    /// `modify`なのに差分層に実体が無い（copy-upの失敗は製品側で捨てられる）。**その書込は
+    /// 失われている**ので、これは計器の検算に使う（中身の無い作成とは別の事実）。
+    lost_in_diff_layer: bool,
     git_component: bool,
     byte_identical: bool,
     /// `modify`のファイルについて、バイト比較の結果と「`baseline_hash`＝差分層の中身のハッシュ」が
@@ -2653,8 +2660,11 @@ fn classify_census(
             let f = diff_layer.join(path.replace('/', "\\"));
             (f.is_dir(), f.exists(), Some(f))
         };
-        let missing_in_diff_layer =
-            !ext && (op == "modify" || op == "create") && !exists;
+        let phantom_create = !ext
+            && op == "create"
+            && !exists
+            && !ws.join(path.replace('/', "\\")).exists();
+        let lost_in_diff_layer = !ext && op == "modify" && !exists;
         let (byte_identical, baseline_agrees) = match &diff_file {
             Some(f) if op == "modify" && exists && !is_dir => {
                 let diff_bytes =
@@ -2677,7 +2687,8 @@ fn classify_census(
             rejected: item.get("rejected").is_some_and(|r| !r.is_null()),
             ext,
             is_dir,
-            missing_in_diff_layer,
+            phantom_create,
+            lost_in_diff_layer,
             git_component,
             byte_identical,
             baseline_agrees,
@@ -2847,6 +2858,7 @@ fn census_counts(entries: &[CensusEntry]) -> serde_json::Value {
                 "count": of.len(),
                 "directories": of.iter().filter(|e| e.is_dir).count(),
                 "unledgered": of.iter().filter(|e| e.unledgered).count(),
+                "phantom_create": of.iter().filter(|e| e.phantom_create).count(),
                 "ops": ops,
                 "product_category": cats,
             }),
@@ -2858,6 +2870,8 @@ fn census_counts(entries: &[CensusEntry]) -> serde_json::Value {
         "overlaps": {
             // .git の中の、中身が変わらないコピー（packの時刻更新など）。
             "git_and_byte_identical": entries.iter().filter(|e| e.git_component && e.byte_identical).count(),
+            // 差分層にも本物にも実体の無い create（[`CensusEntry::phantom_create`]）。
+            "phantom_create": entries.iter().filter(|e| e.phantom_create).count(),
             "ext": entries.iter().filter(|e| e.ext).count(),
         },
     })
@@ -2877,6 +2891,9 @@ fn census_paths(entries: &[CensusEntry]) -> serde_json::Value {
                 }
                 if e.git_component && e.byte_identical {
                     s.push_str(" (identical)");
+                }
+                if e.phantom_create {
+                    s.push_str(" (phantom)");
                 }
                 s
             })
@@ -3042,9 +3059,9 @@ fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, St
         .filter(|e| e.rejected)
         .map(|e| e.path.as_str())
         .collect();
-    let missing: Vec<&str> = entries
+    let lost: Vec<&str> = entries
         .iter()
-        .filter(|e| e.missing_in_diff_layer)
+        .filter(|e| e.lost_in_diff_layer)
         .map(|e| e.path.as_str())
         .collect();
     let disagreements: Vec<&str> = entries
@@ -3098,7 +3115,7 @@ fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, St
             "visible_plus_folded": visible_plus_folded,
             "json_total": entries.len(),
             "baseline_hash_disagreements": disagreements,
-            "missing_in_diff_layer": missing,
+            "lost_in_diff_layer": lost,
             "denied_inside_workspace": denied_inside,
             "denied_outside_workspace": denied.len() - denied_inside.len(),
             "control_guide_is_byte_identical": class_of("docs/guide.txt").map(|c| c.key()),
@@ -3155,8 +3172,10 @@ fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, St
             "バイト比較と baseline_hash が逆の答えを出した（計器のどちらかが壊れている）: {disagreements:?}"
         ));
     }
-    if !missing.is_empty() {
-        broken.push(format!("一覧にあるのに差分層に実体が無い（copy-up の失敗）: {missing:?}"));
+    if !lost.is_empty() {
+        broken.push(format!(
+            "modify なのに差分層に実体が無い（copy-up の失敗＝その書込は失われている）: {lost:?}"
+        ));
     }
     if !denied_inside.is_empty() {
         broken.push(format!(
@@ -3424,10 +3443,17 @@ fn census_classifier_separates_each_axis_and_leaves_lookalikes_alone() {
     }
     // 追跡されている src/lib.txt は ignore に入らない（check-ignore の既定）。
     assert!(!entries.iter().find(|e| e.path == "src/lib.txt").unwrap().ignored);
-    // 差分層に実体の無い create は印が付く（copy-up の失敗を見逃さない）。
-    let with_missing = serde_json::json!([entry("create", "ghost.txt", None, "side_effect")]);
-    let ghost = classify_census(&ws, &diff, &with_missing).expect("classify");
-    assert!(ghost[0].missing_in_diff_layer);
+    // 差分層にも本物にも実体の無い create は「中身の無い作成」、実体の無い modify は
+    // 「失われた書込」。**2つを取り違えない**（前者は一覧の性質、後者は計器の検算）。
+    let without_entity = serde_json::json!([
+        entry("create", "ghost.txt", None, "side_effect"),
+        entry("modify", "README.md", Some(b"census seed\n"), "side_effect"),
+    ]);
+    let ghosts = classify_census(&ws, &diff, &without_entity).expect("classify");
+    assert!(ghosts[0].phantom_create && !ghosts[0].lost_in_diff_layer);
+    assert!(ghosts[1].lost_in_diff_layer && !ghosts[1].phantom_create);
+    // 実体のある create は中身の無い作成ではない。
+    assert!(!entries.iter().find(|e| e.path == "scratch.txt").unwrap().phantom_create);
 }
 
 /// `.git`の中でも、中身の変わらないコピーは「重なり」として数えられ、分類は`.git`が勝つ。
