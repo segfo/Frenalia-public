@@ -2089,7 +2089,8 @@ fn case_u_deleting_a_missing_file_leaves_no_entry(ex: &CowExclusive) -> Result<(
         println!(
             "{}",
             serde_json::json!({
-                "case": "U",
+                // 各ケースの合否の行（`{"case":…,"passed":…}`）と見分けられる名前にする。
+                "observed_in": "U",
                 "note": "the diff layer was kept right after a clean apply (not BUG-171)",
                 "verdict": format!("{verdict:?}"),
                 "facts": facts,
@@ -2234,7 +2235,7 @@ $content = if (Test-Path test3.txt) { Get-Content test3.txt -Raw } else { $null 
     let applied = apply_cow(ws, &session2, None)?;
     println!(
         "{}",
-        serde_json::json!({ "case": "W", "apply_report": applied })
+        serde_json::json!({ "observed_in": "W", "apply_report": applied })
     );
     expect_eq(
         "test3.txt after apply (it must not be deleted)",
