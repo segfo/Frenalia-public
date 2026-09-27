@@ -1954,6 +1954,254 @@ fn case_t_workspace_path_longer_than_max_path(ex: &CowExclusive) -> Result<(), S
     Ok(())
 }
 
+// --- U〜W（BUG-171）: 失敗した操作を、台帳が「起きた」と記録しないこと ----------------------
+//
+// Redirector（子の書込を差分層へ向け直すDLL）は、台帳への記録を**本当の操作を呼ぶ前に、
+// 結果を見ずに**行っていた。操作が失敗しても記録は残り、台帳だけが「起きた」と言う。
+// 台帳は一覧（`harness changes`）・承認（`harness apply`）・セッションの中の見え方
+// （削除済みの集合）の唯一の材料なので、3つが揃って実体と食い違う。
+// U・V・Wは、同じ形が現れる3つの場所（開く・名前の変更・削除の予約）を1つずつ失敗させる。
+
+/// ラウンド2を1本の`run_shell`で回し、その行が最後に印字したJSONの要約（`key`を持つ最後の行）を返す。
+/// 要約は子のstdout（道具の結果欄）からだけ読む（BUG-137）。
+fn run_round2_with_report(
+    ex: &CowExclusive,
+    ws: &Path,
+    script: &str,
+    case_name: &str,
+    key: &str,
+) -> Result<(String, serde_json::Value), String> {
+    let before = ex.list_cow_sessions();
+    let run = run_harness(
+        ws,
+        &run_shell_script_turns(script),
+        &["--sandbox", "tier2a-cow"],
+        case_name,
+    );
+    if !run.status.success() {
+        return Err(format!("round2 harness invocation failed: {}", run.stderr));
+    }
+    let session = ex.new_cow_session(&before)?;
+    let outcome = parse_json_stdout(&run)?;
+    let result_text = outcome.first_tool_result()?;
+    let report = result_text
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .rfind(|v| v.get(key).is_some())
+        .ok_or_else(|| {
+            format!("could not find the JSON summary line with {key:?} in the tool output: {result_text}")
+        })?;
+    Ok((session, report))
+}
+
+/// 変更一覧（`harness changes`のJSON）のうち、`path`のエントリの`op`を並べる。
+fn change_ops_for(changes: &serde_json::Value, path: &str) -> Result<Vec<String>, String> {
+    Ok(changes
+        .as_array()
+        .ok_or("changes json is not an array")?
+        .iter()
+        .filter(|c| c["path"].as_str().map(|p| p.replace('\\', "/")).as_deref() == Some(path))
+        .map(|c| c["op"].as_str().unwrap_or_default().to_string())
+        .collect())
+}
+
+/// `apply`の結果に、人の手が要る欄（衝突・拒否・台帳に無い実体・hard-deny・外への書込）が1件も無いこと。
+fn expect_apply_clean(what: &str, report: &serde_json::Value) -> Result<(), String> {
+    for key in [
+        "conflicts",
+        "rejected",
+        "unledgered",
+        "hard_denied",
+        "ext_blocked",
+    ] {
+        let n = report[key]
+            .as_array()
+            .map(|a| a.len())
+            .ok_or_else(|| format!("apply report has no {key}[]: {report}"))?;
+        if n != 0 {
+            return Err(format!("{what}: apply left {n} entr(ies) in {key}: {report}"));
+        }
+    }
+    Ok(())
+}
+
+/// U: 存在しないファイルを消そうとしただけで、変更一覧に「作った」が残らないこと。
+///
+/// Windowsの削除は「削除の権限を付けてファイルを開く」から始まる。Redirectorはそのopenを
+/// 本当に開く前に台帳へ`create`として記録していた（`copy_up`）。開くのは「ファイルが無い」で
+/// 失敗するので、対になる`delete`は来ない——一覧に中身の無い`create`が残り、`apply`は中身を
+/// 読めずに拒否欄へ積み（終了コード4）、差分層も回収されなかった。存在しないファイルを黙って
+/// 消すのはビルドの後始末やgit自身が普通にやることで（段5の測定で`.git`の中に7件出た）、
+/// CoWを既定にすると承認が毎回これで止まる。
+///
+/// 対照として、同じ行で既存の`test3.txt`を消す（こちらは`delete`が載り、適用で本物が消える）。
+fn case_u_deleting_a_missing_file_leaves_no_entry(ex: &CowExclusive) -> Result<(), String> {
+    let ws = case_dir("cow-u-delete-missing");
+    let session1 = setup_baseline(ex, &ws, "cow-u")?;
+    let script = "[System.IO.File]::Delete('stale.txt'); \
+[System.IO.File]::Delete('test3.txt'); \
+[pscustomobject]@{ staleExists = (Test-Path stale.txt); test3Exists = (Test-Path test3.txt) } \
+| ConvertTo-Json -Compress";
+    let (session2, report) = run_round2_with_report(ex, &ws, script, "cow-u-r2", "test3Exists")?;
+    if report["test3Exists"].as_bool() != Some(false)
+        || report["staleExists"].as_bool() != Some(false)
+    {
+        return Err(format!(
+            "control: inside the session test3.txt must be gone and stale.txt must not exist: {report}"
+        ));
+    }
+
+    let changes = list_changes_json(&ws, &session2)?;
+    let stale = change_ops_for(&changes, "stale.txt")?;
+    if !stale.is_empty() {
+        return Err(format!(
+            "BUG-171: deleting a file that does not exist left {stale:?} for stale.txt in the change \
+             list (the ledger was written before the open, whose result was 'not found'): {changes}"
+        ));
+    }
+    let test3 = change_ops_for(&changes, "test3.txt")?;
+    if test3 != ["delete"] {
+        return Err(format!(
+            "control: deleting the existing test3.txt must be listed as one delete, got {test3:?}: {changes}"
+        ));
+    }
+
+    let applied = apply_cow(&ws, &session2, None)?;
+    expect_apply_clean("U", &applied)?;
+    if ws.join("test3.txt").exists() {
+        return Err(format!("test3.txt must be deleted by apply: {applied}"));
+    }
+    if ws.join("stale.txt").exists() {
+        return Err(format!("apply must not create stale.txt: {applied}"));
+    }
+    // 合格基準P4の形: 全部を適用し切ったセッションは、差分層も残らない（D-82の回収）。
+    if cow_diff_layer_dir(&session2).exists() {
+        return Err(format!(
+            "a fully applied session must have its diff layer reclaimed: {applied}"
+        ));
+    }
+
+    cleanup_on_success(&ws, &[&session1, &session2], "cow-u");
+    Ok(())
+}
+
+/// V: 失敗した名前の変更が、元のファイルを消したことにしないこと。
+///
+/// Redirectorは名前の変更を受け取ると、本当の変更を呼ぶ前に台帳へ「旧パスを削除・新パスを作成」を
+/// 書いていた。移動先が既にある等で変更が失敗しても記録は残り、元のファイルは台帳の上で
+/// 削除済みになる——セッションの中から見えなくなり、`apply`は本物を消しに行く。
+/// ここでは移動先`fresh.txt`を先に作っておき、上書き無しの移動を必ず失敗させる。
+fn case_v_a_failed_rename_keeps_the_source(ex: &CowExclusive) -> Result<(), String> {
+    let ws = case_dir("cow-v-failed-rename");
+    let session1 = setup_baseline(ex, &ws, "cow-v")?;
+    let script = "Set-Content fresh.txt 'fresh' -NoNewline; \
+try { [System.IO.File]::Move('test.txt', 'fresh.txt'); $moved = $true } catch { $moved = $false }; \
+$source = if (Test-Path test.txt) { Get-Content test.txt -Raw } else { $null }; \
+[pscustomobject]@{ moved = $moved; source = $source } | ConvertTo-Json -Compress";
+    let (session2, report) = run_round2_with_report(ex, &ws, script, "cow-v-r2", "moved")?;
+    if report["moved"].as_bool() != Some(false) {
+        return Err(format!(
+            "precondition: the move onto the existing fresh.txt must fail, otherwise this case \
+             tests nothing: {report}"
+        ));
+    }
+    if report["source"].as_str() != Some("helloworld") {
+        return Err(format!(
+            "BUG-171: after a failed rename, test.txt must still be readable inside the session \
+             (the ledger recorded the rename before it failed): {report}"
+        ));
+    }
+
+    let changes = list_changes_json(&ws, &session2)?;
+    if change_ops_for(&changes, "test.txt")?
+        .iter()
+        .any(|op| op == "delete")
+    {
+        return Err(format!(
+            "BUG-171: a failed rename left a delete of test.txt in the change list: {changes}"
+        ));
+    }
+
+    let applied = apply_cow(&ws, &session2, None)?;
+    expect_apply_clean("V", &applied)?;
+    expect_eq(
+        "test.txt after apply",
+        &read_file(&ws.join("test.txt"))?,
+        "helloworld",
+    )?;
+    expect_eq(
+        "fresh.txt after apply",
+        &read_file(&ws.join("fresh.txt"))?,
+        "fresh",
+    )?;
+
+    cleanup_on_success(&ws, &[&session1, &session2], "cow-v");
+    Ok(())
+}
+
+/// W: 読み取り専用で消せなかったファイルを、消したことにしないこと。
+///
+/// Redirectorは「閉じたら消す」予約（`FileDispositionInformation`）を、本当の予約が成功したかを
+/// 見ずに覚えておき、閉じるときに台帳へ`delete`を書いていた。読み取り専用のファイルは予約そのものが
+/// 断られる（`STATUS_CANNOT_DELETE`）ので、実際には消えていないのに台帳の上では削除済みになる。
+fn case_w_a_refused_delete_keeps_the_file(ex: &CowExclusive) -> Result<(), String> {
+    let ws = case_dir("cow-w-refused-delete");
+    let session1 = setup_baseline(ex, &ws, "cow-w")?;
+    // サンドボックスの外（この試験プロセス）で本物を読み取り専用にする。
+    // **どの経路で抜けても戻す**——残すと次の回の`case_dir`がこのワークスペースを消せない。
+    let target = ws.join("test3.txt");
+    set_readonly_checked(&target, true)?;
+    let body = case_w_body(ex, &ws, &target);
+    let restored = if target.exists() {
+        set_readonly_checked(&target, false)
+    } else {
+        Ok(())
+    };
+    let session2 = body?;
+    restored?;
+    cleanup_on_success(&ws, &[&session1, &session2], "cow-w");
+    Ok(())
+}
+
+fn case_w_body(ex: &CowExclusive, ws: &Path, target: &Path) -> Result<String, String> {
+    let script = "try { [System.IO.File]::Delete('test3.txt'); $deleted = $true } \
+catch { $deleted = $false }; \
+$content = if (Test-Path test3.txt) { Get-Content test3.txt -Raw } else { $null }; \
+[pscustomobject]@{ deleted = $deleted; content = $content } | ConvertTo-Json -Compress";
+    let (session2, report) = run_round2_with_report(ex, ws, script, "cow-w-r2", "deleted")?;
+    if report["deleted"].as_bool() != Some(false) {
+        return Err(format!(
+            "precondition: deleting the read-only test3.txt must fail inside the session, \
+             otherwise this case tests nothing: {report}"
+        ));
+    }
+    if report["content"].as_str() != Some("baseline3") {
+        return Err(format!(
+            "BUG-171: after a refused delete, test3.txt must still be readable inside the session \
+             (the delete was recorded although the disposition was refused): {report}"
+        ));
+    }
+
+    let changes = list_changes_json(ws, &session2)?;
+    if change_ops_for(&changes, "test3.txt")?
+        .iter()
+        .any(|op| op == "delete")
+    {
+        return Err(format!(
+            "BUG-171: a refused delete left a delete of test3.txt in the change list: {changes}"
+        ));
+    }
+
+    let applied = apply_cow(ws, &session2, None)?;
+    expect_apply_clean("W", &applied)?;
+    expect_eq(
+        "test3.txt after apply",
+        &read_file(target)?,
+        "baseline3",
+    )?;
+    Ok(session2)
+}
+
 #[test]
 #[ignore]
 fn tier2a_cow_commit_matrix() {
@@ -2007,6 +2255,19 @@ fn tier2a_cow_commit_matrix() {
         (
             "T-workspace-longer-than-max-path",
             case_t_workspace_path_longer_than_max_path,
+        ),
+        // U〜W: BUG-171。失敗した操作を台帳が「起きた」と記録しないこと。
+        (
+            "U-deleting-a-missing-file-leaves-no-entry",
+            case_u_deleting_a_missing_file_leaves_no_entry,
+        ),
+        (
+            "V-a-failed-rename-keeps-the-source",
+            case_v_a_failed_rename_keeps_the_source,
+        ),
+        (
+            "W-a-refused-delete-keeps-the-file",
+            case_w_a_refused_delete_keeps_the_file,
         ),
     ];
     let mut passed = 0;
@@ -6896,11 +7157,19 @@ fn write_fs_settings(ws: &Path, paths: &[&Path]) -> Result<(), String> {
 }
 
 fn set_ledger_readonly(path: &Path, readonly: bool) {
-    if let Ok(metadata) = std::fs::metadata(path) {
-        let mut perms = metadata.permissions();
-        perms.set_readonly(readonly);
-        let _ = std::fs::set_permissions(path, perms);
-    }
+    // 台帳の後始末は最善努力（失敗しても次の手当てがある）なので、結果は捨てる。
+    let _ = set_readonly_checked(path, readonly);
+}
+
+/// 読み取り専用の属性を立てる／下ろす。**失敗を返す**——属性が立たなかったのに先へ進むと、
+/// それを前提にした試験（CoW行列のW）が何も確かめないまま緑になる。
+fn set_readonly_checked(path: &Path, readonly: bool) -> Result<(), String> {
+    let mut perms = std::fs::metadata(path)
+        .map_err(|e| format!("metadata {}: {e}", path.display()))?
+        .permissions();
+    perms.set_readonly(readonly);
+    std::fs::set_permissions(path, perms)
+        .map_err(|e| format!("set readonly={readonly} on {}: {e}", path.display()))
 }
 
 /// 2つのワークスペースが同じパスを宣言している間はエントリが生き、両方が宣言を外して初めて
