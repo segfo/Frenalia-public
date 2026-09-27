@@ -314,6 +314,53 @@ pub fn validate_sink_under(
     Ok(resolved_parent.join(file_name))
 }
 
+/// **昇格側が書く監査ログを、依頼する側（非昇格）が先に作る**
+/// （[BUG-109](../../docs/bugs/BUG-109.md)）。
+///
+/// 昇格したヘルパー（`harness-policy-learnd`の収集器・`harness-netfilterd`）は、
+/// 受け取ったシンクを`OpenOptions::create(true).append(true)`で開く。**昇格したプロセスが
+/// 先に作ると所有者が`BUILTIN\Administrators`になり、非昇格のharnessは以後そのファイルの
+/// DACLを書けなくなる**（所有者ではなく、継承ACEが与えるのはModifyまでで`WRITE_DAC`を
+/// 含まない）。
+///
+/// これは単なる行儀の問題ではない。シンクは`<workspace>/.harness/`配下＝**制御面**に
+/// あり、`preflight`は起動のたびに`.harness/**`の全ノードへ保護DACLを書いて
+/// AppContainerから隔離する（D-05のhard-deny）。1ノードでも書けなければ保護は完成せず、
+/// Tier2aはfail-closedで中止する——BUG-109では**ポリシーエディタのパス1が、パス2には
+/// もう触れないファイルを制御面に作る**という形で、同じworkspaceでの記録が二度と
+/// 成立しなくなっていた。
+///
+/// 先に作っておけば所有者は依頼した側になり、昇格側は追記するだけになる。
+/// **既にあれば触らない**（中身を消さない。昇格側は`append`で開くので、こちらが
+/// `truncate`すると再接続のたびに前の記録が消える）。
+/// **失敗しても止めない**——ここで作れないなら昇格側も作れない見込みで、その失敗は
+/// 昇格側の応答として返る方が情報量が多い（B-10: 握り潰さないが、判断は理由を持っている
+/// 側に任せる）。
+///
+/// **呼ぶ場所は、昇格側へ要求を組み立てる唯一の点に閉じ込めること**
+/// （`policy_learnd::client`の`start_collect_bytes`・`netfilterd`の`apply_rules_bytes`）。
+/// 送信点ごとに書くと、送信点が増えた日に片方だけ漏れる（B-06）。
+pub fn precreate_audit_sink(path: &Path, what: &str) {
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        eprintln!(
+            "warning: could not pre-create the {what} {}: {e}. The elevated helper will \
+             create it instead, which leaves it owned by Administrators and makes the \
+             control-plane protection fail on later runs (see docs/bugs/BUG-109.md)",
+            path.display()
+        );
+    }
+}
+
 /// Windowsのパス比較は大小を区別しない。`Path::starts_with`はコンポーネント単位で比較するので
 /// `C:\a\bc`が`C:\a\b`の配下と誤判定されることは無いが、大小の違いを吸収しないため自前で行う。
 fn starts_with_ignore_case(path: &Path, prefix: &Path) -> bool {

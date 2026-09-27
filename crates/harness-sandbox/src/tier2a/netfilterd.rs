@@ -485,9 +485,7 @@ fn send_apply(
     pipe: HANDLE,
     policy: NetfilterPolicy,
 ) -> Result<Option<ChainLaunchReport>, NetfilterError> {
-    let req = NetfilterRequest::ApplyRules(policy);
-    let bytes = serde_json::to_vec(&req)
-        .map_err(|e| NetfilterError::Ipc(format!("failed to serialize request: {e}")))?;
+    let bytes = apply_rules_bytes(policy)?;
     write_framed_timeout(pipe, &bytes, REQUEST_WRITE_TIMEOUT)?;
     let response_bytes = read_framed_timeout(pipe, APPLY_RESPONSE_TIMEOUT)?;
     let response: NetfilterResponse = serde_json::from_slice(&response_bytes)
@@ -499,6 +497,23 @@ fn send_apply(
             "unexpected {other:?} response for an ApplyRules request"
         ))),
     }
+}
+
+/// `ApplyRules`のワイヤ表現を作る。送信点は[`send_apply`]だけで、初回と再適用の両方が通る。
+///
+/// **監査ログのシンクの先行作成をここに閉じ込める**（なぜ先に作るかは
+/// [`crate::elevated_launch::precreate_audit_sink`]）。この要求を組む送り手は、harness本体の
+/// 起動・ポリシーエディタのパス2の2つがあり、どちらもここを通る。
+///
+/// 先に作るのは、`netfilterd`が実際に書く条件（`audit_log_path`と`workspace_root`の両方がある。
+/// `handle_apply_rules`）と同じときだけにする。書かれないシンクを作ると、`workspace_root`を
+/// 運ばない古い形の要求で、相対パスのままカレントディレクトリへファイルを生やす。
+fn apply_rules_bytes(policy: NetfilterPolicy) -> Result<Vec<u8>, NetfilterError> {
+    if let (Some(sink), Some(_)) = (&policy.audit_log_path, &policy.workspace_root) {
+        crate::elevated_launch::precreate_audit_sink(sink, "network audit log");
+    }
+    serde_json::to_vec(&NetfilterRequest::ApplyRules(policy))
+        .map_err(|e| NetfilterError::Ipc(format!("failed to serialize request: {e}")))
 }
 
 /// 既に接続待ち可能な状態のパイプへ、daemonの接続を待ってから`ApplyRules`を送り応答を待つ
@@ -2032,6 +2047,67 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// **通信の監査ログは、依頼する側（非昇格）が先に作る。**
+    ///
+    /// `netfilterd`は昇格しており、WFPの拒否や連鎖起動の結末を`net-audit.jsonl`へ
+    /// `create(true)`で書く（`wfp.rs`の`WfpAuditSink::record`）。先に作っておかないと所有者が
+    /// `BUILTIN\Administrators`になり、次回の起動で`.harness/**`の保護が書けずTier2aが
+    /// 丸ごと中止する（[BUG-109](../../../../docs/bugs/BUG-109.md)と同じ形。あちらは収集器の
+    /// `fs-audit.jsonl`）。
+    ///
+    /// **測る対象は`apply_rules_bytes`**（初回と再適用の両方が通る組み立て点）。先行作成の
+    /// 関数を直接呼ぶと「配線されていなくても緑」になる。
+    #[test]
+    fn the_net_audit_sink_exists_before_netfilterd_is_asked_to_write_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = tmp
+            .path()
+            .join(".harness")
+            .join("sandbox")
+            .join("audit-session-x")
+            .join("net-audit.jsonl");
+        assert!(!sink.exists());
+
+        apply_rules_bytes(NetfilterPolicy {
+            session_profile: "harness.shell.sandbox.1-2".to_string(),
+            allow_loopback_tcp_ports: Vec::new(),
+            allow_loopback_udp_ports: Vec::new(),
+            audit_log_path: Some(sink.clone()),
+            mcp_profiles: Vec::new(),
+            workspace_root: Some(tmp.path().to_path_buf()),
+            chain_launch_policy_learnd: None,
+        })
+        .expect("serialize ApplyRules");
+
+        assert!(
+            sink.is_file(),
+            "netfilterdへ渡す前にシンクが無ければ、作るのは昇格側になる: {}",
+            sink.display()
+        );
+    }
+
+    /// **対の側**（`B-35`）: `workspace_root`を運ばない要求では、`netfilterd`は
+    /// シンクを検証できないので書かない（`handle_apply_rules`）。書かれないものを先に作ると、
+    /// 相対パスのままカレントディレクトリへファイルを生やす。
+    #[test]
+    fn a_sink_that_netfilterd_will_not_write_is_not_precreated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = tmp.path().join("net-audit.jsonl");
+
+        apply_rules_bytes(NetfilterPolicy {
+            session_profile: "harness.shell.sandbox.1-2".to_string(),
+            allow_loopback_tcp_ports: Vec::new(),
+            allow_loopback_udp_ports: Vec::new(),
+            audit_log_path: Some(sink.clone()),
+            mcp_profiles: Vec::new(),
+            workspace_root: None,
+            chain_launch_policy_learnd: None,
+        })
+        .expect("serialize ApplyRules");
+
+        assert!(!sink.exists());
     }
 
     /// `NetfilterRequest`のJSON表現そのものを固定する。上の往復テストは encode→decode が

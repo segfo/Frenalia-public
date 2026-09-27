@@ -477,32 +477,18 @@ pub fn daemon_is_dead(error: &LearnError) -> bool {
     }
 }
 
-/// **監査ログのシンクを、依頼する側（非昇格）が先に作る**
-/// （[BUG-109](../../../../docs/bugs/BUG-109.md)）。
-///
-/// 収集器は`OpenOptions::create(true).append(true)`でこのファイルを開く（`server.rs`）。
-/// **収集器は昇格している**（ETWリアルタイムセッションの開始に管理者権限が要る）ので、
-/// 収集器が先に作ると所有者が`BUILTIN\Administrators`になり、**非昇格のharnessは以後
-/// そのファイルのDACLを書けなくなる**（所有者ではなく、継承ACEが与えるのはModifyまでで
-/// `WRITE_DAC`を含まない）。
-///
-/// これは単なる行儀の問題ではない。シンクは`<workspace>/.harness/sandbox/`配下＝**制御面**に
-/// あり、`preflight`は起動のたびに`.harness/**`の全ノードへ保護DACLを書いて
-/// AppContainerから隔離する（D-05のhard-deny）。1ノードでも書けなければ保護は完成せず、
-/// Tier2aはfail-closedで中止する——つまり**パス1が、パス2にはもう触れないファイルを
-/// 制御面に作る**という形で、同じworkspaceでの記録が二度と成立しなくなっていた。
-///
-/// 先に作っておけば所有者は依頼した側になり、収集器は追記するだけになる。
-/// **失敗しても止めない**——ここで作れないなら収集器も作れない見込みで、その失敗は
-/// 収集器側の応答（`LearnResponse::Err`）として返る方が情報量が多い（B-10: 握り潰さないが、
-/// 判断は理由を持っている側に任せる）。
 /// `StartCollect`のワイヤ表現を作る。
 ///
-/// **シンクの先行作成をここに閉じ込める。** 送信点は2つある（生きているdaemonへの再送＝
-/// [`PolicyLearnHandle::start_collect`]と、起こした直後の[`handshake`]）ので、
-/// 「送る前に作る」を各所へ書くと3つ目が生えたときに片方だけ漏れる（B-06: 選ぶ自由を奪う）。
+/// **シンクの先行作成をここに閉じ込める**（なぜ先に作るかは
+/// [`crate::elevated_launch::precreate_audit_sink`]、[BUG-109](../../../../docs/bugs/BUG-109.md)）。
+/// 送信点は2つある（生きているdaemonへの再送＝[`PolicyLearnHandle::start_collect`]と、
+/// 起こした直後の[`handshake`]）ので、「送る前に作る」を各所へ書くと3つ目が生えたときに
+/// 片方だけ漏れる（B-06: 選ぶ自由を奪う）。
 fn start_collect_bytes(policy: &LearnPolicy) -> Result<Vec<u8>, LearnError> {
-    precreate_sink(&policy.fs_audit_log_path, "policy-learn audit sink");
+    crate::elevated_launch::precreate_audit_sink(
+        &policy.fs_audit_log_path,
+        "policy-learn audit sink",
+    );
     if policy.capture_argv {
         // **候補の積み先も先に作る**（段階6d）。書き手は同じ昇格プロセスなので、
         // 先に作らなければ所有者が`BUILTIN\Administrators`になる——ここは
@@ -511,34 +497,13 @@ fn start_collect_bytes(policy: &LearnPolicy) -> Result<Vec<u8>, LearnError> {
         //
         // **拒否の待ち行列（`pending.jsonl`）には要らない。** あちらの書き手は
         // Spawn Daemonで、**昇格していない**（§10.2の書き手の表）。
-        precreate_sink(
+        crate::elevated_launch::precreate_audit_sink(
             &super::observed::observed_path(&policy.workspace_root),
             "observed transition candidates",
         );
     }
     serde_json::to_vec(&LearnRequest::StartCollect(policy.clone()))
         .map_err(|e| LearnError::Ipc(format!("failed to serialize StartCollect: {e}")))
-}
-
-fn precreate_sink(path: &std::path::Path, what: &str) {
-    if path.exists() {
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Err(e) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        eprintln!(
-            "warning: could not pre-create the {what} {}: {e}. The elevated collector will \
-             create it instead, which leaves it owned by Administrators and makes the \
-             control-plane protection fail on later runs (see docs/bugs/BUG-109.md)",
-            path.display()
-        );
-    }
 }
 
 fn handshake(pipe: HANDLE, policy: &LearnPolicy) -> Result<bool, LearnError> {
