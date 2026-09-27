@@ -51,31 +51,128 @@ pub(crate) fn append_ledger_entry(
     }
 }
 
+/// 台帳へ書く**予定**の1件（[BUG-171](../../../docs/bugs/BUG-171.md)）。
+///
+/// 記録の中身（どの操作か・最初に触った時点の中身の指紋）は本当の操作の前に決めてよいが、
+/// **書くのは、本当の操作が成功したと分かってから**である（設計書§19.6「実際に…した瞬間に追記する」）。
+/// 先に書くと、操作が失敗したときに台帳だけが「起きた」と言う。台帳は一覧（`harness changes`）・
+/// 承認（`harness apply`）・セッションの中の見え方（削除済みの集合）の唯一の材料なので、
+/// 3つが揃って実体と食い違う——実際に、存在しないファイルを消しただけで中身の無い`create`が残り、
+/// 失敗した名前の変更と断られた削除では、元のファイルが台帳の上で削除済みになった。
+///
+/// 書く・書かないは[`Self::settle`]に本当の操作の結果を渡して決める。**呼ばずに捨てると何も書かない**
+/// ——結果が分からないまま「起きた」とは言わない側へ倒すため。
+#[must_use = "settle() with the real operation's result; dropping it writes nothing"]
+pub(crate) struct PendingRecord {
+    op: ChangeOp,
+    rel: String,
+    baseline_hash: Option<String>,
+}
+
+impl PendingRecord {
+    /// `rel`の最初の接触として書く予定を作る。workspace側に元があれば`Modify`、無ければ`Create`。
+    fn first_touch(cfg: &Config, rel: &str) -> Self {
+        let baseline_hash = baseline_hash_for(cfg, rel);
+        let op = if baseline_hash.is_some() {
+            ChangeOp::Modify
+        } else {
+            ChangeOp::Create
+        };
+        Self {
+            op,
+            rel: rel.to_string(),
+            baseline_hash,
+        }
+    }
+
+    /// 名前の変更の旧パス（`Delete`）として書く予定を作る。
+    pub(crate) fn delete(cfg: &Config, rel: &str) -> Self {
+        Self {
+            op: ChangeOp::Delete,
+            rel: rel.to_string(),
+            baseline_hash: baseline_hash_for(cfg, rel),
+        }
+    }
+
+    /// 名前の変更の新パスとして書く予定を作る（[`Self::first_touch`]と同じ判定）。
+    pub(crate) fn rename_target(cfg: &Config, rel: &str) -> Self {
+        Self::first_touch(cfg, rel)
+    }
+
+    /// 本当の操作の結果を受け取り、成功したときだけ台帳へ書く。
+    pub(crate) fn settle(self, cfg: &Config, succeeded: bool) {
+        if succeeded {
+            append_ledger_entry(cfg, self.op, &self.rel, self.baseline_hash);
+        }
+    }
+}
+
+/// [`copy_up`]が差分層へ用意したもの。本当のopenの結果とともに[`finish_copy_up`]へ渡す。
+#[must_use = "pass it to finish_copy_up() with the real open's result"]
+pub(crate) struct CopyUp {
+    record: PendingRecord,
+    /// この呼び出しでworkspaceから写した実体（写さなかったなら`None`）。
+    copied: Option<PathBuf>,
+}
+
 /// copy-up（設計書§18の最小サブセット、一時ファイル+原子renameは省略——初期実装として
 /// 単純上書きコピーを採用する。並行copy-upの競合は許容し、後勝ちで構わない
-/// スコープに留める）。実際に差分層へコピー/新規作成した瞬間（冪等チェックを通過して実際に
-/// 作業した瞬間）にCreate/Modifyを1件台帳へ追記する（設計書§19.6）。
-pub(crate) fn copy_up(cfg: &Config, rel: &str, workspace_path: &Path, diff_layer_path: &Path) {
+/// スコープに留める）。
+///
+/// **ここでは台帳へ書かない**（BUG-171）。書く予定を返し、本当のopenの結果を見た
+/// [`finish_copy_up`]が書く。差分層に既に実体があれば「このセッションで既に触った」ので
+/// 何もせず`None`を返す（この判定があるので、`apply`は適用した実体を差分層から消している、BUG-034）。
+pub(crate) fn copy_up(
+    cfg: &Config,
+    rel: &str,
+    workspace_path: &Path,
+    diff_layer_path: &Path,
+) -> Option<CopyUp> {
     if diff_layer_path.exists() {
-        return;
+        return None;
     }
-    let baseline_hash = baseline_hash_for(cfg, rel);
+    let record = PendingRecord::first_touch(cfg, rel);
     if let Some(parent) = diff_layer_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if workspace_path.is_file() {
-        let _ = std::fs::copy(workspace_path, diff_layer_path);
-    }
-    let op = if baseline_hash.is_some() {
-        ChangeOp::Modify
-    } else {
-        ChangeOp::Create
+    let copied = (workspace_path.is_file()
+        && std::fs::copy(workspace_path, diff_layer_path).is_ok())
+    .then(|| diff_layer_path.to_path_buf());
+    Some(CopyUp { record, copied })
+}
+
+/// [`copy_up`]の後始末。本当のopenが成功したときだけ台帳へ書く（設計書§19.6）。
+///
+/// 失敗したときは、この呼び出しで写した実体を差分層から消す。残すと、次に同じパスを
+/// 書込で開いたとき[`copy_up`]が「既に触った」と判定して**その回を台帳へ書かない**
+/// （台帳に無い実体として一覧には出るが、元の中身の指紋を失うので`apply`の衝突検出が効かない）。
+/// 消せなかったら警告台帳へ残す（黙って捨てない）。空のディレクトリは一覧に出ないので残してよい。
+pub(crate) fn finish_copy_up(cfg: &Config, copy_up: Option<CopyUp>, open_succeeded: bool) {
+    let Some(CopyUp { record, copied }) = copy_up else {
+        return;
     };
-    append_ledger_entry(cfg, op, rel, baseline_hash);
+    if !open_succeeded {
+        if let Some(path) = copied {
+            if let Err(e) = std::fs::remove_file(&path) {
+                append_warning_kind(
+                    cfg,
+                    "copy_up_rollback_failed",
+                    &format!(
+                        "the open that copied {} into the diff layer failed, and removing the copy \
+                         failed too ({e}); the next write to {} will not be recorded in the ledger",
+                        path.display(),
+                        record.rel
+                    ),
+                );
+            }
+        }
+    }
+    record.settle(cfg, open_succeeded);
 }
 
 /// 差分層配下の実体へ**直接**書かれた1件（＝`copy_up`を経由しない書込）を、workspace側と
-/// 同じ台帳キーで記録する（[BUG-066](../../../docs/bugs/BUG-066.md)）。
+/// 同じ台帳キーで記録する予定を作る（[BUG-066](../../../docs/bugs/BUG-066.md)）。
+/// 書くのは本当のopenの結果を見た[`finish_diff_layer_alias_write`]である（BUG-171）。
 ///
 /// diff_layer_dirはサンドボックス子へRW付与されており、`<差分層>\<rel>`という綴りで書けば
 /// ACLも通るしフックの誘導も要らない。実際にモデルが`Set-Content <差分層>\merge-demo.txt`を
@@ -85,19 +182,29 @@ pub(crate) fn copy_up(cfg: &Config, rel: &str, workspace_path: &Path, diff_layer
 /// 実workspace側の現在内容＝セッション開始時点の姿。workspaceはROなので後から変わらない）。
 ///
 /// 同一パスの2回目以降はプロセス内の集合で抑止する（`copy_up`の`diff_layer_path.exists()`と同じ
-/// 役割）。兄弟プロセスや`copy_up`との重複追記は起こり得るが、`replay`はパス単位で畳むので
+/// 役割）。**集合へ入れるのも成功した後**——先に入れると、失敗した1回がその後の成功した書込の
+/// 記録まで止める。兄弟プロセスや`copy_up`との重複追記は起こり得るが、`replay`はパス単位で畳むので
 /// 実害は無い（初回のbaselineが権威という規律も`baseline_hash_for`側で保たれる）。
-pub(crate) fn record_diff_layer_alias_write(cfg: &Config, rel: &str) {
-    if !diff_layer_alias_first_touch(rel) {
-        return;
+pub(crate) fn plan_diff_layer_alias_write(cfg: &Config, rel: &str) -> Option<PendingRecord> {
+    if diff_layer_alias_already_recorded(rel) {
+        return None;
     }
-    let baseline_hash = baseline_hash_for(cfg, rel);
-    let op = if baseline_hash.is_some() {
-        ChangeOp::Modify
-    } else {
-        ChangeOp::Create
+    Some(PendingRecord::first_touch(cfg, rel))
+}
+
+/// [`plan_diff_layer_alias_write`]の後始末。openが成功し、かつこのプロセスでまだ誰も書いて
+/// いなければ台帳へ書く（同じパスを複数のスレッドが同時に開いたときに2行にしないため、
+/// 集合への登録と書込の判定を1回の`insert`で行う）。
+pub(crate) fn finish_diff_layer_alias_write(
+    cfg: &Config,
+    record: Option<PendingRecord>,
+    open_succeeded: bool,
+) {
+    let Some(record) = record else {
+        return;
     };
-    append_ledger_entry(cfg, op, rel, baseline_hash);
+    let first = open_succeeded && diff_layer_alias_first_touch(&record.rel);
+    record.settle(cfg, first);
 }
 
 // `copy_up`（`std::fs::copy`/`create_dir_all`）はWin32のCreateFileW等を経由するため、
@@ -263,5 +370,128 @@ pub(crate) fn check_deleted(cfg: &Config, rel: &str, allow_recreate: bool) -> Op
         None
     } else {
         Some(STATUS_OBJECT_NAME_NOT_FOUND)
+    }
+}
+
+/// BUG-171: 台帳へ書くのは本当の操作が成功した後。フックは実プロセスへ注入しないと動かないので、
+/// ここでは「操作の前に用意する側」と「結果を受けて書く側」の組を、結果を手で渡して固定する。
+/// 実プロセスでの確認は CoW 行列の U・V・W（`crates/harness-cli/tests/tier2a_e2e.rs`）。
+///
+/// パス名は`bug171-`で始めて他のテストと重ねない——`baseline_hash_for`のキャッシュと
+/// 差分層を直接開いたときの記録済み集合は、プロセスに1つしか無い。削除（`Delete`）は書かない
+/// （削除済み集合もプロセスに1つで、別のテストがその中身を見ている）。
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harness_change_ledger::COW_OPS_LEDGER_FILENAME;
+
+    /// 一時的なworkspaceと差分層で、CoWが有効な設定を作る（2つの一時ディレクトリは返り値が持つ）。
+    fn fixture() -> (tempfile::TempDir, tempfile::TempDir, Config) {
+        let ws = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            workspace_root: ws.path().to_path_buf(),
+            diff_layer_dir: diff_layer.path().to_path_buf(),
+            cow_enabled: true,
+            broker_pipe: None,
+            ext_capture_roots: Vec::new(),
+            process_hooks: false,
+        };
+        (ws, diff_layer, cfg)
+    }
+
+    /// 台帳に`rel`について書かれた行の`op`を、書かれた順に返す。
+    fn ledger_ops(cfg: &Config, rel: &str) -> Vec<ChangeOp> {
+        let text = std::fs::read_to_string(cfg.diff_layer_dir.join(COW_OPS_LEDGER_FILENAME))
+            .unwrap_or_default();
+        parse_ledger(&text)
+            .into_iter()
+            .filter(|e| e.path == rel)
+            .map(|e| e.op)
+            .collect()
+    }
+
+    /// 存在しないファイルを書込で開いて失敗した（削除のためのopenが「ファイルが無い」で返った）
+    /// ときは、台帳に何も書かず、差分層にも何も残さない。作成できたopenなら`Create`を書く（許可側）。
+    #[test]
+    fn a_failed_open_of_a_missing_file_records_nothing_and_a_successful_one_records_create() {
+        let (_ws, _diff_layer, cfg) = fixture();
+        let rel = "bug171-missing.txt";
+        let ws_path = cfg.workspace_root.join(rel);
+        let diff_path = cfg.diff_layer_dir.join(rel);
+
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path);
+        assert!(prepared.is_some(), "the first touch must prepare a record");
+        finish_copy_up(&cfg, prepared, false);
+        assert!(
+            ledger_ops(&cfg, rel).is_empty(),
+            "BUG-171: a failed open must not leave a create for a file that was never made"
+        );
+        assert!(!diff_path.exists());
+
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path);
+        std::fs::write(&diff_path, "created by the real open").unwrap();
+        finish_copy_up(&cfg, prepared, true);
+        assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Create]);
+    }
+
+    /// 既存ファイルを写した後でopenが失敗したら、写した実体を消す。残すと次の書込が
+    /// 「既に触った」と判定されて台帳に載らない（`apply`が適用済みの実体を消すのと同じ理由、BUG-034）。
+    #[test]
+    fn a_failed_open_after_copying_rolls_back_the_copy_so_the_next_write_is_recorded() {
+        let (_ws, _diff_layer, cfg) = fixture();
+        let rel = "bug171-existing.txt";
+        let ws_path = cfg.workspace_root.join(rel);
+        let diff_path = cfg.diff_layer_dir.join(rel);
+        std::fs::write(&ws_path, "base").unwrap();
+
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path);
+        assert!(
+            diff_path.is_file(),
+            "copy_up must copy the existing file before the open (the open needs it)"
+        );
+        finish_copy_up(&cfg, prepared, false);
+        assert!(
+            ledger_ops(&cfg, rel).is_empty(),
+            "BUG-171: a failed open must not leave a modify"
+        );
+        assert!(
+            !diff_path.exists(),
+            "the copy made for the failed open must be removed"
+        );
+
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path);
+        assert!(
+            prepared.is_some(),
+            "after the rollback, the next write must count as the first touch again"
+        );
+        finish_copy_up(&cfg, prepared, true);
+        assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Modify]);
+        assert_eq!(std::fs::read_to_string(&diff_path).unwrap(), "base");
+    }
+
+    /// 差分層を直接開く経路も同じ組。失敗した回は書かず、**記録済みの印も付けない**
+    /// ——付けると、その後の成功した書込が記録されない。成功した2回目は1行だけ書く。
+    #[test]
+    fn a_failed_diff_layer_alias_open_neither_records_nor_marks_the_path() {
+        let (_ws, _diff_layer, cfg) = fixture();
+        let rel = "bug171-alias.txt";
+
+        let planned = plan_diff_layer_alias_write(&cfg, rel);
+        assert!(planned.is_some());
+        finish_diff_layer_alias_write(&cfg, planned, false);
+        assert!(ledger_ops(&cfg, rel).is_empty(), "BUG-171");
+
+        let planned = plan_diff_layer_alias_write(&cfg, rel);
+        assert!(
+            planned.is_some(),
+            "a failed open must not mark the path as already recorded"
+        );
+        finish_diff_layer_alias_write(&cfg, planned, true);
+        assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Create]);
+        assert!(
+            plan_diff_layer_alias_write(&cfg, rel).is_none(),
+            "once recorded, later touches in this process are not recorded again"
+        );
     }
 }

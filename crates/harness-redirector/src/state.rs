@@ -346,10 +346,20 @@ pub(crate) fn record_denied_attempt(cfg: &Config, path: &Path, access_mask: u32)
 }
 
 /// BUG-066: 差分層配下の実体へ直接書かれたパスのうち、既にこのプロセスが台帳へ記録済みの集合
-/// （`record_diff_layer_alias_write`の冪等化。`copy_up`の`diff_layer_path.exists()`と同じ役割を果たす）。
-pub(crate) fn diff_layer_alias_first_touch(rel: &str) -> bool {
+/// （差分層を直接開く書込の冪等化。`copy_up`の`diff_layer_path.exists()`と同じ役割を果たす）。
+fn diff_layer_alias_recorded() -> &'static Mutex<HashSet<String>> {
     static S: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// `rel`をこのプロセスが既に記録したか（**登録はしない**）。openの前に見る側（BUG-171）。
+pub(crate) fn diff_layer_alias_already_recorded(rel: &str) -> bool {
+    diff_layer_alias_recorded().lock().unwrap().contains(rel)
+}
+
+/// `rel`を記録済みとして登録し、**今回が最初だったか**を返す。openが成功した後に呼ぶ（BUG-171）。
+pub(crate) fn diff_layer_alias_first_touch(rel: &str) -> bool {
+    diff_layer_alias_recorded()
         .lock()
         .unwrap()
         .insert(rel.to_string())

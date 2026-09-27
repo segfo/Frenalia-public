@@ -151,13 +151,14 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
                 // 「workspaceをどう見せるか」の論理であって、行き先の実体への直接アクセスに
                 // 被せると、削除済みパスの差分層実体を消すことすらできなくなる。
                 if kind == TargetKind::DiffLayerAlias {
-                    if should_redirect_write(
+                    // BUG-171: 台帳へ書くのは本当のopenが成功した後。
+                    let record = should_redirect_write(
                         is_write_intent(desired_access.0, Some(create_disposition.0)),
                         create_options.0,
                         Some(create_disposition.0),
-                    ) {
-                        record_diff_layer_alias_write(cfg, &rel_str);
-                    }
+                    )
+                    .then(|| plan_diff_layer_alias_write(cfg, &rel_str))
+                    .flatten();
                     let hook = CREATE_FILE_HOOK.get().expect("hook installed");
                     let status = unsafe {
                         hook.call(
@@ -174,6 +175,7 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
                             ea_length,
                         )
                     };
+                    finish_diff_layer_alias_write(cfg, record, status.is_ok());
                     track_new_handle(file_handle, status, &rel_str, create_options.0);
                     return status;
                 }
@@ -195,7 +197,9 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
                     Some(create_disposition.0),
                 ) {
                     let diff_layer_path = cfg.diff_layer_dir.join(&rel);
-                    copy_up(cfg, &rel_str, &path, &diff_layer_path);
+                    // BUG-171: 写すのはopenの前（写さないと既存ファイルを開けない）、
+                    // 台帳へ書くのはopenが成功した後。
+                    let copied = copy_up(cfg, &rel_str, &path, &diff_layer_path);
                     let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
                     let (mut redirected_oa, mut redirected_name) =
                         unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
@@ -216,6 +220,7 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
                             ea_length,
                         )
                     };
+                    finish_copy_up(cfg, copied, status.is_ok());
                     if is_probe {
                         debug_log(&format!(
                             "hooked_nt_create_file: rel={rel_str:?} branch=write-redirect \
@@ -451,13 +456,14 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
                 }
                 // BUG-066: 差分層配下の実体を直接開いている（`hooked_nt_create_file`と同じ理由）。
                 if kind == TargetKind::DiffLayerAlias {
-                    if should_redirect_write(
+                    // BUG-171: 台帳へ書くのは本当のopenが成功した後。
+                    let record = should_redirect_write(
                         is_write_intent(desired_access, None),
                         open_options,
                         None,
-                    ) {
-                        record_diff_layer_alias_write(cfg, &rel_str);
-                    }
+                    )
+                    .then(|| plan_diff_layer_alias_write(cfg, &rel_str))
+                    .flatten();
                     let hook = OPEN_FILE_HOOK.get().expect("hook installed");
                     let status = unsafe {
                         hook.call(
@@ -469,6 +475,7 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
                             open_options,
                         )
                     };
+                    finish_diff_layer_alias_write(cfg, record, status.is_ok());
                     track_new_handle(file_handle, status, &rel_str, open_options);
                     return status;
                 }
@@ -485,7 +492,8 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
                 if should_redirect_write(is_write_intent(desired_access, None), open_options, None)
                 {
                     let diff_layer_path = cfg.diff_layer_dir.join(&rel);
-                    copy_up(cfg, &rel_str, &path, &diff_layer_path);
+                    // BUG-171: `hooked_nt_create_file`と同じ組（写すのは前、書くのは成功の後）。
+                    let copied = copy_up(cfg, &rel_str, &path, &diff_layer_path);
                     let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
                     let (mut redirected_oa, mut redirected_name) =
                         unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
@@ -501,6 +509,7 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
                             open_options,
                         )
                     };
+                    finish_copy_up(cfg, copied, status.is_ok());
                     if is_probe {
                         debug_log(&format!(
                             "hooked_nt_open_file: rel={rel_str:?} branch=write-redirect \
@@ -676,14 +685,46 @@ pub(crate) fn build_rename_info_buffer(
     (buf, header_offset + name_bytes_len)
 }
 
+/// 名前の変更1回ぶんの、台帳へ書く予定とハンドル対応表の更新（BUG-171）。
+/// 本当の変更の結果を[`PendingRename::settle`]へ渡し、成功したときだけ反映する。
+#[must_use = "settle() with the real rename's result; dropping it records nothing"]
+pub(crate) struct PendingRename {
+    handle_key: isize,
+    new_rel_str: String,
+    old: PendingRecord,
+    new: PendingRecord,
+}
+
+impl PendingRename {
+    /// 成功したら、台帳へ旧パスの`Delete`と新パスの`Create`/`Modify`を書き、以降この
+    /// ハンドルへの操作（例: リネーム直後の削除予約）が新パスを指すよう対応表を更新する。
+    /// 失敗したら何もしない——元のファイルはそのまま在るので、台帳にもそう残す。
+    pub(crate) fn settle(self, cfg: &Config, succeeded: bool) {
+        if !succeeded {
+            return;
+        }
+        self.old.settle(cfg, true);
+        self.new.settle(cfg, true);
+        handle_paths()
+            .lock()
+            .unwrap()
+            .insert(self.handle_key, self.new_rel_str);
+    }
+}
+
 /// リネーム/移動を検知し、(1) 移動先パスを差分層配下へ書き換え、(2) 台帳へ旧パスの`Delete`と
-/// 新パスの`Create`/`Modify`を1件ずつ追記する（設計書§19.4/§19.6）。書き換え後のバッファと
-/// 論理長を返す（`None`なら素通し）。
+/// 新パスの`Create`/`Modify`を1件ずつ書く**予定**を作る（設計書§19.4/§19.6）。書き換え後の
+/// バッファ・論理長・予定を返す（`None`なら素通し）。
+///
+/// **台帳へはここで書かない**（BUG-171）。移動先が既にある・共有違反などで本当の変更は
+/// 失敗し得るので、書くのは呼び出し側が結果を見た後である。先に書いていた頃は、失敗した
+/// 変更の元ファイルが台帳の上で削除済みになり、セッションの中から見えなくなって、
+/// `apply`が本物を消しに行った。
 pub(crate) unsafe fn rewrite_rename_target(
     cfg: &Config,
     handle_key: isize,
     info_ptr: *const c_void,
-) -> Option<(Vec<u8>, usize)> {
+) -> Option<(Vec<u8>, usize, PendingRename)> {
     let old_rel = handle_paths().lock().unwrap().get(&handle_key).cloned()?;
     let new_path = unsafe { rename_target_path(info_ptr) }?;
     let Classified {
@@ -699,26 +740,15 @@ pub(crate) unsafe fn rewrite_rename_target(
         let _ = std::fs::create_dir_all(parent);
     }
     let anonymous = unsafe { (*(info_ptr as *const FILE_RENAME_INFORMATION)).Anonymous };
-    let buf = build_rename_info_buffer(anonymous, &diff_layer_new);
+    let (buf, len) = build_rename_info_buffer(anonymous, &diff_layer_new);
 
-    let old_baseline = baseline_hash_for(cfg, &old_rel);
-    append_ledger_entry(cfg, ChangeOp::Delete, &old_rel, old_baseline);
-    let new_baseline = baseline_hash_for(cfg, &new_rel_str);
-    let new_op = if new_baseline.is_some() {
-        ChangeOp::Modify
-    } else {
-        ChangeOp::Create
+    let pending = PendingRename {
+        handle_key,
+        old: PendingRecord::delete(cfg, &old_rel),
+        new: PendingRecord::rename_target(cfg, &new_rel_str),
+        new_rel_str,
     };
-    append_ledger_entry(cfg, new_op, &new_rel_str, new_baseline);
-
-    // 以降このハンドルに対する操作（例: リネーム直後の削除予約）は新パスを指すべきなので、
-    // 対応表を更新しておく。
-    handle_paths()
-        .lock()
-        .unwrap()
-        .insert(handle_key, new_rel_str);
-
-    Some(buf)
+    Some((buf, len, pending))
 }
 
 pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
@@ -728,6 +758,11 @@ pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
     length: u32,
     file_information_class: FILE_INFORMATION_CLASS,
 ) -> NTSTATUS {
+    // 削除予約の申告（ハンドルと、立てるのか下ろすのか）。**本当の設定が成功してから**
+    // 削除予約の集合へ反映する（BUG-171）——読み取り専用のファイルなどは設定そのものが
+    // 断られ（`STATUS_CANNOT_DELETE`）、実際には消えない。先に集合へ入れていた頃は、
+    // 閉じるときに台帳へ`Delete`が書かれ、消えていないファイルが削除済みになっていた。
+    let mut disposition_request: Option<(isize, bool)> = None;
     if let Some(_guard) = ReentryGuard::try_acquire() {
         // [D-88] **DirectRwのlazyレーンでは何もしない。** ここはCoWの削除追跡と
         // rename誘導だけで、差分層が無ければ行き先が無い。**fault-inの引き金にもしない**
@@ -741,22 +776,16 @@ pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
             {
                 let is_ex = file_information_class == FileDispositionInformationEx;
                 let delete_flag = unsafe { disposition_delete_flag(is_ex, file_information) };
-                let pending = delete_pending();
-                let mut g = pending.lock().unwrap();
-                if delete_flag {
-                    g.insert(handle_key);
-                } else {
-                    g.remove(&handle_key);
-                }
+                disposition_request = Some((handle_key, delete_flag));
             } else if !file_information.is_null()
                 && (file_information_class == FileRenameInformation
                     || file_information_class == FileRenameInformationEx)
             {
-                if let Some((buf, len)) =
+                if let Some((buf, len, pending)) =
                     unsafe { rewrite_rename_target(cfg, handle_key, file_information) }
                 {
                     let hook = SET_INFO_HOOK.get().expect("hook installed");
-                    return unsafe {
+                    let status = unsafe {
                         hook.call(
                             file_handle,
                             io_status_block,
@@ -765,12 +794,15 @@ pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
                             file_information_class,
                         )
                     };
+                    // BUG-171: 台帳へ書くのは本当の変更が成功した後（再入防止ガードの内側で）。
+                    pending.settle(cfg, status.is_ok());
+                    return status;
                 }
             }
         }
     }
     let hook = SET_INFO_HOOK.get().expect("hook installed");
-    unsafe {
+    let status = unsafe {
         hook.call(
             file_handle,
             io_status_block,
@@ -778,7 +810,19 @@ pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
             length,
             file_information_class,
         )
+    };
+    if let Some((handle_key, delete_flag)) = disposition_request {
+        if status.is_ok() {
+            let pending = delete_pending();
+            let mut g = pending.lock().unwrap();
+            if delete_flag {
+                g.insert(handle_key);
+            } else {
+                g.remove(&handle_key);
+            }
+        }
     }
+    status
 }
 
 pub(crate) unsafe extern "system" fn hooked_nt_close(handle: HANDLE) -> NTSTATUS {
