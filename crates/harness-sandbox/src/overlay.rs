@@ -740,6 +740,26 @@ struct EffectiveChange {
 /// | 実体が無い | `Create`（baseline `None`＝新規作成。適用しても失うものが無い） |
 /// | 実体があり内容が同じ | **変更ではない**ので列挙しない |
 /// | 実体があり内容が違う | `Modify`だが**baselineは不明**（`None`のまま。捏造しない） |
+///
+/// # 台帳由来でも「中身が同じなら変更ではない」（[BUG-174](../../docs/bugs/BUG-174.md)）
+///
+/// **記録が在ることは、中身が変わったことを意味しない。** Windowsの削除も名前の変更も
+/// 「消す権限を付けて開く」から始まるので、Redirectorはその open を書込として扱い、
+/// ワークスペースの元を差分層へ写して`Modify`を1件記録する（写さないと、読取専用の
+/// ワークスペースでは開くことも消すことも通らないので、この写しは要る）。ところが**その後で
+/// 削除が断られる・名前の変更が失敗する**ことがあり、そのとき残るのは1バイトも違わないコピーと
+/// 嘘の`Modify`である。読取専用のファイルでは`apply`が同じ中身を書こうとして断られ、
+/// 承認が毎回「要対応」（終了コード4）で止まっていた。
+///
+/// そこで**同じ規則を台帳由来の項目にも当てる**——`Create`/`Modify`で、差分層の実体が
+/// 実workspace側と**バイト一致**するなら列挙しない。`Delete`は実体を持たないので対象外。
+/// §19.12が「台帳は唯一の正本ではない。実体と突き合わせる」と定めているのと同じ向きで、
+/// 判定の置き場もここ1箇所に保つ（DLL側で記録を止める案は、失敗した名前の変更が
+/// 呼び出し元へ成功として見える副作用が実機で出たため採らなかった）。
+///
+/// **これは更新時刻だけを触るopenが作る同一コピー**（gitのpack。CoW設計書§18.1の実測）**にも効く。**
+/// **限界**: コピー自体は差分層に残るので、差分層の回収（D-82）は今までどおり
+/// 「実体が在る＝変更を抱えている」と判定する。
 fn effective_changes(jail: &WorkspaceJail, overlay: &OverlayBackend) -> Vec<EffectiveChange> {
     let ledger = store::replay_ledger(&overlay.dir);
     let known: BTreeSet<String> = ledger
@@ -748,6 +768,7 @@ fn effective_changes(jail: &WorkspaceJail, overlay: &OverlayBackend) -> Vec<Effe
         .collect();
     let mut out: Vec<EffectiveChange> = ledger
         .into_iter()
+        .filter(|change| !ledgered_entry_is_byte_identical(jail, overlay, change))
         .map(|change| EffectiveChange {
             change,
             unledgered: false,
@@ -795,6 +816,67 @@ fn effective_changes(jail: &WorkspaceJail, overlay: &OverlayBackend) -> Vec<Effe
         });
     }
     out
+}
+
+/// 台帳に載っている1件が、**実体としては何も変えていない**か（[BUG-174](../../docs/bugs/BUG-174.md)）。
+///
+/// 真になる条件は3つそろったとき——(1) `Create`か`Modify`である（`Delete`は実体を持たないので
+/// 対象外。**ここを外すと削除が一覧から消え、承認で本物が消えなくなる**）、(2) 差分層に実体が読める、
+/// (3) その中身が実workspace側の**今の中身とバイト一致**する。
+///
+/// 比べ方は走査由来の判定（同じ関数の下半分、`Some(current) if current == overlay_bytes`）と
+/// **同じ規則**である。読めないときは`false`（＝一覧に残す側）へ倒す——読めないことを
+/// 「変わっていない」の証拠にしない。
+fn ledgered_entry_is_byte_identical(
+    jail: &WorkspaceJail,
+    overlay: &OverlayBackend,
+    change: &harness_change_ledger::CowChange,
+) -> bool {
+    if change.op == ChangeOp::Delete {
+        return false;
+    }
+    let is_ext = Path::new(&change.path).is_absolute();
+    let overlay_rel = if is_ext {
+        match store::ext_key(&change.path) {
+            Ok(k) => format!("_ext/{k}"),
+            Err(_) => return false,
+        }
+    } else {
+        change.path.clone()
+    };
+    let workspace_rel = if is_ext {
+        None
+    } else {
+        match canonical_ledger_path(&change.path) {
+            Ok(rel) => Some(rel),
+            Err(_) => return false,
+        }
+    };
+
+    // **中身を読む前に長さで篩う。** この判定は一覧のたびに全件へ掛かるので、
+    // 「新規作成（実workspace側に無い）」と「長さが違う」で終わる場合に全部を読まない。
+    // 新規作成はビルドの生成物で最も多く、そこで両側を読み切るのは丸損である。
+    let workspace_len = match (&workspace_rel, is_ext) {
+        (Some(rel), _) => jail.file_len(rel),
+        (None, true) => std::fs::metadata(&change.path).ok().map(|m| m.len()),
+        (None, false) => None,
+    };
+    let Some(workspace_len) = workspace_len else {
+        return false;
+    };
+    if overlay.jail.file_len(&overlay_rel) != Some(workspace_len) {
+        return false;
+    }
+
+    let Ok(overlay_bytes) = overlay.jail.read_bytes(&overlay_rel) else {
+        return false;
+    };
+    let workspace_bytes = match (&workspace_rel, is_ext) {
+        (Some(rel), _) => jail.read_bytes(rel).ok(),
+        (None, true) => std::fs::read(&change.path).ok(),
+        (None, false) => None,
+    };
+    workspace_bytes.is_some_and(|current| current == overlay_bytes)
 }
 
 /// `apply()`の実体。`--staged`/`--sandbox tier2a-cow`で別々に実装していたロジック（旧`SandboxFs::apply`・
@@ -2582,6 +2664,75 @@ mod tests {
         write_directly_into_diff_layer(diff_layer.path(), "same.txt", "same bytes");
 
         assert!(fs.change_set().unwrap().is_empty());
+    }
+
+    // ---- BUG-174: 台帳に記録が在っても、実体が同じなら変更ではない ----
+
+    /// 削除・名前の変更のためのopenが写したコピーは、操作が断られても台帳に`modify`を残す
+    /// （Redirectorはopenの成功までしか見ていない）。**中身が1バイトも違わないなら一覧に出さない。**
+    /// 読取専用のファイルでは、これが`apply`の拒否欄（終了コード4）になっていた。
+    #[test]
+    fn a_ledgered_modify_whose_content_matches_the_workspace_is_not_a_change() {
+        let ws = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("kept.txt"), "baseline3").unwrap();
+        let fs = cow_fs(ws.path(), diff_layer.path());
+        // Redirectorがやることの結果だけを作る: 差分層へ同じ中身を写し、台帳へ`modify`を1件。
+        write_directly_into_diff_layer(diff_layer.path(), "kept.txt", "baseline3");
+        store::append_entry(
+            diff_layer.path(),
+            ChangeOp::Modify,
+            "kept.txt",
+            Some(harness_change_ledger::hash_bytes(b"baseline3")),
+        );
+
+        assert!(
+            fs.change_set().unwrap().is_empty(),
+            "BUG-174: an unchanged copy must not be listed just because the ledger has a modify"
+        );
+    }
+
+    /// **歯**: 中身が違えば今までどおり出る（上の判定を「常に同じ」に壊すとここが赤くなる）。
+    #[test]
+    fn a_ledgered_modify_whose_content_differs_is_still_a_change() {
+        let ws = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("edited.txt"), "baseline3").unwrap();
+        let fs = cow_fs(ws.path(), diff_layer.path());
+        write_directly_into_diff_layer(diff_layer.path(), "edited.txt", "really edited");
+        store::append_entry(
+            diff_layer.path(),
+            ChangeOp::Modify,
+            "edited.txt",
+            Some(harness_change_ledger::hash_bytes(b"baseline3")),
+        );
+
+        let changes = fs.change_set().unwrap();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].op, ChangeOp::Modify);
+        assert!(!changes[0].unledgered, "the ledger entry must be kept");
+    }
+
+    /// **削除は実体を持たないので、この判定の対象外**。ここを外すと削除が一覧から消え、
+    /// 承認しても本物が残る（守っているものが逆になる）。
+    #[test]
+    fn a_ledgered_delete_is_never_folded_away_by_the_content_comparison() {
+        let ws = tempfile::tempdir().unwrap();
+        let diff_layer = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("gone.txt"), "baseline3").unwrap();
+        let fs = cow_fs(ws.path(), diff_layer.path());
+        // 削除の直前に写されたコピーが残っていても（中身は同じ）、削除は削除として出る。
+        write_directly_into_diff_layer(diff_layer.path(), "gone.txt", "baseline3");
+        store::append_entry(
+            diff_layer.path(),
+            ChangeOp::Delete,
+            "gone.txt",
+            Some(harness_change_ledger::hash_bytes(b"baseline3")),
+        );
+
+        let changes = fs.change_set().unwrap();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].op, ChangeOp::Delete);
     }
 
     /// 台帳に載っているパスは走査で二重に数えない（綴りの大小差があっても同一視する）。

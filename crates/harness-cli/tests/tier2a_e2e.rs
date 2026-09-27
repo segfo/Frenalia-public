@@ -1964,13 +1964,17 @@ fn case_t_workspace_path_longer_than_max_path(ex: &CowExclusive) -> Result<(), S
 
 /// ラウンド2を1本の`run_shell`で回し、その行が最後に印字したJSONの要約（`key`を持つ最後の行）を返す。
 /// 要約は子のstdout（道具の結果欄）からだけ読む（BUG-137）。
+///
+/// **要約だけでなく、道具の結果の全文も返す。** 2026-09-28、要約（「移動は成功した」）と
+/// 機構側の記録（「衝突で失敗した」）が食い違い、**どちらが嘘かを要約だけでは決められなかった**
+/// ——シェルが実際に何を言ったか（エラー行・何回走ったか）が見えなかったためである。
 fn run_round2_with_report(
     ex: &CowExclusive,
     ws: &Path,
     script: &str,
     case_name: &str,
     key: &str,
-) -> Result<(String, serde_json::Value), String> {
+) -> Result<(String, serde_json::Value, String), String> {
     let before = ex.list_cow_sessions();
     let run = run_harness(
         ws,
@@ -1991,7 +1995,7 @@ fn run_round2_with_report(
         .ok_or_else(|| {
             format!("could not find the JSON summary line with {key:?} in the tool output: {result_text}")
         })?;
-    Ok((session, report))
+    Ok((session, report, result_text.to_string()))
 }
 
 /// 変更一覧（`harness changes`のJSON）のうち、`path`のエントリの`op`を並べる。
@@ -2042,7 +2046,7 @@ fn case_u_deleting_a_missing_file_leaves_no_entry(ex: &CowExclusive) -> Result<(
 [System.IO.File]::Delete('test3.txt'); \
 [pscustomobject]@{ staleExists = (Test-Path stale.txt); test3Exists = (Test-Path test3.txt) } \
 | ConvertTo-Json -Compress";
-    let (session2, report) = run_round2_with_report(ex, &ws, script, "cow-u-r2", "test3Exists")?;
+    let (session2, report, _raw) = run_round2_with_report(ex, &ws, script, "cow-u-r2", "test3Exists")?;
     if report["test3Exists"].as_bool() != Some(false)
         || report["staleExists"].as_bool() != Some(false)
     {
@@ -2130,15 +2134,25 @@ fn cow_gc_verdict_for(
 fn case_v_a_failed_rename_keeps_the_source(ex: &CowExclusive) -> Result<(), String> {
     let ws = case_dir("cow-v-failed-rename");
     let session1 = setup_baseline(ex, &ws, "cow-v")?;
+    // **移動先は絶対パスで渡す。** `[System.IO.File]::Move`の相対パスは**.NETの現在位置**を基準に
+    // 解決するが、それはPowerShellの現在位置とは別物である（`Set-Location`は.NET側を動かさない）。
+    // 相対で渡していたころ、移動元は正しく解決される（`$PWD`と一致していた）のに移動先は
+    // 別のディレクトリを指し、**そこには何も無いので衝突せず成功していた**——この案件で狙っている
+    // 「移動先が既にあるので失敗する」という前提が、静かに成立しなくなっていた（2026-09-28に実測）。
+    // 失敗の理由も同じ行で拾う（`moved`だけだと、なぜ成功したのかが分からない）。
     let script = "Set-Content fresh.txt 'fresh' -NoNewline; \
-try { [System.IO.File]::Move('test.txt', 'fresh.txt'); $moved = $true } catch { $moved = $false }; \
+$src = Join-Path $PWD 'test.txt'; $dst = Join-Path $PWD 'fresh.txt'; \
+try { [System.IO.File]::Move($src, $dst); $moved = $true; $err = $null } \
+catch { $moved = $false; $err = $_.Exception.GetType().Name }; \
 $source = if (Test-Path test.txt) { Get-Content test.txt -Raw } else { $null }; \
-[pscustomobject]@{ moved = $moved; source = $source } | ConvertTo-Json -Compress";
-    let (session2, report) = run_round2_with_report(ex, &ws, script, "cow-v-r2", "moved")?;
+$dstContent = if (Test-Path fresh.txt) { Get-Content fresh.txt -Raw } else { $null }; \
+[pscustomobject]@{ moved = $moved; err = $err; source = $source; dst = $dstContent } \
+| ConvertTo-Json -Compress";
+    let (session2, report, raw) = run_round2_with_report(ex, &ws, script, "cow-v-r2", "moved")?;
     if report["moved"].as_bool() != Some(false) {
         return Err(format!(
             "precondition: the move onto the existing fresh.txt must fail, otherwise this case \
-             tests nothing: {report}"
+             tests nothing: {report}\n--- the whole tool result ---\n{raw}"
         ));
     }
     if report["source"].as_str() != Some("helloworld") {
@@ -2155,6 +2169,16 @@ $source = if (Test-Path test.txt) { Get-Content test.txt -Raw } else { $null }; 
     {
         return Err(format!(
             "BUG-171: a failed rename left a delete of test.txt in the change list: {changes}"
+        ));
+    }
+    // BUG-174: 失敗した名前の変更は、元のファイルを**1ビットも変えていない**。移動元を開くために
+    // 差分層へ写したコピーが`modify`として載っていたら、一覧が嘘をついている
+    // （承認は同じ中身で上書きするだけなので赤くならず、嘘だけが残る）。
+    let source_ops = change_ops_for(&changes, "test.txt")?;
+    if !source_ops.is_empty() {
+        return Err(format!(
+            "BUG-174: a failed rename left {source_ops:?} for test.txt, but nothing about it \
+             changed (the copy made to open it is byte-identical): {changes}"
         ));
     }
 
@@ -2204,7 +2228,7 @@ fn case_w_body(ex: &CowExclusive, ws: &Path, target: &Path) -> Result<String, St
 catch { $deleted = $false }; \
 $content = if (Test-Path test3.txt) { Get-Content test3.txt -Raw } else { $null }; \
 [pscustomobject]@{ deleted = $deleted; content = $content } | ConvertTo-Json -Compress";
-    let (session2, report) = run_round2_with_report(ex, ws, script, "cow-w-r2", "deleted")?;
+    let (session2, report, _raw) = run_round2_with_report(ex, ws, script, "cow-w-r2", "deleted")?;
     if report["deleted"].as_bool() != Some(false) {
         return Err(format!(
             "precondition: deleting the read-only test3.txt must fail inside the session, \
@@ -2228,15 +2252,19 @@ $content = if (Test-Path test3.txt) { Get-Content test3.txt -Raw } else { $null 
         ));
     }
 
-    // BUG-171が守るのは「本物を消さない」こと。`apply`の結果が綺麗かは見ない——削除のための
-    // openは成功しているので、中身の変わらないコピーが`modify`として載り（合格基準P2の問題、段6）、
-    // `apply`は読み取り専用の本物へ同じ中身を書こうとして断られる（2026-09-27の実行で観測。
-    // 拒否欄へ入るので終了コード4になるが、本物は変わらない）。その結果は印字して記録へ回す。
+    // BUG-174: 断られた削除は、ファイルを**1ビットも変えていない**。かつては削除のためのopenが
+    // 成功した時点で`modify`を書いていたので、中身の変わらないコピーが一覧に載り、`apply`が
+    // 読み取り専用の本物へ同じ中身を書こうとして断られていた（拒否欄へ入り終了コード4。
+    // 本物は変わらないが、承認が毎回これで止まる）。
+    let remaining = change_ops_for(&changes, "test3.txt")?;
+    if !remaining.is_empty() {
+        return Err(format!(
+            "BUG-174: a refused delete left {remaining:?} for test3.txt, but nothing about it \
+             changed (the copy made to open it is byte-identical): {changes}"
+        ));
+    }
     let applied = apply_cow(ws, &session2, None)?;
-    println!(
-        "{}",
-        serde_json::json!({ "observed_in": "W", "apply_report": applied })
-    );
+    expect_apply_clean("W", &applied)?;
     expect_eq(
         "test3.txt after apply (it must not be deleted)",
         &read_file(target)?,
@@ -2263,7 +2291,7 @@ catch { $createdNew = $false }; \
 $fresh = if (Test-Path test1.txt) { [System.IO.File]::ReadAllText('test1.txt') } else { $null }; \
 [pscustomobject]@{ appended = $appended; createdNew = $createdNew; fresh = $fresh } \
 | ConvertTo-Json -Compress";
-    let (session2, report) = run_round2_with_report(ex, &ws, script, "cow-x-r2", "createdNew")?;
+    let (session2, report, _raw) = run_round2_with_report(ex, &ws, script, "cow-x-r2", "createdNew")?;
     if report["appended"].as_str() != Some("x") {
         return Err(format!(
             "appending to a deleted-then-recreated test.txt must give only the new content 'x' \
@@ -2304,7 +2332,7 @@ $exists = Test-Path test.txt; \
 $s = [System.IO.File]::Open('test.txt', 'OpenOrCreate', 'Read'); \
 $len = $s.Length; $s.Dispose(); \
 [pscustomobject]@{ exists = $exists; len = $len } | ConvertTo-Json -Compress";
-    let (session2, report) = run_round2_with_report(ex, &ws, script, "cow-y-r2", "len")?;
+    let (session2, report, _raw) = run_round2_with_report(ex, &ws, script, "cow-y-r2", "len")?;
     if report["exists"].as_bool() != Some(false) {
         return Err(format!(
             "control: after Remove-Item, Test-Path must say the file is gone: {report}"
@@ -3587,9 +3615,19 @@ fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, St
             "ワークスペース内への書込が ACL に拒否された＝その書込は一覧から漏れている: {denied_inside:?}"
         ));
     }
-    if guide_written_identically && class_of("docs/guide.txt") != Some(CensusClass::ByteIdentical) {
+    // **[BUG-174] 同じ中身で書き直したものは、そもそも一覧に出ない。**
+    // かつてここは「同一コピーの分類に入る」ことを陽性対照にしていた。いまは製品が
+    // 「台帳に記録が在っても、差分層の実体が実workspaceとバイト一致するなら変更ではない」と
+    // 判定して畳むので（`harness-sandbox`の`effective_changes`）、**一覧から消えるのが正しい**
+    // ——これが合格基準P2（中身の変わらないコピーを雑音として出さない）の中身である。
+    //
+    // **対照はここで反転させる**: 段9が同じ中身を書いた回では、一覧に**出ないこと**を要求する。
+    // 出たら畳みが壊れている。あわせて`byte_identical`の分類は**構造的に空**になるので、
+    // 空でないことが分かったらそれも壊れている（下の集合の照合が拾う）。
+    if guide_written_identically && class_of("docs/guide.txt").is_some() {
         broken.push(format!(
-            "陽性対照: 同じ中身で書き直した docs/guide.txt が「中身の変わらないコピー」に入らない（{:?}）",
+            "BUG-174: 同じ中身で書き直した docs/guide.txt が一覧に出た（{:?}）。\
+             台帳に記録が在っても、実体がバイト一致なら変更ではない",
             class_of("docs/guide.txt")
         ));
     }
@@ -3627,14 +3665,17 @@ fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, St
                 "「それ以外」が手順で作った変更（段2・3・6・7・8）と一致しない: got={other:?} expected={expected_other:?}"
             ));
         }
+        // **[BUG-174] この分類は構造的に空である。** 製品が「実体がバイト一致なら変更ではない」と
+        // 判定して一覧から畳むので、ここへ入るものがあったら畳みが壊れている
+        // （`.git`の中の同一コピーも同じ理由で出ない。`.git`は分類が勝つので重なりでも空になる）。
         let identical: Vec<&str> = entries
             .iter()
             .filter(|e| e.class == CensusClass::ByteIdentical)
             .map(|e| e.path.as_str())
             .collect();
-        if identical != ["docs/guide.txt"] {
+        if !identical.is_empty() {
             broken.push(format!(
-                "「.git 以外の中身の変わらないコピー」が段9の docs/guide.txt だけでない: {identical:?}"
+                "BUG-174: 中身の変わらないコピーが一覧に出た（畳みが壊れている）: {identical:?}"
             ));
         }
         let ignored: HashSet<&str> = entries

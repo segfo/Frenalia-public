@@ -186,6 +186,17 @@ impl WorkspaceJail {
         Ok(buf)
     }
 
+    /// ジェイル内のファイルの長さ（バイト）。無い・読めない・ファイルでないなら`None`。
+    ///
+    /// **中身を読む前の篩に使う**——「差分層の実体が実workspace側とバイト一致するか」の判定は
+    /// 一覧（`harness changes`）のたびに走るので、長さが違うだけで分かる場合に全部を読まない
+    /// （[BUG-174](../../docs/bugs/BUG-174.md)）。
+    pub fn file_len(&self, rel_path: &str) -> Option<u64> {
+        let rel = check_relative_path(rel_path).ok()?;
+        let meta = self.dir.metadata(&rel).ok()?;
+        meta.is_file().then(|| meta.len())
+    }
+
     /// ジェイル内にディレクトリを（親ごと）作る。
     pub fn create_dir_all(&self, rel_path: &str) -> Result<(), JailError> {
         let rel = check_relative_path(rel_path)?;
