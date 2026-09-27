@@ -284,48 +284,20 @@ pub(crate) fn shell_sees_staged_writes(shell_tier: &harness_core::ShellTierSelec
     }
 }
 
-/// `--session <id>`（省略時は最新）から、そのセッションが使ったオーバーレイ置き場を解決する。
-/// `--staged`置き場（workspace内`.harness/sandbox/<id>`）を先に試し、無ければ`--sandbox tier2a-cow`置き場
-/// （workspace外CoW 差分層ディレクトリ、Windows専用）を試す——1セッションは常にどちらか
-/// 一方でしか起動されないため、両方見つかることはない。**その保証はclapの`conflicts_with_all`
-/// ではなく`setup::resolve_staging_mode_checked`の実行時拒否が持つ**（値依存の排他はclapでは
-/// 宣言できないので実行時へ移した）。正しさの論証を、もう存在しない宣言に預けないこと。
-/// どちらも見つからなければ`None`。
-pub(crate) fn resolve_session_overlay(
-    workspace_root: &Path,
-    session: Option<&str>,
-) -> Option<(StagingConfig, Option<PathBuf>)> {
-    if let Some(sandbox_dir) = resolve_sandbox_dir(workspace_root, session) {
-        if workspace_root.join(&sandbox_dir).exists() {
-            return Some((
-                StagingConfig {
-                    mode: StagingMode::Staged,
-                    sandbox_dir: Some(sandbox_dir),
-                },
-                None,
-            ));
-        }
-    }
-    if let Some(dir) = cow_diff_layer_dir_checked(session) {
-        return Some((StagingConfig::default(), Some(dir)));
-    }
-    None
-}
-
-#[cfg(windows)]
-pub(crate) fn cow_diff_layer_dir_checked(session: Option<&str>) -> Option<PathBuf> {
-    resolve_cow_diff_layer_dir(session)
-}
-#[cfg(not(windows))]
-pub(crate) fn cow_diff_layer_dir_checked(_session: Option<&str>) -> Option<PathBuf> {
-    None
-}
-
 /// `apply`/`changes`/`discard`/`resolve`サブコマンドを処理する。プロバイダ資格情報を
 /// 一切必要としない（§非対話モード、プロンプトは一切送らない）。CoW一本化（Phase 2）に
 /// より`--staged`/`--sandbox tier2a-cow`は同じ`SandboxFs`バックエンドを使うため、単一の`SandboxFs`だけを
 /// 組み立てて全サブコマンドで使い回す。
 pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> ExitCode {
+    run_sandbox_subcommand_in(cmd, workspace_root, &production_cow_roots())
+}
+
+/// [`run_sandbox_subcommand`]の本体。CoWの根を引数で受ける理由は`review_target`のモジュールdoc。
+pub(crate) fn run_sandbox_subcommand_in(
+    cmd: Commands,
+    workspace_root: &Path,
+    cow_roots: &[PathBuf],
+) -> ExitCode {
     let (session, output_format_and_kind) = match &cmd {
         Commands::Changes {
             session,
@@ -374,7 +346,7 @@ pub(crate) fn run_sandbox_subcommand(cmd: Commands, workspace_root: &Path) -> Ex
     };
 
     let Some((staging, cow_diff_layer_dir)) =
-        resolve_session_overlay(workspace_root, session.as_deref())
+        resolve_session_overlay_in(workspace_root, session.as_deref(), cow_roots)
     else {
         eprintln!("no staged sandbox or CoW diff layer directory found (nothing to show)");
         return ExitCode::FAILURE;

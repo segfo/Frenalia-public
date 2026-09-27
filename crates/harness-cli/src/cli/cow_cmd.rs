@@ -28,13 +28,15 @@ pub(crate) fn run_cow_subcommand(_action: CowAction) -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// セッションIDから差分層の位置を引く。**全部の根を探す**（D-81で根が複数になった）。
-#[cfg(windows)]
-pub(crate) fn cow_diff_layer_dir_for(session_id: &str) -> Option<PathBuf> {
-    let (roots, _unreachable) = harness_sandbox::session_scope::cow_diff_layer_roots();
+/// セッションIDから差分層の位置を引く。**渡された根を全部探す**（D-81で根が複数になった）。
+///
+/// **根を引数で受ける**のは、テストが実機の`%LOCALAPPDATA%`を触らずに済むようにするため
+/// である（`cargo test`が開発機の差分層を70件消した前例がある。`startup::sandbox`の
+/// `sweep_empty_cow_diff_areas`のdoc）。本番の根は`session_scope::cow_diff_layer_roots`。
+pub(crate) fn cow_diff_layer_dir_for_in(roots: &[PathBuf], session_id: &str) -> Option<PathBuf> {
     roots
-        .into_iter()
-        .map(|root| harness_sandbox::session_scope::cow_diff_layer_dir_in(&root, session_id))
+        .iter()
+        .map(|root| harness_sandbox::session_scope::cow_diff_layer_dir_in(root, session_id))
         .find(|dir| dir.is_dir())
 }
 
@@ -256,15 +258,23 @@ pub(crate) fn cow_gc(dry_run: bool, with_changes: bool, older_than_days: u64) ->
 /// 「最新セッションを選ぶ」考え方をCoW側にも適用する。
 #[cfg(windows)]
 pub(crate) fn resolve_cow_diff_layer_dir(session: Option<&str>) -> Option<PathBuf> {
+    let (roots, _unreachable) = harness_sandbox::session_scope::cow_diff_layer_roots();
+    resolve_cow_diff_layer_dir_in(&roots, session)
+}
+
+/// [`resolve_cow_diff_layer_dir`]の本体（根を引数で受ける理由は[`cow_diff_layer_dir_for_in`]と同じ）。
+pub(crate) fn resolve_cow_diff_layer_dir_in(
+    roots: &[PathBuf],
+    session: Option<&str>,
+) -> Option<PathBuf> {
     if let Some(id) = session {
-        return cow_diff_layer_dir_for(id);
+        return cow_diff_layer_dir_for_in(roots, id);
     }
     // D-81で根が複数になったので、**全部の根を横断して**最新を選ぶ。1つの根だけを見ると、
     // 別ボリュームのワークスペースで作った差分層が「無い」ことにされる。
-    let (roots, _unreachable) = harness_sandbox::session_scope::cow_diff_layer_roots();
     let mut newest: Option<(PathBuf, std::time::SystemTime)> = None;
     for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else {
+        let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
         for entry in entries.flatten() {
