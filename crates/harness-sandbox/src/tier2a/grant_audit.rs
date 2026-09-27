@@ -350,10 +350,28 @@ impl GrantAudit {
             parts.push(line);
         }
         if !self.recorded_absent.is_empty() {
-            parts.push(format!(
-                "台帳にあるのにACEが載っていないパス {} 件（幻の台帳エントリ）",
-                self.recorded_absent.len()
-            ));
+            // **パスを出す。** ここは件数だけを出していた——`present_unrecorded` の側は
+            // 5件まで出しているのに、こちらは出していなかった。件数だけでは
+            // 「本当に記録だけが残っているのか」「測る集合の選び方が間違っていて
+            // 無関係なパスを数えているのか」を誰も判別できず、**毎回出る無害な行**として
+            // 読み飛ばされる（実際に1回の実機テストで21回出ていた）。
+            const SHOWN: usize = 5;
+            let head: Vec<String> = self
+                .recorded_absent
+                .iter()
+                .take(SHOWN)
+                .map(|p| p.display().to_string())
+                .collect();
+            let mut line = format!(
+                "台帳にあるのにACEが載っていないパス {} 件（幻の台帳エントリ。宛先は {}）: {}",
+                self.recorded_absent.len(),
+                self.subject,
+                head.join(" / ")
+            );
+            if self.recorded_absent.len() > SHOWN {
+                line.push_str(&format!(" ほか{}件", self.recorded_absent.len() - SHOWN));
+            }
+            parts.push(line);
         }
         if !self.unreadable.is_empty() {
             parts.push(format!(
@@ -688,6 +706,27 @@ mod tests {
         );
         let summary = audit.summary().expect("差があるなら必ず言う");
         assert!(summary.contains("preflight.rs:516"), "{summary}");
+    }
+
+    /// **もう一方の分類も、件数ではなくパスを出すこと。**
+    ///
+    /// ここは件数だけを出していた。毎回の実機テストで同じ行が21回出ており、
+    /// 「本当に記録だけが残っているのか」「測る集合の選び方が違って無関係なパスを
+    /// 数えているのか」を誰も判別できなかった——**値を出さない診断は読み飛ばされる**。
+    #[test]
+    fn a_ledger_entry_without_an_ace_is_reported_with_the_path_not_just_a_count() {
+        let audit = classify(
+            Stage::Preflight,
+            "S-1-15-2-x",
+            vec![probed("C:\\Users\\me\\.cargo", Probe::Absent)],
+            &["C:\\Users\\me\\.cargo".to_string()],
+        );
+        assert_eq!(audit.recorded_absent.len(), 1);
+        let summary = audit.summary().expect("差があるなら必ず言う");
+        assert!(summary.contains("C:\\Users\\me\\.cargo"), "{summary}");
+        // 宛先SIDも出す——どのSIDで測った結果なのかが分からないと、
+        // 「測る集合の選び方が違う」側の疑いを確かめられない。
+        assert!(summary.contains("S-1-15-2-x"), "{summary}");
     }
 
     /// **対になる許可側**（B-35）。正しく記録された付与では差が出ないこと。

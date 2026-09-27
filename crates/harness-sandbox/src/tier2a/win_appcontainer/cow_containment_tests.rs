@@ -13,7 +13,9 @@
 //! **`--test-threads=1`で実行すること。** 並列だとAppContainerプロファイル・共有祖先への
 //! traverse ACE付与といったマシン全体の共有状態を複数テストが同時に触るため不安定になる。
 
-use super::test_support::{scopeguard, spawn_in_workspace, spawn_in_workspace_as};
+use super::test_support::{
+    preflight_for_test, scopeguard, spawn_in_workspace, spawn_in_workspace_as,
+};
 use super::*;
 use crate::manifest::ManifestOp;
 use crate::overlay::{ApplyOptions, ApplyReport, SandboxError, SandboxFs};
@@ -82,7 +84,7 @@ fn cow_write_is_redirected_to_diff_layer_and_workspace_stays_unchanged() {
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
@@ -185,7 +187,7 @@ fn cow_redirect_survives_every_workspace_root_spelling() {
             diff_layer_dir: diff_layer.path().to_path_buf(),
         };
         // ACL付与は常に**実パス**で行う（実験対象はDLLが受け取る文字列だけに絞る）。
-        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+        preflight_for_test(workspace.path(), &[], None, &write_mode);
 
         let raw_spelling = make_spelling(workspace.path());
         // 2026-08-05に実際に失敗した操作の形＝**絶対パス指定の書込**。
@@ -330,8 +332,7 @@ fn cow_ext_capture_redirects_fs_allow_rw_write_to_diff_layer_and_leaves_real_tar
         forced: false,
         scope: GrantScope::Recursive,
     }];
-    let outcome = preflight(workspace.path(), &passthrough, None, &write_mode)
-        .expect("preflight (cow + fs-allow rw)");
+    let outcome = preflight_for_test(workspace.path(), &passthrough, None, &write_mode);
 
     // D-01/D-30: `--sandbox tier2a-cow`下では`--fs-allow <path>:rw`要求でも実ACLは読取のみに留め、
     // 頼まれていない実行権限も付与しない（境界はACLのまま、DLLの`_ext` captureは
@@ -456,7 +457,7 @@ fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     let probe_path = outside.join("denied.txt");
     let script = format!(
@@ -525,7 +526,7 @@ fn workspace_write_fails_closed_without_redirector_injection() {
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
@@ -587,7 +588,7 @@ fn cow_write_from_grandchild_process_is_redirected_to_diff_layer() {
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     // cmd.exeは直接の子（powershell）がCreateProcessで起動する孫プロセス。`>`はcmd自身の
     // リダイレクトなので、書込を行うのはcmd.exe自身（孫）——PowerShellの`>`と混同しないよう
@@ -675,7 +676,7 @@ fn cow_write_via_createprocessa_grandchild_is_redirected_to_diff_layer() {
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     let probe = tier2a_proc_probe_x64_exe();
     let env = crate::secret_env::build_child_env();
@@ -742,7 +743,7 @@ fn cow_write_via_winexec_grandchild_is_redirected_to_diff_layer() {
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     let probe = tier2a_proc_probe_x64_exe();
     let env = crate::secret_env::build_child_env();
@@ -814,7 +815,7 @@ fn cow_write_from_wow64_grandchild_process_is_redirected_to_diff_layer() {
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     const CMD: &str = "\
         C:\\Windows\\SysWOW64\\cmd.exe /c \"echo created-by-wow64-grandchild>new_by_wow64.txt\"; \
@@ -886,8 +887,7 @@ fn preflight_refuses_a_directrw_session_when_the_x86_redirector_is_missing() {
 
     // ---- 許可側: 2本そろっていれば`DirectRw`でも通る ----
     let allow_ws = tempfile::tempdir().expect("workspace tempdir (allow side)");
-    preflight(allow_ws.path(), &[], None, &WorkspaceWriteMode::DirectRw)
-        .expect("preflight (DirectRw) must pass while both redirector DLLs are in place");
+    preflight_for_test(allow_ws.path(), &[], None, &WorkspaceWriteMode::DirectRw);
 
     // ---- 拒否側: x86を退避すると同じ呼び出しが落ちる ----
     let current = std::env::current_exe().expect("current_exe");
@@ -947,7 +947,7 @@ fn cow_wow64_grandchild_without_x86_dll_at_injection_time_fails_closed_with_warn
     };
     // ゲートを通す側。ここではまだ2本そろっている（そろっていなければ、そのこと自体が
     // このテストの前提を満たさないので`expect`で落ちるのが正しい）。
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     let current = std::env::current_exe().expect("current_exe");
     let dir = current.parent().expect("current_exe has parent");
@@ -1028,7 +1028,7 @@ fn cow_writable_memory_mapped_file_is_redirected_to_diff_layer() {
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     // 書込可能なview（ReadWrite）を作成し、8バイト全体を書き換える(元の"original"と
     // 同じ長さにして容量周りの複雑さを避ける)。`mapName`に`$null`を渡すと.NET側で
@@ -1112,7 +1112,7 @@ fn cow_ledger_records_single_session_changes_and_applies_cleanly() {
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     const CMD: &str = "\
         $ErrorActionPreference = 'Stop'; \
@@ -1231,24 +1231,22 @@ fn cow_ledger_isolates_concurrent_sessions_and_detects_apply_conflicts() {
     // diff_layer_dirごとに個別に付与される**（`preflight`のCowブランチの`grant_ace_inheritable_rw(diff_layer_dir, ..)`
     // 参照）ため、diff_layer_a・diff_layer_bそれぞれについて`preflight`を呼ぶ必要がある
     // （実機E2Eで発見: 1回しか呼ばないとpreflightされなかった側の子がACCESS_DENIEDで失敗する）。
-    preflight(
+    preflight_for_test(
         workspace.path(),
         &[],
         None,
         &WorkspaceWriteMode::Cow {
             diff_layer_dir: diff_layer_a.path().to_path_buf(),
         },
-    )
-    .expect("preflight (cow, diff_layer_a)");
-    preflight(
+    );
+    preflight_for_test(
         workspace.path(),
         &[],
         None,
         &WorkspaceWriteMode::Cow {
             diff_layer_dir: diff_layer_b.path().to_path_buf(),
         },
-    )
-    .expect("preflight (cow, diff_layer_b)");
+    );
 
     fn probe_cmd(suffix: &str) -> String {
         format!(
@@ -1429,7 +1427,7 @@ fn cow_ledger_records_rename_as_delete_plus_create_and_applies() {
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     const CMD: &str = "\
         $ErrorActionPreference = 'Stop'; \
@@ -1534,7 +1532,7 @@ fn cow_ledger_records_delete_persists_across_processes_and_applies() {
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
@@ -1896,9 +1894,19 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
     let guard_sid = session_sid();
     let guard_exes = probe_exes.clone();
     let _probe_exe_guard = scopeguard(move || {
+        // **剥がしてから記録を落とす。** 逆にすると、剥がせなかったACEへ到達する手掛かりが
+        // 消える（台帳は撤収対象を列挙する唯一の一覧である。BUG-101）。
+        //
+        // 記録を落とすようにしたのは、ここが許可だけ削除して台帳へ残していたためである
+        // ——このセッションはプロセス全体で1つなので、**以後のテスト20本すべてが**
+        // 自己検証で「台帳にあるのにACEが載っていない」を報告し続けていた（実測で21回）。
+        let mut revoked = Vec::new();
         for exe in &guard_exes {
-            let _ = revoke_ace(exe, guard_sid.as_psid());
+            if revoke_ace(exe, guard_sid.as_psid()).is_ok() {
+                revoked.push(exe.clone());
+            }
         }
+        crate::tier2a::session_profile::forget_granted_paths(&revoked);
     });
 
     // 読み取り側の脱走試行用: workspace外（ACL未付与）の秘密ファイル。全チェーンで
@@ -1920,7 +1928,7 @@ fn run_containment_chains(chains: &[&[&str]], timeout_secs: u64, sanitize_env: b
         let write_mode = WorkspaceWriteMode::Cow {
             diff_layer_dir: diff_layer.path().to_path_buf(),
         };
-        preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+        preflight_for_test(workspace.path(), &[], None, &write_mode);
 
         let injected = expected_injected(chain);
         let gen1_exe = if chain[0] == "x64" {
@@ -2184,7 +2192,7 @@ fn cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_diff_
     let write_mode = WorkspaceWriteMode::Cow {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
-    preflight(workspace.path(), &[], None, &write_mode).expect("preflight (cow)");
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
 
     // 子はdiff_layer_dir配下へ直接junctionを張ろうとする（diff_layer_dirはRWで付与済み、
     // かつRedirector DLLの`classify`はdiff_layer_dir配下をリダイレクト対象外にしている）。

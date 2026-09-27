@@ -10,6 +10,68 @@
 
 use crate::tier2a::workspace_ledger::WorkspaceMode;
 
+/// 実機テストが `preflight` を呼ぶときの**唯一の入口**。`Err` で落ちるほかに、
+/// **「このセッションでは注入できない」と告げている警告があれば落ちる。**
+///
+/// # なぜ要るのか
+///
+/// `preflight` は `Ok` を返しながら `PreflightOutcome.warnings` へ
+/// 「宛先 capability を導出できなかった」「Redirector DLL への許可付与に失敗した」を積む。
+/// どちらも**そのセッションでは DLL を注入できない**という意味だが、
+/// 実機テストは 20 箇所すべてが `preflight(...).expect(...)` で `Ok` の中身を捨てていた。
+/// そのため**許可の付与が失敗しても、テストは理由を1行も出さずに別の場所で失敗する**。
+///
+/// 実際に高くついた: [BUG-169] の調査で、失敗の原因が「渡し忘れ」なのか「付与の失敗」なのかを
+/// 切り分ける材料がここに在ったのに、誰も読んでいなかった。
+///
+/// # 何で落とし、何は出すだけか
+///
+/// - **落とす**: 注入不能を告げる警告（下の `BLOCKS_INJECTION`）。これが出たセッションで
+///   封じ込めを測っても、測っているのは「透過役が居ない世界」である。
+/// - **出すだけ**: それ以外の警告。到達できない `--fs-allow` の穴の診断などは、
+///   そのテストの主題と無関係に出ることがあり、落とすと無関係な理由で赤になる。
+///
+/// # 使わない場所
+///
+/// `preflight` が**失敗することを測る**テスト（版が揃わないときに拒否されること等）は
+/// こちらを通さない。`Err` を期待しているので、落とす側の入口とは向きが逆である。
+pub(crate) fn preflight_for_test(
+    workspace_root: &std::path::Path,
+    passthrough: &[crate::shell_tier::FsPassthrough],
+    wfp_chain_pipe: Option<String>,
+    write_mode: &crate::shell_tier::WorkspaceWriteMode,
+) -> super::PreflightOutcome {
+    /// これが警告に含まれていたら、そのセッションは Redirector DLL を注入できない。
+    /// **文面は `preflight` の該当 arm と対である**——あちらを書き替えるならここも直すこと。
+    const BLOCKS_INJECTION: &[&str] = &[
+        "injection will fail for this session",
+        "failed to grant the redirector DLL",
+    ];
+
+    let outcome = super::preflight(workspace_root, passthrough, wfp_chain_pipe, write_mode)
+        .unwrap_or_else(|e| panic!("preflight({}): {e}", workspace_root.display()));
+
+    let blocking: Vec<&String> = outcome
+        .warnings
+        .iter()
+        .filter(|w| BLOCKS_INJECTION.iter().any(|needle| w.contains(needle)))
+        .collect();
+    assert!(
+        blocking.is_empty(),
+        "preflight は Ok を返したが、このセッションでは Redirector DLL を注入できない\
+         （封じ込めを測っても「透過役が居ない世界」を測ることになる）:\n  {}",
+        blocking
+            .iter()
+            .map(|w| w.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+    for warning in &outcome.warnings {
+        eprintln!("preflight warning: {warning}");
+    }
+    outcome
+}
+
 /// **本番の`run_shell`と同じ形で**AppContainer子を起こす（D-54）。
 ///
 /// `preflight`はworkspaceツリーのACEを、セッションのpackage SIDではなく

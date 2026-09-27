@@ -711,6 +711,41 @@ fn write_into_session_entry(token: &str, write: &mut impl FnMut(&mut SessionEntr
     })
 }
 
+/// [`record_granted_paths`]の**対**。ACEを撤収し終えたパスの記録を台帳から落とす。
+///
+/// # 呼ぶ順序（逆にしてはいけない）
+///
+/// **ACEを実際に削除できたパスだけを渡すこと。** 記録を先に落とすと、削除できなかったACEへ
+/// 到達する手掛かりが消える——台帳は撤収対象を列挙する唯一の一覧なので、記録を失うと
+/// 剥がす手段ごと失われる（`docs/bugs/BUG-101.md`）。
+///
+/// # 何のために足したか
+///
+/// 付与と記録の対（[`record_granted_paths`]）に対して、**撤収側の記録を落とす口が無かった**。
+/// そのため「ACEは剥がしたが記録は残る」状態が作れてしまい、以後の自己検証が
+/// そのパスを毎回「台帳にあるのにACEが載っていない」として報告し続けた
+/// （1回の実機テストで同じ行が21回出ていた。件数だけ出す文面だったので誰も中身を見ていなかった）。
+///
+/// # セッションのエントリが無ければ何もしない
+///
+/// 落とす対象が無いので作らない（[`record_into_session_entry`]は無ければ作るが、
+/// こちらは逆向きである）。
+pub fn forget_granted_paths(paths: &[std::path::PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    let drop_set: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let token = session_token();
+    write_into_session_entry(token, &mut |entry| {
+        entry
+            .granted_paths
+            .retain(|recorded| !drop_set.iter().any(|d| same_ledger_path(d, recorded)));
+    });
+}
+
 /// [§22.3.2] capability SID宛に付けたACEを台帳へ記録する（撤収時に剥がす対象）。
 ///
 /// [`record_granted_path`]のcapability版。**付与が成功した後にだけ呼ぶこと**——先に記録すると
