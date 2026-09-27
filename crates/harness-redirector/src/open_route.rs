@@ -81,18 +81,29 @@ pub(crate) fn decide_open_route(
         };
     }
     let deleted = facts.is_deleted();
-    if deleted && !req.can_recreate() {
-        return Route::Refuse(STATUS_OBJECT_NAME_NOT_FOUND);
+    if deleted {
+        // **作り直せない開き方なら「無い」。** 設計書§19.7の優先順位（削除済み＞差分層＞workspace）。
+        if !req.can_recreate() {
+            return Route::Refuse(STATUS_OBJECT_NAME_NOT_FOUND);
+        }
+        // **作り直せる開き方は、書込目的があるかを問わず差分層へ誘導する。**
+        //
+        // ここを`redirects_write()`で絞っていたのが穴だった（行列のケースY）。
+        // `FILE_OPEN_IF`＋読み取りだけ（`.NET`の`FileMode.OpenOrCreate`）は書込目的が立たないので
+        // 素通しになり、**読取専用のworkspaceに在る元のファイルが開けていた**——同じとき
+        // `Test-Path`（属性照会のフック）は「無い」と答えるので、セッションの中の見え方が
+        // 入口ごとに食い違う。論理削除は「無い」を意味するのだから、
+        // **読む側も「無いところに作る」へ落ちなければならない。**
+        //
+        // BUG-172: 作り直しなので、workspaceの元の中身は写さない。
+        return Route::RedirectWrite {
+            source: CopySource::Nothing,
+        };
     }
     if req.redirects_write() {
-        // BUG-172: このセッションで消したパスの作り直しなら、元の中身は写さない。
-        // ここへ削除済みのまま来るのは、作り直せる開き方（`NtCreateFile`）だけである。
-        let source = if deleted {
-            CopySource::Nothing
-        } else {
-            CopySource::Workspace
+        return Route::RedirectWrite {
+            source: CopySource::Workspace,
         };
-        return Route::RedirectWrite { source };
     }
     if let Some(path) = facts.diff_layer_file() {
         return Route::ReadThrough(path);
@@ -397,13 +408,25 @@ mod tests {
                 [1, 0, 0],
             ),
             (
-                "deleted path opened with FILE_OPEN_IF for reading only falls through to the workspace \
-                 (today's behavior; N1 changes this row)",
+                "deleted path opened with FILE_OPEN_IF for reading only is redirected to the diff \
+                 layer, so the workspace original stays invisible (case Y)",
                 Ws,
                 create(FILE_READ_DATA | SYNCHRONIZE, FILE_OPEN_IF, 0),
                 fake(true, None, None),
-                Route::Passthrough,
-                [1, 1, 1],
+                Route::RedirectWrite {
+                    source: CopySource::Nothing,
+                },
+                [1, 0, 0],
+            ),
+            (
+                "deleted path opened with FILE_SUPERSEDE is also a recreate",
+                Ws,
+                create(FILE_READ_DATA, 0, 0),
+                fake(true, None, None),
+                Route::RedirectWrite {
+                    source: CopySource::Nothing,
+                },
+                [1, 0, 0],
             ),
             (
                 "write to an existing file copies it up, without asking for the diff layer version",

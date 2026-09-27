@@ -2286,6 +2286,56 @@ $fresh = if (Test-Path test1.txt) { [System.IO.File]::ReadAllText('test1.txt') }
     Ok(())
 }
 
+/// Y: セッションの中で消したファイルを「無ければ作る」開き方で開くと、**元の中身が見えない**こと。
+///
+/// 論理削除の判定（`check_deleted`）は、作り直せる開き方を通していた——作り直しの書込に
+/// 進ませるためである。ところがその後の分岐は**書込目的があるかどうか**で誘導を決めるので、
+/// 「無ければ作るが、読むだけ」という開き方はどちらの枝にも入らず素通しし、
+/// **読取専用のworkspaceに在る元のファイルを開いてしまう**。同じとき`Test-Path`は偽を返すので、
+/// セッションの中の見え方が入口ごとに食い違う（BUG-172の教訓「状態を読む入口がすべて同じ答えを
+/// 返すか」の残り）。`.NET`の`FileMode.OpenOrCreate`がこの開き方である。
+fn case_y_opening_a_deleted_file_with_open_or_create_does_not_see_the_original(
+    ex: &CowExclusive,
+) -> Result<(), String> {
+    let ws = case_dir("cow-y-deleted-open-or-create");
+    let session1 = setup_baseline(ex, &ws, "cow-y")?;
+    let script = "Remove-Item test.txt; \
+$exists = Test-Path test.txt; \
+$s = [System.IO.File]::Open('test.txt', 'OpenOrCreate', 'Read'); \
+$len = $s.Length; $s.Dispose(); \
+[pscustomobject]@{ exists = $exists; len = $len } | ConvertTo-Json -Compress";
+    let (session2, report) = run_round2_with_report(ex, &ws, script, "cow-y-r2", "len")?;
+    if report["exists"].as_bool() != Some(false) {
+        return Err(format!(
+            "control: after Remove-Item, Test-Path must say the file is gone: {report}"
+        ));
+    }
+    if report["len"].as_i64() != Some(0) {
+        return Err(format!(
+            "BUG: opening the deleted test.txt with OpenOrCreate must not show the original \
+             content (got {} bytes; the workspace original is 10): {report}",
+            report["len"].as_i64().unwrap_or(-1)
+        ));
+    }
+
+    // 台帳の側も、削除のあとに作り直しが載っていること（見え方と一覧が食い違わない）。
+    let changes = list_changes_json(&ws, &session2)?;
+    let ops = change_ops_for(&changes, "test.txt")?;
+    if ops.last().map(String::as_str) == Some("delete") {
+        return Err(format!(
+            "the change list still ends with a delete of test.txt, although the session recreated \
+             it: {changes}"
+        ));
+    }
+
+    let applied = apply_cow(&ws, &session2, None)?;
+    expect_apply_clean("Y", &applied)?;
+    expect_eq("test.txt after apply", &read_file(&ws.join("test.txt"))?, "")?;
+
+    cleanup_on_success(&ws, &[&session1, &session2], "cow-y");
+    Ok(())
+}
+
 #[test]
 #[ignore]
 fn tier2a_cow_commit_matrix() {
@@ -2357,6 +2407,11 @@ fn tier2a_cow_commit_matrix() {
         (
             "X-recreating-a-deleted-file-starts-empty",
             case_x_recreating_a_deleted_file_starts_empty,
+        ),
+        // Y: 論理削除の後の「無ければ作るが読むだけ」の開き方（`.NET`の`OpenOrCreate`）。
+        (
+            "Y-deleted-file-opened-with-open-or-create-is-empty",
+            case_y_opening_a_deleted_file_with_open_or_create_does_not_see_the_original,
         ),
     ];
     let mut passed = 0;
