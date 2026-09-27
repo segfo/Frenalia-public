@@ -391,6 +391,65 @@ pub fn redirector_dll_capability_sids() -> Vec<crate::win_common::OwnedSid> {
         .collect()
 }
 
+/// 子のトークンへ積む「このドメインのFS到達範囲」。**4種類ある。**
+///
+/// | 種類 | 誰が所有するか |
+/// |---|---|
+/// | ワークスペース本体（D-54） | 呼び出し側 |
+/// | `--fs-allow`の穴（§22.3） | 呼び出し側 |
+/// | CoWの差分層（§22.3.2） | 呼び出し側 |
+/// | **Redirector DLL（§22.9の前提）** | **この型** |
+///
+/// # なぜ4つめだけこの型が引くのか
+///
+/// **忘れられたからである。2度。** 前の3つは呼び出し側が自分の文脈から作るしか無いが、
+/// 4つめは「注入する子なら必ず要る」という定数的な要求で、文脈を持たない。それを
+/// 呼び出し側に引かせていたので、組み立て点が2つ（製品の[`launch`]とテスト専用の
+/// [`test_support`]）に分かれた時点で**片方だけが欠けた**。
+///
+/// - 1度目: D-84（ワークスペース本体の宛先が capability SID へ移った回）。
+///   テスト側が積まず、`cow-diagnostics`が17/19になった（`test_support`のモジュールdoc）。
+/// - 2度目: [BUG-169]。2026-09-19にDLLの宛先がcapability SIDへ移り、製品とdaemonには
+///   足されたがテスト側には届かず、**18本が7日間赤のまま**だった。`#[ignore]`なので
+///   明示的に撃つまで誰も気付かない。
+///
+/// **所有をこの型へ寄せるのが「忘れられない」の中身である**——`collect`を呼べば4つめが入り、
+/// 呼ばなければ何も手に入らない。呼び出し側に「引くかどうか」の選択肢を残さない。
+///
+/// # この機構が守らないもの
+///
+/// **まったく別の方法でトークンを組む経路**は止められない。daemonがドメインを用意する
+/// [`domain_provision`]は宛先を**文字列の一覧としてIPCで送る**別表現なので、この型を通らない
+/// （あちらは自分で4つめを積んでいる）。「2箇所ちょうど」であることは
+/// `redirector_dll_capability_sids`の呼び出しを数えるテストが固定する。
+pub(crate) struct DomainCapabilities {
+    /// **この型が所有する宛先。** 生存期間をここへ束ねてあるので、[`Self::psids`]が返す
+    /// ポインタはこの値より長生きできない。
+    redirector: Vec<crate::win_common::OwnedSid>,
+    /// 呼び出し側が所有している宛先（上の表の前3つ）。
+    caller_owned: Vec<PSID>,
+}
+
+impl DomainCapabilities {
+    /// 呼び出し側が持っている宛先を受け取り、**Redirector DLLの宛先をここで引いて**束ねる。
+    pub(crate) fn collect(caller_owned: Vec<PSID>) -> Self {
+        Self {
+            // **引くだけで発行しない。** 発行するのは`preflight`だけにしておかないと、
+            // preflightを経ていない構成に記録だけが増える（`redirector_dll_capability_sids`のdoc）。
+            redirector: redirector_dll_capability_sids(),
+            caller_owned,
+        }
+    }
+
+    /// `SECURITY_CAPABILITIES`へ渡す一覧。**`&self`を借りる**ので、返り値が指す先は
+    /// この値より長生きできない（spawnを跨いで持ち回さないこと）。
+    pub(crate) fn psids(&self) -> Vec<PSID> {
+        let mut out = self.caller_owned.clone();
+        out.extend(self.redirector.iter().map(|sid| sid.as_psid()));
+        out
+    }
+}
+
 /// `declared_path`宛に**既に発行済み**の宣言capability SIDを引く（発行はしない）。
 ///
 /// 撤収側（`harness fs revoke <path>`・セッション終了時の自動撤収）が使う。
@@ -1098,6 +1157,12 @@ mod acl_dacl_size_limit_tests;
 pub(crate) fn ensure_profile_for_test(name: &str) -> Result<OwnedContainerSid, AppContainerError> {
     crate::with_named_lock(PROFILE_LOCK, || ensure_profile_locked(name))
 }
+
+/// [BUG-169] 子のトークンへ積む宛先の**組み立て点が増えていないか**をソースで数える。
+/// 昇格も実機も要らない（落ちるのが`#[ignore]`のテストだけだと7日間気付かれない、という
+/// のがBUG-169の学びである）。
+#[cfg(all(windows, test))]
+mod domain_capabilities_tests;
 
 /// **診断テスト専用**の口。任意のマスク・継承指定でACEを付ける。
 ///

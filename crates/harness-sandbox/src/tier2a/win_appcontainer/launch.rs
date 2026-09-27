@@ -271,15 +271,16 @@ fn spawn_shell_in_workspace_on(
     // （注入の失敗は設計上fatal。BUG-116）。症状が「子が起動しない」なので、
     // ここを落とすとTier2aが丸ごと使えなくなる。
     //
-    // **引くだけで発行しない**（差分層と同じ形）。発行するのは`preflight`だけにしておかないと、
-    // preflightを経ていない構成に記録だけが増える。引けないときは積まない——症状は
-    // `ACCESS_DENIED`＝fail-closedで、無言で広がる向きには倒れない。
-    let redirector_dll_caps = super::redirector_dll_capability_sids();
-
-    let mut domain_caps = vec![workspace_cap.as_psid()];
-    domain_caps.extend(fs_allow_caps.iter().map(|cap| cap.as_psid()));
-    domain_caps.extend(cow_diff_layer_cap.iter().map(|cap| cap.as_psid()));
-    domain_caps.extend(redirector_dll_caps.iter().map(|cap| cap.as_psid()));
+    // **[BUG-169] その4つめは`DomainCapabilities`が自分で引く。** ここで引いていた頃、
+    // 同じ組み立てをするテスト専用ヘルパー（`test_support`）に4つめが無く、実機の封じ込め
+    // テスト18本が7日間赤のままだった。**呼び出し側に引かせると、引かせた数だけ忘れられる。**
+    let owned = vec![workspace_cap.as_psid()]
+        .into_iter()
+        .chain(fs_allow_caps.iter().map(|cap| cap.as_psid()))
+        .chain(cow_diff_layer_cap.iter().map(|cap| cap.as_psid()))
+        .collect();
+    let capabilities = super::DomainCapabilities::collect(owned);
+    let domain_caps = capabilities.psids();
 
     // 起こす手順は**注入するものを除いて同一**なので、1つのクロージャに畳む。2回書くと、
     // 片方だけ引数が変わっても誰も気付けない（`B-05`: コンパイラが守らない複製）。

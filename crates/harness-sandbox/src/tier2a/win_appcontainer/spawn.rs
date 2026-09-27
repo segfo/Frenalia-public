@@ -233,18 +233,143 @@ pub(crate) unsafe fn inject_redirector(process: HANDLE) -> Result<(), AppContain
             )));
         }
         if exit_code == 0 {
-            // **見当が付く形で返す。** この失敗の既知の形は「子のトークンがDLLの宛先capabilityを
-            // 持っていない」（`redirector_dll_capability_sids`が空）なので、その本数を添える。
-            let sids = super::redirector_dll_capability_sids().len();
-            return Err(AppContainerError::Win32(format!(
-                "LoadLibraryW returned NULL in target process (redirector DLL failed to load): {} \
-                 (the child token was given {sids} redirector capability SID(s); 0 means the \
-                 declaration capability could not be looked up and the DLL is unreadable)",
-                dll_path.display()
-            )));
+            return Err(AppContainerError::Win32(
+                describe_load_library_failure(process, &dll_path),
+            ));
         }
     }
     Ok(())
+}
+
+/// `LoadLibraryW`がNULLを返したときだけ呼ぶ、**実測の診断**。
+///
+/// # かつてここは嘘をついていた（[BUG-169]）
+///
+/// 旧実装は「子のトークンに N 本積んだ」と書きながら、その N を**台帳から撃ち直して**
+/// 数えていた。渡した数ではないので、**実際は0本なのに「2本積んだ」と報告**していた。
+/// 症状を素直に読むと「宛先は渡っているのにDLLが読めない」になり、調査を丸1回ぶん誤らせた
+/// ——原因は「渡っていない」側だった。**報告するのは測った値だけにする。**
+///
+/// # 見るのは2つで、どちらが欠けているかで直し方が違う
+///
+/// | 欠けている側 | 意味 | 直す場所 |
+/// |---|---|---|
+/// | 子のトークン | 起こす側が宛先を積んでいない | トークンを組む場所（`DomainCapabilities`） |
+/// | DLLのDACL | 許可が付いていない（付与の失敗・撤収のしすぎ） | `preflight`の付与ブロック |
+/// | 両方在る | 別の理由（依存DLLの解決失敗・祖先を辿れない等） | この文面の外 |
+///
+/// **費用は失敗したときだけ払う。** 正常時はここへ来ないので、トークンの読み出しも
+/// DACLの列挙も起こらない。
+fn describe_load_library_failure(process: HANDLE, dll_path: &Path) -> String {
+    let head = format!(
+        "LoadLibraryW returned NULL in target process (redirector DLL failed to load): {}",
+        dll_path.display()
+    );
+
+    let token = child_token_capability_sids(process);
+    let dacl = super::capability_sid_aces(dll_path);
+
+    let (token_sids, token_note) = match token {
+        Ok(sids) => (Some(sids), String::new()),
+        Err(e) => (None, format!(" [could not read the child token: {e}]")),
+    };
+    let (dacl_sids, dacl_note) = match dacl {
+        Ok(subjects) => (
+            Some(subjects.into_iter().map(|s| s.sid).collect::<Vec<_>>()),
+            String::new(),
+        ),
+        Err(e) => (None, format!(" [could not read the DLL's DACL: {e}]")),
+    };
+
+    // 突き合わせは**両方読めたときだけ**行う。読めなかった側を「無い」と扱うと、
+    // 計器の故障を原因として報告することになる。
+    let verdict = match (&token_sids, &dacl_sids) {
+        (Some(token), Some(dacl)) => {
+            let shared: Vec<&String> = dacl
+                .iter()
+                .filter(|d| token.iter().any(|t| t.eq_ignore_ascii_case(d)))
+                .collect();
+            if !shared.is_empty() {
+                format!(
+                    "the child token and the DLL share {} capability SID(s), so the missing piece \
+                     is neither the token nor the DACL — look for a dependency the DLL cannot \
+                     resolve, or an ancestor directory the child cannot traverse",
+                    shared.len()
+                )
+            } else if dacl.is_empty() {
+                "the DLL carries no capability ACE at all, so the grant in preflight did not land \
+                 (or was revoked afterwards)"
+                    .to_string()
+            } else {
+                "the DLL's capability ACEs and the child token have nothing in common: the spawn \
+                 built the token without the redirector DLL capability (see DomainCapabilities)"
+                    .to_string()
+            }
+        }
+        _ => "one of the two sides could not be measured, so no verdict is given".to_string(),
+    };
+
+    format!(
+        "{head}\n  child token capability SIDs ({}): {}{token_note}\n  \
+         capability SIDs on the DLL ({}): {}{dacl_note}\n  verdict: {verdict}",
+        token_sids.as_ref().map_or(0, |v| v.len()),
+        token_sids.as_ref().map_or_else(|| "?".to_string(), |v| v.join(", ")),
+        dacl_sids.as_ref().map_or(0, |v| v.len()),
+        dacl_sids.as_ref().map_or_else(|| "?".to_string(), |v| v.join(", ")),
+    )
+}
+
+/// 子プロセスのトークンが**実際に持っている** capability SID を読む。
+///
+/// 起こす側の意図（何を積んだつもりか）ではなく、OSが子へ渡した結果を見る。
+/// 失敗したら`Err`にして、それを診断の文面へそのまま載せる——計器が壊れたことを
+/// 「capabilityが無い」と読み替えない。
+fn child_token_capability_sids(process: HANDLE) -> Result<Vec<String>, String> {
+    use windows::Win32::Security::{GetTokenInformation, TokenCapabilities, TOKEN_GROUPS};
+    use windows::Win32::System::Threading::OpenProcessToken;
+
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(process, windows::Win32::Security::TOKEN_QUERY, &mut token) }
+        .map_err(|e| format!("OpenProcessToken: {e}"))?;
+
+    // **ハンドルは必ず閉じる。** ここは失敗の説明を作るために呼ばれるので、漏らすと
+    // 「診断がトークンを掴んだまま」になり、後続の後始末が理由不明で失敗する。
+    let read = (|| {
+        let mut needed: u32 = 0;
+        // 1回目は長さを聞くだけ。バッファ不足は期待どおりの失敗なので結果を見ない。
+        let _ = unsafe { GetTokenInformation(token, TokenCapabilities, None, 0, &mut needed) };
+        if needed == 0 {
+            return Err("GetTokenInformation(TokenCapabilities) asked for a zero-sized buffer"
+                .to_string());
+        }
+        // **`u64`の配列で確保する。** `TOKEN_GROUPS`はポインタを含むので8バイト境界が要り、
+        // `Vec<u8>`（境界1）を読み替えると整列が保証されない。
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenCapabilities,
+                Some(buf.as_mut_ptr() as *mut c_void),
+                needed,
+                &mut needed,
+            )
+        }
+        .map_err(|e| format!("GetTokenInformation(TokenCapabilities): {e}"))?;
+
+        let groups = unsafe { &*(buf.as_ptr() as *const TOKEN_GROUPS) };
+        // `Groups`は可変長配列の先頭1要素として宣言されているので、件数ぶん読み直す。
+        let entries =
+            unsafe { std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize) };
+        Ok(entries
+            .iter()
+            .filter_map(|g| crate::win_common::sid_to_string(g.Sid).ok())
+            .collect())
+    })();
+
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    read
 }
 
 /// D-30: Redirector DLLが`HARNESS_COW_READY_HANDLE`へ1バイト書き込むのを`timeout`まで待つ

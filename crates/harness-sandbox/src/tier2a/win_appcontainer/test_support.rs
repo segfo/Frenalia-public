@@ -144,15 +144,25 @@ pub(crate) fn spawn_in_workspace_as(
             .unwrap_or_else(|_| inject.workspace_root.to_path_buf());
         super::lookup_cow_diff_layer_capability_sid(&ws, inject.diff_layer_dir)
     });
-    // [§22.3] 積むのはworkspace本体・CoWの差分層・**呼び出し側が明示した宣言capability**の3種類。
+    // [§22.3] ここが渡すのはworkspace本体・CoWの差分層・**呼び出し側が明示した宣言capability**。
     // [`spawn_in_workspace`]は3つめを空で呼ぶので、**あちら経由の子は`--fs-allow`で開けた穴へ
     // 届かない**——1件ずつの到達性なら`probe_passthrough`（宛先SIDを直接渡せる）でも測れるが、
     // 子の中で複数の操作を回す測定はここへ宣言capabilityを渡すこと。
     // 渡さないまま穴の到達性を測ると、**全操作が失敗する**（実際にそうなっていた: BUG-153）。
-    let mut domain_caps: Vec<windows::Win32::Security::PSID> = Vec::new();
-    domain_caps.extend(cap.iter().map(|s| s.as_psid()));
-    domain_caps.extend(cow_cap.iter().map(|s| s.as_psid()));
-    domain_caps.extend_from_slice(declaration_caps);
+    //
+    // **[BUG-169] 4つめ（Redirector DLLの宛先）は`DomainCapabilities`が自分で引く。**
+    // かつてここは3種類を自分で並べており、DLLの宛先がcapability SIDへ移った回
+    // （2026-09-19）に製品側だけが4つめを足したため、**このヘルパー経由の子は
+    // `LoadLibraryW`でNULLを受け取り、実機の封じ込めテスト18本が7日間赤のまま**だった。
+    // 同じ形はD-84のときにも起きている（モジュールdoc）——だから並べ方を共有した。
+    let owned: Vec<windows::Win32::Security::PSID> = cap
+        .iter()
+        .map(|s| s.as_psid())
+        .chain(cow_cap.iter().map(|s| s.as_psid()))
+        .chain(declaration_caps.iter().copied())
+        .collect();
+    let capabilities = super::DomainCapabilities::collect(owned);
+    let domain_caps = capabilities.psids();
 
     super::spawn_with_workspace(
         exe,
