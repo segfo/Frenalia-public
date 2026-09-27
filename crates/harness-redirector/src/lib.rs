@@ -150,6 +150,7 @@ use windows::Win32::System::IO::IO_STATUS_BLOCK;
 // | `ntpath`        | NTパス ⇔ Win32パスの相互変換 |
 // | `policy`        | リダイレクト要否の判定（純粋） |
 // | `ledger`        | 操作台帳・copy-up・リダイレクト先OAの組み立て |
+// | `open_route`    | 2つのopenフック（`NtCreateFile`・`NtOpenFile`）が共有する分岐の判断と実行 |
 // | `file_hooks`    | ファイル系NTフック |
 // | `dir_merge`     | ディレクトリ列挙のマージ |
 // | `inject`        | 子プロセスへのDLL注入 |
@@ -166,6 +167,7 @@ mod init;
 mod inject;
 mod ledger;
 mod ntpath;
+mod open_route;
 mod pipe_io;
 mod policy;
 mod process_hooks;
@@ -179,6 +181,7 @@ use file_hooks::*;
 use inject::*;
 use ledger::*;
 use ntpath::*;
+use open_route::*;
 use policy::*;
 use process_hooks::*;
 use state::*;

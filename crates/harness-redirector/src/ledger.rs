@@ -386,13 +386,17 @@ pub(crate) fn refresh_deleted_set(cfg: &Config) {
 /// （台帳は「削除済み」のまま＝一覧と見え方が食い違う）。呼び出し側は[`is_logically_deleted`]で
 /// 「作り直しか」を知り、元の中身を写さない（[`CopySource::Nothing`]）。
 pub(crate) fn check_deleted(cfg: &Config, rel: &str, allow_recreate: bool) -> Option<NTSTATUS> {
-    refresh_deleted_set(cfg);
-    let deleted = deleted_paths_state();
-    let g = deleted.lock().unwrap();
-    if !g.contains(rel) || allow_recreate {
+    if !is_deleted_after_refresh(cfg, rel) || allow_recreate {
         return None;
     }
     Some(STATUS_OBJECT_NAME_NOT_FOUND)
+}
+
+/// `rel`が論理削除済みか。兄弟プロセスが台帳へ書いた削除を先に取り込んでから見る
+/// （[`check_deleted`]と同じ読み方。openの分岐は判定と写し元の選び方をこの1回の答えで行う）。
+pub(crate) fn is_deleted_after_refresh(cfg: &Config, rel: &str) -> bool {
+    refresh_deleted_set(cfg);
+    is_logically_deleted(rel)
 }
 
 /// BUG-171: 台帳へ書くのは本当の操作が成功した後。フックは実プロセスへ注入しないと動かないので、

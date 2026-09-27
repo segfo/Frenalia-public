@@ -32,7 +32,7 @@ use super::*;
 /// 「1 openにつきbroker要求最大1回・元open再試行最大1回」を求めているのがこの形である。
 ///
 /// 呼び出し側は**本来のopenを済ませてから**ここへ来ること（成功経路で呼ばない）。
-fn retry_once_after_fault_in<F>(
+pub(crate) fn retry_once_after_fault_in<F>(
     cfg: &Config,
     oa: *const OBJECT_ATTRIBUTES,
     retry: F,
@@ -96,286 +96,13 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
     ea_buffer: *const c_void,
     ea_length: u32,
 ) -> NTSTATUS {
-    if let Some(_guard) = ReentryGuard::try_acquire() {
-        // [D-88] DirectRwのlazyレーン: **本来のopenを先に呼び、拒否されてから初めて分類する。**
-        // 分類を前に置くと1 openあたり+28.3 µs（§S25、モジュールdoc）。
-        if let Some(cfg) = CONFIG.get().filter(|cfg| !cfg.cow_enabled) {
-            let hook = CREATE_FILE_HOOK.get().expect("hook installed");
-            let call = || unsafe {
-                hook.call(
-                    file_handle,
-                    desired_access,
-                    object_attributes,
-                    io_status_block,
-                    allocation_size,
-                    file_attributes,
-                    share_access,
-                    create_disposition,
-                    create_options,
-                    ea_buffer,
-                    ea_length,
-                )
-            };
-            let status = call();
-            if status != STATUS_ACCESS_DENIED {
-                return status;
-            }
-            return retry_once_after_fault_in(cfg, object_attributes, call).unwrap_or(status);
-        }
-        if let (Some(cfg), Some(path)) = (CONFIG.get(), unsafe {
-            object_attributes_path(object_attributes)
-        }) {
-            if let Some(Classified {
-                rel,
-                ledger_key: rel_str,
-                kind,
-            }) = classify_target(cfg, &path)
-            {
-                let rel_lower = rel_str.to_ascii_lowercase();
-                let is_probe = rel_lower.contains("test.txt") || rel_lower.contains("grandchild");
-                if is_probe {
-                    debug_log(&format!(
-                        "hooked_nt_create_file: rel={rel_str:?} kind={kind:?} desired_access={:#x} \
-                         disposition={:#x} options={:#x} is_dir={} write_intent={} diff_layer_exists={}",
-                        desired_access.0,
-                        create_disposition.0,
-                        create_options.0,
-                        create_options.0 & 0x0000_0001 != 0, // FILE_DIRECTORY_FILE
-                        is_write_intent(desired_access.0, Some(create_disposition.0)),
-                        cfg.diff_layer_dir.join(&rel).is_file(),
-                    ));
-                }
-                // BUG-066: 差分層配下の実体を直接開いている＝**既にCoWの行き先**。誘導は
-                // 一切せず（差分層の差分層は作らない）、書込意図のときだけ台帳へ記録して
-                // 素通しする。tombstone判定（`check_deleted`）も掛けない——あれは
-                // 「workspaceをどう見せるか」の論理であって、行き先の実体への直接アクセスに
-                // 被せると、削除済みパスの差分層実体を消すことすらできなくなる。
-                if kind == TargetKind::DiffLayerAlias {
-                    // BUG-171: 台帳へ書くのは本当のopenが成功した後。
-                    let record = should_redirect_write(
-                        is_write_intent(desired_access.0, Some(create_disposition.0)),
-                        create_options.0,
-                        Some(create_disposition.0),
-                    )
-                    .then(|| plan_diff_layer_alias_write(cfg, &rel_str))
-                    .flatten();
-                    let hook = CREATE_FILE_HOOK.get().expect("hook installed");
-                    let status = unsafe {
-                        hook.call(
-                            file_handle,
-                            desired_access,
-                            object_attributes,
-                            io_status_block,
-                            allocation_size,
-                            file_attributes,
-                            share_access,
-                            create_disposition,
-                            create_options,
-                            ea_buffer,
-                            ea_length,
-                        )
-                    };
-                    finish_diff_layer_alias_write(cfg, record, status.is_ok());
-                    track_new_handle(file_handle, status, &rel_str, create_options.0);
-                    return status;
-                }
-                if let Some(status) = check_deleted(
-                    cfg,
-                    &rel_str,
-                    is_create_capable_disposition(create_disposition.0),
-                ) {
-                    if is_probe {
-                        debug_log(&format!(
-                            "hooked_nt_create_file: rel={rel_str:?} check_deleted short-circuit status={status:?}"
-                        ));
-                    }
-                    return status;
-                }
-                if should_redirect_write(
-                    is_write_intent(desired_access.0, Some(create_disposition.0)),
-                    create_options.0,
-                    Some(create_disposition.0),
-                ) {
-                    let diff_layer_path = cfg.diff_layer_dir.join(&rel);
-                    // BUG-171: 写すのはopenの前（写さないと既存ファイルを開けない）、
-                    // 台帳へ書くのはopenが成功した後。
-                    // BUG-172: このセッションで消したパスの作り直しなら、元の中身は写さない
-                    // （`check_deleted`が作成できる開き方だけを通しているので、ここへ来るのはそれ）。
-                    let source = if is_logically_deleted(&rel_str) {
-                        CopySource::Nothing
-                    } else {
-                        CopySource::Workspace
-                    };
-                    let copied = copy_up(cfg, &rel_str, &path, &diff_layer_path, source);
-                    let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
-                    let (mut redirected_oa, mut redirected_name) =
-                        unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
-                    redirected_oa.ObjectName = &mut redirected_name;
-                    let hook = CREATE_FILE_HOOK.get().expect("hook installed");
-                    let status = unsafe {
-                        hook.call(
-                            file_handle,
-                            desired_access,
-                            &redirected_oa,
-                            io_status_block,
-                            allocation_size,
-                            file_attributes,
-                            share_access,
-                            create_disposition,
-                            create_options,
-                            ea_buffer,
-                            ea_length,
-                        )
-                    };
-                    finish_copy_up(cfg, copied, status.is_ok());
-                    if is_probe {
-                        debug_log(&format!(
-                            "hooked_nt_create_file: rel={rel_str:?} branch=write-redirect \
-                             diff_layer_path={diff_layer_path:?} status={status:?}"
-                        ));
-                    }
-                    track_new_handle(file_handle, status, &rel_str, create_options.0);
-                    return status;
-                }
-                // 読み取りread-through（設計書§19.3/§19.7「削除済み＞差分層＞workspace」の中間段）:
-                // 書込意図が無い開き方（`Get-Content`等）でも、差分層に版があればそちらを読ませる。
-                // これが無いと「書いた直後に読み返す」操作が実workspace側（実体が無いか古い）を見て
-                // 失敗する（実機E2Eで発見、既存の`cow_diagnostics`はAppContainer外から
-                // `std::fs::read_to_string`で確認するだけだったため見逃されていた）。
-                if let Some(diff_layer_path) = diff_layer_version_path(cfg, &rel) {
-                    let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
-                    let (mut redirected_oa, mut redirected_name) =
-                        unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
-                    redirected_oa.ObjectName = &mut redirected_name;
-                    let hook = CREATE_FILE_HOOK.get().expect("hook installed");
-                    let status = unsafe {
-                        hook.call(
-                            file_handle,
-                            desired_access,
-                            &redirected_oa,
-                            io_status_block,
-                            allocation_size,
-                            file_attributes,
-                            share_access,
-                            create_disposition,
-                            create_options,
-                            ea_buffer,
-                            ea_length,
-                        )
-                    };
-                    if is_probe {
-                        debug_log(&format!(
-                            "hooked_nt_create_file: rel={rel_str:?} branch=read-through \
-                             diff_layer_path={diff_layer_path:?} status={status:?}"
-                        ));
-                    }
-                    track_new_handle(file_handle, status, &rel_str, create_options.0);
-                    return status;
-                }
-                // ディレクトリ read-through（BUG-128）: 差分層 にしか無いディレクトリを開くときは
-                // 差分層 へ誘導する。無いと read-only の workspace 側を開こうとして ACCESS_DENIED／
-                // OBJECT_NAME_NOT_FOUND になり、git の pathspec 解決・列挙が壊れる
-                // （`diff_layer_only_dir_path` のdoc参照）。
-                //
-                // **`FILE_DIRECTORY_FILE` フラグでは絞らない**——git/Cygwin の `lstat` は、対象が
-                // ファイルかディレクトリか未確定のまま `FILE_OPEN_FOR_BACKUP_INTENT`（フラグ無し）で
-                // 開いて存在と種別を確かめる。フラグで絞ると、この lstat が 差分層 のみのディレクトリを
-                // 「存在しない」と誤認し、`git add <path>` が対象を見つけられず何もステージしない
-                // （実機ログで確認）。ファイルの read-through（`diff_layer_version_path`）は上で済んでいるので、
-                // ここに来る時点で対象はファイルではない＝ディレクトリ判定と衝突しない。
-                if let Some(diff_layer_path) = diff_layer_only_dir_path(cfg, &rel) {
-                    let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
-                    let (mut redirected_oa, mut redirected_name) =
-                        unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
-                    redirected_oa.ObjectName = &mut redirected_name;
-                    let hook = CREATE_FILE_HOOK.get().expect("hook installed");
-                    let status = unsafe {
-                        hook.call(
-                            file_handle,
-                            desired_access,
-                            &redirected_oa,
-                            io_status_block,
-                            allocation_size,
-                            file_attributes,
-                            share_access,
-                            create_disposition,
-                            create_options,
-                            ea_buffer,
-                            ea_length,
-                        )
-                    };
-                    if is_probe {
-                        debug_log(&format!(
-                            "hooked_nt_create_file: rel={rel_str:?} branch=dir-read-through \
-                             diff_layer_path={diff_layer_path:?} status={status:?}"
-                        ));
-                    }
-                    track_new_handle(file_handle, status, &rel_str, create_options.0);
-                    return status;
-                }
-                // 差分層にも版が無い（このセッションで一度も触っていない）場合は、これまで通り
-                // ハンドル→パス対応表にだけ載せて実workspace側を読ませる（`FILE_DELETE_ON_CLOSE`
-                // 無し・この時点では削除予定ではないが、NtClose側での取り除き漏れを防ぐため
-                // 対応表自体には登録しておく）。
-                let hook = CREATE_FILE_HOOK.get().expect("hook installed");
-                let status = unsafe {
-                    hook.call(
-                        file_handle,
-                        desired_access,
-                        object_attributes,
-                        io_status_block,
-                        allocation_size,
-                        file_attributes,
-                        share_access,
-                        create_disposition,
-                        create_options,
-                        ea_buffer,
-                        ea_length,
-                    )
-                };
-                if is_probe {
-                    debug_log(&format!(
-                        "hooked_nt_create_file: rel={rel_str:?} branch=passthrough-no-diff_layer \
-                         status={status:?}"
-                    ));
-                }
-                track_new_handle(file_handle, status, &rel_str, create_options.0);
-                return status;
-            } else if is_write_intent(desired_access.0, Some(create_disposition.0)) {
-                // Phase 4（設計書§19.8）: workspace内でもext capture root配下でもない絶対パスへの
-                // 書込意図。素通しさせ、実際にACLで拒否された（`STATUS_ACCESS_DENIED`）場合のみ
-                // 監査台帳へ記録する（境界自体はACLが既に保証しているので、ここでは何も遮断/
-                // 誘導しない——フックは境界にしない、D-01）。
-                let hook = CREATE_FILE_HOOK.get().expect("hook installed");
-                let status = unsafe {
-                    hook.call(
-                        file_handle,
-                        desired_access,
-                        object_attributes,
-                        io_status_block,
-                        allocation_size,
-                        file_attributes,
-                        share_access,
-                        create_disposition,
-                        create_options,
-                        ea_buffer,
-                        ea_length,
-                    )
-                };
-                if status == STATUS_ACCESS_DENIED {
-                    record_denied_attempt(cfg, &path, desired_access.0);
-                }
-                return status;
-            }
-        }
-    }
-
+    // 分岐は`NtOpenFile`と共有する（`open_route`のモジュールdoc）。ここは引数を詰めるだけ。
     let hook = CREATE_FILE_HOOK.get().expect("hook installed");
-    unsafe {
+    let real = |oa: *const OBJECT_ATTRIBUTES| unsafe {
         hook.call(
             file_handle,
             desired_access,
-            object_attributes,
+            oa,
             io_status_block,
             allocation_size,
             file_attributes,
@@ -384,6 +111,20 @@ pub(crate) unsafe extern "system" fn hooked_nt_create_file(
             create_options,
             ea_buffer,
             ea_length,
+        )
+    };
+    let req = OpenRequest {
+        desired_access: desired_access.0,
+        create_disposition: Some(create_disposition.0),
+        options: create_options.0,
+    };
+    unsafe {
+        route_open(
+            "hooked_nt_create_file",
+            file_handle,
+            object_attributes,
+            req,
+            &real,
         )
     }
 }
@@ -418,224 +159,31 @@ pub(crate) unsafe extern "system" fn hooked_nt_open_file(
     share_access: u32,
     open_options: u32,
 ) -> NTSTATUS {
-    // `NtOpenFile`はcreate dispositionを取らない（常に`FILE_OPEN`相当）ため、write intentは
-    // desired_accessのみで判定する。既存ファイルの書込open（copy-up要）が主な対象。
-    if let Some(_guard) = ReentryGuard::try_acquire() {
-        // [D-88] DirectRwのlazyレーン（`hooked_nt_create_file`と同じ形・同じ理由）。
-        if let Some(cfg) = CONFIG.get().filter(|cfg| !cfg.cow_enabled) {
-            let hook = OPEN_FILE_HOOK.get().expect("hook installed");
-            let call = || unsafe {
-                hook.call(
-                    file_handle,
-                    desired_access,
-                    object_attributes,
-                    io_status_block,
-                    share_access,
-                    open_options,
-                )
-            };
-            let status = call();
-            if status != STATUS_ACCESS_DENIED {
-                return status;
-            }
-            return retry_once_after_fault_in(cfg, object_attributes, call).unwrap_or(status);
-        }
-        if let (Some(cfg), Some(path)) = (CONFIG.get(), unsafe {
-            object_attributes_path(object_attributes)
-        }) {
-            if let Some(Classified {
-                rel,
-                ledger_key: rel_str,
-                kind,
-            }) = classify_target(cfg, &path)
-            {
-                let rel_lower = rel_str.to_ascii_lowercase();
-                let is_probe = rel_lower.contains("test.txt") || rel_lower.contains("grandchild");
-                if is_probe {
-                    debug_log(&format!(
-                        "hooked_nt_open_file: rel={rel_str:?} kind={kind:?} \
-                         desired_access={desired_access:#x} options={open_options:#x} is_dir={} \
-                         write_intent={} diff_layer_exists={}",
-                        open_options & 0x0000_0001 != 0, // FILE_DIRECTORY_FILE
-                        is_write_intent(desired_access, None),
-                        cfg.diff_layer_dir.join(&rel).is_file(),
-                    ));
-                }
-                // BUG-066: 差分層配下の実体を直接開いている（`hooked_nt_create_file`と同じ理由）。
-                if kind == TargetKind::DiffLayerAlias {
-                    // BUG-171: 台帳へ書くのは本当のopenが成功した後。
-                    let record = should_redirect_write(
-                        is_write_intent(desired_access, None),
-                        open_options,
-                        None,
-                    )
-                    .then(|| plan_diff_layer_alias_write(cfg, &rel_str))
-                    .flatten();
-                    let hook = OPEN_FILE_HOOK.get().expect("hook installed");
-                    let status = unsafe {
-                        hook.call(
-                            file_handle,
-                            desired_access,
-                            object_attributes,
-                            io_status_block,
-                            share_access,
-                            open_options,
-                        )
-                    };
-                    finish_diff_layer_alias_write(cfg, record, status.is_ok());
-                    track_new_handle(file_handle, status, &rel_str, open_options);
-                    return status;
-                }
-                // `NtOpenFile`は既存ファイルを開く操作のみ（`FILE_OPEN`相当）のため、
-                // 論理削除済みなら常に失敗させる（再作成の余地は無い）。
-                if let Some(status) = check_deleted(cfg, &rel_str, false) {
-                    if is_probe {
-                        debug_log(&format!(
-                            "hooked_nt_open_file: rel={rel_str:?} check_deleted short-circuit status={status:?}"
-                        ));
-                    }
-                    return status;
-                }
-                if should_redirect_write(is_write_intent(desired_access, None), open_options, None)
-                {
-                    let diff_layer_path = cfg.diff_layer_dir.join(&rel);
-                    // BUG-171: `hooked_nt_create_file`と同じ組（写すのは前、書くのは成功の後）。
-                    // `NtOpenFile`は作り直せない（削除済みなら直前の`check_deleted`が断る）ので、
-                    // 常に元の中身を写す。
-                    let copied = copy_up(
-                        cfg,
-                        &rel_str,
-                        &path,
-                        &diff_layer_path,
-                        CopySource::Workspace,
-                    );
-                    let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
-                    let (mut redirected_oa, mut redirected_name) =
-                        unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
-                    redirected_oa.ObjectName = &mut redirected_name;
-                    let hook = OPEN_FILE_HOOK.get().expect("hook installed");
-                    let status = unsafe {
-                        hook.call(
-                            file_handle,
-                            desired_access,
-                            &redirected_oa,
-                            io_status_block,
-                            share_access,
-                            open_options,
-                        )
-                    };
-                    finish_copy_up(cfg, copied, status.is_ok());
-                    if is_probe {
-                        debug_log(&format!(
-                            "hooked_nt_open_file: rel={rel_str:?} branch=write-redirect \
-                             diff_layer_path={diff_layer_path:?} status={status:?}"
-                        ));
-                    }
-                    track_new_handle(file_handle, status, &rel_str, open_options);
-                    return status;
-                }
-                // 読み取りread-through（`hooked_nt_create_file`と同じ理由、設計書§19.3/§19.7）。
-                if let Some(diff_layer_path) = diff_layer_version_path(cfg, &rel) {
-                    let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
-                    let (mut redirected_oa, mut redirected_name) =
-                        unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
-                    redirected_oa.ObjectName = &mut redirected_name;
-                    let hook = OPEN_FILE_HOOK.get().expect("hook installed");
-                    let status = unsafe {
-                        hook.call(
-                            file_handle,
-                            desired_access,
-                            &redirected_oa,
-                            io_status_block,
-                            share_access,
-                            open_options,
-                        )
-                    };
-                    if is_probe {
-                        debug_log(&format!(
-                            "hooked_nt_open_file: rel={rel_str:?} branch=read-through \
-                             diff_layer_path={diff_layer_path:?} status={status:?}"
-                        ));
-                    }
-                    track_new_handle(file_handle, status, &rel_str, open_options);
-                    return status;
-                }
-                // ディレクトリ read-through（BUG-128、`hooked_nt_create_file`と同じ理由。
-                // `FILE_DIRECTORY_FILE` では絞らない＝git の lstat に追随する）。
-                if let Some(diff_layer_path) = diff_layer_only_dir_path(cfg, &rel) {
-                    let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
-                    let (mut redirected_oa, mut redirected_name) =
-                        unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
-                    redirected_oa.ObjectName = &mut redirected_name;
-                    let hook = OPEN_FILE_HOOK.get().expect("hook installed");
-                    let status = unsafe {
-                        hook.call(
-                            file_handle,
-                            desired_access,
-                            &redirected_oa,
-                            io_status_block,
-                            share_access,
-                            open_options,
-                        )
-                    };
-                    if is_probe {
-                        debug_log(&format!(
-                            "hooked_nt_open_file: rel={rel_str:?} branch=dir-read-through \
-                             diff_layer_path={diff_layer_path:?} status={status:?}"
-                        ));
-                    }
-                    track_new_handle(file_handle, status, &rel_str, open_options);
-                    return status;
-                }
-                let hook = OPEN_FILE_HOOK.get().expect("hook installed");
-                let status = unsafe {
-                    hook.call(
-                        file_handle,
-                        desired_access,
-                        object_attributes,
-                        io_status_block,
-                        share_access,
-                        open_options,
-                    )
-                };
-                if is_probe {
-                    debug_log(&format!(
-                        "hooked_nt_open_file: rel={rel_str:?} branch=passthrough-no-diff_layer \
-                         status={status:?}"
-                    ));
-                }
-                track_new_handle(file_handle, status, &rel_str, open_options);
-                return status;
-            } else if is_write_intent(desired_access, None) {
-                // Phase 4（設計書§19.8）: `hooked_nt_create_file`と同じ理由。
-                let hook = OPEN_FILE_HOOK.get().expect("hook installed");
-                let status = unsafe {
-                    hook.call(
-                        file_handle,
-                        desired_access,
-                        object_attributes,
-                        io_status_block,
-                        share_access,
-                        open_options,
-                    )
-                };
-                if status == STATUS_ACCESS_DENIED {
-                    record_denied_attempt(cfg, &path, desired_access);
-                }
-                return status;
-            }
-        }
-    }
-
+    // `NtOpenFile`はcreate dispositionを取らない（常に`FILE_OPEN`相当）。分岐は`NtCreateFile`と
+    // 共有する（`open_route`のモジュールdoc）。Windowsの削除・名前の変更はこちらを通る。
     let hook = OPEN_FILE_HOOK.get().expect("hook installed");
-    unsafe {
+    let real = |oa: *const OBJECT_ATTRIBUTES| unsafe {
         hook.call(
             file_handle,
             desired_access,
-            object_attributes,
+            oa,
             io_status_block,
             share_access,
             open_options,
+        )
+    };
+    let req = OpenRequest {
+        desired_access,
+        create_disposition: None,
+        options: open_options,
+    };
+    unsafe {
+        route_open(
+            "hooked_nt_open_file",
+            file_handle,
+            object_attributes,
+            req,
+            &real,
         )
     }
 }
