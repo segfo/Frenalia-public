@@ -190,14 +190,25 @@ pub(crate) fn is_logically_deleted(rel: &str) -> bool {
 /// 書込で開いたとき[`copy_up`]が「既に触った」と判定して**その回を台帳へ書かない**
 /// （台帳に無い実体として一覧には出るが、元の中身の指紋を失うので`apply`の衝突検出が効かない）。
 /// 消せなかったら警告台帳へ残す（黙って捨てない）。空のディレクトリは一覧に出ないので残してよい。
+///
+/// **ただし、写しを他のハンドルが開いていたら消さない**（[BUG-178](../../../docs/bugs/BUG-178.md)）。
+/// 写してから本当のopenが失敗するまでの間に、別のスレッド・兄弟プロセスがその写しを開くことがある
+/// （そちらの[`copy_up`]は「既に在る」ので何も書かない）。そこで名前を消すと、そのハンドルが書いた中身は
+/// 行き場を失い、台帳にも何も残らない。使われている写しは、このパスの初回の接触なので、
+/// **元の中身の指紋つきで記録する**（中身が元と同じなら、一覧と承認はバイト一致で変更に数えない、BUG-174）。
 pub(crate) fn finish_copy_up(cfg: &Config, copy_up: Option<CopyUp>, open_succeeded: bool) {
     let Some(CopyUp { record, copied }) = copy_up else {
         return;
     };
     if !open_succeeded {
         if let Some(path) = copied {
-            if let Err(e) = std::fs::remove_file(&path) {
-                append_warning_kind(
+            match reclaim_unused_copy(&path) {
+                Reclaim::Removed => {}
+                Reclaim::InUse => {
+                    record.settle(cfg, true);
+                    return;
+                }
+                Reclaim::Failed(e) => append_warning_kind(
                     cfg,
                     "copy_up_rollback_failed",
                     &format!(
@@ -206,11 +217,44 @@ pub(crate) fn finish_copy_up(cfg: &Config, copy_up: Option<CopyUp>, open_succeed
                         path.display(),
                         record.rel
                     ),
-                );
+                ),
             }
         }
     }
     record.settle(cfg, open_succeeded);
+}
+
+/// [`reclaim_unused_copy`]の結末。
+enum Reclaim {
+    /// 誰も開いていなかったので消した。
+    Removed,
+    /// 他のハンドルが開いている。消していない。
+    InUse,
+    /// それ以外の理由で消せなかった。
+    Failed(std::io::Error),
+}
+
+/// `path`を**排他で**開けたときだけ消す（共有を一切許さず、閉じたら消える開き方）。
+///
+/// `std::fs::remove_file`は他のハンドルが削除の共有を許していれば成功し、名前はその場で消える
+/// （POSIXの削除の意味）。「誰も使っていなければ消す」は、排他で開けたかどうかで判定するしかない。
+fn reclaim_unused_copy(path: &Path) -> Reclaim {
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    match std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+        .open(path)
+    {
+        Ok(handle) => {
+            drop(handle);
+            Reclaim::Removed
+        }
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Reclaim::InUse,
+        Err(e) => Reclaim::Failed(e),
+    }
 }
 
 /// 差分層配下の実体へ**直接**書かれた1件（＝`copy_up`を経由しない書込）を、workspace側と
@@ -502,6 +546,41 @@ mod tests {
         finish_copy_up(&cfg, prepared, true);
         assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Modify]);
         assert_eq!(std::fs::read_to_string(&diff_path).unwrap(), "base");
+    }
+
+    /// BUG-178: 失敗したopenの巻き戻しは、写しを**他のハンドルが開いていたら**消さない。
+    /// 消すと名前がすぐ消え、そのハンドルが書いた中身が行き場を失う。しかもそのハンドルは
+    /// 「既に写しが在った」ので台帳に何も書いていない。写しが使われているなら、それがこのパスの
+    /// 初回の接触なので、元の中身の指紋つきで記録する。
+    #[test]
+    fn a_failed_open_does_not_roll_back_a_copy_that_another_handle_is_using() {
+        use std::io::Write as _;
+        let (_ws, _diff_layer, cfg) = fixture();
+        let rel = "bug178-shared.txt";
+        let ws_path = cfg.workspace_root.join(rel);
+        let diff_path = cfg.diff_layer_dir.join(rel);
+        std::fs::write(&ws_path, "base").unwrap();
+
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
+        // 別のハンドルが写しを開いて書く（Rustの既定の共有は読み・書き・削除を許す）。
+        let mut other = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&diff_path)
+            .unwrap();
+        other.write_all(b"other").unwrap();
+        finish_copy_up(&cfg, prepared, false);
+        drop(other);
+
+        assert!(
+            diff_path.exists(),
+            "BUG-178: the copy another handle was writing must not be removed by the rollback"
+        );
+        assert_eq!(std::fs::read_to_string(&diff_path).unwrap(), "other");
+        assert_eq!(
+            ledger_ops(&cfg, rel),
+            [ChangeOp::Modify],
+            "the copy is the first touch of this path, so it is recorded with the original's hash"
+        );
     }
 
     /// BUG-172: このセッションで消したパスを作り直すときは、workspaceに元のファイルが在っても
