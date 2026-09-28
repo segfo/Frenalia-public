@@ -281,11 +281,17 @@ pub(crate) fn copy_up(
 /// |---|---|
 /// | 差分層に既に在る（このセッションで作った・前に写した） | 何もしない |
 /// | ワークスペースに在る | 差分層へ写す（写さないと、既存のディレクトリの中へ書けない） |
-/// | どちらにも無い | **作らない**——本当の呼び出しが本物と同じく「パスが無い」で失敗する |
+/// | どちらにも無いと**確定した** | **作らない**——本当の呼び出しが本物と同じく「パスが無い」で失敗する |
+/// | ワークスペースの側を**見られない**（サンドボックスの中から拒否された） | 写す（在るかどうか分からないので、以前の挙動のまま） |
 ///
 /// 以前は3つめでも作っていたので、`newdir`を作らずに`newdir/f.txt`を作る呼び出しが成功し、
 /// 呼び出しが失敗しても差分層にだけ在るディレクトリが残った（開けて一覧にも出るのに、`Test-Path`は
 /// 「無い」と言う）。写した親はワークスペースに在るディレクトリなので、残っても見え方を変えない。
+///
+/// **4つめを3つめと同じに扱ってはいけない。** `--fs-allow`の書込先（`_ext`）は、その宣言の
+/// capabilityを持たない子からは見えない（問い合わせがアクセス拒否で返る）。真偽だけで「ディレクトリか」
+/// を見ていた版は、それを「無い」と読み、書込先の直下への書込を「パスが無い」で失敗させた
+/// （`cow-diagnostics`の`_ext`の試験で実機で観測）。
 pub(crate) fn prepare_diff_layer_parent(counterpart: &Path, diff_layer_target: &Path) {
     let Some(parent) = diff_layer_target.parent() else {
         return;
@@ -293,8 +299,19 @@ pub(crate) fn prepare_diff_layer_parent(counterpart: &Path, diff_layer_target: &
     if parent.is_dir() {
         return;
     }
-    if counterpart.parent().is_some_and(Path::is_dir) {
+    let seen = counterpart.parent().map(std::fs::metadata);
+    if parent_should_be_mirrored(seen.as_ref().map(|r| r.as_ref().map(|m| m.is_dir()))) {
         let _ = std::fs::create_dir_all(parent);
+    }
+}
+
+/// [`prepare_diff_layer_parent`]の判断。引数は、ワークスペースの側の親を問い合わせた結果
+/// （`Ok(ディレクトリか)`・`Err`、親の無いパスなら`None`）。
+fn parent_should_be_mirrored(seen: Option<Result<bool, &std::io::Error>>) -> bool {
+    match seen {
+        Some(Ok(is_dir)) => is_dir,
+        Some(Err(e)) => e.kind() != std::io::ErrorKind::NotFound,
+        None => false,
     }
 }
 
@@ -767,6 +784,29 @@ mod tests {
         std::fs::write(&diff_path, "new").unwrap();
         finish_copy_up(&cfg, prepared, true);
         assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Create]);
+    }
+
+    /// BUG-177: 親を写すかの判断。**「無い」と確定したときだけ作らない。** サンドボックスの中から
+    /// 見られない（アクセス拒否）ときは在るかどうか分からないので写す——`--fs-allow`の書込先は
+    /// 宣言のcapabilityを持たない子からは見えず、真偽だけで見ていた版はそれを「無い」と読んだ。
+    #[test]
+    fn a_parent_is_left_uncreated_only_when_it_is_known_to_be_missing() {
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(parent_should_be_mirrored(Some(Ok(true))), "a directory");
+        assert!(
+            !parent_should_be_mirrored(Some(Ok(false))),
+            "a file is not a parent"
+        );
+        assert!(
+            !parent_should_be_mirrored(Some(Err(&not_found))),
+            "known to be missing"
+        );
+        assert!(
+            parent_should_be_mirrored(Some(Err(&denied))),
+            "cannot be seen from inside the sandbox: unknown, so mirror as before"
+        );
+        assert!(!parent_should_be_mirrored(None), "no parent at all");
     }
 
     /// BUG-177: 属性の問い合わせは、差分層にだけ在るディレクトリも見る（`Test-Path`がセッションで
