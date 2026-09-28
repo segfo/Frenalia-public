@@ -71,11 +71,12 @@
 //! 別スレッドのため完了保証が無い）。②孫プロセス内の自DLLのベースアドレスを`EnumProcessModulesEx`
 //! で特定し、自プロセスで計算した`harness_cow_init`（エクスポート済み）のRVAを加算した
 //! アドレスへ`CreateRemoteThread`し、その終了を待つ——これが「フック設置完了」を保証する唯一の
-//! 同期点になる。`DllMain`側の自動初期化スレッドとの競合は`INIT_ONCE`（`std::sync::Once`）で
-//! 吸収する（どちらが先に走っても安全、後者は即noop）。
+//! 同期点になる。`DllMain`側の自動初期化スレッドとの競合は`ensure_init`（`INIT_LOCK`と
+//! `INIT_SUCCEEDED`、BUG-045）で吸収する（成功だけを確定させ、先に成功した側があれば後者は即戻る）。
 //!
 //! 注入・初期化のいずれかに失敗しても、孫プロセスの生成自体は拒否しない（Q6）。かわりに
 //! `<diff_layer_dir>/.harness-cow-warnings.jsonl`へ理由を追記する（`append_warning_entry`）。
+//! **待ちが時間切れになったのも失敗に数える**（`inject::RemoteThreadEnd`、BUG-175）。
 //!
 //! ## Phase 4b: 32bit（WOW64）ターゲットへの再注入
 //!
@@ -114,7 +115,7 @@ use windows::Wdk::Storage::FileSystem::{
 };
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, HANDLE, HMODULE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_OVERFLOW,
-    STATUS_NO_MORE_FILES, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_NO_MORE_FILES, STATUS_OBJECT_NAME_NOT_FOUND, WAIT_EVENT,
 };
 use windows::Win32::Storage::FileSystem::WriteFile;
 use windows::Win32::Storage::FileSystem::{

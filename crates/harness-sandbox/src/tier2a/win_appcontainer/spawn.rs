@@ -200,7 +200,6 @@ pub(crate) unsafe fn inject_redirector(process: HANDLE) -> Result<(), AppContain
         let mut exit_code: u32 = 0;
         let exit_code_read = GetExitCodeThread(remote_thread, &mut exit_code);
         let _ = CloseHandle(remote_thread);
-        let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
 
         if wait == windows::Win32::Foundation::WAIT_TIMEOUT {
             return Err(AppContainerError::Win32(format!(
@@ -225,6 +224,10 @@ pub(crate) unsafe fn inject_redirector(process: HANDLE) -> Result<(), AppContain
                 windows::core::Error::from_win32()
             )));
         }
+        // **DLLのパスを解放するのは、スレッドが終わったと分かってから**（BUG-175の横展開）。
+        // 上の2つの失敗ではスレッドがまだそれを読んでいるかもしれない。解放せずに返しても、
+        // 呼び出し側は子を起こさずに畳むので残らない。
+        let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
         if let Err(e) = exit_code_read {
             return Err(AppContainerError::Win32(format!(
                 "GetExitCodeThread after LoadLibraryW({}): {e} — whether the DLL loaded is unknown, \

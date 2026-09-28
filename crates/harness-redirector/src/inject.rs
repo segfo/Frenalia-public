@@ -21,6 +21,76 @@ pub(crate) fn self_dll_path() -> Option<PathBuf> {
     )))
 }
 
+/// 孫へ立てたリモートスレッド（`LoadLibraryW`・`harness_cow_init`）を待つ上限。
+const REMOTE_THREAD_WAIT_MS: u32 = 5000;
+
+/// 孫のプロセスへ立てたリモートスレッドを待った結末（[BUG-175](../../../docs/bugs/BUG-175.md)）。
+///
+/// **「成功したか」と「渡したメモリを解放してよいか」は別の問いである。** 以前は4箇所の注入が
+/// どちらも待ちの結果を見ず、時間切れの後に読んだ`STILL_ACTIVE`（259）を「0でない＝成功」と読み、
+/// **まだ走っているスレッドが読んでいるDLLのパス・設定ブロブを解放していた**。その孫は
+/// 警告台帳に1行も残らないまま、フックの設置が終わる前に再開されていた。
+///
+/// 判定の形は`harness-sandbox`の`inject_redirector`（直接の子への注入）が既に持っていたもの
+/// （時間切れ／`WAIT_OBJECT_0`以外／終了コードが読めない／0）をそのまま写している。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteThreadEnd {
+    /// スレッドは終わった。値はその終了コード。
+    Finished(u32),
+    /// 待ちが時間切れになった。スレッドはまだ走っている。
+    StillRunning,
+    /// スレッドは終わったが、終了コードを読めなかった。
+    ExitCodeUnknown,
+    /// 待ちそのものが失敗した。スレッドが走っているかどうか分からない。
+    WaitFailed,
+}
+
+impl RemoteThreadEnd {
+    /// 待ちの結果と、読めたなら終了コードから結末を決める。**終了コードは、待ちが
+    /// `WAIT_OBJECT_0`（スレッドが終わった）のときにしか意味を持たない**——それ以外のときの値は
+    /// `STILL_ACTIVE`（259）で、0でないので成功に見える。
+    pub(crate) fn classify(wait: WAIT_EVENT, exit_code: Option<u32>) -> Self {
+        if wait == windows::Win32::Foundation::WAIT_TIMEOUT {
+            return Self::StillRunning;
+        }
+        if wait != windows::Win32::Foundation::WAIT_OBJECT_0 {
+            return Self::WaitFailed;
+        }
+        match exit_code {
+            Some(code) => Self::Finished(code),
+            None => Self::ExitCodeUnknown,
+        }
+    }
+
+    /// 注入のこの段が成功したか。終わっていて、終了コードが0でないときだけ。
+    pub(crate) fn succeeded(self) -> bool {
+        matches!(self, Self::Finished(code) if code != 0)
+    }
+
+    /// スレッドへ渡したメモリを解放してよいか。**終わったと分かっているときだけ。**
+    /// 終わっていない（または分からない）なら解放せずに残す——数百バイトが孫に残るだけで、
+    /// 読まれている最中に解放するよりずっと安い。
+    pub(crate) fn may_free_remote_memory(self) -> bool {
+        matches!(self, Self::Finished(_) | Self::ExitCodeUnknown)
+    }
+}
+
+/// `thread`を待ち、結末を返して取っ手を閉じる。注入の4箇所（x64・WOW64 × `LoadLibraryW`・
+/// `harness_cow_init`）はすべてここを通る。解放してよいかは[`RemoteThreadEnd::may_free_remote_memory`]
+/// で決めること。
+///
+/// # Safety
+/// `thread`は`CreateRemoteThread`が返した有効なスレッドの取っ手であること。
+pub(crate) unsafe fn wait_remote_thread(thread: HANDLE) -> RemoteThreadEnd {
+    let wait = unsafe { WaitForSingleObject(thread, REMOTE_THREAD_WAIT_MS) };
+    let mut exit_code: u32 = 0;
+    let exit_code_read = unsafe { GetExitCodeThread(thread, &mut exit_code) }.is_ok();
+    unsafe {
+        let _ = CloseHandle(thread);
+    }
+    RemoteThreadEnd::classify(wait, exit_code_read.then_some(exit_code))
+}
+
 /// `process`（孫プロセス、`LoadLibraryW`完了後）内で、`dll_path`と同じ完全パスを持つ
 /// モジュールのベースアドレスを`EnumProcessModulesEx`/`GetModuleFileNameExW`で特定する。
 /// `GetExitCodeThread`によるHMODULE取得（32bit切り詰めの既知の制約、`inject_redirector`の
@@ -197,19 +267,18 @@ pub(crate) unsafe fn inject_grandchild(process: HANDLE, cfg: &Config) -> bool {
         }
         return false;
     };
-    let wait_result = unsafe { WaitForSingleObject(load_thread, 5000) };
-    let mut exit_code: u32 = 0;
-    unsafe {
-        let _ = GetExitCodeThread(load_thread, &mut exit_code);
-        let _ = CloseHandle(load_thread);
-        let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
+    let load_end = unsafe { wait_remote_thread(load_thread) };
+    if load_end.may_free_remote_memory() {
+        unsafe {
+            let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
+        }
     }
     debug_log(&format!(
-        "inject_grandchild: step1 LoadLibraryW wait_result={:#x} exit_code={:#x}",
-        wait_result.0, exit_code
+        "inject_grandchild: step1 LoadLibraryW end={load_end:?}"
     ));
-    if exit_code == 0 {
-        // `LoadLibraryW`が孫プロセス内で失敗した（32bitターゲット等、Phase 4bの対象）。
+    if !load_end.succeeded() {
+        // `LoadLibraryW`が孫プロセス内で失敗した（32bitターゲット等、Phase 4bの対象）か、
+        // 終わったかどうかが分からない。
         return false;
     }
 
@@ -272,20 +341,16 @@ pub(crate) unsafe fn inject_grandchild(process: HANDLE, cfg: &Config) -> bool {
         }
         return false;
     };
-    let init_wait_result = unsafe { WaitForSingleObject(init_thread, 5000) };
-    let mut init_exit: u32 = 0;
-    unsafe {
-        let _ = GetExitCodeThread(init_thread, &mut init_exit);
-        let _ = CloseHandle(init_thread);
-        if let Some(buf) = config_blob {
+    let init_end = unsafe { wait_remote_thread(init_thread) };
+    if let (Some(buf), true) = (config_blob, init_end.may_free_remote_memory()) {
+        unsafe {
             let _ = VirtualFreeEx(process, buf, 0, MEM_RELEASE);
         }
     }
     debug_log(&format!(
-        "inject_grandchild: step2 harness_cow_init wait_result={:#x} exit_code={:#x}",
-        init_wait_result.0, init_exit
+        "inject_grandchild: step2 harness_cow_init end={init_end:?}"
     ));
-    init_exit != 0
+    init_end.succeeded()
 }
 
 /// フック設置成功後、`lpProcessInformation`（非NULL、Win32 API仕様上保証）から`hProcess`/
@@ -441,5 +506,49 @@ pub(crate) unsafe fn inject_grandchild_and_maybe_resume(
         unsafe {
             let _ = ResumeThread(pi.hThread);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+    /// `GetExitCodeThread`が「まだ走っている」ときに返す値。
+    const STILL_ACTIVE: u32 = 259;
+
+    /// BUG-175: 待ちが時間切れのとき（または待ちそのものが失敗したとき）、あとから読んだ終了コードは
+    /// `STILL_ACTIVE`（259）＝「まだ走っている」で、0でないからといって成功ではない。
+    /// そのスレッドは渡したメモリ（DLLのパス・設定ブロブ）をまだ読んでいるかもしれないので、解放もしない。
+    #[test]
+    fn a_remote_thread_that_did_not_finish_is_neither_a_success_nor_safe_to_free() {
+        for (what, wait) in [("timed out", WAIT_TIMEOUT), ("wait failed", WAIT_FAILED)] {
+            let end = RemoteThreadEnd::classify(wait, Some(STILL_ACTIVE));
+            assert!(
+                !end.succeeded(),
+                "BUG-175: a remote thread whose wait {what} must not count as injected ({end:?})"
+            );
+            assert!(
+                !end.may_free_remote_memory(),
+                "BUG-175: memory a still-running thread may read must not be freed ({what}, {end:?})"
+            );
+        }
+    }
+
+    /// 許可側: 終わったスレッドは終了コードで成否が決まり、成否にかかわらずメモリは解放してよい
+    /// （もう誰も読まない）。終了コードが読めなかったときは成功と言わない。
+    #[test]
+    fn a_finished_remote_thread_is_judged_by_its_exit_code_and_its_memory_may_be_freed() {
+        let loaded = RemoteThreadEnd::classify(WAIT_OBJECT_0, Some(1));
+        assert!(loaded.succeeded());
+        assert!(loaded.may_free_remote_memory());
+
+        let failed = RemoteThreadEnd::classify(WAIT_OBJECT_0, Some(0));
+        assert!(!failed.succeeded());
+        assert!(failed.may_free_remote_memory());
+
+        let unknown = RemoteThreadEnd::classify(WAIT_OBJECT_0, None);
+        assert!(!unknown.succeeded());
+        assert!(unknown.may_free_remote_memory());
     }
 }

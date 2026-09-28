@@ -22,7 +22,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessWow64Information};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HMODULE};
+use windows::Win32::Foundation::{HANDLE, HMODULE};
 use windows::Win32::System::Diagnostics::Debug::{
     FlushInstructionCache, ReadProcessMemory, Wow64GetThreadContext, WriteProcessMemory,
     WOW64_CONTEXT, WOW64_CONTEXT_CONTROL,
@@ -36,8 +36,7 @@ use windows::Win32::System::ProcessStatus::{
 };
 use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_I386;
 use windows::Win32::System::Threading::{
-    CreateRemoteThread, GetExitCodeThread, IsWow64Process2, ResumeThread, SuspendThread,
-    WaitForSingleObject,
+    CreateRemoteThread, IsWow64Process2, ResumeThread, SuspendThread,
 };
 
 use super::debug_log;
@@ -488,18 +487,14 @@ unsafe fn remote_load_library(process: HANDLE, load_library_addr: usize, dll_pat
         }
         return false;
     };
-    let wait_result = unsafe { WaitForSingleObject(thread, 5000) };
-    let mut exit_code: u32 = 0;
-    unsafe {
-        let _ = GetExitCodeThread(thread, &mut exit_code);
-        let _ = CloseHandle(thread);
-        let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
+    let end = unsafe { super::wait_remote_thread(thread) };
+    if end.may_free_remote_memory() {
+        unsafe {
+            let _ = VirtualFreeEx(process, remote_buf, 0, MEM_RELEASE);
+        }
     }
-    debug_log(&format!(
-        "wow64: LoadLibraryW wait_result={:#x} exit_code={:#x}",
-        wait_result.0, exit_code
-    ));
-    exit_code != 0
+    debug_log(&format!("wow64: LoadLibraryW end={end:?}"));
+    end.succeeded()
 }
 
 /// `cfg`はBUG-045のF2で追加した設定引き渡し。32bit孫のenv blockに依存せず設定を届けるため、
@@ -534,20 +529,14 @@ unsafe fn remote_call_init(process: HANDLE, init_addr: usize, cfg: &super::Confi
         }
         return false;
     };
-    let wait_result = unsafe { WaitForSingleObject(thread, 5000) };
-    let mut exit_code: u32 = 0;
-    unsafe {
-        let _ = GetExitCodeThread(thread, &mut exit_code);
-        let _ = CloseHandle(thread);
-        if let Some(buf) = config_blob {
+    let end = unsafe { super::wait_remote_thread(thread) };
+    if let (Some(buf), true) = (config_blob, end.may_free_remote_memory()) {
+        unsafe {
             let _ = VirtualFreeEx(process, buf, 0, MEM_RELEASE);
         }
     }
-    debug_log(&format!(
-        "wow64: harness_cow_init wait_result={:#x} exit_code={:#x}",
-        wait_result.0, exit_code
-    ));
-    exit_code != 0
+    debug_log(&format!("wow64: harness_cow_init end={end:?}"));
+    end.succeeded()
 }
 
 /// Phase 4b本体。`process`/`thread`はまだSUSPENDEDのWOW64孫。`x64_dll_path`は自DLL（x64）の
