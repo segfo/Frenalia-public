@@ -2364,6 +2364,64 @@ $len = $s.Length; $s.Dispose(); \
     Ok(())
 }
 
+/// Z: BUG-177。ディレクトリの見え方が本物のファイルシステムと同じであること。
+///
+/// - `New-Item -ItemType Directory`（`CreateDirectoryW`）でディレクトリを作れる。以前は一覧の権限だけの
+///   `FILE_CREATE`が素通しされ、読取専用のワークスペースに断られていた（copy_upが後続の書込のために
+///   親を勝手に作っていたので隠れていた）
+/// - 作ったディレクトリを`Test-Path`が「在る」と答える（属性の問い合わせも差分層のディレクトリを見る）
+/// - 親の無いパスへの書込は、本物と同じく失敗し、親のディレクトリも生えない
+///
+/// ワークスペースに既に在るディレクトリへの`mkdir`が衝突することは、単体試験
+/// （`harness-redirector`の`open_route`の表）だけで確かめている。PowerShellの`New-Item`は
+/// 先に在るかを問い合わせて自分で断るのでフックまで届かず、`CreateDirectoryW`を直接呼ぶ
+/// `cmd /c mkdir`は危険な構文（T-09）として許可規則があっても拒否されるため。
+fn case_z_directories_look_the_same_as_on_the_real_file_system(
+    ex: &CowExclusive,
+) -> Result<(), String> {
+    let ws = case_dir("cow-z-directories");
+    let session1 = setup_baseline(ex, &ws, "cow-z")?;
+    let script = "$mk = $true; try { New-Item -ItemType Directory newdir -ErrorAction Stop | Out-Null } catch { $mk = $false }; \
+$seen = Test-Path newdir; \
+$inside = $true; try { Set-Content -LiteralPath newdir/f.txt -Value 'inside' -NoNewline -ErrorAction Stop } catch { $inside = $false }; \
+$orphan = $true; try { Set-Content -LiteralPath missingdir/g.txt -Value 'x' -NoNewline -ErrorAction Stop } catch { $orphan = $false }; \
+$orphanParent = Test-Path missingdir; \
+[pscustomobject]@{ mkdir = $mk; seen = $seen; inside = $inside; orphan = $orphan; orphan_parent = $orphanParent } | ConvertTo-Json -Compress";
+    let (session2, report, raw) = run_round2_with_report(ex, &ws, script, "cow-z-r2", "mkdir")?;
+    let want = [
+        ("mkdir", true, "New-Item -ItemType Directory must create the directory"),
+        ("seen", true, "Test-Path must see the directory the session made"),
+        ("inside", true, "a file can be written inside the new directory"),
+        (
+            "orphan",
+            false,
+            "writing under a parent that exists nowhere must fail, as on the real file system",
+        ),
+        ("orphan_parent", false, "that failed write must not leave its parent behind"),
+    ];
+    for (key, value, why) in want {
+        if report[key].as_bool() != Some(value) {
+            return Err(format!("BUG-177: {why} ({key} = {}): {report}\n{raw}", report[key]));
+        }
+    }
+
+    let changes = list_changes_json(&ws, &session2)?;
+    for path in ["newdir", "newdir/f.txt"] {
+        if change_ops_for(&changes, path)? != ["create"] {
+            return Err(format!("the change list must have exactly one create of {path}: {changes}"));
+        }
+    }
+    let applied = apply_cow(&ws, &session2, None)?;
+    expect_apply_clean("Z", &applied)?;
+    expect_eq("newdir/f.txt after apply", &read_file(&ws.join("newdir").join("f.txt"))?, "inside")?;
+    if ws.join("missingdir").exists() {
+        return Err("apply brought missingdir/ into the workspace".into());
+    }
+
+    cleanup_on_success(&ws, &[&session1, &session2], "cow-z");
+    Ok(())
+}
+
 #[test]
 #[ignore]
 fn tier2a_cow_commit_matrix() {
@@ -2440,6 +2498,11 @@ fn tier2a_cow_commit_matrix() {
         (
             "Y-deleted-file-opened-with-open-or-create-is-empty",
             case_y_opening_a_deleted_file_with_open_or_create_does_not_see_the_original,
+        ),
+        // Z: BUG-177。ディレクトリの作成・問い合わせ・親の無い書込が本物と同じに見えること。
+        (
+            "Z-directories-look-the-same-as-on-the-real-file-system",
+            case_z_directories_look_the_same_as_on_the_real_file_system,
         ),
     ];
     let mut passed = 0;

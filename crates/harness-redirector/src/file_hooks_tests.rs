@@ -8,7 +8,7 @@ use super::*;
 use crate::test_support::{cow_fixture, ledger_ops};
 use std::cell::Cell;
 use windows::Wdk::Storage::FileSystem::FILE_RENAME_INFORMATION_0;
-use windows::Win32::Foundation::{BOOLEAN, STATUS_SUCCESS};
+use windows::Win32::Foundation::{BOOLEAN, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SUCCESS};
 
 /// 移動先`target`へ向けた名前の変更のバッファを、情報クラス`class`の形で作る。
 fn rename_info(class: FILE_INFORMATION_CLASS, target: &Path, replace_if_exists: bool) -> Vec<u8> {
@@ -271,4 +271,47 @@ fn rename_refusal_follows_the_logical_view_of_the_destination() {
         };
         assert_eq!(rename_refusal(replace, &facts), want, "{what}");
     }
+}
+
+/// BUG-177: 名前の変更の移動先の親がどこにも無ければ、差分層にも作らない（本物と同じく
+/// 本当の呼び出しが「パスが無い」で失敗する）。在る親（ワークスペースの`sub/`）は写す。
+#[test]
+fn a_rename_does_not_create_a_destination_parent_that_does_not_exist_anywhere() {
+    let (_ws, _diff_layer, cfg) = cow_fixture();
+    let src = "bug177-rename-src.txt";
+    std::fs::write(cfg.diff_layer_dir.join(src), "moved").unwrap();
+    let dst = cfg
+        .workspace_root
+        .join("bug177-rename-newdir")
+        .join("x.txt");
+    let (_, calls) = rename_through_the_hook(
+        &cfg,
+        0x0177_0001,
+        FileRenameInformation,
+        src,
+        &dst,
+        false,
+        STATUS_OBJECT_PATH_NOT_FOUND,
+    );
+    assert_eq!(calls, 1, "the real rename answers the missing path itself");
+    assert!(
+        !cfg.diff_layer_dir.join("bug177-rename-newdir").exists(),
+        "BUG-177: the rename must not create a parent that does not exist logically"
+    );
+
+    std::fs::create_dir(cfg.workspace_root.join("bug177-rename-sub")).unwrap();
+    let src = "bug177-rename-src2.txt";
+    std::fs::write(cfg.diff_layer_dir.join(src), "moved").unwrap();
+    let dst = cfg.workspace_root.join("bug177-rename-sub").join("x.txt");
+    let (status, _) = rename_through_the_hook(
+        &cfg,
+        0x0177_0003,
+        FileRenameInformation,
+        src,
+        &dst,
+        false,
+        STATUS_SUCCESS,
+    );
+    assert_eq!(status, Some(STATUS_SUCCESS));
+    assert!(cfg.diff_layer_dir.join("bug177-rename-sub").is_dir());
 }

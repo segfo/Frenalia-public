@@ -145,14 +145,37 @@ pub(crate) fn copy_up(
         return None;
     }
     let record = PendingRecord::first_touch(cfg, rel);
-    if let Some(parent) = diff_layer_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    prepare_diff_layer_parent(workspace_path, diff_layer_path);
     let copied = (source == CopySource::Workspace
         && workspace_path.is_file()
         && std::fs::copy(workspace_path, diff_layer_path).is_ok())
     .then(|| diff_layer_path.to_path_buf());
     Some(CopyUp { record, copied })
+}
+
+/// 差分層の`diff_layer_target`の親ディレクトリを、**論理的に在るときだけ**用意する
+/// （[BUG-177](../../../docs/bugs/BUG-177.md)）。`counterpart`は同じパスのワークスペースの側
+/// （`_ext`なら実パスの側）。copy_upと名前の変更の移動先の両方がここを通る。
+///
+/// | 親が | すること |
+/// |---|---|
+/// | 差分層に既に在る（このセッションで作った・前に写した） | 何もしない |
+/// | ワークスペースに在る | 差分層へ写す（写さないと、既存のディレクトリの中へ書けない） |
+/// | どちらにも無い | **作らない**——本当の呼び出しが本物と同じく「パスが無い」で失敗する |
+///
+/// 以前は3つめでも作っていたので、`newdir`を作らずに`newdir/f.txt`を作る呼び出しが成功し、
+/// 呼び出しが失敗しても差分層にだけ在るディレクトリが残った（開けて一覧にも出るのに、`Test-Path`は
+/// 「無い」と言う）。写した親はワークスペースに在るディレクトリなので、残っても見え方を変えない。
+pub(crate) fn prepare_diff_layer_parent(counterpart: &Path, diff_layer_target: &Path) {
+    let Some(parent) = diff_layer_target.parent() else {
+        return;
+    };
+    if parent.is_dir() {
+        return;
+    }
+    if counterpart.parent().is_some_and(Path::is_dir) {
+        let _ = std::fs::create_dir_all(parent);
+    }
 }
 
 /// `rel`がこのセッションで論理削除されているか（削除済み集合に入っているか）。
@@ -338,6 +361,17 @@ pub(crate) fn diff_layer_only_dir_path(cfg: &Config, rel: &Path) -> Option<PathB
     }
 }
 
+/// 属性の問い合わせ（`Test-Path`・`File.Exists`・`Directory.Exists`が降りる`NtQuery*AttributesFile`）の
+/// 行き先。差分層にファイルの版があればそれ、**差分層にだけディレクトリとして在ればそれ**
+/// （[BUG-177](../../../docs/bugs/BUG-177.md)）。どちらも無ければ`None`（素通し）。
+///
+/// 以前はファイルの版しか見ておらず、セッションで作ったディレクトリを`Test-Path`が「無い」と
+/// 答えていた——同じディレクトリは開けて（[`diff_layer_only_dir_path`]、BUG-128）一覧にも出るのに、
+/// である。openの分岐（`open_route`）と同じ2つの問いを、同じ順で問う。
+pub(crate) fn attribute_query_target(cfg: &Config, rel: &Path) -> Option<PathBuf> {
+    diff_layer_version_path(cfg, rel).or_else(|| diff_layer_only_dir_path(cfg, rel))
+}
+
 /// 台帳ファイルの、前回同期以降に追記された**完全な行だけ**を取り込み、`deleted_paths_state`
 /// を増分更新する（設計書§19.2）。`FILE_APPEND_DATA`による1行1書込みという既存の追記規律
 /// （書く側、本ファイル`append_ledger_entry`）により、途中まで書かれた行（末尾に`\n`が無い）は
@@ -490,6 +524,87 @@ mod tests {
         finish_copy_up(&cfg, prepared, true);
         assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Modify]);
         assert_eq!(std::fs::read_to_string(&diff_path).unwrap(), "new");
+    }
+
+    /// BUG-177: 親ディレクトリがどこにも無いパスへの作成は、本物と同じく「パスが無い」で失敗させる。
+    /// copy_upが差分層に親を作ってしまうと作成が成功し、openが失敗しても差分層にだけ在る
+    /// ディレクトリが残る（そのディレクトリは開けて一覧にも出るのに、`Test-Path`は「無い」と言う）。
+    #[test]
+    fn copy_up_does_not_create_a_parent_directory_that_does_not_exist_anywhere() {
+        let (_ws, _diff_layer, cfg) = fixture();
+        let rel = "bug177-newdir/f.txt";
+        let ws_path = cfg.workspace_root.join("bug177-newdir").join("f.txt");
+        let diff_path = cfg.diff_layer_dir.join("bug177-newdir").join("f.txt");
+
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
+        assert!(
+            !cfg.diff_layer_dir.join("bug177-newdir").exists(),
+            "BUG-177: a parent that exists neither in the workspace nor in the diff layer must not be created before the real open"
+        );
+        finish_copy_up(&cfg, prepared, false);
+        assert!(ledger_ops(&cfg, rel).is_empty());
+    }
+
+    /// 許可側: ワークスペースに在る親は差分層へ写す（写さないと既存のディレクトリの中へ書けない）。
+    /// このセッションで差分層に作ったディレクトリの下は、そのまま書ける。
+    #[test]
+    fn copy_up_mirrors_a_parent_that_exists_in_the_workspace_or_the_diff_layer() {
+        let (_ws, _diff_layer, cfg) = fixture();
+        std::fs::create_dir_all(cfg.workspace_root.join("bug177-sub").join("deep")).unwrap();
+        let rel = "bug177-sub/deep/f.txt";
+        let ws_path = cfg.workspace_root.join("bug177-sub/deep/f.txt");
+        let diff_path = cfg
+            .diff_layer_dir
+            .join("bug177-sub")
+            .join("deep")
+            .join("f.txt");
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
+        assert!(diff_path.parent().unwrap().is_dir());
+        std::fs::write(&diff_path, "new").unwrap();
+        finish_copy_up(&cfg, prepared, true);
+        assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Create]);
+
+        std::fs::create_dir(cfg.diff_layer_dir.join("bug177-made")).unwrap();
+        let rel = "bug177-made/f.txt";
+        let diff_path = cfg.diff_layer_dir.join("bug177-made").join("f.txt");
+        let prepared = copy_up(
+            &cfg,
+            rel,
+            &cfg.workspace_root.join("bug177-made/f.txt"),
+            &diff_path,
+            CopySource::Workspace,
+        );
+        std::fs::write(&diff_path, "new").unwrap();
+        finish_copy_up(&cfg, prepared, true);
+        assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Create]);
+    }
+
+    /// BUG-177: 属性の問い合わせは、差分層にだけ在るディレクトリも見る（`Test-Path`がセッションで
+    /// 作ったディレクトリを「在る」と答える）。ワークスペースにも在るディレクトリは素通し
+    /// （素通しでも在ると答える）、ファイルの版はそのファイル。
+    #[test]
+    fn attribute_queries_see_a_directory_that_only_the_diff_layer_has() {
+        let (_ws, _diff_layer, cfg) = fixture();
+        std::fs::create_dir(cfg.diff_layer_dir.join("bug177-made")).unwrap();
+        assert_eq!(
+            attribute_query_target(&cfg, Path::new("bug177-made")),
+            Some(cfg.diff_layer_dir.join("bug177-made")),
+            "BUG-177: Test-Path must see the directory the session made"
+        );
+
+        std::fs::create_dir(cfg.workspace_root.join("bug177-both")).unwrap();
+        std::fs::create_dir(cfg.diff_layer_dir.join("bug177-both")).unwrap();
+        assert_eq!(attribute_query_target(&cfg, Path::new("bug177-both")), None);
+
+        std::fs::write(cfg.diff_layer_dir.join("bug177-file.txt"), "v").unwrap();
+        assert_eq!(
+            attribute_query_target(&cfg, Path::new("bug177-file.txt")),
+            Some(cfg.diff_layer_dir.join("bug177-file.txt"))
+        );
+        assert_eq!(
+            attribute_query_target(&cfg, Path::new("bug177-nowhere")),
+            None
+        );
     }
 
     /// 差分層を直接開く経路も同じ組。失敗した回は書かず、**記録済みの印も付けない**

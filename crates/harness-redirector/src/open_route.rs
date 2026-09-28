@@ -36,6 +36,12 @@ impl OpenRequest {
         self.create_disposition
             .is_some_and(is_create_capable_disposition)
     }
+
+    /// ディレクトリを新しく作る開き方（mkdir）か。`FILE_CREATE`＋`FILE_DIRECTORY_FILE`。
+    fn creates_directory(&self) -> bool {
+        const FILE_CREATE: u32 = 2;
+        self.options & FILE_DIRECTORY_FILE.0 != 0 && self.create_disposition == Some(FILE_CREATE)
+    }
 }
 
 /// openをどこへ向けるか（[`decide_open_route`]の答え）。
@@ -63,6 +69,8 @@ pub(crate) trait OpenFacts {
     fn diff_layer_file(&self) -> Option<PathBuf>;
     /// 差分層にだけディレクトリとして在れば、そのパス。
     fn diff_layer_only_dir(&self) -> Option<PathBuf>;
+    /// ワークスペース（`_ext`なら実パス）の側に、このパスの何か（ファイルでもディレクトリでも）が在るか。
+    fn in_workspace(&self) -> bool;
 }
 
 /// openをどこへ向けるかを決める。
@@ -100,6 +108,23 @@ pub(crate) fn decide_open_route(
             source: CopySource::Nothing,
         };
     }
+    // **ディレクトリの新規作成（mkdir）は、書込目的の有無を問わず差分層へ誘導する**（BUG-177）。
+    //
+    // `CreateDirectoryW`（PowerShellの`New-Item -ItemType Directory`・.NET）とCygwinのmkdir（git）は
+    // 一覧の権限（`FILE_LIST_DIRECTORY|SYNCHRONIZE`）だけで`FILE_CREATE`するので、書込目的が立たない。
+    // 以前は素通しで読取専用のワークスペースに断られ、**mkdirはCoWの下で1度も成功していなかった**
+    // ——copy_upが後続の書込のために親を勝手に作っていた（それ自体がBUG-177）ので、隠れていた。
+    //
+    // 誘導した先の差分層には「このセッションで作ったもの」しか無いので、**ワークスペースに既に在るなら
+    // 本物と同じく衝突を返す**（BUG-176と同じ形: 在るかどうかは誘導した先で判定されてしまう）。
+    if req.creates_directory() {
+        if facts.in_workspace() {
+            return Route::Refuse(STATUS_OBJECT_NAME_COLLISION);
+        }
+        return Route::RedirectWrite {
+            source: CopySource::Workspace,
+        };
+    }
     if req.redirects_write() {
         return Route::RedirectWrite {
             source: CopySource::Workspace,
@@ -120,6 +145,8 @@ pub(crate) fn decide_open_route(
 /// 実際のフック状態から事実を引く[`OpenFacts`]。
 struct LiveFacts<'a> {
     cfg: &'a Config,
+    /// フックが受け取ったパス（workspace内ならワークスペースの側、`_ext`なら実パスの側）。
+    path: &'a Path,
     rel: &'a Path,
     ledger_key: &'a str,
 }
@@ -135,6 +162,10 @@ impl OpenFacts for LiveFacts<'_> {
 
     fn diff_layer_only_dir(&self) -> Option<PathBuf> {
         diff_layer_only_dir_path(self.cfg, self.rel)
+    }
+
+    fn in_workspace(&self) -> bool {
+        self.path.exists()
     }
 }
 
@@ -237,6 +268,7 @@ unsafe fn route_open_guarded(
 
     let facts = LiveFacts {
         cfg,
+        path: &path,
         rel: &rel,
         ledger_key: &ledger_key,
     };
@@ -309,9 +341,11 @@ mod tests {
         deleted: bool,
         file: Option<&'static str>,
         dir: Option<&'static str>,
+        workspace: bool,
         asked_deleted: Cell<u32>,
         asked_file: Cell<u32>,
         asked_dir: Cell<u32>,
+        asked_workspace: Cell<u32>,
     }
 
     impl OpenFacts for Fake {
@@ -326,6 +360,10 @@ mod tests {
         fn diff_layer_only_dir(&self) -> Option<PathBuf> {
             self.asked_dir.set(self.asked_dir.get() + 1);
             self.dir.map(PathBuf::from)
+        }
+        fn in_workspace(&self) -> bool {
+            self.asked_workspace.set(self.asked_workspace.get() + 1);
+            self.workspace
         }
     }
 
@@ -345,8 +383,8 @@ mod tests {
         }
     }
 
-    /// 1行: (説明, 種別, 要求, 事実) → (答え, 問い合わせた回数 [削除済み, 版, ディレクトリ])。
-    type Row = (&'static str, TargetKind, OpenRequest, Fake, Route, [u32; 3]);
+    /// 1行: (説明, 種別, 要求, 事実) → (答え, 問い合わせた回数 [削除済み, 版, ディレクトリ, ワークスペース])。
+    type Row = (&'static str, TargetKind, OpenRequest, Fake, Route, [u32; 4]);
 
     fn rows() -> Vec<Row> {
         use TargetKind::{DiffLayerAlias as Alias, Ext, Workspace as Ws};
@@ -363,7 +401,7 @@ mod tests {
                 create(FILE_WRITE_DATA, FILE_OPEN_IF, 0),
                 fake(true, Some("x"), None),
                 Route::DiffLayerAlias { record: true },
-                [0, 0, 0],
+                [0, 0, 0, 0],
             ),
             (
                 "alias read is not recorded",
@@ -371,7 +409,7 @@ mod tests {
                 open(FILE_READ_DATA | SYNCHRONIZE, 0),
                 fake(false, None, None),
                 Route::DiffLayerAlias { record: false },
-                [0, 0, 0],
+                [0, 0, 0, 0],
             ),
             (
                 "alias directory open with DELETE is not recorded (BUG-048)",
@@ -379,7 +417,7 @@ mod tests {
                 open(DELETE | SYNCHRONIZE, DIR),
                 fake(false, None, None),
                 Route::DiffLayerAlias { record: false },
-                [0, 0, 0],
+                [0, 0, 0, 0],
             ),
             (
                 "deleted path opened by NtOpenFile is refused",
@@ -387,7 +425,7 @@ mod tests {
                 open(DELETE | FILE_READ_ATTRIBUTES, 0),
                 fake(true, None, None),
                 Route::Refuse(STATUS_OBJECT_NAME_NOT_FOUND),
-                [1, 0, 0],
+                [1, 0, 0, 0],
             ),
             (
                 "deleted path read with FILE_OPEN is refused",
@@ -395,7 +433,7 @@ mod tests {
                 create(FILE_READ_DATA, FILE_OPEN, 0),
                 fake(true, None, None),
                 Route::Refuse(STATUS_OBJECT_NAME_NOT_FOUND),
-                [1, 0, 0],
+                [1, 0, 0, 0],
             ),
             (
                 "deleted path recreated with FILE_CREATE is redirected without copying (BUG-172)",
@@ -405,7 +443,7 @@ mod tests {
                 Route::RedirectWrite {
                     source: CopySource::Nothing,
                 },
-                [1, 0, 0],
+                [1, 0, 0, 0],
             ),
             (
                 "deleted path opened with FILE_OPEN_IF for reading only is redirected to the diff \
@@ -416,7 +454,7 @@ mod tests {
                 Route::RedirectWrite {
                     source: CopySource::Nothing,
                 },
-                [1, 0, 0],
+                [1, 0, 0, 0],
             ),
             (
                 "deleted path opened with FILE_SUPERSEDE is also a recreate",
@@ -426,7 +464,7 @@ mod tests {
                 Route::RedirectWrite {
                     source: CopySource::Nothing,
                 },
-                [1, 0, 0],
+                [1, 0, 0, 0],
             ),
             (
                 "write to an existing file copies it up, without asking for the diff layer version",
@@ -436,7 +474,7 @@ mod tests {
                 Route::RedirectWrite {
                     source: CopySource::Workspace,
                 },
-                [1, 0, 0],
+                [1, 0, 0, 0],
             ),
             (
                 "NtOpenFile with DELETE only is a write (the start of a Windows delete or rename)",
@@ -446,7 +484,7 @@ mod tests {
                 Route::RedirectWrite {
                     source: CopySource::Workspace,
                 },
-                [1, 0, 0],
+                [1, 0, 0, 0],
             ),
             (
                 "truncating disposition is a write even with read access only",
@@ -456,7 +494,7 @@ mod tests {
                 Route::RedirectWrite {
                     source: CopySource::Workspace,
                 },
-                [1, 0, 0],
+                [1, 0, 0, 0],
             ),
             (
                 "read with a diff layer version reads it, without asking for the directory",
@@ -464,7 +502,7 @@ mod tests {
                 create(FILE_READ_DATA | SYNCHRONIZE, FILE_OPEN, 0),
                 fake(false, Some("v"), Some("d")),
                 Route::ReadThrough(PathBuf::from("v")),
-                [1, 1, 0],
+                [1, 1, 0, 0],
             ),
             (
                 "read of a diff-layer-only directory reads it (BUG-128)",
@@ -472,7 +510,7 @@ mod tests {
                 open(FILE_LIST_DIRECTORY | SYNCHRONIZE, DIR),
                 fake(false, None, Some("d")),
                 Route::DirReadThrough(PathBuf::from("d")),
-                [1, 1, 1],
+                [1, 1, 1, 0],
             ),
             (
                 "existing directory opened with DELETE is not a redirected write (BUG-048)",
@@ -480,16 +518,18 @@ mod tests {
                 open(DELETE | SYNCHRONIZE, DIR),
                 fake(false, None, Some("d")),
                 Route::DirReadThrough(PathBuf::from("d")),
-                [1, 1, 1],
+                [1, 1, 1, 0],
             ),
             (
-                "directory created with FILE_CREATE and list access only is not a write intent \
-                 (only truncating dispositions count), so it passes through",
+                "mkdir (FILE_CREATE a directory with list access only, as CreateDirectoryW and \
+                 Cygwin do) is redirected to the diff layer even without a write intent (BUG-177)",
                 Ws,
                 create(FILE_LIST_DIRECTORY | SYNCHRONIZE, FILE_CREATE, DIR),
                 fake(false, None, None),
-                Route::Passthrough,
-                [1, 1, 1],
+                Route::RedirectWrite {
+                    source: CopySource::Workspace,
+                },
+                [1, 0, 0, 1],
             ),
             (
                 "directory created with FILE_CREATE and write access is a redirected write",
@@ -499,7 +539,19 @@ mod tests {
                 Route::RedirectWrite {
                     source: CopySource::Workspace,
                 },
-                [1, 0, 0],
+                [1, 0, 0, 1],
+            ),
+            (
+                "mkdir of a directory the workspace already has collides, as on the real file \
+                 system (the diff layer only has what this session made)",
+                Ws,
+                create(FILE_LIST_DIRECTORY | SYNCHRONIZE, FILE_CREATE, DIR),
+                Fake {
+                    workspace: true,
+                    ..Fake::default()
+                },
+                Route::Refuse(STATUS_OBJECT_NAME_COLLISION),
+                [1, 0, 0, 1],
             ),
             (
                 "read of an untouched file passes through",
@@ -507,7 +559,7 @@ mod tests {
                 create(FILE_READ_DATA | SYNCHRONIZE, FILE_OPEN, 0),
                 fake(false, None, None),
                 Route::Passthrough,
-                [1, 1, 1],
+                [1, 1, 1, 0],
             ),
             (
                 "ext capture roots follow the same table",
@@ -517,7 +569,7 @@ mod tests {
                 Route::RedirectWrite {
                     source: CopySource::Workspace,
                 },
-                [1, 0, 0],
+                [1, 0, 0, 0],
             ),
         ]
     }
@@ -525,7 +577,7 @@ mod tests {
     #[test]
     fn open_routes_match_the_table() {
         let rows = rows();
-        assert!(rows.len() >= 16, "the table must not silently shrink");
+        assert!(rows.len() >= 19, "the table must not silently shrink");
         for (what, kind, req, facts, want, asked) in rows {
             let got = decide_open_route(kind, &req, &facts);
             assert_eq!(got, want, "{what}");
@@ -533,7 +585,8 @@ mod tests {
                 [
                     facts.asked_deleted.get(),
                     facts.asked_file.get(),
-                    facts.asked_dir.get()
+                    facts.asked_dir.get(),
+                    facts.asked_workspace.get(),
                 ],
                 asked,
                 "{what}: facts must be asked only on the branches that need them"

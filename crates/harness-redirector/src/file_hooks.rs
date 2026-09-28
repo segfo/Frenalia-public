@@ -404,9 +404,7 @@ unsafe fn rewrite_rename_target(
     target: RenameTarget,
     info_ptr: *const c_void,
 ) -> (Vec<u8>, usize, PendingRename) {
-    if let Some(parent) = target.diff_layer_new.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    prepare_diff_layer_parent(&target.counterpart, &target.diff_layer_new);
     let anonymous = unsafe { (*(info_ptr as *const FILE_RENAME_INFORMATION)).Anonymous };
     let (buf, len) = build_rename_info_buffer(anonymous, &target.diff_layer_new);
     let pending = PendingRename {
@@ -607,7 +605,8 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_full_attributes_file(
                 }
                 // read-through: `Test-Path`/`.NET File.Exists`が使うこの経路も、差分層に版が
                 // あればそちらの属性を返す（設計書§19.3/§19.7、`hooked_nt_create_file`と同じ理由）。
-                if let Some(diff_layer_path) = diff_layer_version_path(cfg, &rel) {
+                // 差分層にだけ在るディレクトリも同じ（BUG-177、`attribute_query_target`）。
+                if let Some(diff_layer_path) = attribute_query_target(cfg, &rel) {
                     let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
                     let (mut redirected_oa, mut redirected_name) =
                         unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
@@ -683,8 +682,8 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_attributes_file(
                     }
                     return status;
                 }
-                // read-through（`hooked_nt_query_full_attributes_file`と同じ理由）。
-                if let Some(diff_layer_path) = diff_layer_version_path(cfg, &rel) {
+                // read-through（`hooked_nt_query_full_attributes_file`と同じ理由・同じ関数）。
+                if let Some(diff_layer_path) = attribute_query_target(cfg, &rel) {
                     let diff_layer_wide: Vec<u16> = nt_path_wide(&diff_layer_path);
                     let (mut redirected_oa, mut redirected_name) =
                         unsafe { build_redirected_oa(object_attributes, &diff_layer_wide) };
