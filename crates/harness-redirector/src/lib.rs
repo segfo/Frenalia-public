@@ -111,11 +111,12 @@ use windows::Wdk::Storage::FileSystem::{
     FileDispositionInformation, FileDispositionInformationEx, FileRenameInformation,
     FileRenameInformationEx, FILE_DELETE_ON_CLOSE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_DELETE,
     FILE_DISPOSITION_INFORMATION, FILE_DISPOSITION_INFORMATION_EX, FILE_INFORMATION_CLASS,
-    FILE_RENAME_INFORMATION, NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS,
+    FILE_RENAME_INFORMATION, FILE_RENAME_REPLACE_IF_EXISTS, NTCREATEFILE_CREATE_DISPOSITION,
+    NTCREATEFILE_CREATE_OPTIONS,
 };
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, HANDLE, HMODULE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_OVERFLOW,
-    STATUS_NO_MORE_FILES, STATUS_OBJECT_NAME_NOT_FOUND, WAIT_EVENT,
+    STATUS_NO_MORE_FILES, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, WAIT_EVENT,
 };
 use windows::Win32::Storage::FileSystem::WriteFile;
 use windows::Win32::Storage::FileSystem::{
@@ -174,6 +175,8 @@ mod policy;
 mod process_hooks;
 mod spawn_broker;
 mod state;
+#[cfg(test)]
+mod test_support;
 
 use config::*;
 use dir_merge::*;

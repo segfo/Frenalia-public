@@ -275,43 +275,181 @@ impl PendingRename {
     }
 }
 
-/// リネーム/移動を検知し、(1) 移動先パスを差分層配下へ書き換え、(2) 台帳へ旧パスの`Delete`と
-/// 新パスの`Create`/`Modify`を1件ずつ書く**予定**を作る（設計書§19.4/§19.6）。書き換え後の
-/// バッファ・論理長・予定を返す（`None`なら素通し）。
+/// 名前の変更1回の行き先（解決しただけで、まだ何もしていない）。
+pub(crate) struct RenameTarget {
+    old_rel: String,
+    /// 移動先の台帳キー（workspace相対パス、`_ext`なら正規化済み絶対パス）。
+    new_key: String,
+    /// 移動先の、差分層の側の実体パス。本当の名前の変更はここへ向ける。
+    diff_layer_new: PathBuf,
+    /// 移動先の、ワークスペース（`_ext`なら実パス）の側のパス。差分層に無いとき、
+    /// 移動先が論理的に在るかはこちらで決まる。
+    counterpart: PathBuf,
+}
+
+/// 名前の変更の移動先を解決する（副作用なし）。`None`なら素通し。`RootDirectory`が非NULL
+/// （ディレクトリハンドル相対）の場合も素通しにする（設計書§19.6、[`rename_target_path`]）。
+unsafe fn resolve_rename_target(
+    cfg: &Config,
+    handle_key: isize,
+    info_ptr: *const c_void,
+) -> Option<RenameTarget> {
+    let old_rel = handle_paths().lock().unwrap().get(&handle_key).cloned()?;
+    let new_path = unsafe { rename_target_path(info_ptr) }?;
+    let Classified {
+        rel: new_rel,
+        ledger_key: new_key,
+        kind,
+    } = classify_target(cfg, &new_path)?;
+    // `DiffLayerAlias`でも`rel`は差分層ルートからの相対なので、`diff_layer_dir.join(&new_rel)`が
+    // **移動先そのもの**（恒等）になる。ワークスペースの側は同じ相対パスをワークスペースへ当てたもの。
+    let counterpart = match kind {
+        TargetKind::DiffLayerAlias => cfg.workspace_root.join(&new_rel),
+        TargetKind::Workspace | TargetKind::Ext => new_path,
+    };
+    Some(RenameTarget {
+        old_rel,
+        new_key,
+        diff_layer_new: cfg.diff_layer_dir.join(&new_rel),
+        counterpart,
+    })
+}
+
+/// 名前の変更が既存の移動先を置き換えてよいか。**読む場所が情報クラスで違う**——
+/// `FileRenameInformation`は1バイトの`BOOLEAN`で、残りの3バイトは呼び出し元の詰め物（値を持たない）。
+/// `FileRenameInformationEx`は32bitのフラグ。
+unsafe fn rename_replaces_existing(class: FILE_INFORMATION_CLASS, info_ptr: *const c_void) -> bool {
+    let anonymous = unsafe { (*(info_ptr as *const FILE_RENAME_INFORMATION)).Anonymous };
+    if class == FileRenameInformationEx {
+        let flags = unsafe { anonymous.Flags };
+        flags & FILE_RENAME_REPLACE_IF_EXISTS != 0
+    } else {
+        let replace = unsafe { anonymous.ReplaceIfExists };
+        replace.0 != 0
+    }
+}
+
+/// 名前の変更の移動先について、[`rename_refusal`]が必要な枝でだけ問い合わせる事実。
+pub(crate) trait RenameTargetFacts {
+    /// 差分層に移動先の実体が在るか。在れば、本当の呼び出しが自分で衝突・拒否を返す。
+    fn in_diff_layer(&self) -> bool;
+    /// ワークスペース（`_ext`なら実パス）の側に移動先が在るか。
+    fn in_workspace(&self) -> bool;
+    /// ワークスペースの側の移動先がディレクトリか（[`Self::in_workspace`]が真のときだけ問う）。
+    fn workspace_is_dir(&self) -> bool;
+    /// 移動先がこのセッションで論理削除されているか（兄弟プロセスの削除も取り込んだうえで）。
+    fn is_deleted(&self) -> bool;
+}
+
+/// 名前の変更を、本当の呼び出しをする前に断るべきか。断るならその状態を返す
+/// （[BUG-176](../../../docs/bugs/BUG-176.md)）。
+///
+/// 移動先は差分層へ書き換えてから本当の呼び出しをするので、差分層に何も無ければ本当の呼び出しは
+/// 成功する——**ワークスペースに移動先が在って、論理的には「在る」のに**、である。以前はそのまま
+/// 通しており、上書きを許さない名前の変更でもワークスペースのファイルを黙って置き換えていた
+/// （台帳に`Modify`が残り、承認で本物が変わる）。本物のファイルシステムが返すものを返す:
+///
+/// | 移動先（差分層には無い） | 上書き不可 | 上書き可 |
+/// |---|---|---|
+/// | ワークスペースにファイル | 衝突 | 通す（置き換え） |
+/// | ワークスペースにディレクトリ | 衝突 | **拒否**（ディレクトリはファイルで置き換えられない。NTFSで実測） |
+/// | 論理削除済み・どこにも無い | 通す | 通す |
+pub(crate) fn rename_refusal(
+    replace_if_exists: bool,
+    facts: &impl RenameTargetFacts,
+) -> Option<NTSTATUS> {
+    if facts.in_diff_layer() || !facts.in_workspace() || facts.is_deleted() {
+        return None;
+    }
+    if !replace_if_exists {
+        return Some(STATUS_OBJECT_NAME_COLLISION);
+    }
+    facts.workspace_is_dir().then_some(STATUS_ACCESS_DENIED)
+}
+
+/// 実際のファイルシステムと台帳から事実を引く[`RenameTargetFacts`]。
+struct LiveRenameFacts<'a> {
+    cfg: &'a Config,
+    target: &'a RenameTarget,
+}
+
+impl RenameTargetFacts for LiveRenameFacts<'_> {
+    fn in_diff_layer(&self) -> bool {
+        self.target.diff_layer_new.exists()
+    }
+
+    fn in_workspace(&self) -> bool {
+        self.target.counterpart.exists()
+    }
+
+    fn workspace_is_dir(&self) -> bool {
+        self.target.counterpart.is_dir()
+    }
+
+    fn is_deleted(&self) -> bool {
+        is_deleted_after_refresh(self.cfg, &self.target.new_key)
+    }
+}
+
+/// 解決した移動先を差分層へ向けたバッファを作り、台帳へ旧パスの`Delete`と新パスの
+/// `Create`/`Modify`を1件ずつ書く**予定**を作る（設計書§19.4/§19.6）。
 ///
 /// **台帳へはここで書かない**（BUG-171）。移動先が既にある・共有違反などで本当の変更は
 /// 失敗し得るので、書くのは呼び出し側が結果を見た後である。先に書いていた頃は、失敗した
 /// 変更の元ファイルが台帳の上で削除済みになり、セッションの中から見えなくなって、
 /// `apply`が本物を消しに行った。
-pub(crate) unsafe fn rewrite_rename_target(
+unsafe fn rewrite_rename_target(
     cfg: &Config,
     handle_key: isize,
+    target: RenameTarget,
     info_ptr: *const c_void,
-) -> Option<(Vec<u8>, usize, PendingRename)> {
-    let old_rel = handle_paths().lock().unwrap().get(&handle_key).cloned()?;
-    let new_path = unsafe { rename_target_path(info_ptr) }?;
-    let Classified {
-        rel: new_rel,
-        ledger_key: new_rel_str,
-        kind: _,
-    } = classify_target(cfg, &new_path)?;
-    // `kind`で分岐しないのは、`DiffLayerAlias`でも`rel`が差分層ルートからの相対なので
-    // `diff_layer_dir.join(&new_rel)`が**移動先そのもの**（恒等）になるため。台帳の2行
-    // （旧パスDelete＋新パスCreate/Modify）はどちらの種別でも同じように要る。
-    let diff_layer_new = cfg.diff_layer_dir.join(&new_rel);
-    if let Some(parent) = diff_layer_new.parent() {
+) -> (Vec<u8>, usize, PendingRename) {
+    if let Some(parent) = target.diff_layer_new.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let anonymous = unsafe { (*(info_ptr as *const FILE_RENAME_INFORMATION)).Anonymous };
-    let (buf, len) = build_rename_info_buffer(anonymous, &diff_layer_new);
-
+    let (buf, len) = build_rename_info_buffer(anonymous, &target.diff_layer_new);
     let pending = PendingRename {
         handle_key,
-        old: PendingRecord::delete(cfg, &old_rel),
-        new: PendingRecord::rename_target(cfg, &new_rel_str),
-        new_rel_str,
+        old: PendingRecord::delete(cfg, &target.old_rel),
+        new: PendingRecord::rename_target(cfg, &target.new_key),
+        new_rel_str: target.new_key,
     };
-    Some((buf, len, pending))
+    (buf, len, pending)
+}
+
+/// 本当の`NtSetInformationFile`を、情報のバッファと長さだけを差し替えて呼ぶ手順。
+pub(crate) type RealSetInfo<'a> = &'a dyn Fn(*const c_void, u32) -> NTSTATUS;
+
+/// 名前の変更1回を、移動先を差分層へ向けて実行する。`None`は素通し（呼び出し側が元の引数のまま
+/// 本当の呼び出しをする）。`real`は元の関数を呼ぶ手順で、試験では偽物を渡す。
+///
+/// # Safety
+/// `info_ptr`は`class`の形の`FILE_RENAME_INFORMATION`を指していること。
+pub(crate) unsafe fn route_rename(
+    cfg: &Config,
+    handle_key: isize,
+    info_ptr: *const c_void,
+    class: FILE_INFORMATION_CLASS,
+    real: RealSetInfo<'_>,
+) -> Option<NTSTATUS> {
+    let target = unsafe { resolve_rename_target(cfg, handle_key, info_ptr) }?;
+    let replace_if_exists = unsafe { rename_replaces_existing(class, info_ptr) };
+    if let Some(refused) = rename_refusal(
+        replace_if_exists,
+        &LiveRenameFacts {
+            cfg,
+            target: &target,
+        },
+    ) {
+        // 本当の呼び出しはしない。何も動いていないので、台帳にも何も書かない。
+        return Some(refused);
+    }
+    let (buf, len, pending) = unsafe { rewrite_rename_target(cfg, handle_key, target, info_ptr) };
+    let status = real(buf.as_ptr() as *const c_void, len as u32);
+    // BUG-171: 台帳へ書くのは本当の変更が成功した後（再入防止ガードの内側で）。
+    pending.settle(cfg, status.is_ok());
+    Some(status)
 }
 
 pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
@@ -344,21 +482,25 @@ pub(crate) unsafe extern "system" fn hooked_nt_set_information_file(
                 && (file_information_class == FileRenameInformation
                     || file_information_class == FileRenameInformationEx)
             {
-                if let Some((buf, len, pending)) =
-                    unsafe { rewrite_rename_target(cfg, handle_key, file_information) }
-                {
-                    let hook = SET_INFO_HOOK.get().expect("hook installed");
-                    let status = unsafe {
-                        hook.call(
-                            file_handle,
-                            io_status_block,
-                            buf.as_ptr() as *const c_void,
-                            len as u32,
-                            file_information_class,
-                        )
-                    };
-                    // BUG-171: 台帳へ書くのは本当の変更が成功した後（再入防止ガードの内側で）。
-                    pending.settle(cfg, status.is_ok());
+                let hook = SET_INFO_HOOK.get().expect("hook installed");
+                let real = |info: *const c_void, len: u32| unsafe {
+                    hook.call(
+                        file_handle,
+                        io_status_block,
+                        info,
+                        len,
+                        file_information_class,
+                    )
+                };
+                if let Some(status) = unsafe {
+                    route_rename(
+                        cfg,
+                        handle_key,
+                        file_information,
+                        file_information_class,
+                        &real,
+                    )
+                } {
                     return status;
                 }
             }
@@ -569,3 +711,7 @@ pub(crate) unsafe extern "system" fn hooked_nt_query_attributes_file(
     let hook = QUERY_ATTR_HOOK.get().expect("hook installed");
     unsafe { hook.call(object_attributes, file_information) }
 }
+
+#[cfg(test)]
+#[path = "file_hooks_tests.rs"]
+mod tests;
