@@ -167,9 +167,13 @@ pub(crate) unsafe fn ensure_init(param: *const u8) -> bool {
 /// # Safety
 /// `param`は[`resolve_config`]の要件を満たすこと。
 pub(crate) unsafe fn init(param: *const u8) -> bool {
-    let Some(cfg) = (unsafe { resolve_config(param) }) else {
+    let Some(candidate) = (unsafe { resolve_config(param) }) else {
         return false;
     };
+    // **以下の判断はすべて、採用された設定で行う**（BUG-179）。再試行では、前の試みが既に
+    // 採用した設定がフックの見るもの（`CONFIG`）になっており、今回の候補は捨てられる。
+    // 候補で判断すると、フックが見る差分層と、削除済みの集合・置くフックの種類が食い違う。
+    let cfg = adopt_config(candidate);
     // [段階5b] **ファイル系フックを置く理由があるか。** CoWの誘導もfault受付も無いなら、
     // あの7本は`NtCreateFile`等の全呼び出しを素通りさせるだけの回り道になる
     // （`file_hooks`のモジュールdocの表: `cow_enabled`が偽のとき成功経路では何もしない。
@@ -198,8 +202,6 @@ pub(crate) unsafe fn init(param: *const u8) -> bool {
     let process_hooks_are_the_only_reason = cfg.process_hooks && !file_hooks_wanted;
     let process_hooks_are_mandatory =
         self_is_child_process_restricted || process_hooks_are_the_only_reason;
-    load_deleted_set(&cfg);
-    let _ = CONFIG.set(cfg);
 
     if !file_hooks_wanted {
         debug_log("init: no diff layer and no fault broker; installing process hooks only");

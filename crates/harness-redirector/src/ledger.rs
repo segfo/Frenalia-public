@@ -47,6 +47,13 @@ struct DeletedSet {
 }
 
 impl DeletedSet {
+    fn empty() -> Self {
+        Self {
+            paths: HashSet::new(),
+            read_offset: 0,
+        }
+    }
+
     /// 台帳の1項目を集合へ反映する。**このモジュールの外から呼べない唯一の変更口。**
     fn apply(&mut self, op: ChangeOp, path: &str) {
         match op {
@@ -63,12 +70,7 @@ impl DeletedSet {
 /// プロセスに1つの[`DeletedSet`]。フックはプロセスごとの`static`しか持てない（`state`のモジュールdoc）。
 fn deleted_paths_state() -> &'static Mutex<DeletedSet> {
     static D: OnceLock<Mutex<DeletedSet>> = OnceLock::new();
-    D.get_or_init(|| {
-        Mutex::new(DeletedSet {
-            paths: HashSet::new(),
-            read_offset: 0,
-        })
-    })
+    D.get_or_init(|| Mutex::new(DeletedSet::empty()))
 }
 
 /// 台帳（`<diff_layer_dir>/.harness-cow-ops.jsonl`）へ1エントリを追記し、メモリ上の削除済み集合も
@@ -93,20 +95,75 @@ pub(crate) fn record_delete_before_close(cfg: &Config, rel: &str) {
     append_ledger_entry(cfg, ChangeOp::Delete, rel, baseline);
 }
 
+/// プロセスに1つの削除済みの集合を、`cfg`の台帳から組み立て直す（試験専用）。製品は起動時に
+/// [`adopt_config`]を通し、採用した設定の台帳から組み立てる。
+#[cfg(test)]
+pub(crate) fn load_deleted_set(cfg: &Config) {
+    reload_deleted_set(deleted_paths_state(), cfg);
+}
+
 /// 既存の台帳（あれば）を読み、削除済みの集合を組み立て直す（設計書§19.7）。DLLは
 /// `run_shell`呼び出しのたびに別プロセスへ再ロードされ得るため、台帳ファイルを唯一の正本に
 /// して起動のたびに再生する。読んだ全内容を読込位置として記録し、以降[`refresh_deleted_set`]が
 /// 同じ範囲を二重に取り込まないようにする。
-pub(crate) fn load_deleted_set(cfg: &Config) {
+fn reload_deleted_set(set: &Mutex<DeletedSet>, cfg: &Config) {
     let ledger_path = cfg.diff_layer_dir.join(COW_OPS_LEDGER_FILENAME);
     let Ok(contents) = std::fs::read(&ledger_path) else {
         return;
     };
     let text = String::from_utf8_lossy(&contents);
     let entries = parse_ledger(&text);
-    let mut set = deleted_paths_state().lock().unwrap();
+    let mut set = set.lock().unwrap();
     set.paths = harness_change_ledger::deleted_paths(&entries);
     set.read_offset = contents.len() as u64;
+}
+
+/// 起動時に設定を採用し、**採用した方の**台帳から削除済みの集合を組み立てる（`init`、
+/// [BUG-179](../../../docs/bugs/BUG-179.md)）。返すのはフックが実際に見る設定である。
+///
+/// `CONFIG`は1度しか入らない。初期化は失敗したら再試行される（`ensure_init`、BUG-045）ので、
+/// 前の試みが`CONFIG`を入れてから失敗していると、今回の候補は捨てられる。以前は集合を**候補の**
+/// 台帳から読んでから`CONFIG.set`して黙って失敗していたので、フックはAの差分層を見るのに
+/// 削除済みの集合はBのもの、という状態が作れた。**後から来た候補で上書きしない**のは、フックが
+/// 既に最初の設定を見ているからである（入れ替えると、動いている途中のフックの見る先が変わる）。
+/// 候補が違っていたことは警告台帳へ残す。
+pub(crate) fn adopt_config(candidate: Config) -> &'static Config {
+    adopt_config_into(&CONFIG, deleted_paths_state(), candidate)
+}
+
+fn adopt_config_into<'a>(
+    slot: &'a OnceLock<Config>,
+    set: &Mutex<DeletedSet>,
+    candidate: Config,
+) -> &'a Config {
+    let mut differs = None;
+    let adopted = match slot.get() {
+        Some(existing) => {
+            if existing.workspace_root != candidate.workspace_root
+                || existing.diff_layer_dir != candidate.diff_layer_dir
+            {
+                differs = Some(candidate);
+            }
+            existing
+        }
+        None => slot.get_or_init(|| candidate),
+    };
+    if let Some(dropped) = differs {
+        append_warning_kind(
+            adopted,
+            "config_retry_mismatch",
+            &format!(
+                "a retried initialisation brought a different configuration (workspace {}, diff \
+                 layer {}); the one already in effect (workspace {}, diff layer {}) is kept",
+                dropped.workspace_root.display(),
+                dropped.diff_layer_dir.display(),
+                adopted.workspace_root.display(),
+                adopted.diff_layer_dir.display()
+            ),
+        );
+    }
+    reload_deleted_set(set, adopted);
+    adopted
 }
 
 /// 削除済みの集合の写し（ディレクトリの一覧のマージが、ロックを持ったまま列挙しないため）。
@@ -737,6 +794,48 @@ mod tests {
         assert_eq!(
             attribute_query_target(&cfg, Path::new("bug177-nowhere")),
             None
+        );
+    }
+
+    /// BUG-179: 起動の再試行で、既に採用済みの設定（A）があるのに別の候補（B）が来たら、
+    /// 削除済みの集合は**フックが実際に使うAの台帳から**組み立てる。以前は候補Bの台帳から読み、
+    /// そのあと`CONFIG.set`が黙って失敗していた（フックはAの差分層を見るのに、集合はBのもの）。
+    #[test]
+    fn a_retried_init_loads_the_deleted_set_from_the_config_that_is_in_effect() {
+        let (_wa, _da, a) = fixture();
+        let (_wb, _db, b) = fixture();
+        for (cfg, rel) in [(&a, "bug179-a.txt"), (&b, "bug179-b.txt")] {
+            std::fs::write(
+                cfg.diff_layer_dir.join(COW_OPS_LEDGER_FILENAME),
+                format!(
+                    "{{\"op\":\"delete\",\"path\":\"{rel}\",\"baseline_hash\":\"h\",\"ts_unix_millis\":1}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let a_diff_layer = a.diff_layer_dir.clone();
+        let slot = OnceLock::new();
+        let set = Mutex::new(DeletedSet::empty());
+        // 1回目の試み: Aを採用した（その後、フックの設置で失敗した、という想定）。
+        let _ = adopt_config_into(&slot, &set, a);
+        // 2回目の試み: 別の候補Bで再試行する。
+        let adopted = adopt_config_into(&slot, &set, b);
+
+        assert_eq!(
+            adopted.diff_layer_dir, a_diff_layer,
+            "the first config stays in effect"
+        );
+        let warnings = std::fs::read_to_string(a_diff_layer.join(COW_WARNINGS_LEDGER_FILENAME))
+            .unwrap_or_default();
+        assert!(
+            warnings.contains("config_retry_mismatch"),
+            "the dropped candidate must be reported, not discarded silently: {warnings:?}"
+        );
+        let set = set.lock().unwrap();
+        assert!(
+            set.paths.contains("bug179-a.txt") && !set.paths.contains("bug179-b.txt"),
+            "BUG-179: the deleted set must come from the config the hooks use, got {:?}",
+            set.paths
         );
     }
 
