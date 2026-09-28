@@ -30,25 +30,88 @@ pub(crate) fn baseline_hash_for(cfg: &Config, ledger_key: &str) -> Option<String
     hash
 }
 
-/// 台帳（`<diff_layer_dir>/.harness-cow-ops.jsonl`）へ1エントリを追記し、メモリ上の削除済み集合も
-/// 更新する。追記の実体は`store::append_entry`（host側と共有、設計書§19.2「追記の並行性」）。
-pub(crate) fn append_ledger_entry(
-    cfg: &Config,
-    op: ChangeOp,
-    rel: &str,
-    baseline_hash: Option<String>,
-) {
-    store::append_entry(&cfg.diff_layer_dir, op, rel, baseline_hash);
-    let deleted = deleted_paths_state();
-    let mut g = deleted.lock().unwrap();
-    match op {
-        ChangeOp::Delete => {
-            g.insert(rel.to_string());
-        }
-        ChangeOp::Create | ChangeOp::Modify => {
-            g.remove(rel);
+/// このセッションで論理削除済みのパスの集合（設計書§19.7）と、それを組み立てるために台帳を
+/// どこまで読んだか（設計書§19.2）。
+///
+/// **変わるのは台帳の項目からだけである**——このDLLが書いた項目（[`append_ledger_entry`]）、
+/// 兄弟プロセスが書いた項目の取り込み（[`refresh_deleted_set`]）、起動時の再生
+/// （[`load_deleted_set`]）。[BUG-172](../../../docs/bugs/BUG-172.md)は、作り直しのopenの前に
+/// 集合から印を直接外していた形だった。同じ形を型で止めるため、中身も置き場もこのモジュールの
+/// 外から見えない（外から触る行が無いことは`ledger_ownership_tests.rs`が数える）。
+///
+/// 集合と読込位置を1つのロックに入れているのは、2つが同じ事実（台帳のどこまでを集合へ反映したか）の
+/// 両面だからである。別々のロックだと、片方だけ進んだ瞬間が生まれる。
+struct DeletedSet {
+    paths: HashSet<String>,
+    read_offset: u64,
+}
+
+impl DeletedSet {
+    /// 台帳の1項目を集合へ反映する。**このモジュールの外から呼べない唯一の変更口。**
+    fn apply(&mut self, op: ChangeOp, path: &str) {
+        match op {
+            ChangeOp::Delete => {
+                self.paths.insert(path.to_string());
+            }
+            ChangeOp::Create | ChangeOp::Modify => {
+                self.paths.remove(path);
+            }
         }
     }
+}
+
+/// プロセスに1つの[`DeletedSet`]。フックはプロセスごとの`static`しか持てない（`state`のモジュールdoc）。
+fn deleted_paths_state() -> &'static Mutex<DeletedSet> {
+    static D: OnceLock<Mutex<DeletedSet>> = OnceLock::new();
+    D.get_or_init(|| {
+        Mutex::new(DeletedSet {
+            paths: HashSet::new(),
+            read_offset: 0,
+        })
+    })
+}
+
+/// 台帳（`<diff_layer_dir>/.harness-cow-ops.jsonl`）へ1エントリを追記し、メモリ上の削除済み集合も
+/// 更新する。追記の実体は`store::append_entry`（host側と共有、設計書§19.2「追記の並行性」）。
+///
+/// **このモジュールの外からは呼べない。** 書くのは本当の操作の結果を見た後（BUG-171）なので、
+/// 外の呼び出し元は[`PendingRecord::settle`]を通る。例外は[`record_delete_before_close`]だけで、
+/// 例外であることを名前で残している。
+fn append_ledger_entry(cfg: &Config, op: ChangeOp, rel: &str, baseline_hash: Option<String>) {
+    store::append_entry(&cfg.diff_layer_dir, op, rel, baseline_hash);
+    deleted_paths_state().lock().unwrap().apply(op, rel);
+}
+
+/// 削除の予約が付いたハンドルを閉じる**前に**、そのパスの`Delete`を台帳へ書く（`hooked_nt_close`）。
+///
+/// **本当の閉じる処理の結果を見ていない**——[`PendingRecord`]の約束（結果を見てから書く）の例外で、
+/// 例外であることを名前で残すためにここへ分けた。閉じる処理が失敗した・削除の予約が他のハンドルに
+/// 取り消されたときに偽の`Delete`が残る穴は、台帳だけでは本当に消えたかを後から確かめられないので、
+/// 段6で承認の側と一緒に扱う（`plans/PLAN-COW-AS-DEFAULT.md`の「その段の最後に必ず解消するもの」）。
+pub(crate) fn record_delete_before_close(cfg: &Config, rel: &str) {
+    let baseline = baseline_hash_for(cfg, rel);
+    append_ledger_entry(cfg, ChangeOp::Delete, rel, baseline);
+}
+
+/// 既存の台帳（あれば）を読み、削除済みの集合を組み立て直す（設計書§19.7）。DLLは
+/// `run_shell`呼び出しのたびに別プロセスへ再ロードされ得るため、台帳ファイルを唯一の正本に
+/// して起動のたびに再生する。読んだ全内容を読込位置として記録し、以降[`refresh_deleted_set`]が
+/// 同じ範囲を二重に取り込まないようにする。
+pub(crate) fn load_deleted_set(cfg: &Config) {
+    let ledger_path = cfg.diff_layer_dir.join(COW_OPS_LEDGER_FILENAME);
+    let Ok(contents) = std::fs::read(&ledger_path) else {
+        return;
+    };
+    let text = String::from_utf8_lossy(&contents);
+    let entries = parse_ledger(&text);
+    let mut set = deleted_paths_state().lock().unwrap();
+    set.paths = harness_change_ledger::deleted_paths(&entries);
+    set.read_offset = contents.len() as u64;
+}
+
+/// 削除済みの集合の写し（ディレクトリの一覧のマージが、ロックを持ったまま列挙しないため）。
+pub(crate) fn deleted_paths_snapshot() -> HashSet<String> {
+    deleted_paths_state().lock().unwrap().paths.clone()
 }
 
 /// 台帳へ書く**予定**の1件（[BUG-171](../../../docs/bugs/BUG-171.md)）。
@@ -181,7 +244,7 @@ pub(crate) fn prepare_diff_layer_parent(counterpart: &Path, diff_layer_target: &
 /// `rel`がこのセッションで論理削除されているか（削除済み集合に入っているか）。
 /// 読むだけで、集合は変えない。直前に[`check_deleted`]が台帳の増分を取り込んでいる前提で使う。
 pub(crate) fn is_logically_deleted(rel: &str) -> bool {
-    deleted_paths_state().lock().unwrap().contains(rel)
+    deleted_paths_state().lock().unwrap().paths.contains(rel)
 }
 
 /// [`copy_up`]の後始末。本当のopenが成功したときだけ台帳へ書く（設計書§19.6）。
@@ -416,42 +479,33 @@ pub(crate) fn attribute_query_target(cfg: &Config, rel: &Path) -> Option<PathBuf
     diff_layer_version_path(cfg, rel).or_else(|| diff_layer_only_dir_path(cfg, rel))
 }
 
-/// 台帳ファイルの、前回同期以降に追記された**完全な行だけ**を取り込み、`deleted_paths_state`
+/// 台帳ファイルの、前回同期以降に追記された**完全な行だけ**を取り込み、削除済みの集合
 /// を増分更新する（設計書§19.2）。`FILE_APPEND_DATA`による1行1書込みという既存の追記規律
 /// （書く側、本ファイル`append_ledger_entry`）により、途中まで書かれた行（末尾に`\n`が無い）は
 /// 次回の呼び出しまで無視して安全に据え置ける——サイズが前回と変わっていなければファイルI/O
 /// すらしないため、フックのホットパスでのコストは兄弟プロセスが実際に書いた場合のみ発生する。
 pub(crate) fn refresh_deleted_set(cfg: &Config) {
     let ledger_path = cfg.diff_layer_dir.join(COW_OPS_LEDGER_FILENAME);
-    let mut offset_guard = ledger_read_offset().lock().unwrap();
+    let mut set = deleted_paths_state().lock().unwrap();
     let Ok(contents) = std::fs::read(&ledger_path) else {
         return;
     };
     let len = contents.len() as u64;
-    if len <= *offset_guard {
+    if len <= set.read_offset {
         // 変化なし、または（想定外だが）縮小。縮小はスコープ外として無視する。
         return;
     }
-    let new_bytes = &contents[*offset_guard as usize..];
+    let new_bytes = &contents[set.read_offset as usize..];
     let Some(last_nl) = new_bytes.iter().rposition(|&b| b == b'\n') else {
-        // 完全な行がまだ1つも届いていない（書込み途中）。オフセットは進めない。
+        // 完全な行がまだ1つも届いていない（書込み途中）。読込位置は進めない。
         return;
     };
     let complete = &new_bytes[..=last_nl];
     let text = String::from_utf8_lossy(complete);
-    let entries = parse_ledger(&text);
-    let mut deleted = deleted_paths_state().lock().unwrap();
-    for entry in &entries {
-        match entry.op {
-            ChangeOp::Delete => {
-                deleted.insert(entry.path.clone());
-            }
-            ChangeOp::Create | ChangeOp::Modify => {
-                deleted.remove(&entry.path);
-            }
-        }
+    for entry in parse_ledger(&text) {
+        set.apply(entry.op, &entry.path);
     }
-    *offset_guard += complete.len() as u64;
+    set.read_offset += complete.len() as u64;
 }
 
 /// 論理削除済み集合を確認し、必要なら書換後の`NTSTATUS`を返す（`Some`なら即returnすべき）。
@@ -711,3 +765,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ledger_ownership_tests.rs"]
+mod ownership_tests;

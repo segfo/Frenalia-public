@@ -309,16 +309,8 @@ pub(crate) fn baseline_cache() -> &'static Mutex<HashMap<String, Option<String>>
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 現在「論理的に削除済み」のworkspace相対パス集合（設計書§19.7）。DLL初期化時に既存の
-/// 台帳を再生して組み立て、以降はこのDLLがフックした操作でその都度更新する。
-///
-/// Phase 4a（孫プロセスへの再注入）により、同じ台帳へ複数プロセス（兄弟）が並行して追記し得る
-/// ようになったため、自プロセスが起こしていない削除（兄弟プロセスが起こした削除）もここへ
-/// 反映する必要がある。`refresh_deleted_set`が増分tail再読込でこれを行う（設計書§19.2）。
-pub(crate) fn deleted_paths_state() -> &'static Mutex<HashSet<String>> {
-    static D: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    D.get_or_init(|| Mutex::new(HashSet::new()))
-}
+// 論理削除済みのパスの集合は`ledger`が持つ（`ledger::DeletedSet`）。台帳の項目からしか
+// 変わらないことを可視性で守るため、ここ（どのモジュールからも見える置き場）には置かない。
 
 /// Phase 4: 既にこのプロセスで`.harness-cow-denied.jsonl`へ記録済みのパス集合（同一パスへの
 /// 繰り返し拒否試行で台帳が肥大しないようにする、プロセス内のみのdedup——別プロセス/セッションで
@@ -363,10 +355,4 @@ pub(crate) fn diff_layer_alias_first_touch(rel: &str) -> bool {
         .lock()
         .unwrap()
         .insert(rel.to_string())
-}
-
-/// `deleted_paths_state`を最後に同期した時点での台帳ファイルの読み込み済みバイトオフセット。
-pub(crate) fn ledger_read_offset() -> &'static Mutex<u64> {
-    static O: OnceLock<Mutex<u64>> = OnceLock::new();
-    O.get_or_init(|| Mutex::new(0))
 }

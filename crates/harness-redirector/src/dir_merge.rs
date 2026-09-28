@@ -332,7 +332,7 @@ pub(crate) unsafe fn try_merged_dir_query(
     }
     let (base_layer_dir, diff_layer_dir, rel_prefix) = dir_query_roots(cfg, &rel_str)?;
     refresh_deleted_set(cfg);
-    let deleted = deleted_paths_state().lock().unwrap().clone();
+    let deleted = deleted_paths_snapshot();
     let merged =
         dir_merge::merge_dir_entries(&base_layer_dir, &diff_layer_dir, &deleted, &rel_prefix);
     // BUG-128: マージ結果が空で、本体層側にも実体が無い（＝本当に空のディレクトリで、削除隠し

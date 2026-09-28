@@ -22,23 +22,6 @@ pub(crate) unsafe fn resolve_module_export(module: &str, name: &str) -> Option<*
     Some(addr as *const c_void)
 }
 
-/// 既存の台帳（あれば）を読み、`deleted_paths_state`を組み立てる（設計書§19.7）。DLLは
-/// `run_shell`呼び出しのたびに別プロセスへ再ロードされ得るため、台帳ファイルを唯一の正本に
-/// して起動のたびに再生する。
-pub(crate) fn load_deleted_set(cfg: &Config) {
-    let ledger_path = cfg.diff_layer_dir.join(COW_OPS_LEDGER_FILENAME);
-    let Ok(contents) = std::fs::read(&ledger_path) else {
-        return;
-    };
-    let text = String::from_utf8_lossy(&contents);
-    let entries = parse_ledger(&text);
-    let deleted = harness_change_ledger::deleted_paths(&entries);
-    *deleted_paths_state().lock().unwrap() = deleted;
-    // 起動時に読んだ全内容をオフセットとして記録し、以降`refresh_deleted_set`が同じ範囲を
-    // 二重に取り込まないようにする。
-    *ledger_read_offset().lock().unwrap() = contents.len() as u64;
-}
-
 /// 設定の取得（BUG-045のF2）。注入パラメータ（`harness_cow_init`の引数、非NULLなら正）を
 /// 優先し、無ければ環境変数`HARNESS_COW_*`へフォールバックする。Launcherが直接起動する子
 /// （`win_appcontainer.rs`の`inject_redirector`）はenv経路、DLL自身が再注入する孫以降は

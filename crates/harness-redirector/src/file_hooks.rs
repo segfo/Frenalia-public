@@ -539,8 +539,7 @@ pub(crate) unsafe extern "system" fn hooked_nt_close(handle: HANDLE) -> NTSTATUS
             dir_query_cursor().lock().unwrap().remove(&key);
             if was_pending {
                 if let Some(rel) = rel_opt {
-                    let baseline = baseline_hash_for(cfg, &rel);
-                    append_ledger_entry(cfg, ChangeOp::Delete, &rel, baseline);
+                    record_delete_before_close(cfg, &rel);
                 }
             }
         }
