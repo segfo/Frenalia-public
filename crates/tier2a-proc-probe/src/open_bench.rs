@@ -47,13 +47,20 @@ pub struct Spec {
     /// 与えられたらこのDLLを`LoadLibraryW`し、`harness_cow_init(NULL)`を呼んでから2区間目を撮る。
     /// 設定は環境変数（`HARNESS_COW_WORKSPACE`・`HARNESS_COW_DIFF_LAYER`）で渡す。
     pub dll: Option<String>,
+    /// **初めて書込で開く**腕のためのディレクトリ。`before/`と`after/`に同じ数の既存ファイルを置き、
+    /// 各区間でその区間のファイルを1回ずつ書込で開いて閉じる（CoWでは毎回copy-upが走る）。
+    /// 1つのファイルを2回開くとcopy-upは1回しか走らないので、区間ごとに別のファイルを使う。
+    pub first_touch: Option<String>,
+    /// **写し済みのファイルを書込で開く**腕のファイル（1つを`iters`回書込で開いて閉じる）。
+    /// 2回目以降はcopy-upが走らないので、初めての書込の腕に対する対照になる。
+    pub rewrite: Option<String>,
 }
 
 #[cfg(windows)]
 pub fn run(spec: &Spec) -> Value {
     use std::time::Instant;
     use windows::core::{PCSTR, PCWSTR};
-    use windows::Win32::Foundation::{CloseHandle, GetLastError, GENERIC_READ};
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, GENERIC_READ, GENERIC_WRITE};
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, GetFileAttributesW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
@@ -96,6 +103,52 @@ pub fn run(spec: &Spec) -> Value {
         json!({ "us_per_op": us, "ok": ok, "iters": iters, "last_error": last_error })
     }
 
+    /// `paths`を1回ずつ書込で開いて閉じる。**成功数を数える**（`time_opens`と同じ理由）。
+    fn time_write_opens(paths: &[String]) -> Value {
+        let mut ok = 0usize;
+        let mut last_error = 0u32;
+        let t = Instant::now();
+        for path in paths {
+            let w = wide(path);
+            let h = unsafe {
+                CreateFileW(
+                    PCWSTR(w.as_ptr()),
+                    GENERIC_WRITE.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    None,
+                )
+            };
+            match h {
+                Ok(h) => {
+                    ok += 1;
+                    unsafe {
+                        let _ = CloseHandle(h);
+                    }
+                }
+                Err(_) => last_error = unsafe { GetLastError() }.0,
+            }
+        }
+        let n = paths.len().max(1);
+        let us = t.elapsed().as_secs_f64() * 1e6 / (n as f64);
+        json!({ "us_per_op": us, "ok": ok, "iters": paths.len(), "last_error": last_error })
+    }
+
+    /// `dir/<phase>/`直下のファイルを名前順に並べる。
+    fn files_in(dir: &str, phase: &str) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(std::path::Path::new(dir).join(phase))
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.path().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
     fn time_attrs(path: &str, iters: usize) -> Value {
         let w = wide(path);
         let mut ok = 0usize;
@@ -116,6 +169,8 @@ pub fn run(spec: &Spec) -> Value {
             "open_inside": time_opens(&spec.inside, spec.iters),
             "open_outside": spec.outside.as_ref().map(|p| time_opens(p, spec.iters)),
             "attrs_inside": time_attrs(&spec.inside, spec.iters),
+            "first_touch_write": spec.first_touch.as_ref().map(|d| time_write_opens(&files_in(d, label))),
+            "rewrite_write": spec.rewrite.as_ref().map(|p| time_write_opens(&vec![p.clone(); spec.iters])),
         })
     };
 
@@ -181,6 +236,8 @@ pub fn run(spec: &Spec) -> Value {
             "open_inside": delta(&before, &after, "open_inside"),
             "open_outside": delta(&before, &after, "open_outside"),
             "attrs_inside": delta(&before, &after, "attrs_inside"),
+            "first_touch_write": delta(&before, &after, "first_touch_write"),
+            "rewrite_write": delta(&before, &after, "rewrite_write"),
         },
     })
 }
