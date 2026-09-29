@@ -9227,6 +9227,29 @@ fn run_arm_collecting_denials(
     log_tag: &str,
     extra_args: &[String],
 ) -> Result<DeniedArm, String> {
+    run_arm_collecting_denials_in(
+        ws, case_name, "tier2a", enforce, script, log_tag, extra_args,
+    )
+}
+
+/// [`run_arm_collecting_denials`]の、**`--sandbox`の値を選べる版**（BUG-180）。
+///
+/// # なぜ`extra_args`で渡さないのか
+///
+/// `--sandbox`は1回しか書けない（clapが2回目を拒む）。既定の`tier2a`を置いたまま
+/// `extra_args`へ`--sandbox tier2a-cow`を足すと、起動そのものが引数エラーで落ちる。
+///
+/// **`tier2a-cow`を渡すなら、呼び出し側は先に`cow_exclusive()`を取ること**
+/// （CoWセッションを作る入口[`run_harness_driven`]が検査する。BUG-135）。
+fn run_arm_collecting_denials_in(
+    ws: &Path,
+    case_name: &str,
+    sandbox: &str,
+    enforce: bool,
+    script: &str,
+    log_tag: &str,
+    extra_args: &[String],
+) -> Result<DeniedArm, String> {
     use harness_sandbox::tier2a::spawnd::transitions::{
         pending_path, read_from, remedy, PendingRecord, Remedy,
     };
@@ -9240,7 +9263,7 @@ fn run_arm_collecting_denials(
     let daemon_log = scratch_dir().join(format!("{case_name}-spawnd.log"));
     let _ = std::fs::remove_file(&daemon_log);
 
-    let mut args: Vec<&str> = vec!["--sandbox", "tier2a"];
+    let mut args: Vec<&str> = vec!["--sandbox", sandbox];
     if enforce {
         args.push("--enforce-transitions");
     }
@@ -11026,4 +11049,344 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
     // **測定のために作った外のディレクトリは自分で掃く**（`measurement-review`検問11）。
     // 消すとその配下のACEも一緒に消える。
     let _ = std::fs::remove_dir_all(&outside);
+}
+
+/// 別ドメインへの遷移を1段だけ宣言し、`findstr`を遷移先に置いた構成を作る
+/// （[`a_transition_target_domain_is_narrower_than_the_caller`]と同じ置き方）。
+fn declare_findstr_in_another_domain(ws: &Path, case_name: &str) -> String {
+    let findstr = format!(
+        r"{}\System32\findstr.exe",
+        std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())
+    );
+    declare_chain(ws, std::slice::from_ref(&findstr))
+        .unwrap_or_else(|e| panic!("{case_name}: 遷移の宣言を書けなかった: {e}"));
+    assert_chain_crosses_domains(ws, case_name, 1);
+    findstr
+}
+
+/// 本文から`KEY=値`の値を引く。無ければ台本が最後まで走っていない。
+fn script_cell(text: &str, key: &str) -> String {
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix(key).map(str::to_string))
+        .unwrap_or_else(|| panic!("`{key}`の行が本文に無い。台本が最後まで走っていない:\n{text}"))
+}
+
+/// `findstr`がそのファイルを**開けなかった**と言ったか。
+///
+/// 終了コードだけで判定しない——`findstr`は「見つからない」も「開けない」も1を返す
+/// （[`a_transition_target_domain_is_narrower_than_the_caller`]が2026-09-20に実測した）。
+/// 文面は地域化されるので、`FINDSTR:`の接頭辞とパスだけを見る。
+fn findstr_could_not_open(text: &str, path: &str) -> bool {
+    text.lines()
+        .any(|l| l.trim_start().starts_with("FINDSTR:") && l.contains(path))
+}
+
+/// 遷移先の子が**起こせなかった**なら、その理由を失敗として返す。
+///
+/// 断られ方は2つあり、直し方が違うので分けて書く。
+///
+/// - `SpawnFailed`: 辺は許されたが起こせなかった。BUG-180の修正が入る前は、Redirectorの
+///   見張り（差分層を読めない子の初期化を止める）がここで止める
+/// - それ以外: 宣言の問題で、この回はCoWの見え方を測っていない
+fn child_was_refused(arm: &DeniedArm, findstr: &str) -> Option<String> {
+    let refused: Vec<&(String, String)> = arm
+        .denied_detail
+        .iter()
+        .filter(|(exe, _)| exe.eq_ignore_ascii_case(findstr))
+        .collect();
+    if refused.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "遷移先の子（{findstr}）が起きていない: {refused:?}。\
+         `SpawnFailed`なら、差分層へ届かない子をRedirectorの見張りが止めた可能性が高い\
+         （BUG-180。Daemonの診断を見ること）。それ以外なら宣言の問題で、\
+         **この回はCoWの見え方を測っていない**。Daemonの診断:\n{}",
+        arm.daemon_stderr
+    ))
+}
+
+/// [BUG-180] **CoWの下で別ドメインへ移った子は、呼び出し元が差分層へ積んだ変更を見るか。**
+///
+/// # 何が壊れていたのか
+///
+/// `--sandbox tier2a-cow`では、書込は本物のワークスペースではなく差分層へ積まれ、
+/// 読むときはRedirector（子へ注入するDLL）が差分層を先に見る。差分層のACEは
+/// 差分層ごとのcapability SID宛にしか付いていないので、**子のトークンにそのSIDが無いと
+/// 差分層を読めない**。別ドメインへ移った子のトークンは起動時に用意した表から組まれ、
+/// その表に差分層のSIDが無かった。Redirectorは差分層への問い合わせの拒否を「無い」と読むので、
+/// 子は**変更前の中身を黙って読み、消したファイルも元の中身で見えていた**（コードを読んで確認）。
+///
+/// # 予測（修正後）
+///
+/// | 見るもの | 入口ドメイン（シェル自身） | 遷移先ドメイン（`findstr`） |
+/// |---|---|---|
+/// | 書き換えた`edited.txt`の新しい中身 | 見える（対照） | **見える** ← 本体 |
+/// | `edited.txt`の古い中身 | — | **見えない**（対） |
+/// | 消した`gone.txt` | 無い（対照） | **開けない** ← 本体 |
+/// | 本物のワークスペース | 変わっていない | 変わっていない |
+///
+/// 修正前は、遷移先が古い中身を見て（新しい中身は見つからない）、消したファイルを開けた。
+/// 見張り（差分層を読めない子の初期化を止める）だけが入った状態なら、子は起きずに
+/// `SpawnFailed`で断られる。
+///
+/// # 実行
+///
+/// `dev-elevated-run e2e-cow-cross-domain`（Tier2aの準備で祖先へのtraverseを付けるので昇格する）。
+#[test]
+#[ignore = "starts Tier2a CoW sessions with enforced transitions; run through dev-elevated-run e2e-cow-cross-domain"]
+fn a_cross_domain_child_sees_the_callers_staged_workspace_under_cow() {
+    const CASE: &str = "cow-cross-domain";
+    const ORIGINAL: &str = "ORIGINALMARK";
+    const STAGED: &str = "STAGEDMARK";
+    const GONE: &str = "GONEMARK";
+
+    let ex = cow_exclusive();
+    let before = ex.list_cow_sessions();
+    let ws = case_dir(CASE);
+    std::fs::write(ws.join("edited.txt"), format!("{ORIGINAL}\n"))
+        .unwrap_or_else(|e| panic!("edited.txtを置けなかった: {e}"));
+    std::fs::write(ws.join("gone.txt"), format!("{GONE}\n"))
+        .unwrap_or_else(|e| panic!("gone.txtを置けなかった: {e}"));
+    let findstr = declare_findstr_in_another_domain(&ws, CASE);
+
+    // **`findstr`へ渡すパスは`\`区切りにする**（`/`で始まるトークンを自分のオプションとして食う）。
+    let dir = ws.display().to_string();
+    let edited = format!("{dir}\\edited.txt");
+    let gone = format!("{dir}\\gone.txt");
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         Set-Content -LiteralPath '{edited}' -Value '{STAGED}'; \
+         Remove-Item -LiteralPath '{gone}'; \
+         $e = Get-Content -LiteralPath '{edited}' -Raw; \
+         Write-Output ('SHELL_EDITED=' + $(if ($e -match '{STAGED}') {{'STAGED'}} else {{'OTHER'}})); \
+         Write-Output ('SHELL_GONE=' + (Test-Path -LiteralPath '{gone}')); \
+         findstr /c:{STAGED} '{edited}' | Out-Null; \
+         Write-Output ('CHILD_STAGED_RC=' + $LASTEXITCODE); \
+         findstr /c:{ORIGINAL} '{edited}' | Out-Null; \
+         Write-Output ('CHILD_ORIGINAL_RC=' + $LASTEXITCODE); \
+         findstr /c:{GONE} '{gone}' | Out-Null; \
+         Write-Output ('CHILD_GONE_RC=' + $LASTEXITCODE)"
+    );
+    let arm = run_arm_collecting_denials_in(&ws, CASE, "tier2a-cow", true, &script, CASE, &[])
+        .unwrap_or_else(|e| panic!("腕が測れなかった: {e}"));
+    if let Some(reason) = child_was_refused(&arm, &findstr) {
+        panic!("{reason}\n本文:\n{}", arm.text);
+    }
+
+    let shell_edited = script_cell(&arm.text, "SHELL_EDITED=");
+    let shell_gone = script_cell(&arm.text, "SHELL_GONE=");
+    let child_staged = script_cell(&arm.text, "CHILD_STAGED_RC=");
+    let child_original = script_cell(&arm.text, "CHILD_ORIGINAL_RC=");
+    let child_gone = script_cell(&arm.text, "CHILD_GONE_RC=");
+    eprintln!(
+        "[{CASE}] シェル(入口): 書き換え={shell_edited} 消したファイルが在る={shell_gone}／\
+         子(遷移先): 新しい中身のRC={child_staged} 古い中身のRC={child_original} 消したファイルのRC={child_gone}"
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // --- 対照: 入口ドメインは自分の変更を見ている ---
+    if shell_edited != "STAGED" {
+        failures.push(format!(
+            "入口ドメインが**自分で書き換えた中身を読めていない**（{shell_edited}）。\
+             CoWそのものが効いていないので、遷移先の見え方を測っていない"
+        ));
+    }
+    if !shell_gone.eq_ignore_ascii_case("False") {
+        failures.push(format!(
+            "入口ドメインが**自分で消したファイルを見ている**（Test-Path={shell_gone}）。\
+             CoWそのものが効いていない"
+        ));
+    }
+
+    // --- 本体1: 遷移先は新しい中身を読み、古い中身は読まない（対） ---
+    if findstr_could_not_open(&arm.text, &edited) {
+        failures.push(format!(
+            "遷移先の子が**書き換えたファイルを開けていない**: {edited}。\
+             差分層へ届かないまま、別の理由で止まっている"
+        ));
+    }
+    if child_staged != "0" {
+        failures.push(format!(
+            "遷移先の子が**呼び出し元の書き換えを見ていない**（新しい中身のRC={child_staged}）。\
+             **BUG-180の症状である**——差分層を読めず、Redirectorが「差分層に無い」と読んで\
+             本物のワークスペースの古いファイルを返している"
+        ));
+    }
+    if child_original == "0" {
+        failures.push(
+            "遷移先の子が**書き換える前の中身を読めた**。差分層ではなく本物のワークスペースを\
+             読んでいる（BUG-180）"
+                .to_string(),
+        );
+    }
+
+    // --- 本体2: 遷移先は消したファイルを開けない（対は上の「書き換えたファイルは開ける」） ---
+    if !findstr_could_not_open(&arm.text, &gone) {
+        failures.push(format!(
+            "遷移先の子が**呼び出し元の消したファイルを開けた**（RC={child_gone}）。\
+             削除の記録（差分層の台帳）を読めず、元の中身が見えている（BUG-180）"
+        ));
+    }
+
+    // --- 本物のワークスペースは変わっていない（CoWの境界） ---
+    let real_edited = std::fs::read_to_string(ws.join("edited.txt")).unwrap_or_default();
+    if !real_edited.contains(ORIGINAL) || real_edited.contains(STAGED) {
+        failures.push(format!(
+            "本物の`edited.txt`が書き換わっている（承認していないのに反映された）: {real_edited:?}"
+        ));
+    }
+    if !ws.join("gone.txt").exists() {
+        failures.push("本物の`gone.txt`が消えている（承認していないのに反映された）".to_string());
+    }
+
+    assert!(
+        failures.is_empty(),
+        "CoW×別ドメインの見え方で{}件の問題が出た:\n- {}\n本文:\n{}",
+        failures.len(),
+        failures.join("\n- "),
+        arm.text
+    );
+
+    match ex.new_cow_session(&before) {
+        Ok(session) => cleanup_on_success(&ws, &[&session], CASE),
+        Err(e) => eprintln!("[{CASE}] 差分層を特定できなかったので残す: {e}"),
+    }
+}
+
+/// [BUG-180・ユーザー判断 2026-09-29] **別ドメインへ移った子は、呼び出し元のワークスペース外への
+/// 誘導を持たない。**
+///
+/// # 何を守るのか
+///
+/// `--fs-allow <path>:rw`で開けたワークスペース外の書込先は、CoWでは差分層（`_ext`）へ
+/// 受け止められ、承認（`harness apply --dangerously-allow`）で本物へ反映される。
+/// 遷移先ドメインはこの許可を引き継がない（遷移で狭めるのはワークスペースの外）。
+/// ところが差分層の許可を持った子が呼び出し元と同じ誘導の設定のまま動くと、
+/// **許可を持たない外のパスへ承認待ちの変更を置け、外の変更後の中身も読める**。
+/// そこで別ドメインへ移る子からは、この誘導を外した。
+///
+/// # 予測
+///
+/// | 見るもの | 入口ドメイン（シェル自身） | 遷移先ドメイン（`findstr`） |
+/// |---|---|---|
+/// | 入口が外に書いた`ext.txt` | 読める（対照: 誘導が効いている） | **開けない** ← 本体 |
+/// | ワークスペースの中のファイル | — | **読める**（対: 「何も読めない」ではない） |
+/// | 本物の外のディレクトリ | `ext.txt`は作られていない | 同じ |
+///
+/// 誘導を外さない実装なら、遷移先は差分層の`_ext`から`ext.txt`を読めてしまう。
+///
+/// # 限界（この測定が言えないこと）
+///
+/// Redirectorは境界ではないので、**`_ext`のパスを直接指定するプログラム**は読める
+/// （差分層のSIDは`_ext`を含む差分層全体に効く）。ここで測っているのは、普通のツールが
+/// ワークスペース外のパスを指したときの見え方だけである。
+///
+/// # 実行
+///
+/// `dev-elevated-run e2e-cow-cross-domain-ext`（実ACL（`--fs-allow`）を書くので、他の的と混ぜない）。
+#[test]
+#[ignore = "starts a Tier2a CoW session with a real fs-allow ACE and enforced transitions; run through dev-elevated-run e2e-cow-cross-domain-ext"]
+fn a_cross_domain_child_does_not_inherit_ext_capture() {
+    const CASE: &str = "cow-cross-domain-ext";
+    const EXT: &str = "EXTMARK";
+    const INSIDE: &str = "INSIDEMARK";
+
+    // **`cow_exclusive()`→`fs_ledger_exclusive()`の順で取る**（両方が要るテストの約束）。
+    let ex = cow_exclusive();
+    let _ledger = fs_ledger_exclusive();
+    let before = ex.list_cow_sessions();
+    let ws = case_dir(CASE);
+    let outside = fs_allow_case_dir("cow-ext");
+    std::fs::write(ws.join("inside.txt"), format!("{INSIDE}\n"))
+        .unwrap_or_else(|e| panic!("inside.txtを置けなかった: {e}"));
+    let findstr = declare_findstr_in_another_domain(&ws, CASE);
+
+    let ext = format!("{}\\ext.txt", outside.display());
+    let inside = format!("{}\\inside.txt", ws.display());
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         Set-Content -LiteralPath '{ext}' -Value '{EXT}'; \
+         $x = Get-Content -LiteralPath '{ext}' -Raw; \
+         Write-Output ('SHELL_EXT=' + $(if ($x -match '{EXT}') {{'OK'}} else {{'MISSING'}})); \
+         findstr /c:{EXT} '{ext}' | Out-Null; \
+         Write-Output ('CHILD_EXT_RC=' + $LASTEXITCODE); \
+         findstr /c:{INSIDE} '{inside}' | Out-Null; \
+         Write-Output ('CHILD_INSIDE_RC=' + $LASTEXITCODE)"
+    );
+    let allow = format!(r"{}\**:rw", outside.display());
+    let arm = run_arm_collecting_denials_in(
+        &ws,
+        CASE,
+        "tier2a-cow",
+        true,
+        &script,
+        CASE,
+        &["--fs-allow".to_string(), allow],
+    )
+    .unwrap_or_else(|e| panic!("腕が測れなかった: {e}"));
+    if let Some(reason) = child_was_refused(&arm, &findstr) {
+        panic!("{reason}\n本文:\n{}", arm.text);
+    }
+
+    let shell_ext = script_cell(&arm.text, "SHELL_EXT=");
+    let child_ext = script_cell(&arm.text, "CHILD_EXT_RC=");
+    let child_inside = script_cell(&arm.text, "CHILD_INSIDE_RC=");
+    eprintln!(
+        "[{CASE}] シェル(入口): 外へ書いた中身={shell_ext}／\
+         子(遷移先): 外のRC={child_ext} 中のRC={child_inside}"
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+
+    // --- 対照: 入口ドメインでは外への書込が差分層へ受け止められ、読み返せる ---
+    if shell_ext != "OK" {
+        failures.push(format!(
+            "入口ドメインが**外へ書いた中身を読み返せていない**（{shell_ext}）。\
+             ワークスペース外の誘導そのものが効いていないので、遷移先から外したかを測っていない。\
+             起動時の警告:\n{}",
+            arm.harness_stderr
+        ));
+    }
+
+    // --- 本体: 遷移先は外のその中身を見られない ---
+    if !findstr_could_not_open(&arm.text, &ext) || child_ext == "0" {
+        failures.push(format!(
+            "遷移先の子が**呼び出し元が外に書いた中身へ届いている**（RC={child_ext}）。\
+             ワークスペース外への誘導が別ドメインへ渡っている——遷移先は`--fs-allow`の許可を\
+             持たないのに、差分層の`_ext`経由で外の変更後の中身を読めている"
+        ));
+    }
+
+    // --- 対: 遷移先はワークスペースの中なら読める（「何も読めない」ではない） ---
+    if findstr_could_not_open(&arm.text, &inside) || child_inside != "0" {
+        failures.push(format!(
+            "遷移先の子が**ワークスペースの中も読めていない**（RC={child_inside}）。\
+             外が読めないのは誘導を外したからとは言えない"
+        ));
+    }
+
+    // --- 本物の外のディレクトリには何も作られていない（承認前） ---
+    if outside.join("ext.txt").exists() {
+        failures.push(
+            "本物の外のディレクトリに`ext.txt`ができている——承認していないのに反映された"
+                .to_string(),
+        );
+    }
+
+    assert!(
+        failures.is_empty(),
+        "CoW×別ドメインのワークスペース外で{}件の問題が出た:\n- {}\n本文:\n{}",
+        failures.len(),
+        failures.join("\n- "),
+        arm.text
+    );
+
+    // **測定のために作った外のディレクトリは自分で掃く**（消すとその配下のACEも一緒に消える）。
+    let _ = std::fs::remove_dir_all(&outside);
+    match ex.new_cow_session(&before) {
+        Ok(session) => cleanup_on_success(&ws, &[&session], CASE),
+        Err(e) => eprintln!("[{CASE}] 差分層を特定できなかったので残す: {e}"),
+    }
 }

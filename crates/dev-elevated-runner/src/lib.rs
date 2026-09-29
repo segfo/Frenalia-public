@@ -206,6 +206,40 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "a_transition_target_domain_is_narrower_than_the_caller",
         ],
     ),
+    // [BUG-180] `--sandbox tier2a-cow`の下で別ドメインへ移った子が、呼び出し元が差分層へ積んだ
+    // 変更（書き換え・削除）を見るかを測る。修正前は差分層の許可が子のトークンに無く、
+    // 変更前の中身を黙って読んでいた。CoW×遷移は§S73で「未測定」のまま残っていた升である。
+    (
+        "e2e-cow-cross-domain",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "a_cross_domain_child_sees_the_callers_staged_workspace_under_cow",
+        ],
+    ),
+    // [BUG-180・ユーザー判断] 別ドメインへ移った子が、呼び出し元のワークスペース外への誘導
+    // （`--fs-allow :rw`の書込先を差分層へ向ける設定）を持たないことを測る。
+    // **実ACL（`--fs-allow`）を1本書くので、他の的と混ぜない**（`e2e-domain-narrowing`と同じ理由）。
+    (
+        "e2e-cow-cross-domain-ext",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "a_cross_domain_child_does_not_inherit_ext_capture",
+        ],
+    ),
     // [⑤を既定へ入れる準備①] **既定の遷移宣言一式の一次データ**を測る。実務に近い台本を
     // 旗つきで回し、宣言を0本から足しながら**断られたものの一覧**を数える
     // （`plans/DESIGN-MAC-ENFORCEMENT.md`が「旗を立てた回に何が断られるかを数えることが
