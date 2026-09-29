@@ -174,6 +174,29 @@ pub(crate) unsafe fn init(param: *const u8) -> bool {
     // 採用した設定がフックの見るもの（`CONFIG`）になっており、今回の候補は捨てられる。
     // 候補で判断すると、フックが見る差分層と、削除済みの集合・置くフックの種類が食い違う。
     let cfg = adopt_config(candidate);
+    // [BUG-180] **差分層へ届かない子として初期化を終えない。**
+    //
+    // 差分層に在るかの判定は`is_file()`等で行っており、拒否を「無い」と読む。差分層を
+    // 読めないトークンのまま初期化を終えると、**変えたファイルは変更前の中身で、消した
+    // ファイルは元の中身で見え、しかも何も記録されない**（警告の書き先も差分層である）。
+    // ここで止めればreadyを返さないので、起こす側は注入の失敗として子を畳む——
+    // 見え方が嘘になる代わりに、起動の失敗として見える。
+    //
+    // **フックを置く前に確かめる**（置いた後だと、この読取そのものが誘導の対象になる）。
+    // 起こす側が宛先SIDを積み忘れた経路を、どこで作られても同じ場所で止めるための見張りで、
+    // 積む側の直し（`spawnd`の`child_plan`、`launch`の`require_…`）とは別に置く。
+    if cfg.cow_enabled {
+        let verdict = diff_layer_verdict(std::fs::read_dir(&cfg.diff_layer_dir).map(|_| ()));
+        if let DiffLayerVerdict::Unreachable(kind) = verdict {
+            debug_log(&format!(
+                "init: the diff layer {:?} cannot be read by this process ({kind:?}); \
+                 continuing would show the unmodified workspace without any error \
+                 (BUG-180). bail without signalling ready",
+                cfg.diff_layer_dir
+            ));
+            return false;
+        }
+    }
     // [段階5b] **ファイル系フックを置く理由があるか。** CoWの誘導もfault受付も無いなら、
     // あの7本は`NtCreateFile`等の全呼び出しを素通りさせるだけの回り道になる
     // （`file_hooks`のモジュールdocの表: `cow_enabled`が偽のとき成功経路では何もしない。
@@ -594,4 +617,67 @@ extern "system" fn DllMain(_hinst: HANDLE, reason: u32, _reserved: *mut c_void) 
         }
     }
     1
+}
+
+/// [BUG-180] 初期化の時点で、差分層の根をこのプロセスが読めたか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiffLayerVerdict {
+    /// 読めた。
+    Reachable,
+    /// 根が無い。**初期化を止めない**——TUIの「変更を破棄」はセッション中に差分層の根を消すので、
+    /// ここで止めるとその後のコマンドが1つも起動しなくなる。根が無いなら積まれた変更も
+    /// 無いので、ワークスペースをそのまま読むのは正しい。
+    Absent,
+    /// 在るかどうかも分からない（拒否など）。**このまま初期化を終えると、差分層に在るものを
+    /// すべて「無い」と読む**ので、初期化を止める。
+    Unreachable(std::io::ErrorKind),
+}
+
+/// 差分層の根を読んだ結果を判定する。**「無い」と「読めない」を分ける**——同じ扱いにすると、
+/// 読めない子が「差分層は空」として初期化を終える（BUG-180の症状そのもの）。
+pub(crate) fn diff_layer_verdict(probe: std::io::Result<()>) -> DiffLayerVerdict {
+    match probe {
+        Ok(()) => DiffLayerVerdict::Reachable,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DiffLayerVerdict::Absent,
+        Err(e) => DiffLayerVerdict::Unreachable(e.kind()),
+    }
+}
+
+#[cfg(test)]
+mod diff_layer_verdict_tests {
+    use super::*;
+
+    /// **本体**: 拒否は「読めない」であって「無い」ではない。
+    #[test]
+    fn a_denied_diff_layer_is_unreachable_not_absent() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            diff_layer_verdict(Err(denied)),
+            DiffLayerVerdict::Unreachable(std::io::ErrorKind::PermissionDenied),
+            "差分層を読めない子が、差分層は空だとして初期化を終える（BUG-180）"
+        );
+        let other = std::io::Error::other("boom");
+        assert!(matches!(
+            diff_layer_verdict(Err(other)),
+            DiffLayerVerdict::Unreachable(_)
+        ));
+    }
+
+    /// **対の側**（`B-35`）: 読めた・根が無いは止めない。
+    ///
+    /// 片方だけだと、「いつも止める」実装でも上のテストが通る——そうなるとCoWの子が
+    /// 1つも起動しない。
+    #[test]
+    fn a_readable_or_missing_diff_layer_does_not_stop_the_init() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            diff_layer_verdict(std::fs::read_dir(dir.path()).map(|_| ())),
+            DiffLayerVerdict::Reachable
+        );
+        assert_eq!(
+            diff_layer_verdict(std::fs::read_dir(dir.path().join("discarded")).map(|_| ())),
+            DiffLayerVerdict::Absent,
+            "差分層の根が無い（変更を破棄した後）だけで初期化を止めている"
+        );
+    }
 }
