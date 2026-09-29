@@ -32,7 +32,7 @@ fn control_request_hello_keeps_its_wire_shape() {
     .expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":6,"policy":{"schema_version":2,"domains":[]},"workspace_root":"C:/w","domains":[]}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":7,"policy":{"schema_version":2,"domains":[]},"workspace_root":"C:/w","domains":[]}"#
     );
 }
 
@@ -74,6 +74,43 @@ fn control_request_spawn_top_level_keeps_its_wire_shape() {
     assert_eq!(back, request);
 }
 
+/// [BUG-180] **CoWの注入設定は、差分層の宛先SIDを必ず運ぶ。**
+///
+/// この欄が落ちると、Daemonは別ドメインへ移った子へ差分層のSIDを積めない。
+/// 子は差分層へ届かないまま起動に成功し、変更前の中身を黙って読む。
+#[test]
+fn a_cow_redirector_spec_carries_its_diff_layer_capability() {
+    let spec = RedirectorSpec::Cow {
+        workspace_root: "C:/w".to_string(),
+        diff_layer_dir: "C:/d".to_string(),
+        ext_capture_roots: vec!["C:/x".to_string()],
+        // **追加は必ず末尾へ**（上の`Hello`と同じ理由）。
+        diff_layer_capability_sid: "S-1-15-3-1024-7".to_string(),
+    };
+    let json = serde_json::to_string(&spec).expect("serialize");
+    assert_eq!(
+        json,
+        r#"{"kind":"cow","workspace_root":"C:/w","diff_layer_dir":"C:/d","ext_capture_roots":["C:/x"],"diff_layer_capability_sid":"S-1-15-3-1024-7"}"#
+    );
+    let back: RedirectorSpec = serde_json::from_str(&json).expect("round trip");
+    assert_eq!(back, spec);
+}
+
+/// **対の側**（`B-35`）: 宛先SIDの欄が無いCoWの注入設定は、**読めない**。
+///
+/// 既定値で埋めて受け付けると、「積むSIDが空」の設定で注入することになる
+/// ——古い電文を黙って通す形で、欄を足した意味が消える。
+#[test]
+fn a_cow_spec_without_the_diff_layer_capability_does_not_parse() {
+    let old =
+        r#"{"kind":"cow","workspace_root":"C:/w","diff_layer_dir":"C:/d","ext_capture_roots":[]}"#;
+    let parsed = serde_json::from_str::<RedirectorSpec>(old);
+    assert!(
+        parsed.is_err(),
+        "差分層の宛先SIDが無いCoWの注入設定を受け付けた: {parsed:?}"
+    );
+}
+
 #[test]
 fn control_responses_keep_their_wire_shape() {
     let ready = ControlResponse::Ready {
@@ -83,7 +120,7 @@ fn control_responses_keep_their_wire_shape() {
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":6}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":7}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {

@@ -514,8 +514,14 @@ pub const COW_DIFF_LAYER_ACCESS: FsAccess = FsAccess::ReadWriteExec;
 /// |---|---|---|
 /// | 起動時に付ける | `win_appcontainer/preflight.rs`のCoW分岐 | **する**（この関数） |
 /// | セッション切替・forkで付ける | `session_scope::prepare_cow_diff_layer` | **する**（この関数） |
-/// | 子のトークンへ積む（製品） | `win_appcontainer/launch.rs` | しない（[`lookup_cow_diff_layer_capability_sid`]） |
+/// | 子のトークンへ積む（製品） | `win_appcontainer/launch.rs` | しない（[`require_cow_diff_layer_capability_sid`]） |
 /// | 子のトークンへ積む（実機テスト） | `win_appcontainer/test_support.rs` | しない（同上） |
+///
+/// **[BUG-180] トークンへ積む場所はもう1つある**——Spawn Daemonが入れ子の子（とくに
+/// 別ドメインへ移った子）を起こすときで、`spawnd/child_plan.rs`が積む。ここは**引かない**:
+/// 製品の`launch.rs`が引いた値を注入設定（`RedirectorSpec::Cow`）と一緒に送り、Daemonは
+/// その値をそのまま使う。**積む場所の3つめで、上の表の導出を通らない**ので、ずれたときの
+/// 症状は下と同じ形になる。
 ///
 /// ずれたときの症状は**「ACEは正しく付いているのに子から一切読めない」**で、`ACCESS_DENIED`は
 /// 出るが原因はACL側ではなくトークン側にある——最も原因を追いにくい形である（`launch.rs`の
@@ -559,6 +565,34 @@ pub fn lookup_cow_diff_layer_capability_sid(
         COW_DIFF_LAYER_ACCESS.label(),
     )?;
     capability_sid_from_name(&name).ok()
+}
+
+/// [BUG-180] [`lookup_cow_diff_layer_capability_sid`]の、**引けなければ子を起こさない**版。
+///
+/// # なぜ「引けなければ積まない」で済ませないのか
+///
+/// 以前の子を起こす側は、引けなければ積まずにそのまま起こしていた。拒否（`ACCESS_DENIED`）で
+/// 止まるので安全側だ、という理屈だったが、**それは書込だけの話だった**。Redirectorは
+/// 差分層に在るかを`is_file()`等で確かめており、拒否を「無い」と読む。そのため読取は
+/// **変更前の中身を黙って返し**、消したはずのファイルも元の中身で見えた（BUG-180）。
+/// 差分層へ届かない子を起こす時点で、見え方が嘘になる。
+///
+/// 起こす側（製品の`launch`とテスト補助の`test_support`）は**両方ともここを通す**
+/// ——BUG-169は、同じ組み立てを2か所で書いて片方だけが欠けた形だった。
+pub(crate) fn require_cow_diff_layer_capability_sid(
+    workspace: &Path,
+    diff_layer_dir: &Path,
+) -> Result<crate::win_common::OwnedSid, AppContainerError> {
+    lookup_cow_diff_layer_capability_sid(workspace, diff_layer_dir).ok_or_else(|| {
+        AppContainerError::Preflight(format!(
+            "the CoW diff layer {} has no issued capability for workspace {}; refusing to start \
+             a child that cannot reach it (it would read the unmodified workspace without any \
+             error, BUG-180). The diff layer is prepared by the sandbox preflight or by a \
+             session switch/fork",
+            diff_layer_dir.display(),
+            workspace.display()
+        ))
+    })
 }
 
 /// [§22.3.1] **昇格側が、受け取った秘密から自分で導出した名前**をSIDへ写す。

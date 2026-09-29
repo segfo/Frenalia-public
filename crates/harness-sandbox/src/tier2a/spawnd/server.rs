@@ -1174,6 +1174,8 @@ fn prepare_redirector(
             workspace_root,
             diff_layer_dir,
             ext_capture_roots,
+            // [BUG-180] トークンの側の話で、環境変数へは載せない。積むのは`ChildPlan`である。
+            diff_layer_capability_sid: _,
         } => {
             let workspace = std::path::Path::new(workspace_root);
             let diff = std::path::Path::new(diff_layer_dir);

@@ -11,6 +11,21 @@
 //! そこで**トークンの材料になる[`ResolvedDomain`]は[`ChildPlan::resolve`]からしか作れない**
 //! ようにしてある。2か所とも必ずここを通るので、規則を足す場所は1つで済む。
 //!
+//! # いまここが持つ規則
+//!
+//! **注入するRedirectorが要る宛先SIDを、トークンへ必ず積む**（[`required_capability`]）。
+//! CoWの注入設定なら差分層の宛先SIDである。
+//!
+//! これが無かったのがBUG-180である。別ドメインへの遷移では、トークンの材料が
+//! `Hello`の表（起動時に用意した遷移先ドメインの実体）から来る。表には差分層のSIDが無い
+//! ——差分層はセッションごとに作り直されるので、起動時の表には入れられない。
+//! 一方でRedirectorは呼び出し元と同じCoWの設定で注入されていたので、
+//! **子は差分層へ書けず、読むと変更前の中身が黙って返っていた。**
+//!
+//! 差分層のSIDは、トップレベルを起こすたびにharnessが注入設定と一緒に送ってくる
+//! （[`RedirectorSpec::Cow`]の`diff_layer_capability_sid`）。**注入設定と対で運ぶ**ので、
+//! その設定で注入する子には必ず同じSIDが積まれる。
+//!
 //! # Win32をほとんど呼ばない
 //!
 //! 呼ぶのは`sid_from_string`（文字列→SIDの変換）だけで、昇格も実機も要らない。
@@ -66,15 +81,26 @@ impl<'a> ChildPlan<'a> {
     ) -> Self {
         Self {
             domain,
-            capability_sids: domain.capability_sids.clone(),
+            capability_sids: capabilities_for(domain, redirector.as_ref()),
             redirector,
             crosses_domains,
         }
     }
 
     /// プロセス表へ載せるドメイン。**この子が次に何かを頼んだときの`from`になる。**
+    ///
+    /// トークンへ積むもの（[`Self::capability_sids`]）と違って、計画が足したSIDを含まない
+    /// ——差分層のSIDは系統の注入設定が持つ事実で、ドメインの事実ではない。
     pub(super) fn domain(&self) -> &'a DomainSpec {
         self.domain
+    }
+
+    /// トークンへ積むcapability SID（文字列）。ドメインのものに、注入設定が要るものを足した値。
+    ///
+    /// 製品の経路は[`Self::resolve`]がこの値を直接読む。テストが同じ値を文字列のまま見るための口である。
+    #[cfg(test)]
+    pub(super) fn capability_sids(&self) -> &[String] {
+        &self.capability_sids
     }
 
     /// この子へ注入するRedirectorの設定。`None`は注入しない。
@@ -117,6 +143,39 @@ impl<'a> ChildPlan<'a> {
             identity,
         })
     }
+}
+
+/// [BUG-180] **この注入設定で動くRedirectorが、子のトークンに要求する宛先SID。**
+///
+/// **`_`を書かない。** 注入設定の種類を足した日に、ここがコンパイルできなくなる——
+/// 新しい種類が何かへ届く必要があるかを、足す人に必ず答えさせるためである。
+fn required_capability(spec: &RedirectorSpec) -> Option<&str> {
+    match spec {
+        RedirectorSpec::Cow {
+            diff_layer_capability_sid,
+            ..
+        } => Some(diff_layer_capability_sid.as_str()),
+        // lazyの受付はパイプ経由で、Redirectorが自分で開く場所を持たない。
+        RedirectorSpec::Lazy { .. } => None,
+        // プロセス生成フックだけで、ファイル系フックは差分層を持たない。
+        RedirectorSpec::ProcessHooks { .. } => None,
+    }
+}
+
+/// トークンへ積むcapability SIDの一覧。ドメインのものに、注入設定が要るものを足す。
+///
+/// **既に在れば足さない（重複を必ず除く）。** トップレベルの電文のドメインには、
+/// harnessが差分層のSIDを既に入れている（`win_appcontainer/launch.rs`）。同じSIDが
+/// `SECURITY_CAPABILITIES`に2つ並ぶと`CreateProcessW`が`ERROR_INVALID_PARAMETER`で落ちる
+/// （`spawnd_e2e_tests.rs`の`setup_with_transitions_and_domains`に同じ注記がある）。
+fn capabilities_for(domain: &DomainSpec, redirector: Option<&RedirectorSpec>) -> Vec<String> {
+    let mut sids = domain.capability_sids.clone();
+    if let Some(required) = redirector.and_then(required_capability) {
+        if !sids.iter().any(|sid| sid.eq_ignore_ascii_case(required)) {
+            sids.push(required.to_string());
+        }
+    }
+    sids
 }
 
 /// ワイヤ上のドメイン（文字列のSID）を、`CreateProcessW`へ渡せる形へ戻したもの。

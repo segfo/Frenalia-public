@@ -1147,6 +1147,8 @@ fn top_level_spawn_latency_direct_versus_daemon() {
             NetworkCapability::Deny,
             None,
             &domain_caps,
+            // CoWで注入しないので差分層の宛先SIDは無い（BUG-180）。
+            None,
             DomainIdentity::OwnPackage,
             SpawnRequestAccess::Grant,
             ConsoleNeed::NotNeeded,
@@ -1271,6 +1273,8 @@ fn top_level_spawn_latency_injection_cost() {
             NetworkCapability::Deny,
             inject,
             &domain_caps,
+            // どの腕もCoWで注入しないので差分層の宛先SIDは無い（BUG-180）。
+            None,
             DomainIdentity::OwnPackage,
             SpawnRequestAccess::Grant,
             ConsoleNeed::NotNeeded,

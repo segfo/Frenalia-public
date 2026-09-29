@@ -199,13 +199,19 @@ pub(crate) fn spawn_in_workspace_as(
     // Redirector DLLの退避先へ書けず、CoWのテストが「透過が壊れている」ように見える。
     // ここが本番と食い違うと、「本番と同じ形」を名乗るこのヘルパーだけ別の世界を測ることになる
     // （モジュールdocのD-84のときとまったく同じ理由）。
-    let cow_cap = cow.as_ref().and_then(|inject| {
-        let ws = inject
-            .workspace_root
-            .canonicalize()
-            .unwrap_or_else(|_| inject.workspace_root.to_path_buf());
-        super::lookup_cow_diff_layer_capability_sid(&ws, inject.diff_layer_dir)
-    });
+    //
+    // **[BUG-180] 引けなければ起こさない**（本番と同じ関数を通す）。積まずに起こすと、
+    // 子は差分層に在るものを「無い」と読み、変更前の中身を黙って返す。
+    let cow_cap = cow
+        .as_ref()
+        .map(|inject| {
+            let ws = inject
+                .workspace_root
+                .canonicalize()
+                .unwrap_or_else(|_| inject.workspace_root.to_path_buf());
+            super::require_cow_diff_layer_capability_sid(&ws, inject.diff_layer_dir)
+        })
+        .transpose()?;
     // [§22.3] ここが渡すのはworkspace本体・CoWの差分層・**呼び出し側が明示した宣言capability**。
     // [`spawn_in_workspace`]は3つめを空で呼ぶので、**あちら経由の子は`--fs-allow`で開けた穴へ
     // 届かない**——1件ずつの到達性なら`probe_passthrough`（宛先SIDを直接渡せる）でも測れるが、

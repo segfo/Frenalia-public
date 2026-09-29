@@ -260,11 +260,22 @@ fn spawn_shell_in_workspace_on(
     // 使えるのは子のトークンが持つcapability SIDだけである）。
     //
     // **引くだけで発行しない**（`lookup_`側）。ここで発行すると「起こす側」が台帳エントリを
-    // 作ることになり、`preflight`を経ていない差分層に対して記録だけが増える。引けないときは
-    // 積まない——症状は`ACCESS_DENIED`＝fail-closedで、無言で広がる向きには倒れない。
-    let cow_diff_layer_cap = req.cow_diff_layer_dir.as_ref().and_then(|diff_layer_dir| {
-        super::lookup_cow_diff_layer_capability_sid(&canonical_workspace, diff_layer_dir)
-    });
+    // 作ることになり、`preflight`を経ていない差分層に対して記録だけが増える。
+    //
+    // **[BUG-180] 引けないときは子を起こさない。** 以前は「積まずに起こす——症状は
+    // `ACCESS_DENIED`＝fail-closed」としていたが、**安全側に倒れるのは書込だけだった**。
+    // Redirectorは差分層に在るかを確かめる問い合わせで拒否を「無い」と読むので、読取は
+    // 変更前の中身を黙って返し、消したファイルも元の中身で見える。
+    //
+    // 引いた値はDaemonへも送る（注入設定と対。`spawn_with_workspace_via_daemon`の引数）。
+    // Daemonはこの設定で注入する子——**別ドメインへ移った子を含む**——に同じSIDを積む。
+    let cow_diff_layer_cap = req
+        .cow_diff_layer_dir
+        .as_ref()
+        .map(|diff_layer_dir| {
+            super::require_cow_diff_layer_capability_sid(&canonical_workspace, diff_layer_dir)
+        })
+        .transpose()?;
 
     // [§22.9の前提] Redirector DLLの読取+実行ACEも**宣言宛のcapability SID**へ移った。
     // 積まなければ子は`LoadLibraryW`でNULLを受け取り、**注入が失敗して生成ごと落ちる**
@@ -315,6 +326,8 @@ fn spawn_shell_in_workspace_on(
                 req.net_capability,
                 inject,
                 &domain_caps,
+                // [BUG-180] 注入設定と対で送る（上の`cow_diff_layer_cap`のコメント）。
+                cow_diff_layer_cap.as_ref().map(|cap| cap.as_psid()),
                 domain,
                 // この子は要求受付パイプへ届いてよい（`plans/DESIGN-MAC-PROTOCOL.md` §12）。
                 // 段階⑤で生成能力を取り上げたあと、CLIツールが子を起こす唯一の口がここになる
@@ -751,5 +764,26 @@ mod tests {
             good,
             "the surviving cap must be the well-formed one"
         );
+    }
+
+    /// [BUG-180] **差分層の宛先SIDが発行されていないCoWの子は起こさない。**
+    ///
+    /// 以前は積まずに起こしていた。子は差分層に在るものを「無い」と読むので、変更前の中身を
+    /// 黙って返していた。**読むのは台帳だけ**（発行しない側）なので、`%APPDATA%`へは何も書かない。
+    #[test]
+    fn a_cow_spawn_whose_diff_layer_has_no_issued_capability_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = super::super::require_cow_diff_layer_capability_sid(
+            &dir.path().join("never-prepared-workspace"),
+            &dir.path().join("never-prepared-diff-layer"),
+        );
+        match result {
+            Err(AppContainerError::Preflight(message)) => assert!(
+                message.contains("BUG-180"),
+                "断った理由が原因を名指していない: {message}"
+            ),
+            Err(other) => panic!("断り方の種類が違う: {other}"),
+            Ok(_) => panic!("発行していない差分層の宛先SIDが引けた"),
+        }
     }
 }

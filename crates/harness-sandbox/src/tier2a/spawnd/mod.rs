@@ -123,7 +123,12 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// この欄を読まないので、**harness側は用意したつもりでいるのに、Daemonは別ドメインへの
 /// 遷移を全部断る**——倒れる向きは安全側（拒否）だが、「渡したつもり」と実際が食い違う点は
 /// 段階6bで版を上げたときと同じである。
-pub const PROTOCOL_VERSION: u32 = 6;
+/// **7へ上げたのはBUG-180である。** [`RedirectorSpec::Cow`]が**差分層の宛先SID**
+/// （`diff_layer_capability_sid`）を運ぶようになった。古いDaemonのバイナリはこの欄を読まずに
+/// 注入だけ行うので、**別ドメインへ移った子が差分層を読めないまま起動して成功する**
+/// ——そのとき子は変更前の中身を黙って読む（BUG-180の症状そのもの）。
+/// 倒れる向きが「拒否」ではなく「嘘の見え方」なので、版の一致で止める。
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// 相手が名乗った制御プロトコルの版を判定する。合わなければ理由の文面を返す。
 ///
@@ -217,6 +222,31 @@ pub enum RedirectorSpec {
         workspace_root: String,
         diff_layer_dir: String,
         ext_capture_roots: Vec<String>,
+        /// [BUG-180] **この差分層へ届くためのcapability SID**（`S-1-15-3-…`の文字列）。
+        ///
+        /// # なぜ注入設定と一緒に運ぶのか
+        ///
+        /// Redirectorは子の中で動くので、差分層へ書けるかどうかは**子のトークン**で決まる。
+        /// 差分層のACEは差分層ごとのcapability SID宛にしか付いていない（§22.3.2）ので、
+        /// **この設定で注入する子には、必ずこのSIDを積まなければならない**。積まないと、
+        /// 書込は拒否されるうえ、読取は変更前の中身を黙って返す（BUG-180）。
+        ///
+        /// 積むのはDaemonの`spawnd::child_plan`で、トップレベルでも入れ子でも同じ規則を通る。
+        ///
+        /// # なぜDaemonが自分で引かないのか
+        ///
+        /// 宛先SIDは台帳（`workspace-capability-ledger.json`）にある秘密から導出される。
+        /// Daemonが台帳を読むと、入力の出どころが電文と台帳の2つに割れる
+        /// （[`ControlRequest::Hello`]の`policy`の欄が同じ理由でDaemonにファイルを読ませていない）。
+        ///
+        /// # なぜ起動時の表（`Hello`）に入れないのか
+        ///
+        /// 差分層は`/sessions`・`/fork`で作り直され、宛先SIDも変わる。起動時に1回だけ
+        /// 渡すと古い差分層のSIDを持ち続けるので、**トップレベルを起こすたびに**運ぶ。
+        ///
+        /// **`serde(default)`を付けない。** 欄の無い電文を黙って受け付けると、
+        /// 「積むべきSIDが空」の設定で注入することになる。
+        diff_layer_capability_sid: String,
     },
     Lazy {
         workspace_root: String,

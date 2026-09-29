@@ -1702,11 +1702,15 @@ pub fn spawn_with_workspace_via_daemon<'a>(
     net: NetworkCapability,
     inject: impl Into<RedirectorInject<'a>>,
     domain_caps: &[PSID],
+    // [BUG-180] CoWで注入するなら**その差分層の宛先SID**。注入設定と一緒にDaemonへ運び、
+    // Daemonはこの設定で注入する子（別ドメインへ移った子を含む）に必ず積む。
+    // CoWでないなら`None`（[`daemon_redirector_spec`]が組み合わせを検査する）。
+    cow_diff_layer_capability: Option<PSID>,
     domain: DomainIdentity,
     spawn_request: SpawnRequestAccess,
     console: ConsoleNeed,
 ) -> Result<AppContainerChild, AppContainerError> {
-    use crate::tier2a::spawnd::{DomainIdentitySpec, DomainSpec, RedirectorSpec, TopLevelSpawn};
+    use crate::tier2a::spawnd::{DomainIdentitySpec, DomainSpec, TopLevelSpawn};
 
     let inject = inject.into();
     let container_sid_string = crate::win_common::sid_to_string(container_sid)
@@ -1740,47 +1744,14 @@ pub fn spawn_with_workspace_via_daemon<'a>(
         net,
         spawn_request,
     );
-    // **Redirectorへ渡すパスは、電文へ載せる前にharness側で綴りを揃える**
-    // （[BUG-066](../../../../docs/bugs/BUG-066.md)）。`normalize_cow_root`は
-    // `canonicalize`を使うので**呼び出したプロセスのcwdを基準に相対パスを解決する**——
-    // 揃えるのをDaemon側（`augment_redirector_env`）だけに任せると、基準がDaemonのcwdになり、
-    // BUG-066の修正が置いた「渡す前に一度だけ揃える唯一の絞り」がプロセス境界で失われる。
-    // Daemon側の呼びはそのままでよい（canonical済みの絶対パスは冪等に畳まれる）。
-    let redirector = if let Some(cow) = inject.cow {
-        Some(RedirectorSpec::Cow {
-            workspace_root: normalize_cow_root(cow.workspace_root)
-                .to_string_lossy()
-                .into_owned(),
-            diff_layer_dir: normalize_cow_root(cow.diff_layer_dir)
-                .to_string_lossy()
-                .into_owned(),
-            ext_capture_roots: cow
-                .ext_capture_roots
-                .iter()
-                .map(|path| normalize_cow_root(path).to_string_lossy().into_owned())
-                .collect(),
+    let cow_diff_layer_capability = cow_diff_layer_capability
+        .map(|sid| {
+            crate::win_common::sid_to_string(sid).map_err(|e| {
+                AppContainerError::Win32(format!("sid_to_string(cow diff layer): {e}"))
+            })
         })
-    } else if let Some(pipe) = inject.broker_pipe {
-        Some(RedirectorSpec::Lazy {
-            workspace_root: normalize_cow_root(
-                inject
-                    .workspace_root
-                    .expect("lazy redirector requires workspace root"),
-            )
-            .to_string_lossy()
-            .into_owned(),
-            broker_pipe: pipe.to_string(),
-        })
-    } else if inject.process_hooks {
-        // [段階5b] 誘導も受付も無い。**それでも注入する**（この変種のdoc）。
-        Some(RedirectorSpec::ProcessHooks {
-            workspace_root: inject
-                .workspace_root
-                .map(|root| normalize_cow_root(root).to_string_lossy().into_owned()),
-        })
-    } else {
-        None
-    };
+        .transpose()?;
+    let redirector = daemon_redirector_spec(&inject, cow_diff_layer_capability)?;
 
     let step = |label: &'static str, e: windows::core::Error| {
         AppContainerError::Win32(format!("{label}: {e}"))
@@ -1888,10 +1859,87 @@ pub fn spawn_via_daemon<'a>(
         net,
         inject,
         &[],
+        // CoWで注入する呼び出し元はここを通らない（MCPはプロセス生成フックだけ）。
+        // 通したら[`daemon_redirector_spec`]が「CoWなのに宛先SIDが無い」で断る。
+        None,
         domain,
         spawn_request,
         console,
     )
+}
+
+/// Daemonへ送る注入設定を、harness側で組み立てる。**Win32を呼ばない**ので単体テストできる。
+///
+/// # 綴りをここで揃える
+///
+/// **Redirectorへ渡すパスは、電文へ載せる前にharness側で綴りを揃える**
+/// （[BUG-066](../../../../docs/bugs/BUG-066.md)）。`normalize_cow_root`は
+/// `canonicalize`を使うので**呼び出したプロセスのcwdを基準に相対パスを解決する**——
+/// 揃えるのをDaemon側（`augment_redirector_env`）だけに任せると、基準がDaemonのcwdになり、
+/// BUG-066の修正が置いた「渡す前に一度だけ揃える唯一の絞り」がプロセス境界で失われる。
+/// Daemon側の呼びはそのままでよい（canonical済みの絶対パスは冪等に畳まれる）。
+///
+/// # [BUG-180] CoWと差分層の宛先SIDは対でしか通さない
+///
+/// | CoWで注入するか | 宛先SID | 結果 |
+/// |---|---|---|
+/// | する | ある | 両方を載せた`Cow` |
+/// | する | **無い** | **`Err`**——積むものが無いまま注入すると、子は変更前の中身を黙って読む |
+/// | しない | **ある** | **`Err`**——引数の取り違えである。黙って捨てると、取り違えた側が気付けない |
+/// | しない | 無い | lazy／プロセス生成フック／注入しない（今までどおり） |
+pub(crate) fn daemon_redirector_spec(
+    inject: &RedirectorInject<'_>,
+    cow_diff_layer_capability: Option<String>,
+) -> Result<Option<crate::tier2a::spawnd::RedirectorSpec>, AppContainerError> {
+    use crate::tier2a::spawnd::RedirectorSpec;
+
+    match (inject.cow, cow_diff_layer_capability) {
+        (Some(cow), Some(diff_layer_capability_sid)) => Ok(Some(RedirectorSpec::Cow {
+            workspace_root: normalize_cow_root(cow.workspace_root)
+                .to_string_lossy()
+                .into_owned(),
+            diff_layer_dir: normalize_cow_root(cow.diff_layer_dir)
+                .to_string_lossy()
+                .into_owned(),
+            ext_capture_roots: cow
+                .ext_capture_roots
+                .iter()
+                .map(|path| normalize_cow_root(path).to_string_lossy().into_owned())
+                .collect(),
+            diff_layer_capability_sid,
+        })),
+        (Some(cow), None) => Err(AppContainerError::Preflight(format!(
+            "refusing to inject the CoW redirector for {} without the diff layer's capability \
+             SID: a child that cannot reach its diff layer reads the unmodified workspace \
+             without any error (BUG-180)",
+            cow.diff_layer_dir.display()
+        ))),
+        (None, Some(sid)) => Err(AppContainerError::Preflight(format!(
+            "a CoW diff layer capability ({sid}) was passed for a spawn that does not inject \
+             the CoW redirector; the arguments are mixed up (BUG-180)"
+        ))),
+        (None, None) => Ok(if let Some(pipe) = inject.broker_pipe {
+            Some(RedirectorSpec::Lazy {
+                workspace_root: normalize_cow_root(
+                    inject
+                        .workspace_root
+                        .expect("lazy redirector requires workspace root"),
+                )
+                .to_string_lossy()
+                .into_owned(),
+                broker_pipe: pipe.to_string(),
+            })
+        } else if inject.process_hooks {
+            // [段階5b] 誘導も受付も無い。**それでも注入する**（この変種のdoc）。
+            Some(RedirectorSpec::ProcessHooks {
+                workspace_root: inject
+                    .workspace_root
+                    .map(|root| normalize_cow_root(root).to_string_lossy().into_owned()),
+            })
+        } else {
+            None
+        }),
+    }
 }
 
 /// AppContainer属性（`SECURITY_CAPABILITIES`）を付けて`CreateProcessW`で子を起動する実体。
@@ -2435,5 +2483,107 @@ mod normalize_cow_root_tests {
         let normalized = normalize_cow_root(Path::new(r"no-such-dir-9f3a\"));
         assert_eq!(normalized, PathBuf::from("no-such-dir-9f3a"));
         assert!(!normalized.is_absolute());
+    }
+}
+
+/// [BUG-180] Daemonへ送る注入設定の組み立て。**CoWと差分層の宛先SIDは対でしか通さない。**
+#[cfg(test)]
+mod daemon_redirector_spec_tests {
+    use super::*;
+    use crate::tier2a::spawnd::RedirectorSpec;
+
+    const DIFF_LAYER_SID: &str = "S-1-15-3-1024-7";
+
+    fn cow_inject<'a>(ws: &'a Path, diff: &'a Path, ext: &'a [PathBuf]) -> RedirectorInject<'a> {
+        RedirectorInject::for_tier2a(
+            Some(ws),
+            Some(CowInject {
+                workspace_root: ws,
+                diff_layer_dir: diff,
+                ext_capture_roots: ext,
+            }),
+            None,
+        )
+    }
+
+    /// CoWで注入するなら、宛先SIDは注入設定の中へ入る。
+    #[test]
+    fn a_cow_injection_carries_the_diff_layer_capability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext = vec![dir.path().join("outside")];
+        let spec = daemon_redirector_spec(
+            &cow_inject(dir.path(), &dir.path().join("diff"), &ext),
+            Some(DIFF_LAYER_SID.to_string()),
+        )
+        .expect("a CoW injection with its capability is accepted");
+        match spec {
+            Some(RedirectorSpec::Cow {
+                diff_layer_capability_sid,
+                ext_capture_roots,
+                ..
+            }) => {
+                assert_eq!(diff_layer_capability_sid, DIFF_LAYER_SID);
+                assert_eq!(ext_capture_roots.len(), 1);
+            }
+            other => panic!("CoWの注入設定になっていない: {other:?}"),
+        }
+    }
+
+    /// **本体**: CoWなのに宛先SIDが無ければ断る。黙って注入すると、差分層へ届かない子が
+    /// 変更前の中身を読む（BUG-180）。
+    #[test]
+    fn a_cow_injection_without_the_diff_layer_capability_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result =
+            daemon_redirector_spec(&cow_inject(dir.path(), &dir.path().join("diff"), &[]), None);
+        match result {
+            Err(AppContainerError::Preflight(message)) => assert!(
+                message.contains("BUG-180"),
+                "断った理由が原因を名指していない: {message}"
+            ),
+            other => panic!("宛先SIDの無いCoWの注入を通した: {other:?}"),
+        }
+    }
+
+    /// 宛先SIDだけ渡されてCoWでないのは、引数の取り違えである。黙って捨てない。
+    #[test]
+    fn a_diff_layer_capability_without_a_cow_injection_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = daemon_redirector_spec(
+            &RedirectorInject::for_tier2a(Some(dir.path()), None, None),
+            Some(DIFF_LAYER_SID.to_string()),
+        );
+        assert!(
+            matches!(result, Err(AppContainerError::Preflight(_))),
+            "CoWでない注入に差分層の宛先SIDを渡したのに通った: {result:?}"
+        );
+    }
+
+    /// **対の側**（`B-35`）: CoWでない注入は今までどおり組み立てる。
+    ///
+    /// 片方だけだと、「宛先SIDが無ければ常に断る」実装でも上のテストが通る。
+    #[test]
+    fn non_cow_injections_are_built_as_before() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hooks = daemon_redirector_spec(
+            &RedirectorInject::for_tier2a(Some(dir.path()), None, None),
+            None,
+        )
+        .expect("process hooks");
+        assert!(
+            matches!(hooks, Some(RedirectorSpec::ProcessHooks { .. })),
+            "{hooks:?}"
+        );
+
+        let lazy = daemon_redirector_spec(&RedirectorInject::lazy(dir.path(), "pipe"), None)
+            .expect("lazy");
+        assert!(
+            matches!(lazy, Some(RedirectorSpec::Lazy { .. })),
+            "{lazy:?}"
+        );
+
+        let none =
+            daemon_redirector_spec(&RedirectorInject::default(), None).expect("no injection");
+        assert_eq!(none, None);
     }
 }
