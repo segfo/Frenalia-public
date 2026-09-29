@@ -990,11 +990,16 @@ fn force_request_pipe(env: &mut Vec<(String, String)>, request_pipe: &str) {
 /// **「消す」側を落とすと、呼び出し元が`HARNESS_COW_DIFF_LAYER`を勝手に生やせる**
 /// （`B-01`: 付与と撤収の対を片方だけにしない）。
 ///
-/// # 1回の生成にしか意味が無い値は、ここでは戻さない
+/// # Redirectorの設定の名前は、ここでは戻さない
 ///
-/// `HARNESS_COW_READY_HANDLE`は系統のbase envにも入っているが、それは**トップレベルを
-/// 起こしたときのハンドル値**であって、この子には意味が無い。ここでは消すだけにして、
-/// 正しい値は[`prepare_redirector`]が生成のたびに書き直す。
+/// `HARNESS_COW_*`等（[`redirector_env::FROM_INJECTED_SPEC`]）は系統のbase envにも入っているが、
+/// それは**トップレベルへ注入した設定から書いた値**である。ここでは消すだけにして、
+/// この子へ注入する設定から[`prepare_redirector`]が生成のたびに書き直す。理由は2つある。
+///
+/// - `HARNESS_COW_READY_HANDLE`は**トップレベルを起こしたときのハンドル値**で、この子には意味が無い
+/// - [BUG-180] 別ドメインへ移る子へは`HARNESS_COW_EXT_ROOTS`を外した設定で注入する。
+///   基準envの値を戻すと、環境ブロックは同じ名前が2つあれば先の方が効くので、
+///   **外したはずの誘導が基準envの値で生き返る**
 ///
 /// # [BUG-160] OSが書き換える名前も、同じ規則で系統の値に戻す
 ///
@@ -1049,9 +1054,12 @@ fn env_for_nested(
         .chain(os_rewritten_env_names())
         .collect();
     env.retain(|(name, _)| !forced.iter().any(|o| o.eq_ignore_ascii_case(name)));
-    // 系統の値を戻す。**1回の生成にしか意味が無いものは戻さない**（上記）。
+    // 系統の値を戻す。**Redirectorの設定の名前は戻さない**（上記。注入する設定から書く）。
     for name in forced {
-        if name.eq_ignore_ascii_case(redirector_env::READY_HANDLE) {
+        if redirector_env::FROM_INJECTED_SPEC
+            .iter()
+            .any(|spec_name| spec_name.eq_ignore_ascii_case(name))
+        {
             continue;
         }
         if let Some((_, value)) = base_env.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
@@ -1169,6 +1177,16 @@ fn prepare_redirector(
     let (read, write) = appcontainer_pipe(container_sid)
         .map_err(|e| redirector_err(format!("appcontainer_pipe(redirector-ready): {e}")))?;
     clear_inherit(read);
+    write_redirector_env(spec, env, write);
+    inherit_handles.push(write);
+    Ok(RedirectorHandshake { ready_read: read })
+}
+
+/// 注入設定を、Redirector DLLが読む環境変数へ書く（[`prepare_redirector`]の、Win32を通らない側）。
+///
+/// **書くのは`spec`の値だけ**——系統の基準envからは戻さない（[`env_for_nested`]のdoc）。
+/// だから別ドメインへ移る子へ外した設定（BUG-180）は、ここで書いた値がそのまま効く。
+fn write_redirector_env(spec: &RedirectorSpec, env: &mut Vec<(String, String)>, write: HANDLE) {
     match spec {
         RedirectorSpec::Cow {
             workspace_root,
@@ -1208,12 +1226,14 @@ fn prepare_redirector(
         // [段階5b] 誘導も受付も無いが、プロセス生成フックのために注入する。
         RedirectorSpec::ProcessHooks { workspace_root } => augment_redirector_env(
             env,
-            RedirectorInject::for_tier2a(workspace_root.as_deref().map(std::path::Path::new), None, None),
+            RedirectorInject::for_tier2a(
+                workspace_root.as_deref().map(std::path::Path::new),
+                None,
+                None,
+            ),
             write,
         ),
     }
-    inherit_handles.push(write);
-    Ok(RedirectorHandshake { ready_read: read })
 }
 
 /// 生成の**後**に注入し、子の初期化完了を待つ。**成否によらず読み側を閉じる。**
@@ -1463,7 +1483,9 @@ fn spawn_top_level(
 /// |---|---|---|
 /// | 系統Job | harnessが作って複製を渡す | **呼び出し元と同じ系統**（§10.1.1。別のJobを作ると「1コマンドの子孫だけ殺す」粒度が失われる） |
 /// | ドメイン | 電文の`DomainSpec` | **辺が指す先を`Hello`の表から引いたもの**（[#55]。自己ループなら呼び出し元と同じ値、別ドメインならharnessが用意した実体。表に無ければ[`DenyReason::TargetDomainNotProvisioned`]） |
-/// | env | 電文の`env` | **呼び出し元の申告**へ辺の差分を当て、harness所有の名前だけ系統の値で強制（[`env_for_nested`]） |
+/// | トークンへ積むcapability | 電文の`DomainSpec`＋注入設定が要るもの | **遷移先のドメインの値＋注入設定が要るもの**（[`ChildPlan`]。CoWなら差分層のSID——`Hello`の表には入っていない。BUG-180） |
+/// | Redirectorの注入設定 | 電文の`redirector` | **呼び出し元へ注入した設定**。ドメインを跨ぐならワークスペース外への誘導を外す（[`ChildPlan::nested`]） |
+/// | env | 電文の`env` | **呼び出し元の申告**へ辺の差分を当て、harness所有の名前だけ系統の値で強制（[`env_for_nested`]）。Redirectorの設定の名前は注入設定から書く |
 /// | stdio | harnessが作ったパイプの複製 | **呼び出し元のハンドルを引き抜いたもの**（申告が無い欄は`NUL`） |
 /// | 実行ファイル | コマンドライン任せ | **判定に使った`image`を`lpApplicationName`へ渡す** |
 /// | プロセスハンドル | harnessへ複製して返す | **呼び出し元へ複製して返す**（`CreateProcessW`の戻り値を組み立てられるように） |
@@ -1623,6 +1645,10 @@ fn spawn_nested(
         info.hProcess.0 as u64,
         caller.lineage,
         plan.domain().clone(),
+        // [BUG-180] **この子へ実際に注入した設定**を載せる。この子が孫を頼むときの
+        // 出発点になる——系統のトップレベルの設定を載せると、別ドメインへ移るときに外した
+        // ワークスペース外への誘導が、孫の代で戻る（`table::Entry::redirector`のdoc）。
+        plan.redirector().cloned(),
     );
     if let Err(e) = registered {
         // Resume前なので子はユーザーコードを1行も実行していない。**動かす前に畳む。**
@@ -2342,6 +2368,117 @@ mod nested_env_tests {
         );
         assert_eq!(value_of(&env, "PATH"), Some("C:/fixed"));
         assert_eq!(value_of(&env, "FOO"), None);
+    }
+
+    /// [BUG-180] **Redirectorの設定の名前は、系統の基準envから戻さない。**
+    ///
+    /// 戻すと、この子へ注入する設定（別ドメインへ移る子では`HARNESS_COW_EXT_ROOTS`を外したもの）
+    /// より先に基準envの値が並ぶ。環境ブロックは同じ名前が2つあれば先の方が効くので、
+    /// **外したはずのワークスペース外への誘導が生き返る**。
+    ///
+    /// **対で見る**（`B-35`）: 窓口の名前は今までどおり基準envから戻る。片方だけだと、
+    /// 「harness所有の名前を全部戻さない」実装でも通る。
+    #[test]
+    fn the_redirector_settings_are_not_restored_from_the_lineage() {
+        let mut base = base();
+        base.push((
+            redirector_env::EXT_ROOTS.to_string(),
+            r"C:\outside".to_string(),
+        ));
+        base.push((
+            redirector_env::DIFF_LAYER.to_string(),
+            r"C:\cow\s1".to_string(),
+        ));
+
+        let env = env_for_nested(&base, Some(&caller()), &EnvPolicy::PassThrough);
+
+        assert_eq!(
+            value_of(&env, redirector_env::EXT_ROOTS),
+            None,
+            "系統のトップレベルのワークスペース外への誘導が、注入設定を待たずに子へ渡っている: {env:?}"
+        );
+        assert_eq!(value_of(&env, redirector_env::DIFF_LAYER), None, "{env:?}");
+        assert_eq!(
+            value_of(&env, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
+            Some(PIPE),
+            "窓口の名前まで戻らなくなっている: {env:?}"
+        );
+    }
+
+    /// [BUG-180] 実際に子へ渡る環境を、Daemonと同じ順で組んで見る——
+    /// `env_for_nested`のあとに、計画した注入設定を[`write_redirector_env`]で書く。
+    ///
+    /// 別ドメインへ移る子にはワークスペース外への誘導が**無く**、自己ループの子には**1つ**ある。
+    /// 差分層の置き場はどちらも**1つ**（2つ並ぶと、どちらが効くかが並び順で決まる）。
+    #[test]
+    fn a_cross_domain_child_gets_no_ext_roots_but_a_self_loop_child_gets_exactly_one() {
+        use crate::tier2a::spawnd::table::ProcessTable;
+
+        let spec = RedirectorSpec::Cow {
+            workspace_root: r"C:\ws".to_string(),
+            diff_layer_dir: r"C:\cow\s1".to_string(),
+            ext_capture_roots: vec![r"C:\outside".to_string()],
+            diff_layer_capability_sid: "S-1-15-3-1024-104".to_string(),
+        };
+        // 系統の基準envは、トップレベルへ同じ設定を注入した後のものである（`spawn_top_level`）。
+        let mut lineage_env = base();
+        write_redirector_env(&spec, &mut lineage_env, HANDLE(0x1234 as *mut _));
+
+        let entry = DomainSpec {
+            name: "entry-profile".to_string(),
+            policy_domain: "entry".to_string(),
+            container_sid: "S-1-15-2-1-2-3".to_string(),
+            capability_sids: vec!["S-1-15-3-1024-102".to_string()],
+            identity: DomainIdentitySpec::OwnPackage,
+        };
+        let target = DomainSpec {
+            name: "d0-profile".to_string(),
+            policy_domain: "d0".to_string(),
+            container_sid: "S-1-15-2-4-5-6".to_string(),
+            ..entry.clone()
+        };
+        let mut table = ProcessTable::new();
+        table
+            .register_top_level(4200, 0x11, 0x1000, entry, lineage_env, Some(spec))
+            .expect("register");
+        let top = table.resolve(4200, |_| true).expect("resolve");
+
+        let env_for = |plan: &ChildPlan<'_>| {
+            let mut env = env_for_nested(&top.base_env, Some(&caller()), &EnvPolicy::PassThrough);
+            if let Some(spec) = plan.redirector() {
+                write_redirector_env(spec, &mut env, HANDLE(0x5678 as *mut _));
+            }
+            env
+        };
+        let occurrences = |env: &[(String, String)], name: &str| {
+            env.iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+                .count()
+        };
+
+        let cross = env_for(&ChildPlan::nested(&top, &target));
+        assert_eq!(
+            occurrences(&cross, redirector_env::EXT_ROOTS),
+            0,
+            "別ドメインへ移る子にワークスペース外への誘導が渡っている: {cross:?}"
+        );
+        assert_eq!(
+            occurrences(&cross, redirector_env::DIFF_LAYER),
+            1,
+            "{cross:?}"
+        );
+
+        let self_loop = env_for(&ChildPlan::nested(&top, &top.domain));
+        assert_eq!(
+            occurrences(&self_loop, redirector_env::EXT_ROOTS),
+            1,
+            "自己ループの子のワークスペース外への誘導が消えている、または2つ並んでいる: {self_loop:?}"
+        );
+        assert_eq!(
+            occurrences(&self_loop, redirector_env::DIFF_LAYER),
+            1,
+            "{self_loop:?}"
+        );
     }
 }
 

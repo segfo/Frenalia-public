@@ -26,6 +26,10 @@
 //! （[`RedirectorSpec::Cow`]の`diff_layer_capability_sid`）。**注入設定と対で運ぶ**ので、
 //! その設定で注入する子には必ず同じSIDが積まれる。
 //!
+//! **別ドメインへ移る子からは、ワークスペース外への誘導を外す**（[`redirector_for_nested`]）。
+//! 差分層の許可を渡すだけだと、遷移先が持たない`--fs-allow`の書込先へ、その子が
+//! 変更を承認待ちとして置けてしまうためである。
+//!
 //! # Win32をほとんど呼ばない
 //!
 //! 呼ぶのは`sid_from_string`（文字列→SIDの変換）だけで、昇格も実機も要らない。
@@ -66,12 +70,14 @@ impl<'a> ChildPlan<'a> {
     /// サンドボックスの中から頼まれた入れ子の子。
     ///
     /// ドメインは判定が選んだ遷移先（自己ループなら呼び出し元と同じ値、別ドメインなら
-    /// `Hello`の表の値）、Redirectorの設定は呼び出し元のもの。
+    /// `Hello`の表の値）。Redirectorの設定は呼び出し元へ注入したものから始め、
+    /// **ドメインを跨ぐならワークスペース外への誘導を外す**（[`redirector_for_nested`]）。
     pub(super) fn nested(caller: &Caller, target_domain: &'a DomainSpec) -> Self {
         // [#49] **ドメインを跨ぐか。** 値が1ビットでも違えば跨いだ扱いにする（fail-closed）。
         // ここで1回だけ決める——同じ判断を2か所に置くと、片方だけ直る。
         let crosses_domains = target_domain != &caller.domain;
-        Self::build(target_domain, caller.redirector.clone(), crosses_domains)
+        let redirector = redirector_for_nested(caller.redirector.as_ref(), crosses_domains);
+        Self::build(target_domain, redirector, crosses_domains)
     }
 
     fn build(
@@ -176,6 +182,62 @@ fn capabilities_for(domain: &DomainSpec, redirector: Option<&RedirectorSpec>) ->
         }
     }
     sids
+}
+
+/// [BUG-180] 入れ子の子へ注入する設定。**別ドメインへ移る子からは、ワークスペース外への
+/// 書込を差分層へ向ける設定（`ext_capture_roots`）を外す**（ユーザー判断、2026-09-29）。
+///
+/// 自己ループなら呼び出し元へ注入した設定をそのまま使う。
+///
+/// # なぜ外すのか
+///
+/// `ext_capture_roots`は`--fs-allow <path>:rw`で開けたワークスペース外の書込先で、
+/// **呼び出し元の宣言ごとの穴**である。遷移先ドメインはこの穴を引き継がない——
+/// 狭めるのはワークスペースの外に対して、が§22.9の決定である。ところが差分層の許可を
+/// 持った子（BUG-180の修正で積むようになった）がこの設定のまま動くと、**許可を持たない
+/// ワークスペース外のパスへ新しいファイルを承認待ちとして置ける**。承認
+/// （`harness apply --dangerously-allow`）のときには、呼び出し元の変更と見分けられない。
+///
+/// 外すと、その子のワークスペース外への書込は本物のパスへ向かい、ACLで拒否される
+/// （CoWを使わない構成と同じ結果になる）。
+///
+/// # 外した後も残るもの（限界）
+///
+/// - **Redirectorは境界ではない**（D-01）。差分層のSIDは差分層全体（`_ext`を含む）に効くので、
+///   `_ext`のパスを直接指定するプログラムは読み書きできる。ここで止まるのは、普通のツールが
+///   自動でワークスペース外の変更を積む経路と、変更後の中身を見せる経路だけである
+///   （塞ぐには`_ext`を別のディレクトリ・別の宛先SIDに分ける。`docs/STATUS.md`の残課題）
+/// - 呼び出し元が差分層で変えたワークスペース外のファイルをこの子が読むと、**変更前の中身**が
+///   見える（その読取を遷移先ドメインが宣言している場合だけ。宣言していなければ読めない）
+/// - lazyの受付・プロセス生成フックの設定は跨いでもそのまま渡している。別ドメインで
+///   それが適切かは今回見ていない
+///
+/// **外した子の子孫も外れたまま**である——Daemonはこの値をその子のエントリへ登録し
+/// （`table`の`Entry::redirector`）、孫の計画はそこから始まる。
+fn redirector_for_nested(
+    inherited: Option<&RedirectorSpec>,
+    crosses_domains: bool,
+) -> Option<RedirectorSpec> {
+    let spec = inherited?;
+    Some(match spec {
+        // **`..`を書かない。** 欄を足した日に、ここで「跨ぐ子へ渡してよいか」を答えさせる。
+        RedirectorSpec::Cow {
+            workspace_root,
+            diff_layer_dir,
+            ext_capture_roots,
+            diff_layer_capability_sid,
+        } => RedirectorSpec::Cow {
+            workspace_root: workspace_root.clone(),
+            diff_layer_dir: diff_layer_dir.clone(),
+            ext_capture_roots: if crosses_domains {
+                Vec::new()
+            } else {
+                ext_capture_roots.clone()
+            },
+            diff_layer_capability_sid: diff_layer_capability_sid.clone(),
+        },
+        RedirectorSpec::Lazy { .. } | RedirectorSpec::ProcessHooks { .. } => spec.clone(),
+    })
 }
 
 /// ワイヤ上のドメイン（文字列のSID）を、`CreateProcessW`へ渡せる形へ戻したもの。

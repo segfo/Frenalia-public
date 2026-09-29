@@ -702,6 +702,24 @@ pub(crate) mod redirector_env {
     /// **1回の生成にしか意味が無い値**（注入したDLLが初期化完了を知らせるハンドル）。
     /// 系統の基準envに古い値が残っているので、**使い回さず毎回書き直す**。
     pub(crate) const READY_HANDLE: &str = "HARNESS_COW_READY_HANDLE";
+
+    /// [BUG-180] **その子へ注入する設定から毎回書く名前**（[`super::augment_redirector_env`]が
+    /// 注入設定から組み立てるもの）。
+    ///
+    /// Spawn Daemonは入れ子の子で、これらを**系統の基準envから戻さない**
+    /// （`spawnd::server::env_for_nested`）。子へ注入する設定は系統のトップレベルと同じとは
+    /// 限らない——別ドメインへ移る子からは[`EXT_ROOTS`]を外す。基準envの値を先に並べると、
+    /// 環境ブロックは同じ名前が2つあれば先の方が効くので、**外したはずの値が勝つ**。
+    ///
+    /// Daemon自身の環境から読む抑止リスト（`NO_INJECT_ENV`）はここに入れない。
+    pub(crate) const FROM_INJECTED_SPEC: [&str; 6] = [
+        WORKSPACE,
+        PROCESS_HOOKS,
+        DIFF_LAYER,
+        EXT_ROOTS,
+        BROKER_PIPE,
+        READY_HANDLE,
+    ];
 }
 
 /// harnessが所有する環境変数の名前一式。**呼び出し元に名乗らせてはいけないもの**である。

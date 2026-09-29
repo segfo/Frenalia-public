@@ -124,7 +124,13 @@ fn cross_domain_child_with(redirector: Option<RedirectorSpec>, target: &DomainSp
         .expect("resolve the top-level");
     let plan = ChildPlan::nested(&top, target);
     table
-        .register_in_lineage(4201, PROC_NESTED, lineage, plan.domain().clone())
+        .register_in_lineage(
+            4201,
+            PROC_NESTED,
+            lineage,
+            plan.domain().clone(),
+            plan.redirector().cloned(),
+        )
         .expect("register the nested child");
     table
         .resolve(4201, |_| true)
@@ -408,4 +414,105 @@ fn each_of_the_four_capability_kinds_has_a_source_on_the_cross_domain_path() {
         1,
         "Redirector DLLが無い: {caps:?}"
     );
+}
+
+// --- [BUG-180・ユーザー判断] 別ドメインへ移る子からは、ワークスペース外への誘導を外す ---
+
+fn ext_roots_of(spec: Option<&RedirectorSpec>) -> Option<Vec<String>> {
+    match spec {
+        Some(RedirectorSpec::Cow {
+            ext_capture_roots, ..
+        }) => Some(ext_capture_roots.clone()),
+        _ => None,
+    }
+}
+
+/// **本体。** 別ドメインへ移るCoWの子は、ワークスペース外への誘導を持たない。
+/// **それ以外の欄は呼び出し元と同じ**——差分層・ワークスペース・宛先SIDまで落とすと、
+/// その子はワークスペースの変更も見えなくなる（BUG-180へ逆戻りする）。
+#[test]
+fn a_cross_domain_child_loses_ext_capture_but_keeps_everything_else() {
+    let caller = caller_with(Some(cow_spec()));
+    let target = target_domain();
+    let plan = ChildPlan::nested(&caller, &target);
+
+    match plan.redirector() {
+        Some(RedirectorSpec::Cow {
+            workspace_root,
+            diff_layer_dir,
+            ext_capture_roots,
+            diff_layer_capability_sid,
+        }) => {
+            assert!(
+                ext_capture_roots.is_empty(),
+                "別ドメインへ移る子にワークスペース外への誘導が残っている: {ext_capture_roots:?}"
+            );
+            let RedirectorSpec::Cow {
+                workspace_root: w,
+                diff_layer_dir: d,
+                diff_layer_capability_sid: s,
+                ..
+            } = cow_spec()
+            else {
+                unreachable!()
+            };
+            assert_eq!(workspace_root, &w);
+            assert_eq!(diff_layer_dir, &d);
+            assert_eq!(diff_layer_capability_sid, &s);
+        }
+        other => panic!("CoWの注入設定になっていない: {other:?}"),
+    }
+}
+
+/// **対の側**（`B-35`）: 自己ループの子は、呼び出し元の誘導をそのまま持つ。
+///
+/// 片方だけだと、「いつも外す」実装でも上のテストが通る——そうなると、同じドメインの
+/// 子まで`--fs-allow`で開けた書込先へ書けなくなる。
+#[test]
+fn a_self_loop_child_keeps_the_callers_ext_capture() {
+    let caller = caller_with(Some(cow_spec()));
+    let plan = ChildPlan::nested(&caller, &caller.domain);
+    assert_eq!(plan.redirector(), Some(&cow_spec()));
+}
+
+/// **外した子の子孫も外れたまま**である。台帳が系統のトップレベルの設定を返していた頃は、
+/// 孫の計画がトップレベルの設定から始まり、外した誘導が1世代で戻った。
+///
+/// あわせて、その子を**台帳へ載せたドメインが`Hello`の表の値のまま**であることも見る
+/// （差分層のSIDはドメインの事実ではない。`B-13`）。
+#[test]
+fn a_stripped_child_stays_stripped_in_its_own_self_loop() {
+    let target = target_domain();
+    let child = cross_domain_child_with(Some(cow_spec()), &target);
+    assert_eq!(
+        child.domain, target,
+        "別ドメインへ移った子を台帳へ載せたドメインが、表の値から変わっている"
+    );
+    assert_eq!(
+        ext_roots_of(child.redirector.as_ref()),
+        Some(Vec::new()),
+        "台帳が、その子へ注入した設定ではなく系統のトップレベルの設定を返している"
+    );
+
+    let grandchild = ChildPlan::nested(&child, &child.domain);
+    assert!(!grandchild.crosses_domains());
+    assert_eq!(
+        ext_roots_of(grandchild.redirector()),
+        Some(Vec::new()),
+        "外したワークスペース外への誘導が孫の代で戻っている"
+    );
+    assert_eq!(count(grandchild.capability_sids(), DIFF_LAYER), 1);
+}
+
+/// CoWでない注入設定は、跨いでも跨がなくてもそのまま渡す（今回の判断の射程外）。
+#[test]
+fn non_cow_redirectors_cross_domains_unchanged() {
+    let target = target_domain();
+    for spec in [lazy_spec(), process_hooks_spec()] {
+        let caller = caller_with(Some(spec.clone()));
+        assert_eq!(
+            ChildPlan::nested(&caller, &target).redirector(),
+            Some(&spec)
+        );
+    }
 }

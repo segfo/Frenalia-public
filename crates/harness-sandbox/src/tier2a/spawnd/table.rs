@@ -51,6 +51,25 @@ struct Entry {
     /// 間はそのPIDがOSに再利用されないので、生存が取れた時点でPIDとドメインの対応が
     /// 一意に定まる（§12「PID再利用への対処」）。
     process: u64,
+    /// [段階6f-1] このプロセスへ**実際に注入した**Redirector DLLの設定。
+    ///
+    /// # なぜ呼び出し元に申告させないのか
+    ///
+    /// nestedの子にも**同じ誘導の下で**動いてもらう必要があるが、何を注入するかを
+    /// 呼び出し元に申告させてはいけない——差分層の置き場や受付パイプの名前を
+    /// 自分で決められることになる。**harnessがトップレベルを起こしたときの値が、
+    /// この系統で唯一信頼できる出発点である。**
+    ///
+    /// # なぜ系統ではなくプロセスごとに持つのか（BUG-180）
+    ///
+    /// 別ドメインへ移る子へは、ワークスペース外への書込を差分層へ向ける設定
+    /// （`ext_capture_roots`）を外して注入する（`child_plan`の`redirector_for_nested`）。
+    /// 系統に1つだけ持つと、その子が起こす孫はまたトップレベルの設定から始まり、
+    /// **外したはずの設定が1世代で戻る**。子のエントリが自分へ注入した値を持ち、
+    /// 孫の計画はそこから始める。
+    ///
+    /// `None`は「このプロセスには注入していない」。
+    redirector: Option<super::RedirectorSpec>,
 }
 
 /// 1つの系統が共有するもの。
@@ -70,18 +89,6 @@ struct Lineage {
     /// 辺が`env`の差分を宣言していれば、これへ当てたものを渡す
     /// （`harness_policy::transition::EnvPolicy::Fixed`）。
     base_env: Vec<(String, String)>,
-    /// [段階6f-1] この系統のトップレベルへ注入したRedirector DLLの設定。
-    ///
-    /// # なぜ系統が持つのか（[`Lineage::base_env`]と同じ理由）
-    ///
-    /// nestedの子にも**同じ誘導の下で**動いてもらう必要があるが、何を注入するかを
-    /// 呼び出し元に申告させてはいけない——差分層の置き場や受付パイプの名前を
-    /// 自分で決められることになる。**harnessがトップレベルを起こしたときの値が、
-    /// この系統で唯一信頼できる出発点である。**
-    ///
-    /// `None`は「この系統には注入しない」。段階6bまではnestedへ**常に**注入していなかった
-    /// ので、ここが`Some`でも子は素のままだった（`server::spawn_nested`の限界）。
-    redirector: Option<super::RedirectorSpec>,
     members: HashSet<u32>,
 }
 
@@ -109,7 +116,10 @@ pub struct Caller {
     /// **harnessが所有する名前だけはこちらの値で強制する**
     /// （`win_appcontainer::spawn::harness_owned_env_names`）。
     pub base_env: Vec<(String, String)>,
-    /// [段階6f-1] この系統のRedirector設定（[`Lineage::redirector`]の写し）。
+    /// [段階6f-1] このプロセスへ注入したRedirectorの設定（[`Entry::redirector`]の写し）。
+    ///
+    /// **系統のトップレベルと同じとは限らない**——別ドメインへ移った子とその子孫では、
+    /// ワークスペース外への誘導（`ext_capture_roots`）が外れている（BUG-180）。
     pub redirector: Option<super::RedirectorSpec>,
 }
 
@@ -199,7 +209,6 @@ impl ProcessTable {
             Lineage {
                 job,
                 base_env,
-                redirector,
                 members: HashSet::from([pid]),
             },
         );
@@ -209,6 +218,7 @@ impl ProcessTable {
                 lineage,
                 domain,
                 process,
+                redirector,
             },
         );
         Ok(lineage)
@@ -218,12 +228,15 @@ impl ProcessTable {
     ///
     /// **系統Jobは新しく作らない。** 呼び出し元と同じ系統へ入れるのがこの機構の要点で、
     /// 別のJobを作ると「1コマンドの子孫ツリーだけを殺す」粒度が失われる。
+    ///
+    /// `redirector`は**この子へ実際に注入した設定**（[`Entry::redirector`]のdoc）。
     pub fn register_in_lineage(
         &mut self,
         pid: u32,
         process: u64,
         lineage: LineageId,
         domain: DomainSpec,
+        redirector: Option<super::RedirectorSpec>,
     ) -> Result<(), RegisterError> {
         if self.entries.contains_key(&pid) {
             return Err(RegisterError::PidAlreadyRegistered { pid });
@@ -238,6 +251,7 @@ impl ProcessTable {
                 lineage,
                 domain,
                 process,
+                redirector,
             },
         );
         Ok(())
@@ -273,7 +287,7 @@ impl ProcessTable {
             domain: entry.domain.clone(),
             lineage_job: lineage.job,
             base_env: lineage.base_env.clone(),
-            redirector: lineage.redirector.clone(),
+            redirector: entry.redirector.clone(),
         })
     }
 

@@ -112,7 +112,7 @@ fn the_lineage_job_comes_back_only_when_the_last_member_is_reaped() {
         .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"), Vec::new(), None)
         .expect("register the top level");
     table
-        .register_in_lineage(4201, PROC_2, lineage, domain("git-workspace"))
+        .register_in_lineage(4201, PROC_2, lineage, domain("git-workspace"), None)
         .expect("register a nested child in the same lineage");
 
     let first = table.reap(4200).expect("reap the first member");
@@ -215,7 +215,7 @@ fn drain_returns_every_process_handle_and_every_lineage_job() {
         .register_top_level(4200, PROC_1, JOB_A, domain("pwsh-workspace"), Vec::new(), None)
         .expect("register the top level");
     table
-        .register_in_lineage(4201, PROC_2, lineage, domain("git-workspace"))
+        .register_in_lineage(4201, PROC_2, lineage, domain("git-workspace"), None)
         .expect("register a nested child");
     table
         .register_top_level(5300, PROC_3, JOB_B, domain("pwsh-workspace"), Vec::new(), None)
@@ -263,8 +263,65 @@ fn registering_into_an_unknown_lineage_fails() {
     let _reaped = table.reap(4200).expect("reap so the lineage disappears");
 
     assert_eq!(
-        table.register_in_lineage(4201, PROC_2, lineage, domain("git-workspace")),
+        table.register_in_lineage(4201, PROC_2, lineage, domain("git-workspace"), None),
         Err(RegisterError::UnknownLineage),
         "消えた系統へ子を足せてしまう。どのJobにも入らない子が台帳に載る"
+    );
+}
+
+/// [BUG-180] **注入設定はプロセスごとに持つ。** 入れ子の子は、自分へ注入した設定で引ける。
+///
+/// 系統に1つだけ持っていた頃は、子を引くと必ずトップレベルの設定が返った。別ドメインへ移る子へ
+/// ワークスペース外への誘導を外して注入しても、その子が孫を頼むと**外したはずの設定が戻った**。
+///
+/// **対で見る**（`B-35`）: トップレベルは自分の設定のまま、子は子の設定。片方だけだと、
+/// 「最後に登録した設定を全員へ返す」実装でも通る。
+#[test]
+fn a_nested_entry_keeps_its_own_redirector() {
+    use crate::tier2a::spawnd::RedirectorSpec;
+
+    let top_spec = RedirectorSpec::Cow {
+        workspace_root: "C:/w".to_string(),
+        diff_layer_dir: "C:/d".to_string(),
+        ext_capture_roots: vec!["C:/x".to_string()],
+        diff_layer_capability_sid: "S-1-15-3-1024-7".to_string(),
+    };
+    let child_spec = RedirectorSpec::Cow {
+        workspace_root: "C:/w".to_string(),
+        diff_layer_dir: "C:/d".to_string(),
+        ext_capture_roots: Vec::new(),
+        diff_layer_capability_sid: "S-1-15-3-1024-7".to_string(),
+    };
+
+    let mut table = ProcessTable::new();
+    let lineage = table
+        .register_top_level(
+            4200,
+            PROC_1,
+            JOB_A,
+            domain("pwsh-workspace"),
+            Vec::new(),
+            Some(top_spec.clone()),
+        )
+        .expect("register the top-level process");
+    table
+        .register_in_lineage(
+            4201,
+            PROC_2,
+            lineage,
+            domain("git-workspace"),
+            Some(child_spec.clone()),
+        )
+        .expect("register the nested child");
+
+    assert_eq!(
+        table.resolve(4200, all_alive).expect("top").redirector,
+        Some(top_spec),
+        "トップレベルの注入設定が子の登録で書き換わっている"
+    );
+    assert_eq!(
+        table.resolve(4201, all_alive).expect("child").redirector,
+        Some(child_spec),
+        "子が自分へ注入した設定ではなく、系統のトップレベルの設定で引かれている"
     );
 }
