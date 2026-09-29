@@ -231,8 +231,8 @@ impl PendingRecord {
 #[must_use = "pass it to finish_copy_up() with the real open's result"]
 pub(crate) struct CopyUp {
     record: PendingRecord,
-    /// この呼び出しでworkspaceから写した実体（写さなかったなら`None`）。
-    copied: Option<PathBuf>,
+    /// この呼び出しがworkspaceの元の写しを差分層へ置いたか。
+    placed: bool,
 }
 
 /// copy-upでworkspaceの元の中身を写すか。
@@ -247,9 +247,12 @@ pub(crate) enum CopySource {
     Nothing,
 }
 
-/// copy-up（設計書§18の最小サブセット、一時ファイル+原子renameは省略——初期実装として
-/// 単純上書きコピーを採用する。並行copy-upの競合は許容し、後勝ちで構わない
-/// スコープに留める）。
+/// copy-up（設計書§18）。既存ファイルを書込で開く前に、workspaceの元の中身を差分層へ写す。
+///
+/// **写しは作りかけを誰にも見せずに置く**（[`publish_copy`]）。いったん差分層の中の一時の置き場へ写し、
+/// 「移動先が既に在るなら失敗」の名前の変更で本来のパスへ置く。以前は本来のパスへ直接写していたので、
+/// 同時に写しを作る2つが互いの書きかけを上書きし得たし、写している途中の写しを読む側が読み得た。
+/// 他が先に置いていたら、自分の写しは捨ててそちらを使う。
 ///
 /// **ここでは台帳へ書かない**（BUG-171）。書く予定を返し、本当のopenの結果を見た
 /// [`finish_copy_up`]が書く。差分層に既に実体があれば「このセッションで既に触った」ので
@@ -266,11 +269,106 @@ pub(crate) fn copy_up(
     }
     let record = PendingRecord::first_touch(cfg, rel);
     prepare_diff_layer_parent(workspace_path, diff_layer_path);
-    let copied = (source == CopySource::Workspace
+    let placed = source == CopySource::Workspace
         && workspace_path.is_file()
-        && std::fs::copy(workspace_path, diff_layer_path).is_ok())
-    .then(|| diff_layer_path.to_path_buf());
-    Some(CopyUp { record, copied })
+        && match publish_copy(&cfg.diff_layer_dir, workspace_path, diff_layer_path) {
+            Publish::Placed => true,
+            // 他が先に置いた。その写しを使う（台帳への初回の記録は、置いた側が書く）。
+            Publish::AlreadyThere => false,
+            Publish::Failed(e) => {
+                append_warning_kind(
+                    cfg,
+                    "copy_up_failed",
+                    &format!(
+                        "copying {} into the diff layer failed ({e}); the write open goes ahead \
+                         without the original content",
+                        workspace_path.display()
+                    ),
+                );
+                false
+            }
+        };
+    Some(CopyUp { record, placed })
+}
+
+/// copy-upの写しを作りかけのまま見せないための置き場（差分層の直下）。
+///
+/// 名前が`.harness-cow-`で始まるので、変更の一覧・差分層の回収（どちらも
+/// `store::scan_diff_layer_content_files`）とRedirectorの分類（`policy::diff_layer_relative`）の
+/// どれからも外れる。
+pub(crate) const COPY_UP_STAGING_DIRNAME: &str = ".harness-cow-tmp";
+
+/// [`publish_copy`]の結末。
+#[derive(Debug)]
+pub(crate) enum Publish {
+    /// 写しを本来のパスへ置いた。
+    Placed,
+    /// 本来のパスには既に他の写し（または書き込まれたファイル）が在った。何も上書きしていない。
+    AlreadyThere,
+    /// 写せなかった・置けなかった。
+    Failed(std::io::Error),
+}
+
+/// `source`の中身を差分層の`target`へ、**作りかけを誰にも見せずに**置く。
+///
+/// 一時の置き場（[`COPY_UP_STAGING_DIRNAME`]）へ写してから、「移動先が既に在るなら失敗」の名前の変更
+/// （`MoveFileExW`をフラグ無しで呼ぶ。同じボリュームの中では1回の操作）で`target`へ移す。
+/// **ロックは使わない**——同じサンドボックスの中のプロセスだけでなく、別のAppContainerで動く子や
+/// サンドボックスの外のharness本体（差分層へ直接書く`write_file`）に対しても、ファイルシステムの
+/// 1回の操作として効くため。
+pub(crate) fn publish_copy(diff_layer_dir: &Path, source: &Path, target: &Path) -> Publish {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staging = diff_layer_dir.join(COPY_UP_STAGING_DIRNAME);
+    if let Err(e) = std::fs::create_dir_all(&staging) {
+        return Publish::Failed(e);
+    }
+    let tmp = staging.join(format!(
+        "{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if let Err(e) = std::fs::copy(source, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Publish::Failed(e);
+    }
+    match move_without_replacing(&tmp, target) {
+        Ok(()) => Publish::Placed,
+        Err(e) => {
+            // 一時の置き場は一覧・回収・分類から外れているので、消せなくても見え方は変わらない。
+            let _ = std::fs::remove_file(&tmp);
+            const ERROR_FILE_EXISTS: i32 = 80;
+            const ERROR_ALREADY_EXISTS: i32 = 183;
+            if matches!(
+                e.raw_os_error(),
+                Some(ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS)
+            ) {
+                Publish::AlreadyThere
+            } else {
+                Publish::Failed(e)
+            }
+        }
+    }
+}
+
+/// `from`を`to`へ名前の変更で移す。`to`が既に在れば失敗する（上書きしない）。
+fn move_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+    let wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let (from_w, to_w) = (wide(from), wide(to));
+    unsafe {
+        MoveFileExW(
+            PCWSTR(from_w.as_ptr()),
+            PCWSTR(to_w.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    }
+    .map_err(|e| std::io::Error::from_raw_os_error(e.code().0 & 0xFFFF))
 }
 
 /// 差分層の`diff_layer_target`の親ディレクトリを、**論理的に在るときだけ**用意する
@@ -321,77 +419,23 @@ pub(crate) fn is_logically_deleted(rel: &str) -> bool {
     deleted_paths_state().lock().unwrap().paths.contains(rel)
 }
 
-/// [`copy_up`]の後始末。本当のopenが成功したときだけ台帳へ書く（設計書§19.6）。
+/// [`copy_up`]の後始末。台帳へ初回の記録を書くかを決める（設計書§19.6）。
 ///
-/// 失敗したときは、この呼び出しで写した実体を差分層から消す。残すと、次に同じパスを
-/// 書込で開いたとき[`copy_up`]が「既に触った」と判定して**その回を台帳へ書かない**
-/// （台帳に無い実体として一覧には出るが、元の中身の指紋を失うので`apply`の衝突検出が効かない）。
-/// 消せなかったら警告台帳へ残す（黙って捨てない）。空のディレクトリは一覧に出ないので残してよい。
+/// 書くのは、本当のopenが成功したとき**と**、openは失敗したがこの呼び出しが写しを置いたとき。
+/// **置いた写しは、openが失敗しても消さない。** 以前は消していた（BUG-171・BUG-178）が、
+/// 「差分層に写しが在るか確かめてから開く」側——書込のcopy-up・差分層の版を読むopen・属性の問い合わせ——
+/// は3つあり、その確かめと開く間に消されると、本物のworkspaceに在るファイルを「無い」と言われた。
+/// 消す処理を無くせば、この間は無くなる。
 ///
-/// **ただし、写しを他のハンドルが開いていたら消さない**（[BUG-178](../../../docs/bugs/BUG-178.md)）。
-/// 写してから本当のopenが失敗するまでの間に、別のスレッド・兄弟プロセスがその写しを開くことがある
-/// （そちらの[`copy_up`]は「既に在る」ので何も書かない）。そこで名前を消すと、そのハンドルが書いた中身は
-/// 行き場を失い、台帳にも何も残らない。使われている写しは、このパスの初回の接触なので、
-/// **元の中身の指紋つきで記録する**（中身が元と同じなら、一覧と承認はバイト一致で変更に数えない、BUG-174）。
+/// 残した写しはこのパスの初回の接触なので、元の中身の指紋つきで記録する。中身が元と同じなら、
+/// 一覧と承認はバイト一致で変更に数えない（BUG-174）。代わりに、その差分層は回収の判定
+/// （実体の数だけを見る）で「中身がある」と見られる——`plans/PLAN-COW-AS-DEFAULT.md`の段6の表にある
+/// 「中身の変わらないコピーが差分層に残ると回収されない」と同じ形で、そこで扱う。
 pub(crate) fn finish_copy_up(cfg: &Config, copy_up: Option<CopyUp>, open_succeeded: bool) {
-    let Some(CopyUp { record, copied }) = copy_up else {
+    let Some(CopyUp { record, placed }) = copy_up else {
         return;
     };
-    if !open_succeeded {
-        if let Some(path) = copied {
-            match reclaim_unused_copy(&path) {
-                Reclaim::Removed => {}
-                Reclaim::InUse => {
-                    record.settle(cfg, true);
-                    return;
-                }
-                Reclaim::Failed(e) => append_warning_kind(
-                    cfg,
-                    "copy_up_rollback_failed",
-                    &format!(
-                        "the open that copied {} into the diff layer failed, and removing the copy \
-                         failed too ({e}); the next write to {} will not be recorded in the ledger",
-                        path.display(),
-                        record.rel
-                    ),
-                ),
-            }
-        }
-    }
-    record.settle(cfg, open_succeeded);
-}
-
-/// [`reclaim_unused_copy`]の結末。
-enum Reclaim {
-    /// 誰も開いていなかったので消した。
-    Removed,
-    /// 他のハンドルが開いている。消していない。
-    InUse,
-    /// それ以外の理由で消せなかった。
-    Failed(std::io::Error),
-}
-
-/// `path`を**排他で**開けたときだけ消す（共有を一切許さず、閉じたら消える開き方）。
-///
-/// `std::fs::remove_file`は他のハンドルが削除の共有を許していれば成功し、名前はその場で消える
-/// （POSIXの削除の意味）。「誰も使っていなければ消す」は、排他で開けたかどうかで判定するしかない。
-fn reclaim_unused_copy(path: &Path) -> Reclaim {
-    const DELETE: u32 = 0x0001_0000;
-    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    match std::fs::OpenOptions::new()
-        .access_mode(DELETE)
-        .share_mode(0)
-        .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
-        .open(path)
-    {
-        Ok(handle) => {
-            drop(handle);
-            Reclaim::Removed
-        }
-        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => Reclaim::InUse,
-        Err(e) => Reclaim::Failed(e),
-    }
+    record.settle(cfg, open_succeeded || placed);
 }
 
 /// 差分層配下の実体へ**直接**書かれた1件（＝`copy_up`を経由しない書込）を、workspace側と
@@ -641,10 +685,11 @@ mod tests {
         assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Create]);
     }
 
-    /// 既存ファイルを写した後でopenが失敗したら、写した実体を消す。残すと次の書込が
-    /// 「既に触った」と判定されて台帳に載らない（`apply`が適用済みの実体を消すのと同じ理由、BUG-034）。
+    /// 既存ファイルを写した後でopenが失敗しても、写しは消さず、初回の接触として記録する
+    /// （元の中身の指紋つき）。以前は消していたが、確かめてから開く側との間で消すと「無い」と
+    /// 言われるので、消す処理そのものをやめた。次の書込は写しが在るのでcopy-upを飛ばす。
     #[test]
-    fn a_failed_open_after_copying_rolls_back_the_copy_so_the_next_write_is_recorded() {
+    fn a_failed_open_after_copying_keeps_the_copy_and_records_the_first_touch() {
         let (_ws, _diff_layer, cfg) = fixture();
         let rel = "bug171-existing.txt";
         let ws_path = cfg.workspace_root.join(rel);
@@ -657,23 +702,13 @@ mod tests {
             "copy_up must copy the existing file before the open (the open needs it)"
         );
         finish_copy_up(&cfg, prepared, false);
-        assert!(
-            ledger_ops(&cfg, rel).is_empty(),
-            "BUG-171: a failed open must not leave a modify"
-        );
-        assert!(
-            !diff_path.exists(),
-            "the copy made for the failed open must be removed"
-        );
-
-        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
-        assert!(
-            prepared.is_some(),
-            "after the rollback, the next write must count as the first touch again"
-        );
-        finish_copy_up(&cfg, prepared, true);
+        assert!(diff_path.is_file(), "the copy stays");
         assert_eq!(ledger_ops(&cfg, rel), [ChangeOp::Modify]);
         assert_eq!(std::fs::read_to_string(&diff_path).unwrap(), "base");
+        assert!(
+            copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace).is_none(),
+            "the next write finds the copy and skips copy-up"
+        );
     }
 
     /// BUG-178: 失敗したopenの巻き戻しは、写しを**他のハンドルが開いていたら**消さない。
@@ -708,6 +743,61 @@ mod tests {
             ledger_ops(&cfg, rel),
             [ChangeOp::Modify],
             "the copy is the first touch of this path, so it is recorded with the original's hash"
+        );
+    }
+
+    /// 写しを読む側が「差分層に版が在る」と確かめてから開くまでの間に、写した側の open が失敗しても、
+    /// 写しは消えない。消すと、読む側は本物のワークスペースに在るファイルを「無い」と言われる。
+    #[test]
+    fn a_copy_a_reader_has_chosen_survives_the_writers_failed_open() {
+        let (_ws, _diff_layer, cfg) = fixture();
+        let rel = "gap-reader.txt";
+        let ws_path = cfg.workspace_root.join(rel);
+        let diff_path = cfg.diff_layer_dir.join(rel);
+        std::fs::write(&ws_path, "base").unwrap();
+
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
+        let chosen = diff_layer_version_path(&cfg, Path::new(rel));
+        assert_eq!(
+            chosen.as_deref(),
+            Some(diff_path.as_path()),
+            "the reader chose the copy"
+        );
+        finish_copy_up(&cfg, prepared, false);
+
+        assert!(
+            diff_path.is_file(),
+            "the copy the reader already chose must still be there when it opens it"
+        );
+        assert_eq!(std::fs::read_to_string(&diff_path).unwrap(), "base");
+    }
+
+    /// 写しが在ると見て copy-up を飛ばした書込の側が開く前に、先に写した側の open が失敗しても、
+    /// 写しは消えない。台帳には、この写しがこのパスの初回の接触として1行残る（元の中身の指紋つき）。
+    #[test]
+    fn a_copy_a_second_writer_relies_on_survives_the_first_writers_failed_open() {
+        let (_ws, _diff_layer, cfg) = fixture();
+        let rel = "gap-writer.txt";
+        let ws_path = cfg.workspace_root.join(rel);
+        let diff_path = cfg.diff_layer_dir.join(rel);
+        std::fs::write(&ws_path, "base").unwrap();
+
+        let first = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
+        let second = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
+        assert!(
+            second.is_none(),
+            "the second writer sees the copy and skips copy-up"
+        );
+        finish_copy_up(&cfg, first, false);
+
+        assert!(
+            diff_path.is_file(),
+            "the copy the second writer is about to open must not be removed"
+        );
+        assert_eq!(
+            ledger_ops(&cfg, rel),
+            [ChangeOp::Modify],
+            "the surviving copy is the first touch of this path, recorded with the original's hash"
         );
     }
 
@@ -876,6 +966,50 @@ mod tests {
             set.paths.contains("bug179-a.txt") && !set.paths.contains("bug179-b.txt"),
             "BUG-179: the deleted set must come from the config the hooks use, got {:?}",
             set.paths
+        );
+    }
+
+    /// 写しを置くとき、本来のパスに既に他の写し（またはharness本体が書いたファイル）が在れば
+    /// 上書きしない。一時の置き場にも何も残さない。
+    #[test]
+    fn publishing_a_copy_does_not_replace_what_is_already_there() {
+        let (_ws, _diff_layer, cfg) = fixture();
+        let source = cfg.workspace_root.join("publish-src.txt");
+        let target = cfg.diff_layer_dir.join("publish-dst.txt");
+        std::fs::write(&source, "mine").unwrap();
+        std::fs::write(&target, "theirs").unwrap();
+
+        let outcome = publish_copy(&cfg.diff_layer_dir, &source, &target);
+        assert!(matches!(outcome, Publish::AlreadyThere), "{outcome:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "theirs");
+        let staging = cfg.diff_layer_dir.join(COPY_UP_STAGING_DIRNAME);
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    /// 置いた写しは本来のパスに在り、一時の置き場は空。一時の置き場は、Redirectorの分類からも
+    /// 変更の一覧・回収の数え上げからも外れる（作りかけが残っても変更に数えない）。
+    #[test]
+    fn a_placed_copy_leaves_nothing_behind_and_the_staging_directory_is_invisible() {
+        let (_ws, _diff_layer, cfg) = fixture();
+        let rel = "publish-placed.txt";
+        let ws_path = cfg.workspace_root.join(rel);
+        let diff_path = cfg.diff_layer_dir.join(rel);
+        std::fs::write(&ws_path, "base").unwrap();
+
+        let prepared = copy_up(&cfg, rel, &ws_path, &diff_path, CopySource::Workspace);
+        finish_copy_up(&cfg, prepared, true);
+        assert_eq!(std::fs::read_to_string(&diff_path).unwrap(), "base");
+        let staging = cfg.diff_layer_dir.join(COPY_UP_STAGING_DIRNAME);
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+
+        let leftover = staging.join("left-behind");
+        std::fs::write(&leftover, "partial").unwrap();
+        assert!(classify_target(&cfg, &leftover).is_none());
+        assert!(
+            !harness_change_ledger::store::scan_diff_layer_content_files(&cfg.diff_layer_dir)
+                .iter()
+                .any(|key| key.contains("left-behind")),
+            "the staging directory must not be counted as a change"
         );
     }
 
