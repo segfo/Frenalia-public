@@ -161,7 +161,9 @@ fn required_capability(spec: &RedirectorSpec) -> Option<&str> {
             diff_layer_capability_sid,
             ..
         } => Some(diff_layer_capability_sid.as_str()),
-        // lazyの受付はパイプ経由で、Redirectorが自分で開く場所を持たない。
+        // lazyの受付パイプが通すのはworkspaceのcapability SID（`grant_job::open_broker`が
+        // 全モードぶんをパイプへ載せる）で、それは遷移先ドメインの土台にも入っている
+        // （`domain_provision`）。注入設定の側から足すものは無い。
         RedirectorSpec::Lazy { .. } => None,
         // プロセス生成フックだけで、ファイル系フックは差分層を持たない。
         RedirectorSpec::ProcessHooks { .. } => None,
@@ -209,8 +211,9 @@ fn capabilities_for(domain: &DomainSpec, redirector: Option<&RedirectorSpec>) ->
 ///   （塞ぐには`_ext`を別のディレクトリ・別の宛先SIDに分ける。`docs/STATUS.md`の残課題）
 /// - 呼び出し元が差分層で変えたワークスペース外のファイルをこの子が読むと、**変更前の中身**が
 ///   見える（その読取を遷移先ドメインが宣言している場合だけ。宣言していなければ読めない）
-/// - lazyの受付・プロセス生成フックの設定は跨いでもそのまま渡している。別ドメインで
-///   それが適切かは今回見ていない
+/// - lazyの受付・プロセス生成フックの設定は跨いでもそのまま渡している。lazyの受付パイプへ
+///   届く宛先（workspaceのcapability SID）は遷移先の土台にも入っていることをコードで確かめたが、
+///   別ドメインの子からのfault-inを実機では測っていない
 ///
 /// **外した子の子孫も外れたまま**である——Daemonはこの値をその子のエントリへ登録し
 /// （`table`の`Entry::redirector`）、孫の計画はそこから始まる。
