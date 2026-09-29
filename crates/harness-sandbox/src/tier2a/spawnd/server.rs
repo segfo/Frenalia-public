@@ -53,7 +53,6 @@ use windows::Win32::Foundation::{
     CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_CLOSE_SOURCE, DUPLICATE_HANDLE_OPTIONS,
     DUPLICATE_SAME_ACCESS, HANDLE, HLOCAL, WAIT_TIMEOUT,
 };
-use windows::Win32::Security::SID_AND_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FlushFileBuffers, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED,
     FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -71,17 +70,15 @@ use windows::Win32::System::Threading::{
 use crate::tier2a::win_appcontainer::{
     appcontainer_pipe, augment_redirector_env, command_line_for, create_suspended_in_job,
     harness_owned_env_names, inject_redirector, os_rewritten_env_names, redirector_env,
-    spawn_request_capability_sid, wait_cow_ready, CowInject, DomainIdentity, RedirectorInject,
-    SuspendedSpawn,
+    spawn_request_capability_sid, wait_cow_ready, CowInject, RedirectorInject, SuspendedSpawn,
 };
-use crate::win_common::{
-    build_env_block, clear_inherit, sid_from_string, wide, OwnedSid, SendHandle,
-};
+use crate::win_common::{build_env_block, clear_inherit, wide, SendHandle};
 use crate::win_pipe_ipc::{
     capability_reachable_security_attributes, current_user_sid_string, is_harness_pipe_name,
     read_framed_timeout, unique_pipe_name, write_framed_timeout,
 };
 
+use super::child_plan::ChildPlan;
 use super::console_holder::ConsoleHolders;
 use super::table::ProcessTable;
 use super::transitions::TransitionQueue;
@@ -91,9 +88,6 @@ use super::{
     SpawnRequest, SpawnResponse, SpawnTopLevelRequest, ACCEPT_TIMEOUT, IO_TIMEOUT, MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
 };
-
-/// `SECURITY_CAPABILITIES`へ積むときの属性（`spawn_with_workspace`と同じ値）。
-const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 
 /// 要求受付パイプのcapability SIDへ与えるアクセスマスク（§10.1）。
 ///
@@ -1268,12 +1262,14 @@ fn spawn_top_level(
     // 生成が成功すればJobの複製はProcess Tableが引き取り、stdioの複製は
     // `create_suspended_in_job`が消費する。**成功しなかったぶんは、ここで閉じるしかない**
     // ——閉じ忘れると系統Jobが1本残り、kill-on-closeの保険が二度と働かない（§10.1.1）。
-    let domain = match resolve_domain(&request.domain) {
+    // **持ち物は計画が決める**（[`ChildPlan`]のdoc。入れ子と同じ口を通す）。
+    let plan = ChildPlan::top_level(&request.domain, request.redirector.as_ref());
+    let domain = match plan.resolve() {
         Ok(domain) => domain,
         Err(e) => {
             // `create_suspended_in_job`まで届いていないので、stdioもまだ誰も消費していない。
             close_received_handles(job, &inherit_handles, true);
-            return Err(e);
+            return Err(err(e));
         }
     };
     let capability_attributes = domain.capability_attributes();
@@ -1281,10 +1277,10 @@ fn spawn_top_level(
     let args: Vec<&str> = request.args.iter().map(String::as_str).collect();
     let mut env = request.env.clone();
     force_request_pipe(&mut env, &shared.request_pipe);
-    let handshake = match request.redirector.as_ref() {
+    let handshake = match plan.redirector() {
         Some(spec) => match prepare_redirector(
             spec,
-            domain.container.as_psid(),
+            domain.container_psid(),
             &mut env,
             &mut inherit_handles,
         ) {
@@ -1328,7 +1324,7 @@ fn spawn_top_level(
         application_name: None,
         cwd: std::path::Path::new(&request.cwd),
         env_block: &mut env_block,
-        container_sid: domain.container.as_psid(),
+        container_sid: domain.container_psid(),
         capabilities: &capability_attributes,
         inherit_handles: &inherit_handles,
         stdout_write,
@@ -1387,13 +1383,13 @@ fn spawn_top_level(
         pid,
         info.hProcess.0 as u64,
         job.0 as u64,
-        request.domain.clone(),
+        plan.domain().clone(),
         // [段階6b] この系統のbase env。**Redirectorの変数を足した後の`env`である**
         // ——nestedの子も同じ誘導の下で動かなければ、同じ系統に居る意味が無い。
         env,
         // [段階6f-1] この系統の注入設定。nestedの子へ**同じものを**注入する
         // （`Lineage::redirector`のdoc）。`None`ならnestedも素のままである。
-        request.redirector.clone(),
+        plan.redirector().cloned(),
     );
     if let Err(e) = registered {
         // **登録に失敗したら生成自体を失敗させる。** Resume前なので子はユーザーコードを
@@ -1495,13 +1491,15 @@ fn spawn_nested(
     cwd: &str,
     mut env: Vec<(String, String)>,
 ) -> Result<SpawnResponse, SpawnDaemonError> {
-    let domain = resolve_domain(target_domain)?;
+    // **持ち物（トークンへ積むcapability・注入するRedirectorの設定・跨ぐか）は計画が決める**
+    // （[`ChildPlan`]のdoc。トップレベルと同じ口を通す）。
+    let plan = ChildPlan::nested(caller, target_domain);
+    let domain = plan.resolve().map_err(err)?;
     let capability_attributes = domain.capability_attributes();
     let caller_process = HANDLE(caller.process as *mut _);
     // [#49] **ドメインを跨ぐか。** 跨ぐなら、呼び出し元へ返すハンドルの権限を絞る
-    // （[`caller_handle_rights`]）。**ここで1回だけ見る**——同じ判断を2箇所に置くと、
-    // 片方だけ直る。値が1ビットでも違えば跨いだ扱いにする（fail-closed）。
-    let crosses_domains = target_domain != &caller.domain;
+    // （[`caller_handle_rights`]）。判断は[`ChildPlan::nested`]が1回だけ行う。
+    let crosses_domains = plan.crosses_domains();
 
     // [段階6f-1] 呼び出し元のstdioを**引き抜く**（[`super::CallerHandles`]のdoc）。
     // 申告の無い欄は今までどおり`NUL`へ捨てる。
@@ -1521,10 +1519,10 @@ fn spawn_nested(
 
     // [段階6f-1] **系統と同じ誘導をこの子にも入れる**（`Lineage::redirector`のdoc）。
     // 入れないと、生成禁止を積んだ構成でこの子は孫を起こすことも頼むこともできない。
-    let handshake = match caller.redirector.as_ref() {
+    let handshake = match plan.redirector() {
         Some(spec) => match prepare_redirector(
             spec,
-            domain.container.as_psid(),
+            domain.container_psid(),
             &mut env,
             &mut inherit_handles,
         ) {
@@ -1565,7 +1563,7 @@ fn spawn_nested(
         application_name: Some(request.image),
         cwd: std::path::Path::new(cwd),
         env_block: &mut env_block,
-        container_sid: domain.container.as_psid(),
+        container_sid: domain.container_psid(),
         capabilities: &capability_attributes,
         inherit_handles: &inherit_handles,
         stdout_write,
@@ -1622,7 +1620,7 @@ fn spawn_nested(
         pid,
         info.hProcess.0 as u64,
         caller.lineage,
-        target_domain.clone(),
+        plan.domain().clone(),
     );
     if let Err(e) = registered {
         // Resume前なので子はユーザーコードを1行も実行していない。**動かす前に畳む。**
@@ -1990,69 +1988,6 @@ fn reap_now(shared: &Arc<Shared>, pid: u32) {
     if let Some(reaped) = reaped {
         close_reaped(reaped);
     }
-}
-
-/// ワイヤ上のドメイン（文字列のSID）を、`CreateProcessW`へ渡せる形へ戻したもの。
-///
-/// **`OwnedSid`を持ち続けることに意味がある。** `PSID`は生ポインタなので、
-/// 元の所有者が落ちた瞬間に宙を指す——`CreateProcessW`が終わるまでこの構造体を生かす。
-struct ResolvedDomain {
-    container: OwnedSid,
-    capabilities: Vec<OwnedSid>,
-    /// `None`＝package SIDそのものがドメイン（[`DomainIdentitySpec::OwnPackage`]）。
-    ///
-    /// **capability列とは別に持つ。** ここへ混ぜると、ドメインの宛先として指定しただけの
-    /// SIDが**トークンへ積まれる**（＝黙って権限が1つ増える）。宛先に使うことと
-    /// 名乗ることは別の決定である。
-    identity: Option<OwnedSid>,
-}
-
-impl ResolvedDomain {
-    /// トークンへ積むcapability（**`identity`は含めない**。上記）。
-    fn capability_attributes(&self) -> Vec<SID_AND_ATTRIBUTES> {
-        self.capabilities
-            .iter()
-            .map(|sid| SID_AND_ATTRIBUTES {
-                Sid: sid.as_psid(),
-                Attributes: SE_GROUP_ENABLED,
-            })
-            .collect()
-    }
-
-    fn domain_identity(&self) -> DomainIdentity {
-        match &self.identity {
-            Some(sid) => DomainIdentity::Capability(sid.as_psid()),
-            None => DomainIdentity::OwnPackage,
-        }
-    }
-}
-
-fn resolve_domain(domain: &DomainSpec) -> Result<ResolvedDomain, SpawnDaemonError> {
-    let container = sid_from_string(&domain.container_sid).map_err(|e| {
-        err(format!(
-            "sid_from_string(container {}): {e}",
-            domain.container_sid
-        ))
-    })?;
-    let mut capabilities = Vec::with_capacity(domain.capability_sids.len());
-    for sid in &domain.capability_sids {
-        capabilities.push(
-            sid_from_string(sid)
-                .map_err(|e| err(format!("sid_from_string(capability {sid}): {e}")))?,
-        );
-    }
-    let identity = match &domain.identity {
-        DomainIdentitySpec::OwnPackage => None,
-        DomainIdentitySpec::Capability { sid } => Some(
-            sid_from_string(sid)
-                .map_err(|e| err(format!("sid_from_string(domain identity {sid}): {e}")))?,
-        ),
-    };
-    Ok(ResolvedDomain {
-        container,
-        capabilities,
-        identity,
-    })
 }
 
 /// [段階6b] 辺のenv方針を当てる規則。**Win32を1行も通らないので昇格が要らない。**
@@ -2448,64 +2383,6 @@ mod image_path_tests {
                 "Daemonのcwd／カレントドライブから解決される綴りが通っている: {image:?}"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod domain_tests {
-    use super::*;
-
-    /// 実在の形をしたSID文字列（`ConvertStringSidToSidW`が受け付ければ何でもよい）。
-    /// **実マシンのcapabilityである必要は無い**——ここで測るのは変換ではなく、
-    /// 変換結果をどの欄へ入れるかである。
-    fn spec(identity: DomainIdentitySpec) -> DomainSpec {
-        DomainSpec {
-            name: "test-domain".to_string(),
-            // ここで測っているのはSIDの振り分けだけなので、遷移元の名前は使われない。
-            // **それでも`name`と別の綴りにしておく**——同じにすると、2つの欄を
-            // 取り違えた実装でもこのテストは何も言わない。
-            policy_domain: "test-policy-domain".to_string(),
-            container_sid: "S-1-15-2-1-2-3".to_string(),
-            capability_sids: vec!["S-1-15-3-1024-1".to_string()],
-            identity,
-        }
-    }
-
-    /// **ドメインの宛先に指定したSIDが、トークンへ積まれてはいけない。**
-    ///
-    /// 宛先に使うこと（誰がこの子を開けるか）と名乗ること（この子が何を持っているか）は
-    /// 別の決定である。混ぜると、**宛先を指定しただけで権限が1つ増える**——しかも
-    /// 増えたことはどこにも出ない（`B-10`）。
-    #[test]
-    fn the_domain_identity_sid_is_not_added_to_the_token_capabilities() {
-        let resolved = resolve_domain(&spec(DomainIdentitySpec::Capability {
-            sid: "S-1-15-3-1024-9".to_string(),
-        }))
-        .expect("resolve");
-
-        assert_eq!(
-            resolved.capability_attributes().len(),
-            1,
-            "宣言していないcapabilityがトークンへ積まれている。\
-             ドメインの宛先SIDを指定しただけで権限が1つ増える形になっている"
-        );
-        assert!(
-            matches!(resolved.domain_identity(), DomainIdentity::Capability(_)),
-            "宛先が capability として渡っていない"
-        );
-    }
-
-    /// **対の側**（`B-35`）: package SIDそのものがドメインなら、宛先SIDは持たない。
-    ///
-    /// 片方だけだと、`identity`を常に`None`にする実装でも上のテストが通る。
-    #[test]
-    fn own_package_carries_no_extra_identity_sid() {
-        let resolved = resolve_domain(&spec(DomainIdentitySpec::OwnPackage)).expect("resolve");
-        assert_eq!(resolved.capability_attributes().len(), 1);
-        assert!(
-            matches!(resolved.domain_identity(), DomainIdentity::OwnPackage),
-            "package SIDをドメインにする指定が capability に化けている"
-        );
     }
 }
 

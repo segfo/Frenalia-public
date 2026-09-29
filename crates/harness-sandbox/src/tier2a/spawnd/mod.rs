@@ -46,6 +46,10 @@ pub mod table;
 /// [`table`]と同じくWin32を直接は呼ばないので、昇格なしで単体テストできる。
 pub mod transitions;
 
+/// Daemonが起こす子1人ぶんの持ち物（トークンへ積むcapability・注入するRedirectorの設定）を
+/// 1か所で決める。トップレベルと入れ子の両方がここを通る。
+#[cfg(windows)]
+mod child_plan;
 #[cfg(windows)]
 pub mod client;
 /// [段階⑤] コンソール保持プロセス（§7.1.1・§7.1.2）。Win32のコンソールAPIを直接叩くので
