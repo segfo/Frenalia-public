@@ -110,6 +110,12 @@ fn capability_sids_for(
     // | Redirector DLL | 注入の失敗は生成ごと落とす（BUG-116）。無いと必ず起動に失敗する |
     //
     // **narrowingはワークスペースの外に対して効く**——それがこの骨格の射程である。
+    //
+    // **[BUG-180] CoWの差分層は、意図してここへ入れない。** CoWではワークスペースの書ける側が
+    // 差分層なので、遷移先の子にも差分層のSIDが要る（無いと変更前の中身を黙って読む）。
+    // だが差分層は`/sessions`・`/fork`で作り直され、宛先SIDも変わる——起動時に1回だけ作る
+    // この表へ入れると、古い差分層のSIDを持ち続ける。差分層のSIDはharnessがトップレベルを
+    // 起こすたびに注入設定と一緒に送り、Daemonの`spawnd/child_plan.rs`が積む。
     let traverse = super::traverse_capability_sid()
         .map_err(|e| format!("traverse capabilityを導出できない: {e}"))?;
     let spawn_request = super::spawn_request_capability_sid()

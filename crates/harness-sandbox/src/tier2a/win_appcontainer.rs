@@ -422,6 +422,12 @@ pub fn redirector_dll_capability_sids() -> Vec<crate::win_common::OwnedSid> {
 /// [`domain_provision`]は宛先を**文字列の一覧としてIPCで送る**別表現なので、この型を通らない
 /// （あちらは自分で4つめを積んでいる）。「2箇所ちょうど」であることは
 /// `redirector_dll_capability_sids`の呼び出しを数えるテストが固定する。
+///
+/// **[BUG-180] その経路では、3つめ（CoWの差分層）も別の口から来る。** [`domain_provision`]は
+/// 差分層を積まない（セッションごとに作り直されるので起動時の表に入れられない）。Daemonが
+/// 別ドメインの子を起こすときは、系統の注入設定（`RedirectorSpec::Cow`）が運ぶ差分層のSIDを
+/// `spawnd/child_plan.rs`が積む。**上の表の4種類がDaemonの経路でどこから来るか**は
+/// `spawnd/child_plan_tests.rs`の`each_of_the_four_capability_kinds_has_a_source_on_the_cross_domain_path`が固定する。
 pub(crate) struct DomainCapabilities {
     /// **この型が所有する宛先。** 生存期間をここへ束ねてあるので、[`Self::psids`]が返す
     /// ポインタはこの値より長生きできない。
@@ -520,8 +526,8 @@ pub const COW_DIFF_LAYER_ACCESS: FsAccess = FsAccess::ReadWriteExec;
 /// **[BUG-180] トークンへ積む場所はもう1つある**——Spawn Daemonが入れ子の子（とくに
 /// 別ドメインへ移った子）を起こすときで、`spawnd/child_plan.rs`が積む。ここは**引かない**:
 /// 製品の`launch.rs`が引いた値を注入設定（`RedirectorSpec::Cow`）と一緒に送り、Daemonは
-/// その値をそのまま使う。**積む場所の3つめで、上の表の導出を通らない**ので、ずれたときの
-/// 症状は下と同じ形になる。
+/// その値をそのまま使う。**上の表の導出を通らない積む場所**なので、ずれたときの症状は
+/// 下と同じ形になる（積む場所の全数は`plans/DESIGN-MAC-DOMAIN.md` §22.3.2の表が持つ）。
 ///
 /// ずれたときの症状は**「ACEは正しく付いているのに子から一切読めない」**で、`ACCESS_DENIED`は
 /// 出るが原因はACL側ではなくトークン側にある——最も原因を追いにくい形である（`launch.rs`の
