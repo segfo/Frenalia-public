@@ -2,7 +2,7 @@
 //!
 //! # 何を守るテストか
 //!
-//! `HARNESS_TEST_DUAL_ACE_NODES` はテストが撒くファイル数を変えるだけの目盛りで、
+//! `HARNESS_TEST_LAZY_RACE_NODES` はテストが撒くツリーの大きさを変えるだけの目盛りで、
 //! `HARNESS_ALLOW_USER_WRITABLE_ELEVATED_HELPERS` は昇格ヘルパーの検証を丸ごと外す
 //! セキュリティの逃がし弁である。**かつてはどちらも `HARNESS_` で始まるだけ**だったので、
 //! コードや文書の中で出会ったとき、読み手はどちらなのかを名前から判定できなかった。
@@ -27,7 +27,7 @@
 //!
 //! | 形 | 実例 |
 //! |---|---|
-//! | 文字列リテラル全体が名前 | `env::var("HARNESS_TEST_DUAL_ACE_NODES")` |
+//! | 文字列リテラル全体が名前 | `env::var("HARNESS_TEST_LAZY_RACE_NODES")` |
 //! | 定数を経由する | `pub const ALLOW_USER_WRITABLE_HELPERS_ENV: &str = "HARNESS_ALLOW_..."`（呼び出し側にリテラルが無い） |
 //! | 埋め込みスクリプト中の参照 | `$env:HARNESS_PROBE_DIR`・`${env:HARNESS_TEST_MCP_HTTP_TOKEN}`・`Remove-Item Env:HARNESS_RUN_SHELL_COMMAND` |
 //!
@@ -527,7 +527,7 @@ fn test_side_files_are_recognised_by_path_and_by_name() {
     for rel in [
         "crates/harness-cli/tests/env_var_naming.rs",
         "crates/harness-sandbox/examples/bug102-langmode-matrix.rs",
-        "crates/harness-sandbox/src/tier2a/win_appcontainer/dual_ace_mode_switch_tests.rs",
+        "crates/harness-sandbox/src/tier2a/win_appcontainer/cow_containment_tests.rs",
     ] {
         assert!(is_test_side(rel), "テスト側と判定できていない: {rel}");
     }

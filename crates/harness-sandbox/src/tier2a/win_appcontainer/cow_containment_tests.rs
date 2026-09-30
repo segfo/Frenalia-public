@@ -515,9 +515,25 @@ fn cow_denied_write_outside_workspace_and_ext_roots_is_logged() {
 ///
 /// いま渡しているのは**本番のCoWセッションと同じ`ro`**で、違うのは注入しないことだけである。
 /// `preflight`の側は`WorkspaceWriteMode::Cow`のまま——ACLの配り方は本番と1ビットも変えない。
+///
+/// # D-84の中核の不変条件の、実子での唯一の網でもある
+///
+/// D-84（両モードのcapability SID宛ACEを最初の1回で同時に置く）は、「`rwx`宛のACEが同じDACLに
+/// 同居していても、`ro`のcapability SIDしか持たない子は書けない」を成立の根拠にしている。
+/// これを実子で測ったのは使い捨ての測定（分流T-1、`plans/mac-spike/RESULTS.md` §S16）で、
+/// その文書は「D-84を採るなら`ro`の腕を製品の回帰テストへ移して残すこと」と求めていた。
+/// ここがその移し先である。そのために2つを足してある。
+///
+/// - **前提の確認**: workspaceの根に`ro`と`rwx`の**両方**のACEが載っていること。
+///   `rwx`側が載っていなければ、このテストは「同居していても書けない」を測らなくなる。
+/// - **対の確認（B-35）**: 同じworkspace・同じACLで、`rwx`の子（本番の非CoWセッションと同じ形）は
+///   書けること。書けないなら、上の拒否は「`ro`だから」ではなく別の理由（ファイルのロック・
+///   ACLの崩れ）で起きている。
 #[test]
 #[ignore]
 fn workspace_write_fails_closed_without_redirector_injection() {
+    use crate::tier2a::workspace_ledger::WorkspaceMode;
+
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
     std::fs::write(workspace.path().join("important.txt"), "original").expect("seed important.txt");
@@ -527,6 +543,36 @@ fn workspace_write_fails_closed_without_redirector_injection() {
         diff_layer_dir: diff_layer.path().to_path_buf(),
     };
     preflight_for_test(workspace.path(), &[], None, &write_mode);
+
+    // [D-84] **前提**: 根に両モードのACEが同居している。発行しない側（`lookup_`）で引くので、
+    // `preflight`が発行していなければここで落ちる（台帳へ記録を積み増さない）。
+    let canonical = workspace
+        .path()
+        .canonicalize()
+        .expect("canonicalize the workspace");
+    for mode in [WorkspaceMode::Ro, WorkspaceMode::Rwx] {
+        let cap = crate::tier2a::workspace_capability::lookup_capability_name(
+            &canonical,
+            mode.as_str(),
+        )
+        .and_then(|_| workspace_capability_sid(&canonical, mode.as_str()).ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "preflight must have issued the {} capability for the workspace (D-84 issues both \
+                 modes up front)",
+                mode.as_str()
+            )
+        });
+        assert!(
+            sid_explicit_ace(&canonical, cap.as_psid())
+                .expect("read the workspace root DACL")
+                .is_some(),
+            "[D-84] the workspace root must carry the {} capability ACE; without the rwx one next \
+             to the ro one, this test no longer measures that a ro child cannot write while the \
+             rwx ACE shares the DACL",
+            mode.as_str()
+        );
+    }
 
     let (shell, _) = resolve_shell();
     let env = crate::secret_env::build_child_env();
@@ -573,6 +619,41 @@ fn workspace_write_fails_closed_without_redirector_injection() {
     let workspace_content = std::fs::read_to_string(workspace.path().join("important.txt"))
         .expect("workspace important.txt must still exist");
     assert_eq!(workspace_content, "original");
+
+    // **対**: 同じworkspace・同じACLで、`rwx`の子は書ける。`spawn_in_workspace`は`cow: None`から
+    // 本番の`launch.rs`と同じく`rwx`を導出する——CoWから非CoWへモードを切り替えた回と同じ形で、
+    // D-84の目的どおり**ACLは配り直していない**。
+    let child = spawn_in_workspace(
+        &shell,
+        &[
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            COW_WRITE_PROBE_COMMAND,
+        ],
+        workspace.path(),
+        &env,
+        false,
+        sid.as_psid(),
+        NetworkCapability::Deny,
+        None,
+    )
+    .expect("spawn the rwx child");
+    let (stdout, stderr, code) = child
+        .write_stdin_read_output_and_wait(None)
+        .expect("child should run to completion");
+    assert_eq!(
+        code, 0,
+        "an rwx child must be able to write the same workspace under the same ACL; if it cannot, \
+         the ro child's denial above was caused by something other than the missing write \
+         capability: stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("important.txt"))
+            .expect("read important.txt after the rwx child"),
+        "modified-by-child",
+        "the rwx child's write must have landed in the workspace itself"
+    );
 }
 
 /// Phase 4a: Redirector DLLが`run_shell`の直接の子（powershell）だけでなく、その子がさらに

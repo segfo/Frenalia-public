@@ -1130,19 +1130,18 @@ mod workspace_prepare_tests;
 // `plans/mac-spike/RESULTS.md`、privhelperの受付パイプへの到達（`t4_privhelper_pipe_reach_tests`）は
 // `plans/handoff-issue-20/T4.md`。T4専用だったプローブのモード2つ（パイプ名の列挙・
 // 未使用の名前でのパイプ作成）も同時に外した。復元が要るならこのコミットの親から取る。
-/// **両モードのcapability SID宛ACEを1回で同時に配ったとき、`ro`側の子から
-/// 書けてしまわないか**（分流`plans/handoff/fs-boundary-cost/T-1.md`、実測は§S16）。
-/// 費用側は§S15-1が「1回にまとめれば無料」と実測済みなので、残る問いは安全性だけである。
-/// **非昇格で回す**（昇格すると親トークンが管理者になり、測る世界が実運用とずれる）。
-///
-/// **一回性の測定だったが、残す**（2026-08-27。`docs/CODE-STRUCTURE-RULES.md`規則2の例外）。
-/// 判定が **D-84 という拘束的決定になり、その安全性の不変条件**——「`ro`のcapability SIDしか
-/// 持たない子は書けない」——**を実子プロセスで測っているのは本モジュールだけ**だからである。
-/// `ace_grant_revoke_tests`の対応するテストはDACLの中身までしか見ておらず、
-/// **そこから「だから書けない」を導いてはいけない**（同テストのdocが自分でそう書いている）。
-/// **D-84を変更するときは、まずここを回すこと。**
-#[cfg(all(windows, test))]
-mod dual_ace_mode_switch_tests;
+//
+// **削除済み（2026-09-30）**: `dual_ace_mode_switch_tests`（分流T-1、判定は
+// `plans/mac-spike/RESULTS.md` §S16）。2026-08-27に規則2の例外として残していたのは、D-84の
+// 安全性の不変条件——「`rwx`宛のACEが同じDACLに同居していても、`ro`のcapability SIDしか
+// 持たない子は書けない」——を**実子プロセスで**測っているのがここだけだったからである。
+// その確かめは製品の回帰テスト
+// `cow_containment_tests::workspace_write_fails_closed_without_redirector_injection`へ移した
+// （根に両モードのACEが載っていることを前提として確かめ、同じACLで`rwx`の子は書けることを対で見る）。
+// **D-84を変更するときは、まずあのテストを回すこと**（`dev-elevated-run.exe cow-diagnostics`）。
+// 許可の中身（`ro`に書込・削除のビットが無い、どのモードも`WRITE_DAC`を持たない）は
+// `workspace_aces`の単体テストが毎回固定している。**失ったもの**は、削除・DACLの書き換え・実行の
+// 拒否を実子で確かめる部分と、256ノードの深い木での確かめで、復元が要るならこのコミットの親から取る。
 
 /// **残課題#32の機序を1回で決めるプローブ**（使い捨て）。`acl_baseline_cost_tests`が
 /// 「届いていない」を確定させたのに対し、こちらは**なぜ届かないのか**を候補を並べて測る
