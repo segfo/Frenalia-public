@@ -213,17 +213,17 @@ fn set_file_readonly(_path: &Path, _readonly: bool) {}
 
 /// 1つの台帳ファイル。`T`はその台帳のペイロード型。
 ///
-/// 4台帳の違いは**(ファイル名, ロック名, ペイロード型)** の3点だけなので、それらを
+/// 台帳どうしの違いは**(ファイル名, ロック名, ペイロード型)** の3点だけなので、それらを
 /// この型のフィールド/型引数として持つ。
 pub struct Ledger<T> {
     /// 台帳ファイルの絶対パス。`ProjectDirs`が解決できない環境では`None`になり、
-    /// その場合は読取が`T::default()`・書込がno-opになる（既存4実装と同じ）。
+    /// その場合は読取が`T::default()`・書込がno-opになる（統合前の各実装と同じ）。
     path: Option<PathBuf>,
     /// `Some`なら[`with_named_lock`]で直列化する。`None`ならロックしない。
     ///
-    /// 4台帳（`fs-passthrough`・`traverse-grant`・`tier3-vm`・`workspace-grant`）はいずれも
+    /// 実運用の台帳（[`CONFIG_DIR_LEDGERS`]に載るもの）はいずれも
     /// `Local\harness-<台帳名>-ledger`形式のロック名を渡し、read-modify-writeを直列化する。
-    /// `None`はAPIとしては引き続きサポートするが（テスト用途等）、実運用の4台帳では使わない。
+    /// `None`はAPIとしては引き続きサポートするが（テスト用途等）、実運用の台帳では使わない。
     lock_name: Option<String>,
     _payload: PhantomData<T>,
 }
@@ -850,7 +850,7 @@ mod tests {
     /// R-01: 名前付きロックが実際に並行`update`を直列化することの確認（`traverse-grant`・
     /// `workspace-grant`にロック名を追加する根拠）。名前付きmutexはプロセス跨ぎだが同一
     /// プロセス内のスレッド間でも機能するため、実プロセスを起動せず`std::thread`で検証できる。
-    /// テスト専用のロック名を使い、実運用4台帳のロックとは衝突させない。
+    /// テスト専用のロック名を使い、実運用の台帳のロックとは衝突させない。
     #[cfg(windows)]
     #[test]
     fn a_named_lock_serializes_concurrent_updates_across_threads() {

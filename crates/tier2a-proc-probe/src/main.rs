@@ -7,7 +7,7 @@
 //! を実行したのち、`--chain`が空でなければ先頭のビット幅に対応するexeを次世代として起動し、
 //! その子のstdout（同形式のJSON）を自分の結果へネストして最後にJSONを1行だけ標準出力へ出す。
 //!
-//! `cargo test`側（`crates/harness-sandbox/src/win_appcontainer.rs`の`cow_diagnostics`）が
+//! `cargo test`側（`crates/harness-sandbox/src/tier2a/win_appcontainer/cow_containment_tests.rs`。旧称`cow_diagnostics`）が
 //! 実FS（workspace本体・CoW 差分層ディレクトリ・警告台帳）を直接調べて封じ込めの成否を判定する
 //! ため、このJSONはあくまで二次的な説明用（どの世代でどの操作がどう失敗したか）。i686
 //! （WOW64孫世代）でもビルドできることが必須要件のため、依存はwindows/serde_json最小限に

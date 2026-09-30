@@ -104,6 +104,9 @@ impl EnvironmentFacts {
             mcp_servers,
             transition_facts,
         } = ctx;
+        // run_shell_path_extra: 子のPATHの末尾へディレクトリを足すだけで、何が許可・拒否されるかを
+        // 変えない（`plans/DESIGN-SANDBOX.md`の環境変数の規則の唯一の例外。見つかるコマンドが増えても、
+        // それを実行できるか・どこへ書けるかは隔離Tierと書込モードが決め、それは別の欄が伝える）。
         let _ = run_shell_path_extra;
         // vm_sandbox: Tier3実行チャネルの生ハンドル自体はモデルへ伝える事実を持たない
         // （「現在Tier3である」という事実は`shell_tier.tier`側から既に伝わる）。
@@ -896,7 +899,7 @@ mod tests {
             "the Tier1 line must not hide that network is not contained: {tier1}"
         );
 
-        // Tier0: 保護が無いことを必ず言う。**降格先になったので、ここの正直さが要る。**
+        // Tier0: 保護が無いことを必ず言う。**ユーザーが明示的に選ぶ保護の無い器なので、ここの正直さが要る。**
         let tier0 = line(ShellTier::Tier0);
         assert!(
             tier0.contains("物理的に拒否されません"),

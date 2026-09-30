@@ -264,7 +264,7 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
-/// `run_shell`（`crates/harness-tools/src/shell.rs`）とポリシーエディタの記録モード
+/// `run_shell`（`crates/harness-tools/src/shell/mod.rs`）とポリシーエディタの記録モード
 /// （`plans/POLICY-EDITOR-TOMOYO-DIG.md`）の両方が使う、子プロセスへ注入する環境変数の
 /// 純粋な組み立て。`docs/CODE-STRUCTURE-RULES.md`規則5——同じロジックを2箇所に複製しない。
 ///

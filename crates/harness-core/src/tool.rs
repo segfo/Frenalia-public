@@ -477,7 +477,7 @@ impl ShellTierSelection {
         }
     }
 
-    /// D8: fs passthroughの到達不能診断を積む（`direct`/`downgraded`と組み合わせて使う）。
+    /// D8: fs passthroughの到達不能診断を積む（`direct`と組み合わせて使う）。
     pub fn with_passthrough_warnings(mut self, warnings: Vec<String>) -> Self {
         self.passthrough_warnings = warnings;
         self
@@ -492,8 +492,7 @@ impl ShellTierSelection {
         self
     }
 
-    /// 実際にACE付与が確認できたpassthroughルートの一覧を積む（`direct`と組み合わせて使う。
-    /// `preflight`が失敗した`downgraded`経路では常に空のまま）。
+    /// 実際にACE付与が確認できたpassthroughルートの一覧を積む（`direct`と組み合わせて使う）。
     pub fn with_granted_passthrough(mut self, granted: Vec<GrantedPassthrough>) -> Self {
         self.granted_passthrough = granted;
         self

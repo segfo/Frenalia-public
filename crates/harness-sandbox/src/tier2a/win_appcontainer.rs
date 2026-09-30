@@ -893,7 +893,7 @@ pub use workspace_prepare::{
 /// `preflight`を呼ぶ実機テストは必ずこれを使い、旧共有プロファイル`CONTAINER_NAME`を
 /// 使ってはいけない。D-37でプロファイルはセッション単位になり、`preflight`がworkspace・
 /// CoW 差分層・redirector DLLへACEを付ける先も、製品が子プロセスを起動するSID
-/// （`harness-tools/src/shell.rs`）も、どちらもセッションSIDになった。テストだけが
+/// （`harness-tools/src/shell/`）も、どちらもセッションSIDになった。テストだけが
 /// `CONTAINER_NAME`のまま取り残されると、**`preflight`は正しくACEを付けるのに子はそのACEを
 /// 持たない別のSIDで動く**——redirector DLLを読めず`LoadLibraryW`がNULLを返す。
 /// これが`docs/STATUS.md`旧Tier2a残課題#7（CoW封じ込めE2E 16/17赤）の正体だった。

@@ -972,7 +972,7 @@ pub fn preflight_with_privhelper_launcher(
         // 迂回時にfail-closeせず実ファイルへ直接書けてしまい、workspace本体との一貫性が崩れる
         // （BUG-043発見時の実機検証を経てユーザー指摘により追加、2026-08-02）。`requested`
         // （ユーザーが本来要求したアクセス）は`granted_passthrough`の記録に使い、
-        // `ext_capture_roots`（`crates/harness-tools/src/shell.rs`）の判定材料として残す。
+        // `ext_capture_roots`（`win_appcontainer/launch.rs`が書込可の行から組む）の判定材料として残す。
         //
         // **和（`ReadWriteExec`）が来たときは実行権だけ残す。** ここで落としているのは
         // 「書込をRedirector DLLのフックへ強制的に通す」ためであって、ユーザーが明示的に

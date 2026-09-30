@@ -23,7 +23,7 @@
 //! | 名前付きmutexの生存確認（[`crate::win_common::mutex_exists`]） | 所有者プロセスがまだ生きているか | `workspace_ledger` |
 //!
 //! **台帳を`%ProgramData%`へ置く理由**: 読み書きするのは昇格した`harness-netfilterd.exe`だけ
-//! なので、ユーザープロファイル配下（`%APPDATA%`の既存4台帳）ではなくマシン全体で1本にできる。
+//! なので、ユーザープロファイル配下（`%APPDATA%`の台帳。一覧は`harness_grant_ledger::CONFIG_DIR_LEDGERS`）ではなくマシン全体で1本にできる。
 //! exemptionリスト自体がマシン全体で1本である以上、それを数える台帳も同じ粒度でなければ
 //! 参照カウントが割れる（別ユーザー・別ターミナルセッションのharnessが同時に動く場合）。
 //! 所有者マーカーmutexを`Global\`名前空間にするのも同じ理由（作成にはSeCreateGlobalPrivilegeが
@@ -49,7 +49,7 @@ use crate::win_common::{hold_mutex_for_process_lifetime, mutex_exists, sid_to_st
 /// OSのexemption一覧と台帳の読み書きを丸ごと囲む臨界区間。Get→変更→Setの間に他プロセスが
 /// 割り込むと、他プロセスが追加したexemptionを取りこぼす（lost update）。
 const EXEMPTION_LOCK: &str = r"Global\harness-loopback-exemption";
-/// 台帳ファイル自身のRMWロック（他の4台帳と同じ方針、D-27/R-01）。常に[`EXEMPTION_LOCK`]の
+/// 台帳ファイル自身のRMWロック（`%APPDATA%`の台帳と同じ方針、D-27/R-01）。常に[`EXEMPTION_LOCK`]の
 /// 内側でのみ取る。
 const LEDGER_LOCK: &str = r"Global\harness-loopback-exemption-ledger";
 const LEDGER_FILE: &str = "loopback-exemption-ledger.json";

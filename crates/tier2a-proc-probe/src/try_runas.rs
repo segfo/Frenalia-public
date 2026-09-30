@@ -18,8 +18,8 @@
 //! ことを目視確認した。AppContainerトークンはAPI呼び出しの時点でシェルに拒否され、UAC同意
 //! ブローカ（consent.exe/AIS）へは一切到達しない。リンク2（入れ子harnessが特権昇格ブローカへ
 //! 到達する経路）は実機でも構造的に閉じている。この`ERROR_ACCESS_DENIED`(5)は、
-//! `crates/harness-sandbox/src/win_appcontainer.rs`の回帰テスト
-//! `traverse_diagnostics::appcontainer_child_cannot_reach_uac_elevation_broker`が固定assert
+//! `crates/harness-sandbox/src/tier2a/win_appcontainer/ace_grant_revoke_tests.rs`の回帰テスト
+//! `appcontainer_child_cannot_reach_uac_elevation_broker`が固定assert
 //! している値でもある。
 //!
 //! **副次的な発見**: 初回検証時は`SEE_MASK_FLAG_NO_UI`を付けていなかった。このとき同じ拒否は

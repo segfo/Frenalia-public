@@ -3,7 +3,7 @@
 //! `kernel32!CreateProcessA`または`kernel32!WinExec`で直接起動して完了を待ち、結果をJSONで
 //! 報告するだけの短絡モード（`try_runas`と同じ位置付け）。
 //!
-//! `cow_diagnostics`（`crates/harness-sandbox/src/win_appcontainer.rs`）が、このプローブ自身を
+//! `cow_containment_tests`（旧称`cow_diagnostics`、`crates/harness-sandbox/src/tier2a/win_appcontainer/`）が、このプローブ自身を
 //! Redirector DLL注入済みの孫プロセスとして起動し、このプローブが`CreateProcessA`/`WinExec`
 //! 経由でひ孫プロセスを起動したときにもDLLが再注入され、ひ孫の書込がCoW 差分層へ透過
 //! リダイレクトされることを確認するために使う。

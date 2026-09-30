@@ -8,7 +8,7 @@
 //! 実行方法・前提条件は`docs/DEV-ENVIRONMENT.md`「Tier2a E2Eテストの実行方法」参照。
 //! 実AppContainer・実CoW 差分層ディレクトリ・（ネット側は）実インターネット到達性を使う
 //! 重い/副作用ありのテストのため、既定の`cargo test`では走らない（`#[ignore]`、
-//! `crates/harness-sandbox/src/win_appcontainer.rs`の既存規約と同じ）。
+//! `crates/harness-sandbox/src/tier2a/win_appcontainer.rs`の既存規約と同じ）。
 //!
 //! ワークスペースは`C:\harness-e2e\<case>\`固定（`%TEMP%`を使うと`preflight`がプロファイル
 //! 全階層のtraverse ACEを恒久付与し、保護対象の`traverse-grant-ledger.json`を汚すため、
@@ -4822,7 +4822,7 @@ fn wfp_fail_closed_launcher_exe_with_mode(dir_name: &str, mode: Option<&str>) ->
 /// `harness-netfilterd.exe`の解決先を即座に切断するモックへ差し替えることで、
 /// `NetfilterHandle::start`のハンドシェイクを確実に失敗させる（実WFPエンジン・実netfilterdは
 /// 一切起動しない、決定論的なフォールト注入）。`should_grant_tier2a_network_capability`
-/// （`crates/harness-tools/src/shell.rs`）により、この状態ではAppContainer capability自体が
+/// （`crates/harness-tools/src/shell/net_decision.rs`）により、この状態ではAppContainer capability自体が
 /// `Deny`になる——example.comを明示許可していても、Layer1協調プロキシへの縮退運用にすら
 /// ならず、ソケット生成そのものが一切できない、より強いfail-closed（`main.rs`のWFP起動失敗
 /// 警告文言もこの挙動に合わせて修正済み）。既存のcase 01（ドメイン未指定）と同じ

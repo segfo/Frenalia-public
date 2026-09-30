@@ -99,7 +99,7 @@ pub(crate) fn preflight_for_test(
 /// だけでよい。引数を1本足す形にしなかったのは、19箇所の呼び出しを機械的に置換できる方が
 /// 取りこぼしが無いためである。
 ///
-/// [BUG-082] `run_shell`（`crates/harness-tools/src/shell.rs`）と同じく、spawnの**前**に
+/// [BUG-082] `run_shell`（`crates/harness-tools/src/shell/`）と同じく、spawnの**前**に
 /// `grant_job::wait_until_done()`を通す。D-54の背景ジョブがrootへの伝播（フェーズ0）まで
 /// 引き受けるようになったため、`preflight`直後に子を起こすテストは、既存の（新規作成でない）
 /// ファイルが**まだ見えていない**状態を踏みやすくなった——旧実装はrootへの伝播が`preflight`の
