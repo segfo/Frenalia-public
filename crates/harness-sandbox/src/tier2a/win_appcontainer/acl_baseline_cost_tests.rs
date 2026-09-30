@@ -16,7 +16,7 @@
 //!
 //! > **このファイルは2026-09-01に「#20が閉じたら#20の測定5・6も消す」と書いていた。** それは測る前の
 //! > 見込みで、翌日#20を閉じたときに「残す」へ決め直されていた
-//! > （`plans/HANDOFF-ISSUE-20-SUBJECT-MIGRATION.md`、`plans/handoff/issue20-measure/INDEX.md`）。
+//! > （`plans/handoff/issue20-measure/INDEX.md`）。
 //! > ここだけが古いまま残っており、2026-09-30の掃除で一度それに従って消しかけた。
 //!
 //! **接頭辞`acl_ace_count_cost_*`を共有していても寿命が違う。** 接頭辞だけを見て消さないこと。

@@ -611,7 +611,7 @@ fn only_the_declared_access_class_is_carried_to_the_child() {
     );
 }
 
-/// **受け入れ条件（測定1、`plans/HANDOFF-ISSUE-20-SUBJECT-MIGRATION.md`）**:
+/// **受け入れ条件（残課題#20の測定1。結果は`plans/mac-spike/RESULTS.md` §S38）**:
 /// `--sandbox tier2a-cow`のRO降格を通しても、運ばれる宛先SIDは**実際にACEを書いた級**のものである。
 ///
 /// # 壊れた状態を一文で

@@ -271,7 +271,7 @@ fn the_gc_path_also_takes_the_capability_ace_off_the_diff_layer() {
 /// 子が「起動して、コマンドを解釈するところまでは進んだ」ことの印（`B-33`）。
 const SWITCH_ALIVE_MARKER: &str = "HARNESS-SWITCH-CHILD-ALIVE";
 
-/// **受け入れ条件4（測定4、`plans/HANDOFF-ISSUE-20-SUBJECT-MIGRATION.md`）**:
+/// **受け入れ条件4（残課題#20の測定4。結果は`plans/mac-spike/RESULTS.md` §S39）**:
 /// セッションを切り替えても、**前のセッションの差分層のcapability SIDは子へ持ち越されない**。
 ///
 /// # 壊れた状態を一文で
