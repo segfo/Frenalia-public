@@ -174,7 +174,8 @@ pub fn is_harness_control_path(path: &str) -> bool {
 /// harness自身のAppContainerプロファイル（`%LOCALAPPDATA%\Packages\<プロファイル名>`）配下か。
 ///
 /// **綴りの正本は`harness_sandbox`側**（`session_profile::token_of_profile`）で、
-/// `harness.shell.sandbox.<token>`と`harness.mcp.<token>.<server-id>`の両方を1関数で見分ける。
+/// `harness.shell.sandbox.<token>`・`harness.mcp.<token>.<server-id>`・
+/// `harness.domain.<token>.<domain>`の3族を1関数で見分ける。
 /// ここで`"harness.shell.sandbox"`と書き写すと、プロファイル名の形が変わったときに
 /// 静かにずれる（B-05: 型で守れない複製は実行時にずれる）。
 pub fn is_sandbox_profile_path(path: &str) -> bool {

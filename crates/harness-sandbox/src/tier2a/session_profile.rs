@@ -134,6 +134,38 @@ pub struct SessionEntry {
     pub domains: Vec<DomainProfileEntry>,
 }
 
+impl SessionEntry {
+    /// このセッションが持つ**入れ物（AppContainerプロファイル）の名前をすべて**返す
+    /// ——`run_shell`用・MCPサーバ用・遷移先ドメイン用。
+    ///
+    /// # なぜ1か所にするのか（#63）
+    ///
+    /// 台帳のエントリから名前を集める処理が5か所にあり、`domains`の欄を足した回に
+    /// **2か所（`live_profile_names`・`revocable_profile_names`）へ届かなかった**。
+    /// 走行中のセッションの遷移先ドメインが「残す側」の名簿から漏れ、掃除がその入れ物宛の
+    /// ACEを剥がし得る状態になっていた（BUG-053と同じ形）。
+    ///
+    /// # 欄を`..`無しで全部名指しする（コンパイル時の見張り）
+    ///
+    /// **入れ物の族をもう1つ足したら、ここでビルドが落ちる。** そのとき問うのは
+    /// 「その欄は入れ物の名前を持つか」である——持つならここへ足す。足さずに`_`で黙らせると、
+    /// #63と同じ漏れがもう1度起きる。
+    pub(crate) fn profile_names(&self) -> impl Iterator<Item = &str> {
+        let SessionEntry {
+            token: _,
+            profile_name,
+            granted_paths: _,
+            created_at_unix_secs: _,
+            granted_capabilities: _,
+            mcp,
+            domains,
+        } = self;
+        std::iter::once(profile_name.as_str())
+            .chain(mcp.iter().map(|m| m.profile_name.as_str()))
+            .chain(domains.iter().map(|d| d.profile_name.as_str()))
+    }
+}
+
 /// [§22.3.2] capability SID宛に付けたACE1件（`(パス, 導出済みのcapability名)`）。
 ///
 /// **名前を持つことがこの型の全てである。** capability SIDは名前の一方向ハッシュ
@@ -232,19 +264,28 @@ pub fn token_owner_is_live(token: &str) -> bool {
 
 /// harness由来のプロファイル名からセッショントークンを取り出す。
 ///
-/// `run_shell`用は`harness.shell.sandbox.<token>`、MCPサーバ用は
-/// `harness.mcp.<token>.<server-id>`。**どちらもトークンで生存判定する**ので、GCは種別を
-/// 意識せずに回収できる（MCPプロファイルはセッションと同じ寿命、`mcp_profile`のdoc参照）。
+/// 族は3つある——`run_shell`用は`harness.shell.sandbox.<token>`、MCPサーバ用は
+/// `harness.mcp.<token>.<server-id>`、遷移先ドメイン用は`harness.domain.<token>.<domain>`。
+/// **どれもトークンで生存判定する**ので、GCは種別を意識せずに回収できる（どの族も
+/// セッションと同じ寿命、`mcp_profile`・`domain_profile`のdoc参照）。
+///
+/// **持ち主の判定の唯一の入口である。** 回収（`plan_reclaim`）・名簿（`live_profile_names`・
+/// `revocable_profile_names`）・自分を除く判定（`without_session`）・作成の見張り
+/// （`owner_of_profile`→`ensure_profile`）がすべてここを通る。**族を足したらここへ足す**——
+/// 足し忘れた族は、生きていても死んでいても「harness由来ではない」と同じ`None`になり、
+/// 回収からも名簿からも無言で漏れる（#63。遷移先ドメインの族が2026-09-30までそうだった）。
 pub fn token_of_profile(name: &str) -> Option<&str> {
     if let Some(token) = name.strip_prefix(&format!("{PROFILE_PREFIX}.")) {
         return (!token.is_empty()).then_some(token);
     }
-    let suffix = name.strip_prefix(&format!(
+    if let Some(suffix) = name.strip_prefix(&format!(
         "{}.",
         crate::tier2a::mcp_profile::MCP_PROFILE_PREFIX
-    ))?;
-    let (token, server_id) = suffix.rsplit_once('.')?;
-    (!token.is_empty() && !server_id.is_empty()).then_some(token)
+    )) {
+        let (token, server_id) = suffix.rsplit_once('.')?;
+        return (!token.is_empty() && !server_id.is_empty()).then_some(token);
+    }
+    crate::tier2a::domain_profile::token_of_domain_profile(name)
 }
 
 /// **生きているセッションがまだ使っているcapability宛の付与**（`(パス, capability名)`の集合）。
@@ -352,16 +393,12 @@ pub fn plan_reclaim(
             });
         }
     }
+    // 台帳に載っている入れ物（どの族も）を「台帳に無い」と数えない
+    // ——数えると`grants_known: false`として二重に拾われる。
     let known: std::collections::HashSet<&str> = ledger
         .sessions
         .iter()
-        .flat_map(|e| {
-            std::iter::once(e.profile_name.as_str())
-                .chain(e.mcp.iter().map(|m| m.profile_name.as_str()))
-                // [#55] 台帳に載っているドメインの入れ物を「台帳に無い」と数えない
-                // ——数えると`grants_known: false`として二重に拾われる。
-                .chain(e.domains.iter().map(|d| d.profile_name.as_str()))
-        })
+        .flat_map(SessionEntry::profile_names)
         .collect();
     for name in existing_profiles {
         if known.contains(name.as_str()) {
@@ -392,7 +429,7 @@ pub fn plan_reclaim(
 /// でき、それは永久に残る（B-05: コンパイラが守らない一致には唯一の判定点を置く）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileOwner<'a> {
-    /// このプロセスのセッションのもの（`run_shell`用・MCPサーバ用の両方）。
+    /// このプロセスのセッションのもの（`run_shell`用・MCPサーバ用・遷移先ドメイン用のどれも）。
     ThisSession,
     /// **他プロセス**のセッションのもの。作ってよいのは持ち主だけ。
     OtherSession(&'a str),
@@ -455,7 +492,7 @@ mod win {
     }
 
     /// `%LOCALAPPDATA%\Packages`から接頭辞付きプロファイル名を列挙する（台帳非依存の回収経路）。
-    /// `run_shell`用（D-37）とMCPサーバ用（D-38）の両方を拾う。
+    /// `run_shell`用（D-37）・MCPサーバ用（D-38）・遷移先ドメイン用（§22.9）の3族を拾う。
     pub(super) fn existing_profiles() -> Vec<String> {
         let Some(local) = std::env::var_os("LOCALAPPDATA") else {
             return Vec::new();
@@ -1403,39 +1440,72 @@ pub const LEGACY_SHARED_PROFILE: &str = PROFILE_PREFIX;
 /// 「実行中の他セッションから権限を奪う」誤りになる。
 pub fn revocable_profile_names() -> Vec<String> {
     let mut names = vec![LEGACY_SHARED_PROFILE.to_string()];
-    let ledger_names: Vec<(String, Vec<String>)> = ledger()
-        .load()
-        .sessions
-        .into_iter()
-        .map(|e| {
-            let profiles = std::iter::once(e.profile_name)
-                .chain(e.mcp.into_iter().map(|m| m.profile_name))
-                .collect();
-            (e.token, profiles)
-        })
-        .collect();
-    for (token, profiles) in ledger_names {
-        if win::is_live(&token) {
-            continue;
-        }
-        for profile in profiles {
-            if !names.contains(&profile) {
-                names.push(profile);
-            }
-        }
-    }
-    for profile in win::existing_profiles() {
-        let Some(token) = token_of_profile(&profile) else {
-            continue;
-        };
-        if !win::is_live(token) && !names.contains(&profile) {
-            names.push(profile);
+    for name in profile_names_by_liveness(
+        &ledger().load(),
+        &win::existing_profiles(),
+        &win::is_live,
+        Liveness::Dead,
+    ) {
+        if !names.contains(&name) {
+            names.push(name);
         }
     }
     names
 }
 
-/// **生存している**セッション（とそのMCPサーバ）のプロファイル名を列挙する。
+/// 名簿をどちら側で取るか（[`profile_names_by_liveness`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    /// 走行中のセッションのもの（残す側、[`live_profile_names`]）。
+    Live,
+    /// 走っていないセッションのもの（撤収してよい側、[`revocable_profile_names`]）。
+    Dead,
+}
+
+/// [`live_profile_names`]と[`revocable_profile_names`]の**判定部分**（純粋関数）。
+///
+/// # なぜ1本にしたのか（#63）
+///
+/// 2つは「残す側」と「撤収してよい側」の**対**である。別々に書いていた間に、両方とも
+/// 同じ族（遷移先ドメイン）を落としていた——台帳側は`domains`の欄を読まず、実在の列挙側は
+/// 持ち主の判定がその族を解釈しなかった。対の操作は同じ実装を向きだけ変えて通す
+/// （`docs/CODE-STRUCTURE-RULES.md`§5.1）。非対称なのは、撤収してよい側だけが旧共有
+/// プロファイルを先頭に持つことだけで、それは呼び出し側（殻）に閉じてある。
+///
+/// # 材料は2つ（二重化）
+///
+/// 台帳（名前を持っている）と、実在するプロファイルの列挙（台帳が失われても接頭辞と
+/// 生存マーカーで判定できる）。実世界は引数で受ける（`plan_reclaim`と同じ形）。
+pub(crate) fn profile_names_by_liveness(
+    ledger: &SessionLedger,
+    existing_profiles: &[String],
+    is_live: &dyn Fn(&str) -> bool,
+    side: Liveness,
+) -> Vec<String> {
+    let on_this_side = |token: &str| is_live(token) == (side == Liveness::Live);
+    let mut names: Vec<String> = Vec::new();
+    for entry in &ledger.sessions {
+        if !on_this_side(&entry.token) {
+            continue;
+        }
+        for profile in entry.profile_names() {
+            if !names.iter().any(|n| n == profile) {
+                names.push(profile.to_string());
+            }
+        }
+    }
+    for profile in existing_profiles {
+        let Some(token) = token_of_profile(profile) else {
+            continue;
+        };
+        if on_this_side(token) && !names.contains(profile) {
+            names.push(profile.clone());
+        }
+    }
+    names
+}
+
+/// **生存している**セッション（とそのMCPサーバ・遷移先ドメイン）のプロファイル名を列挙する。
 ///
 /// [`revocable_profile_names`]の裏返しで、「剥がしてはいけない側」を明示的に取るための関数。
 /// 台帳に無いACEを既知パスから掃く経路（BUG-059の孤立ACE回収、`preflight`）が使う——
@@ -1446,30 +1516,12 @@ pub fn revocable_profile_names() -> Vec<String> {
 /// 実行中の他セッションのACEを巻き込まないことが、この関数の唯一の存在意義である
 /// （BUG-053で直したのと同じ「実行中の他セッションから権限を奪う」誤りを繰り返さない）。
 pub fn live_profile_names() -> Vec<String> {
-    let mut names = Vec::new();
-    for entry in ledger().load().sessions {
-        if !win::is_live(&entry.token) {
-            continue;
-        }
-        for profile in
-            std::iter::once(entry.profile_name).chain(entry.mcp.into_iter().map(|m| m.profile_name))
-        {
-            if !names.contains(&profile) {
-                names.push(profile);
-            }
-        }
-    }
-    // 台帳が失われていても、接頭辞付きプロファイルの列挙と生存マーカーで生存判定はできる
-    // （`revocable_profile_names`と同じ二重化）。
-    for profile in win::existing_profiles() {
-        let Some(token) = token_of_profile(&profile) else {
-            continue;
-        };
-        if win::is_live(token) && !names.contains(&profile) {
-            names.push(profile);
-        }
-    }
-    names
+    profile_names_by_liveness(
+        &ledger().load(),
+        &win::existing_profiles(),
+        &win::is_live,
+        Liveness::Live,
+    )
 }
 
 /// 走行中の**他の**セッション（このプロセス自身のものを除く）のプロファイル名。
@@ -1769,6 +1821,106 @@ mod tests {
     fn another_sessions_mcp_profile_still_blocks() {
         let other = crate::tier2a::mcp_profile::mcp_profile_name_for("999-1", "company-docs");
         assert_eq!(without_session(vec![other.clone()], "1234-5"), vec![other]);
+    }
+
+    /// [#63] 自分の遷移先ドメインの入れ物（`harness.domain.<token>.<domain>`）も自分の一部として除く。
+    ///
+    /// MCPと同じ理由——判定をトークンで行うので、持ち主の判定がこの族を解釈できないと、
+    /// 自分のドメインの入れ物だけが「他人」として残り、自分の撤収を止める。
+    /// 名簿（`live_profile_names`）がドメインを拾うようになった回から、これが効き始める。
+    #[test]
+    fn the_callers_own_domain_profiles_are_part_of_itself() {
+        let own = "1234-5";
+        let live = vec![
+            profile_name_for(own),
+            crate::tier2a::domain_profile::domain_profile_name_for(own, "cargo"),
+        ];
+        let others = without_session(live, own);
+        assert!(others.is_empty(), "{others:?}");
+    }
+
+    /// 他セッションの遷移先ドメインの入れ物は他人として残る（上の裏）。
+    #[test]
+    fn another_sessions_domain_profile_still_blocks() {
+        let other = crate::tier2a::domain_profile::domain_profile_name_for("999-1", "cargo");
+        assert_eq!(without_session(vec![other.clone()], "1234-5"), vec![other]);
+    }
+
+    // --- 残す側と撤収してよい側の名簿（`profile_names_by_liveness`） ---
+    //
+    // **どの族も両側を対で見る**（B-35）。片側だけだと、「全部を残す側に入れる」実装でも
+    // 「どちらにも入れない」実装でも片方は緑のままになる。後者が#63の壊れ方だった。
+
+    fn keep_and_revocable(
+        ledger: &SessionLedger,
+        existing: &[String],
+        live: &HashSet<String>,
+    ) -> (Vec<String>, Vec<String>) {
+        (
+            profile_names_by_liveness(ledger, existing, &liveness(live), Liveness::Live),
+            profile_names_by_liveness(ledger, existing, &liveness(live), Liveness::Dead),
+        )
+    }
+
+    /// [#63] 台帳に載った、走行中のセッションの遷移先ドメインは「残す側」にだけ載る。
+    #[test]
+    fn a_running_sessions_domain_profile_in_the_ledger_is_kept() {
+        let ledger = SessionLedger {
+            sessions: vec![entry_with_domains("alive", &["cargo"])],
+        };
+        let live: HashSet<String> = ["alive".to_string()].into_iter().collect();
+        let domain = crate::tier2a::domain_profile::domain_profile_name_for("alive", "cargo");
+
+        let (keep, revocable) = keep_and_revocable(&ledger, &[], &live);
+        assert!(keep.contains(&domain), "keep={keep:?}");
+        assert!(!revocable.contains(&domain), "revocable={revocable:?}");
+    }
+
+    /// 裏: 走っていないセッションの遷移先ドメインは「撤収してよい側」にだけ載る。
+    #[test]
+    fn a_dead_sessions_domain_profile_in_the_ledger_is_revocable() {
+        let ledger = SessionLedger {
+            sessions: vec![entry_with_domains("dead", &["cargo"])],
+        };
+        let domain = crate::tier2a::domain_profile::domain_profile_name_for("dead", "cargo");
+
+        let (keep, revocable) = keep_and_revocable(&ledger, &[], &HashSet::new());
+        assert!(revocable.contains(&domain), "revocable={revocable:?}");
+        assert!(!keep.contains(&domain), "keep={keep:?}");
+    }
+
+    /// 台帳が失われても、実在の列挙から同じ判定ができる（台帳側との二重化）。
+    /// こちらは持ち主の判定（`token_of_profile`）を通るので、台帳側とは別の半分を測る。
+    #[test]
+    fn a_domain_profile_found_only_on_the_machine_is_sorted_by_its_owner() {
+        let running = crate::tier2a::domain_profile::domain_profile_name_for("alive", "cargo");
+        let orphan = crate::tier2a::domain_profile::domain_profile_name_for("dead", "cargo");
+        let existing = vec![running.clone(), orphan.clone()];
+        let live: HashSet<String> = ["alive".to_string()].into_iter().collect();
+
+        let (keep, revocable) = keep_and_revocable(&SessionLedger::default(), &existing, &live);
+        assert_eq!(keep, vec![running], "keep");
+        assert_eq!(revocable, vec![orphan], "revocable");
+    }
+
+    /// 族を問わず同じ判定を通っていること（シェル用・MCP用が崩れていないことの確認を兼ねる）。
+    #[test]
+    fn every_profile_family_of_a_running_session_is_kept() {
+        let mut e = entry_with_domains("alive", &["cargo"]);
+        e.mcp = entry_with_mcp("alive", &[("docs", &[])]).mcp;
+        let ledger = SessionLedger { sessions: vec![e] };
+        let live: HashSet<String> = ["alive".to_string()].into_iter().collect();
+
+        let (keep, revocable) = keep_and_revocable(&ledger, &[], &live);
+        assert_eq!(
+            keep,
+            vec![
+                profile_name_for("alive"),
+                crate::tier2a::mcp_profile::mcp_profile_name_for("alive", "docs"),
+                crate::tier2a::domain_profile::domain_profile_name_for("alive", "cargo"),
+            ]
+        );
+        assert!(revocable.is_empty(), "{revocable:?}");
     }
 
     /// 生存しているものが1つも無ければ空（判定材料が無いときに撤収を止めない、
@@ -2793,6 +2945,34 @@ mod tests {
         assert_eq!(targets[0].profile_name, "harness.mcp.orphan.docs");
     }
 
+    /// [#63] 台帳に載らずに残った**遷移先ドメイン**の入れ物も、接頭辞の実在から回収できる。
+    ///
+    /// # 壊れた状態を一文で
+    ///
+    /// **台帳から外れたドメインの入れ物が、回収も報告もされずに残り続ける。** 持ち主の判定
+    /// （[`token_of_profile`]）がこの族を解釈しないと、実在の列挙が拾った名前をここで黙って
+    /// 捨てる——`grants_known: false`としてすら出ないので、`kept_unknown`の報告にも載らない。
+    /// 台帳から外れるのは、`record_domain_profile`が台帳を開けなかった回（BUG-107の警告）と、
+    /// シェル用の入れ物だけ消せてエントリごと落ちた回である。
+    ///
+    /// 走行中のセッションのものを拾わないことを同じテストで見る（B-35）。
+    #[test]
+    fn orphan_domain_profiles_are_reclaimed_by_prefix_alone() {
+        let orphan = crate::tier2a::domain_profile::domain_profile_name_for("orphan", "cargo");
+        let running = crate::tier2a::domain_profile::domain_profile_name_for("running", "cargo");
+        let existing = vec![orphan.clone(), running, "some.other.appcontainer".to_string()];
+        let mut live = HashSet::new();
+        live.insert("running".to_string());
+
+        let targets = plan_reclaim(&SessionLedger::default(), &existing, &liveness(&live));
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].profile_name, orphan);
+        assert!(
+            !targets[0].grants_known,
+            "an orphan without a ledger entry has unknown grants and must be reported as such"
+        );
+    }
+
     /// 台帳にあるMCPプロファイルを、実在プロファイル側で二重に数えない。
     #[test]
     fn a_dead_mcp_profile_is_reclaimed_once_even_if_both_sources_see_it() {
@@ -2819,6 +2999,21 @@ mod tests {
         );
         assert_eq!(token_of_profile("harness.mcp.1234-5678"), None);
         assert_eq!(token_of_profile("microsoft.windowsterminal"), None);
+    }
+
+    /// [#63] 遷移先ドメインの族からもトークンを取り出す。形の崩れた名前には当てない。
+    ///
+    /// 当てると、他人の入れ物を自分のものとして回収する（`domain_profile::token_of_domain_profile`
+    /// のdoc）。
+    #[test]
+    fn tokens_are_extracted_from_the_domain_family_too() {
+        assert_eq!(
+            token_of_profile("harness.domain.1234-5678.cargo"),
+            Some("1234-5678")
+        );
+        // ドメイン名の無い名前・空の要素は、この族の名前ではない。
+        assert_eq!(token_of_profile("harness.domain.1234-5678"), None);
+        assert_eq!(token_of_profile("harness.domain..cargo"), None);
     }
 
     /// 既存の台帳ファイル（`mcp`フィールドが無い）をそのまま読めること。実マシンには
@@ -2883,6 +3078,27 @@ mod tests {
         assert_eq!(
             owner_of_profile("microsoft.windowsterminal"),
             ProfileOwner::Unowned
+        );
+    }
+
+    /// [#63] 遷移先ドメインの族も同じ3分岐に乗る（禁止側と許可側を対で置く、B-35）。
+    ///
+    /// 乗っていないと、この族は`Unowned`（旧共有プロファイルと同じ扱い）になり、
+    /// `ensure_profile`が**他セッションの名前のドメインの入れ物を拒まずに作る**——BUG-107の見張りが
+    /// この族にだけ効かない。
+    #[test]
+    fn domain_profiles_have_an_owner_like_the_other_families() {
+        assert_eq!(
+            owner_of_profile(&crate::tier2a::domain_profile::domain_profile_name_for(
+                "999999-1", "cargo"
+            )),
+            ProfileOwner::OtherSession("999999-1")
+        );
+        assert_eq!(
+            owner_of_profile(&crate::tier2a::domain_profile::current_domain_profile_name(
+                "cargo"
+            )),
+            ProfileOwner::ThisSession
         );
     }
 }

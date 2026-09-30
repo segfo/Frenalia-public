@@ -15,6 +15,7 @@
 //! | 2 | capability SID宛ACEは**掃除の視野に入らない**（意図された限界） | `the_sweep_is_blind_to_capability_sids_so_workspace_and_traverse_grants_survive` |
 //! | 3 | 掃除が使う「残す側の名簿」が、**走行中の自分を含み・死んだセッションを含まない** | `the_live_list_keeps_this_session_and_excludes_one_that_is_no_longer_running` |
 //! | 4 | 掃除が見に行く先は**走っている実行ファイルの隣だけ**である | `the_sweep_only_ever_looks_next_to_the_running_executable` |
+//! | 5 | 走行中のセッションの**遷移先ドメイン**も残す側に載り、そのACEが**残る**（死んだものは剥がれる） | `the_sweep_leaves_a_running_sessions_transition_domain_alone` |
 //!
 //! # なぜ許可側（残る側）を必ず対にするのか
 //!
@@ -43,7 +44,7 @@
 //!
 //! 1・2・4は一時ディレクトリしか触らないので、通常の`cargo test`で回る。
 //!
-//! **3だけは実台帳**（`%APPDATA%\harness\config\appcontainer-session-ledger.json`）へ
+//! **3と5だけは実台帳**（`%APPDATA%\harness\config\appcontainer-session-ledger.json`）へ
 //! このプロセスのセッションエントリを開き、最後に自分で落とす。並列実行中の隣のテストから
 //! 記録を奪い得るので`#[ignore]`にしてあり、専用ターゲットから**直列で**回す
 //! （理由の全文は同テストのdoc）。
@@ -293,6 +294,82 @@ fn the_live_list_keeps_this_session_and_excludes_one_that_is_no_longer_running()
     assert!(
         !tokens.contains(&session_profile::session_token().to_string()),
         "the measurement must not leave its own session entry behind either; tokens={tokens:?}"
+    );
+}
+
+/// **測定5**（`docs/STATUS.md`「サンドボックス周辺 #63」）: 走行中のセッションの
+/// **遷移先ドメイン**の入れ物宛のACEも、掃除で剥がれない。死んだセッションのものは剥がれる。
+///
+/// # 壊れた状態を一文で
+///
+/// **別のセッションの起動が、走行中の遷移先ドメインから権限を剥がす**（BUG-053と同じ形）。
+/// 残す側の名簿（`live_profile_names`）は台帳の`domains`を拾わず、実在の列挙から拾う側も
+/// 持ち主の判定（`token_of_profile`）がこの族を解釈しなかったので、遷移先ドメインは
+/// 生きていても名簿に載らなかった。掃除（`revoke_stale_appcontainer_aces`）は名簿に無い
+/// package SIDを**持ち主を確かめずに全部**剥がす。
+///
+/// # 今は実害が無い——それでも部品の単位で固定する理由
+///
+/// 2026-09-30時点で、遷移先ドメインの**package SID宛**のACEは1本も付けていない（土台は全部
+/// capability SID宛で、`domain_provision_tests`がそれを固定している）。付ける回が来た瞬間に
+/// 症状になり、しかも壊れるのは剥がされた側（別のプロセスの子が`ACCESS_DENIED`で落ちる）
+/// なので、剥がした側のログをいくら読んでも原因に辿り着けない。
+///
+/// # なぜ`#[ignore]`なのか
+///
+/// 測定3と同じ——実台帳へ自分のセッションとドメインのエントリを開く。**プロファイルは作らない**
+/// （`record_domain_profile`は台帳だけを書き、SIDは`fabricate_subject`で名前から導くだけ）。
+#[test]
+#[ignore = "writes to the real session ledger; run via dev-elevated-run redirector-dll-sweep"]
+fn the_sweep_leaves_a_running_sessions_transition_domain_alone() {
+    use crate::tier2a::{domain_profile, session_profile};
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let dll = dir.path().join("harness_redirector.dll");
+    std::fs::write(&dll, b"not really a dll").expect("write the probe file");
+
+    // 許可側: 自分は走っていて、遷移先ドメインを1つ用意した（台帳だけ）。
+    // **後始末はassertより先に武装する**（測定3と同じ理由）。
+    let _ = session_session_name(&session_profile::begin_session());
+    let _forget_own = scopeguard(|| {
+        session_profile::forget_session_entry_for_test(session_profile::session_token())
+    });
+    let live_domain = session_profile::record_domain_profile("s63keep");
+    // 禁止側: 走っていないセッションの遷移先ドメイン。台帳にも載せない（孤児の形）。
+    let dead_domain = domain_profile::domain_profile_name_for("999999-1", "s63keep");
+
+    let (live_sid, live_text) = fabricate_subject(&live_domain);
+    let (dead_sid, dead_text) = fabricate_subject(&dead_domain);
+    grant_ace_inheritable_access(&dll, live_sid.as_psid(), FsAccess::ReadExec)
+        .expect("grant the running domain's ACE");
+    grant_ace_inheritable_access(&dll, dead_sid.as_psid(), FsAccess::ReadExec)
+        .expect("grant the dead domain's ACE");
+    let _cleanup = scopeguard(|| {
+        let _ = revoke_ace(&dll, live_sid.as_psid());
+        let _ = revoke_ace(&dll, dead_sid.as_psid());
+    });
+
+    let before = package_sids_on(&dll);
+    assert!(
+        before.contains(&live_text) && before.contains(&dead_text),
+        "the ACE reader must see both subjects before the sweep runs; saw {before:?}"
+    );
+
+    // `sweep_stale_redirector_dll_aces`と同じ2つを、同じ順で繋ぐ。
+    let live = session_profile::live_profile_names();
+    let removed =
+        revoke_stale_appcontainer_aces(&dll, &live).expect("sweep the stale ACEs");
+
+    let after = package_sids_on(&dll);
+    assert!(
+        after.contains(&live_text),
+        "a running session's transition domain must keep its ACE, otherwise another session's \
+         startup takes the permission away from a child that is still running (BUG-053); \
+         live list={live:?} domain={live_domain} removed={removed:?}"
+    );
+    assert!(
+        !after.contains(&dead_text),
+        "a dead session's transition domain must still be swept; after={after:?}"
     );
 }
 

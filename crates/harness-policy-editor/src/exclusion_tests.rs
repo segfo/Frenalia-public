@@ -50,6 +50,9 @@ fn sandbox_profile_paths_are_excluded() {
         r"C:\Users\segfo\AppData\Local\Packages\harness.shell.sandbox.1234-5678",
         // MCPサーバ用プロファイルも同じ規則で外れる（綴りは`token_of_profile`が持つ）。
         "C:/Users/segfo/AppData/Local/Packages/harness.mcp.1234-5678.docs/AC/x",
+        // 遷移先ドメイン用も同じ（2026-09-30まで`token_of_profile`がこの族を解釈せず、
+        // 別の規則（他アプリのパッケージデータ）で外れていた。`LOCALAPPDATA`が無いと外れなかった）。
+        "C:/Users/segfo/AppData/Local/Packages/harness.domain.1234-5678.cargo/AC/x",
     ] {
         assert_eq!(
             rules.excluded(path),
@@ -225,6 +228,9 @@ fn sandbox_profile_components_come_from_the_sandbox_crate() {
     ));
     assert!(is_sandbox_profile_path(
         "C:/x/Packages/harness.mcp.1-2.docs"
+    ));
+    assert!(is_sandbox_profile_path(
+        "C:/x/Packages/harness.domain.1-2.cargo"
     ));
     assert!(!is_sandbox_profile_path(
         "C:/x/Packages/harness.shell.sandbox"

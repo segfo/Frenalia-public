@@ -716,7 +716,7 @@ pub fn ensure_profile(name: &str) -> Result<OwnedContainerSid, AppContainerError
     // [BUG-107] 所有者で3分岐する（関数docの表）。判定に使うのは`token_of_profile`——
     // **GCが「誰のものか」を決めるのと同じ関数**なので、作成側と回収側で所有者の定義がずれない。
     match crate::tier2a::session_profile::owner_of_profile(name) {
-        // このプロセスのセッション（`run_shell`用でもMCP用でも）。記録してから作る。
+        // このプロセスのセッション（`run_shell`用・MCP用・遷移先ドメイン用のどれも）。記録してから作る。
         // `begin_session`は生存マーカー（名前付きmutex）も立てるので、作った瞬間から
         // 他プロセスのGCに「死んだセッションの残骸」と誤認されない。
         ProfileOwner::ThisSession => {
