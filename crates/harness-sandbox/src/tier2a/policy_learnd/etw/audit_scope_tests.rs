@@ -25,6 +25,13 @@
 //! 監査ポリシー（サブカテゴリ`Object Access > File System`とresourceSACL）を一時的に変更する。
 //! 撤去は[`AuditPolicyGuard`]のDropで行うので**panicしても残らない**。後始末をテストの最後の行に
 //! 置かないのは、途中で落ちたときに設定が残って監査ログを出し続けるのを避けるため。
+//!
+//! # 寿命: 消さない（流用する測定として残す）
+//!
+//! **答えは「否」で出ている**（package SIDへは絞れない。`plans/etw-spike/RESULTS.md` §14）。
+//! 残すのは、OSの版が変わったときや、Security Audit 4656の経路を検討し直すときに、
+//! 同じ問いを撃ち直すためである（`docs/CODE-STRUCTURE-RULES.md`規則2の例外）。
+//! 残してある測定の一覧は`.claude/skills/measurement-review/SKILL.md`「残してある測定」。
 
 use crate::shell_tier::WorkspaceWriteMode;
 use crate::tier2a::win_appcontainer::test_support::spawn_in_workspace;

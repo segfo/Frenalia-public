@@ -12,6 +12,12 @@
 //! そのため下限だけをassertし、実測値は`--nocapture`で読めるように出す。
 //!
 //! 数値は`plans/etw-spike/RESULTS.md` §12へ転記すること。
+//!
+//! # 寿命: 消さない（流用する測定として残す）
+//!
+//! 判定を1回出して終わる調査ではなく、**ETW収集器を変えたときに取りこぼしの桁を測り直す計器**である
+//! （`docs/CODE-STRUCTURE-RULES.md`規則2の例外）。残してある測定の一覧（何を測るか・動かし方）は
+//! `.claude/skills/measurement-review/SKILL.md`「残してある測定」。
 
 use super::parse::{to_settings_path, Correlator, PendingCreate};
 use super::scope::{ScopeTracker, ScopeVerdict};

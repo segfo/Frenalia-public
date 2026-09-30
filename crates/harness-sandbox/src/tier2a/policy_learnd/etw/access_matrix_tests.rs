@@ -51,6 +51,12 @@
 //! 割れなければ、逆に値は操作種別の信号として使える可能性が残る。
 //!
 //! マシンの状態は変えない（一時ディレクトリのACLのみ）。
+//!
+//! # 寿命: 消さない（流用する測定として残す）
+//!
+//! **拒否の形から提案を組む判定を変えたときに、真理値表を埋め直す計器**である
+//! （`docs/CODE-STRUCTURE-RULES.md`規則2の例外。結果は`plans/etw-spike/RESULTS.md` §15〜§18）。
+//! 残してある測定の一覧は`.claude/skills/measurement-review/SKILL.md`「残してある測定」。
 
 use windows::Win32::Security::NO_INHERITANCE;
 use windows::Win32::Storage::FileSystem::{

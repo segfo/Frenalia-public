@@ -67,6 +67,22 @@ description: >
 - **規模の上書き** — `HARNESS_TEST_ACL_COST_NODES`（腕が多いときに1腕あたりのファイル数を下げる）。
   **下げたら「読むのは絶対値ではなく比」と節に書く。**
 
+## 残してある測定（新しく測定を書く前に、流用できないか見る）
+
+判定を1回出して終わる使い捨てではなく、**同じ問いを撃ち直すために残すと宣言した測定**の一覧である
+（`docs/CODE-STRUCTURE-RULES.md`規則2の例外）。**寿命の宣言は各ファイルの冒頭が持ち、ここは索引だけ**
+——足すときはファイルの冒頭に「寿命: 消さない」の節を書いてから、ここへ1行足す。
+「判定が出たら消す」と宣言した使い捨ての側の件数と残りは`docs/STATUS.md`「コード構造リファクタ」の規則2の段が持つ。
+
+| 測定（`crates/harness-sandbox/src/tier2a/`配下） | 何を測るか／撃ち直す場面 | 動かし方 | 結果の記録 |
+|---|---|---|---|
+| `policy_learnd/etw/diagnostics_tests.rs` | ETW収集器の取りこぼしの桁（`EventsLost`・変換できないパス・相関の取りこぼし・短命プロセスの帰属）。収集器を変えたとき | `dev-elevated-run.exe etw-diagnostics` | `plans/etw-spike/RESULTS.md` §12 |
+| `policy_learnd/etw/access_matrix_tests.rs` | 許可レベル×操作種別の真理値表（拒否の形から何が言えるか）。拒否から提案を組む判定を変えたとき | `dev-elevated-run.exe etw-access-matrix` | 同 §15〜§18 |
+| `policy_learnd/etw/audit_scope_tests.rs` | `auditpol /resourceSACL`をpackage SIDへ絞れるか（答えは「否」）。OSの版が変わったとき・4656の経路を検討し直すとき。**マシンの監査ポリシーを一時的に変える**（Dropで戻す） | `dev-elevated-run.exe etw-audit-scope` | 同 §14 |
+| `win_appcontainer/control_dir_propagation_probe_tests.rs` | 保護したノード自身が、親の伝播で保護ビットを失うか・許可ACEを載せるか（手順15×置き場6×深さ2）と、その直し方の費用。BUG-145の案Aの採否・保護の書き方を変えたとき | 非昇格。`cargo test -p harness-sandbox --lib -- --ignored --test-threads=1 --nocapture control_dir_` | `docs/bugs/BUG-145.md`・`plans/mac-spike/RESULTS.md` |
+| `win_appcontainer/dacl_protection_probe_tests.rs` | どの書込口で`SE_DACL_PROTECTED`が実際に立つか（制御ビットと、伝播が下へ届くかの実効の両方）。保護を書く経路を変えたとき | 非昇格。`cargo test -p harness-sandbox --lib -- --ignored --test-threads=1 --nocapture dacl_protection_write_path_matrix_probe` | `docs/bugs/BUG-083.md` |
+| `win_appcontainer/d79_exec_split_tests.rs` | 継承ACEを2本に割ると、ディレクトリは辿れたまま無宣言のexeだけが止まるか、とその費用。**D-79（ワークスペース内の実行を宣言制にする。不採用）を覆すとき**の材料 | 非昇格。`cargo test -p harness-sandbox --lib -- --ignored --test-threads=1 --nocapture d79_exec_split_tests` | `plans/mac-spike/RESULTS.md` §S9 |
+
 ## 軸の値は、このリポジトリを実測して決める
 
 思いつきの値を振らない。過去の測定が使った決め方は次の形である（**値は実体側が持つので写さない**）。

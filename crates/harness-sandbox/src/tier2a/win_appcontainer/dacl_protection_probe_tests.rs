@@ -50,6 +50,13 @@
 //! - SIDは[`super::capability_sid_from_name`]の純粋導出のみを使う。`workspace_capability_sid`は
 //!   `%APPDATA%`の台帳へ実体を作る副作用があるので**使わない**（CLAUDE.md「絶対に消しては
 //!   いけないファイル」）。
+//!
+//! # 寿命: 消さない（流用する測定として残す）
+//!
+//! BUG-083は閉じたが、**どの書込口で`SE_DACL_PROTECTED`が実際に立つかを、制御ビットと
+//! 実効（伝播が下へ届くか）の両方で1回に測る計器**として、保護を書く経路を変えたときに撃ち直す
+//! （`docs/CODE-STRUCTURE-RULES.md`規則2の例外）。
+//! 残してある測定の一覧は`.claude/skills/measurement-review/SKILL.md`「残してある測定」。
 
 use super::*;
 
