@@ -1254,10 +1254,10 @@ fn assert_arms_got_the_tree_they_asked_for(
 /// **深さの違う腕どうしを絶対値で比べてはいけない**。読むのは各セルの
 /// `分割 ÷ まとめて` で、その比を深さ軸・宛先SID軸に沿って並べる。
 ///
-/// # 寿命（**M3とは別である**）
+/// # 寿命（**M3とは別だった**）
 ///
-/// このファイルのM3ブロックは`docs/STATUS.md`残課題#20が終わったら消す約束だが、
-/// 本テストと§S31のテストは**BUG-145の案Aの採否**が決まったら消す。接頭辞を共有している
+/// このファイルにあったM3ブロックは`docs/STATUS.md`残課題#20が閉じたので2026-09-30に消したが、
+/// 本テストと§S31のテストは**BUG-145の案Aの採否**が決まったら消す。接頭辞を共有していた
 /// だけで、**消す条件が違う**。
 #[test]
 #[ignore = "creates tens of thousands of files across 16 arms and writes DACLs; run NON-elevated"]
@@ -1619,9 +1619,10 @@ fn measure_declaration_ledger_append(
 /// 「まとめれば1.0倍・宛先SIDごとに呼べば約2.9倍」で、**どちらに転ぶかは実装の書き方だけで決まる**。
 /// だから「宛先SIDを分けた」という変更は、書き方次第で後者へ倒れ得る。
 ///
-/// # 既存の6本では答えられない（**新しい腕が要る理由**）
+/// # 既存の`acl_ace_count_cost_*`では答えられない（**新しい腕が要る理由**）
 ///
-/// 既存の`acl_ace_count_cost_*`は全部 `grant_aces_propagating`／`grant_aces_single_object`
+/// 本テストを足した当時の`acl_ace_count_cost_*`（6本。M3の2本は2026-09-30に消した）は全部
+/// `grant_aces_propagating`／`grant_aces_single_object`
 /// ——**D-84のworkspace配布経路の部品**を測っている。N1が触ったのはそこではない。
 ///
 /// | 何が足りないか | 既存 | ここで足すもの |

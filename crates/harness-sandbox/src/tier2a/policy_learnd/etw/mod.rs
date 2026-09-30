@@ -32,7 +32,9 @@ mod spike_tests;
 // 確定した事実」、削除の判断は`docs/refactor/2026-08-19-spike-test-inventory.md`）。昇格キー
 // `spike-etw-net`も同時に外した。復元が要るならこのコミットの親から取る。
 
-/// `docs/STATUS.md`「既知の未検証項目」#1〜#5を実測する。**assertより観測値の出力が主目的**。
+/// OS監査収集器（M15.7）の未検証項目#1〜#5を実測する（項目の一覧と結果は
+/// `plans/etw-spike/RESULTS.md` §12。以前は`docs/STATUS.md`が一覧を持っていた）。
+/// **assertより観測値の出力が主目的**。
 #[cfg(all(windows, test))]
 #[path = "diagnostics_tests.rs"]
 mod diagnostics_tests;

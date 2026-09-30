@@ -34,13 +34,20 @@ mod try_runas;
 #[cfg(windows)]
 mod winid;
 
-// --- MAC/Spawn Daemon設計の実現性スパイク専用モード（`plans/mac-spike/RESULTS.md`）。
-// いずれも通常の検査（FS・脱走・ネット・再帰spawn）を行わない短絡モードで、
-// `try_runas`・`load_library`と同じ位置付け。判定が出たら削除する
-// （`docs/CODE-STRUCTURE-RULES.md`規則2「一回性の調査実験をテストとして残さない」）。
+// --- MAC/Spawn Daemon設計の実現性スパイクで生まれた短絡モード（`plans/mac-spike/RESULTS.md`）。
+// いずれも通常の検査（FS・脱走・ネット・再帰spawn）を行わない。
+// **生まれはスパイクだが、今は製品の受け入れテストが使っているものがある**ので、
+// 消すかどうかはモードごとに「駆動しているテストが使い捨てか」で決める
+// （`docs/CODE-STRUCTURE-RULES.md`規則2。数え方は`docs/STATUS.md`の同規則の段）。
+// - `pipe_client`・`spawn_matrix`・`object_reach`・`spike_handles`の`--emit`:
+//   `spawnd_e2e_tests`配下・`domain_isolation_tests`等の受け入れテストが使う。**消さない。**
+// - `console_share`・`spike_handles`の`--hold-file`: 駆動は使い捨ての
+//   `mac_spike_daemon_tests`だけ。**それを消すときに一緒に消す。**
+// - `spike_handles`の`--use-process-handle`: リポジトリ内に駆動が無い。
+// （`--open-bench`は駆動の2本〔`lazy_hook_overhead_tests`・`copy_up_cost_tests`〕を
+//   消した後に残っていたので、2026-09-30に消した。復元は`plans/mac-spike/RESULTS.md` §S25）
 mod console_share;
 mod object_reach;
-mod open_bench;
 mod pipe_client;
 mod spawn_matrix;
 /// [段階6f-1] **フックの役を演じるモード**（`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2）。
@@ -144,9 +151,6 @@ struct Args {
     /// 起こす前に自分の環境へ置く値（`NAME=VALUE`）。フックが`lpEnvironment=NULL`を
     /// 「自分の環境を継がせたい」と読んで載せるかを測るためにある。
     spawn_set_env: Vec<String>,
-    /// D-88（Lazy ACE fault-in）の着手条件: Redirector DLLのフックが**成功するopen**へ
-    /// 上乗せする時間を、同一プロセスの「載せる前／載せた後」で測る（`open_bench`モジュールdoc）。
-    open_bench: Option<open_bench::Spec>,
     /// MAC設計§7.1.1の測定3: 同じコンソールに繋がったプロセス同士が互いの画面バッファを
     /// 読めるか・互いを落とせるか（`console_share`モジュールdoc）。
     console_share: Option<console_share::Spec>,
@@ -204,12 +208,6 @@ fn parse_args() -> Args {
     let mut pipe_start_at_epoch_ms: Option<u128> = None;
     let mut report_file = None;
     let mut idle_secs = None;
-    let mut bench_inside: Option<String> = None;
-    let mut bench_outside: Option<String> = None;
-    let mut bench_dll: Option<String> = None;
-    let mut bench_iters: usize = 20_000;
-    let mut bench_first_touch: Option<String> = None;
-    let mut bench_rewrite: Option<String> = None;
     let mut console_write: Option<String> = None;
     let mut console_read = false;
     let mut console_ctrl_break = false;
@@ -305,16 +303,6 @@ fn parse_args() -> Args {
             "--pipe-client-at" => pipe_start_at_epoch_ms = next().parse().ok(),
             "--report-file" => report_file = Some(next()),
             "--idle-secs" => idle_secs = next().parse().ok(),
-            "--open-bench" => bench_inside = Some(next()),
-            "--open-bench-outside" => bench_outside = Some(next()),
-            "--open-bench-dll" => bench_dll = Some(next()),
-            "--open-bench-first-touch" => bench_first_touch = Some(next()),
-            "--open-bench-rewrite" => bench_rewrite = Some(next()),
-            "--open-bench-iters" => {
-                if let Ok(v) = next().parse::<usize>() {
-                    bench_iters = v.max(1);
-                }
-            }
             // §7.1.1測定3。**どれか1つでも指定されたらコンソールモード**にする——
             // 「読むだけ」「撃つだけ」の腕があるので、書く引数を必須にできない。
             "--console-write" => {
@@ -380,15 +368,6 @@ fn parse_args() -> Args {
         idle_secs: console_idle_secs,
     });
 
-    let open_bench = bench_inside.map(|inside| open_bench::Spec {
-        inside,
-        outside: bench_outside,
-        iters: bench_iters,
-        dll: bench_dll,
-        first_touch: bench_first_touch,
-        rewrite: bench_rewrite,
-    });
-
     Args {
         gen,
         chain,
@@ -422,7 +401,6 @@ fn parse_args() -> Args {
         spawn_console,
         spawn_transparently,
         spawn_set_env,
-        open_bench,
         console_share,
         report_file,
         idle_secs,
@@ -849,18 +827,6 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::to_string(&report).expect("use_process_handle report must serialize")
-        );
-        return ExitCode::SUCCESS;
-    }
-
-    if let Some(spec) = &args.open_bench {
-        let report = open_bench::run(spec);
-        if let Some(path) = &args.report_file {
-            let _ = fs::write(path, report.to_string());
-        }
-        println!(
-            "{}",
-            serde_json::to_string(&report).expect("open_bench report must serialize")
         );
         return ExitCode::SUCCESS;
     }
