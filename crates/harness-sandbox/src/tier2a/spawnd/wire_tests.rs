@@ -28,11 +28,27 @@ fn control_request_hello_keeps_its_wire_shape() {
         // [#55] **追加は必ず末尾へ。** この電文は別プロセス（`harness-spawnd.exe`）が
         // 読むワイヤ形式で、下の文字列がその表現を固定している。
         domains: Vec::new(),
+        // [残課題 サンドボックス周辺 #65] 空でない値で固定する——空だと、欄が
+        // 落ちても`[]`と区別の付かない形でしか見えない。
+        writable_outside_policy: vec!["C:/tools".to_string()],
     })
     .expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":7,"policy":{"schema_version":2,"domains":[]},"workspace_root":"C:/w","domains":[]}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":8,"policy":{"schema_version":2,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"]}"#
+    );
+}
+
+/// [残課題 サンドボックス周辺 #65] **`writable_outside_policy`の無い`Hello`は読めない。**
+///
+/// この欄が空であることは検査が緩くなる向き（書ける場所を書けないと見る）なので、
+/// 欄の無い電文を黙って空として受け付けない（`serde(default)`を付けていないことの固定）。
+#[test]
+fn a_hello_without_writable_outside_policy_is_refused() {
+    let without = r#"{"kind":"hello","harness_process":4660,"protocol_version":8,"policy":{"schema_version":2,"domains":[]},"workspace_root":"C:/w","domains":[]}"#;
+    assert!(
+        serde_json::from_str::<ControlRequest>(without).is_err(),
+        "a Hello missing writable_outside_policy must not parse as an empty list"
     );
 }
 
@@ -120,7 +136,7 @@ fn control_responses_keep_their_wire_shape() {
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":7}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":8}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {

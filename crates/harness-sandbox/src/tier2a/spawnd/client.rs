@@ -682,16 +682,26 @@ fn daemon_exe_path() -> Result<PathBuf, SpawnDaemonError> {
 /// ここで作れないなら購読者も作れない見込みで、その失敗は購読者側の失敗として現れる。
 /// **黙らせはしない**（警告を出す）。
 fn hello_request(harness_process: u64, policy: super::TransitionPolicy) -> ControlRequest {
-    precreate_transition_queue(&policy.workspace_root);
+    // **`..`無しで全部の欄を名指しして分解する。** `TransitionPolicy`に欄を足すと
+    // ここでビルドが落ちる——電文へ載せ忘れた欄は、Daemonの側で黙って空になる。
+    let super::TransitionPolicy {
+        policy,
+        workspace_root,
+        writable_outside_policy,
+        domains,
+    } = policy;
+    precreate_transition_queue(&workspace_root);
     ControlRequest::Hello {
         harness_process,
         protocol_version: PROTOCOL_VERSION,
         // [段階6b] **宣言はここで1回だけ渡す。** Daemonはこれを受け取ってから
         // 要求受付パイプの受付を始めるので、宣言を持たないまま要求を捌く瞬間が無い。
-        policy: Box::new(policy.policy),
-        workspace_root: policy.workspace_root,
+        policy: Box::new(policy),
+        workspace_root,
         // [#55] 用意できた遷移先ドメインの実体。**宣言と同じ電文で1回だけ渡す。**
-        domains: policy.domains,
+        domains,
+        // [残課題 サンドボックス周辺 #65] harness側の検査と同じ入力をDaemonの検査へ渡す。
+        writable_outside_policy,
     }
 }
 

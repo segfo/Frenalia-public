@@ -48,7 +48,7 @@ fn approve_and_reload(ws: &Path, edges: &[EdgeRef]) -> Vec<transition_listing::R
     );
     let file = policy_file::load(ws).expect("書いたものが読めない");
     let ws_text = ws.to_string_lossy().into_owned();
-    let input = file.transition_graph_input(Some(&ws_text));
+    let input = file.transition_graph_input(Some(&ws_text), &[]);
     transition_listing::rows(&input, ENTRY_DOMAIN).expect("一覧が作れない")
 }
 
@@ -155,7 +155,7 @@ fn an_approved_edge_can_be_removed_again() {
 
     let file = policy_file::load(tmp.path()).expect("読めない");
     let ws_text = tmp.path().to_string_lossy().into_owned();
-    let input = file.transition_graph_input(Some(&ws_text));
+    let input = file.transition_graph_input(Some(&ws_text), &[]);
     let rows = transition_listing::rows(&input, ENTRY_DOMAIN).expect("一覧");
     assert!(rows.is_empty(), "取り消したのに辺が残っている");
     // **ドメインは残す**（`crate::unapprove`と同じ理由——宣言を全部外した状態で
@@ -207,7 +207,7 @@ fn one_commit_can_replace_an_edge_with_a_narrower_one() {
 
     let file = policy_file::load(tmp.path()).expect("読めない");
     let ws_text = tmp.path().to_string_lossy().into_owned();
-    let input = file.transition_graph_input(Some(&ws_text));
+    let input = file.transition_graph_input(Some(&ws_text), &[]);
     let rows = transition_listing::rows(&input, ENTRY_DOMAIN).expect("一覧");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].argv, "git status");

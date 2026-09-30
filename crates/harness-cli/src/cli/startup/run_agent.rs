@@ -68,7 +68,18 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         // **読めなければTier2aセッションを始めない。** 宣言を持たないDaemonを起こすと、
         // 宣言してある遷移まで拒否される。倒れる向きは同じ「拒否」でも、
         // 原因が読み取り失敗であることは画面から分からない（`B-10`）。
-        let transition_policy = match harness_policy::policy_file::load(&workspace_root) {
+        //
+        // [残課題 サンドボックス周辺 #65] **`policy.json`の外で書込を許した場所も検査へ渡す。**
+        // 固定した遷移の先がそこにあれば、ワークスペース内のコードが書き換えて遷移先の権限で
+        // 走らせられる。**一覧はここで1回だけ作り、harnessの検査・モデルへ見せる一覧・
+        // Daemonの検査の3つへ同じ値を渡す**——別々に作ると、どれか1つだけ入力が違う状態が
+        // 黙って成立する（`B-13`）。
+        let writable_outside_policy =
+            super::transition_tool::writable_outside_policy(&fs_passthrough);
+        let transition_policy = match harness_policy::policy_file::load_for_session(
+            &workspace_root,
+            &writable_outside_policy,
+        ) {
             Ok(policy) => {
                 // [段階6e] **モデルへ見せる一覧は、Daemonへ渡すのと同じ宣言から作る**
                 // （§19.3.8）。ここで読み直すと判定に使うグラフとずれ、「起こせる」と
@@ -77,6 +88,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                     super::transition_tool::facts_from_policy(
                         &policy,
                         &workspace_root.to_string_lossy(),
+                        &writable_outside_policy,
                     ),
                 ));
                 // [#55] **遷移先ドメインの実体をここで用意する**（`plans/DESIGN-MAC-BROKER.md` §22.9）。
@@ -109,11 +121,26 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 harness_sandbox::tier2a::spawnd::TransitionPolicy {
                     policy,
                     workspace_root: workspace_root.to_string_lossy().into_owned(),
+                    writable_outside_policy,
                     domains: provisioned.domains,
                 }
             }
             Err(error) => {
                 eprintln!("error: could not read the transition policy: {error}");
+                // **宣言の外から来た「書ける場所」で拒否されたときは、それを言う**（`B-10`）。
+                // 言わないと、`policy.json`のどこにも書込が無いのに拒否された理由が辿れない。
+                if matches!(
+                    error,
+                    harness_policy::policy_file::PolicyFileError::RejectedTransitions { .. }
+                ) && !writable_outside_policy.is_empty()
+                {
+                    eprintln!(
+                        "note: places opened for writing by settings.json `fs.read_write` or \
+                         `--fs-allow <path>:rw` count as writable by the caller, so a fixed \
+                         transition must not point into them: {}",
+                        writable_outside_policy.join(", ")
+                    );
+                }
                 let outcome = harness_sandbox::tier2a::session_profile::end_session(
                     &harness_sandbox::tier2a::win_appcontainer::revoke_session_grant,
                 );

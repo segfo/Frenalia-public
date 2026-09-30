@@ -195,6 +195,22 @@ struct Shared {
     request_pipe: String,
 }
 
+/// [段階6b・残課題 サンドボックス周辺 #65] `Hello`で受け取った入力から遷移のグラフを組む。
+///
+/// **harness側の`policy_file::load_for_session`と同じ3つの入力**（宣言・ワークスペースルート・
+/// `policy.json`の外で書込を許した場所）で検査する。Daemonだけが一部を落とすと、
+/// Daemonの判定だけが緩くなり、しかもharness側が先に通しているので症状が出ない。
+/// 関数にしてあるのは、この3つが実際に検査へ届くことを単体で測るためである。
+fn graph_from_hello(
+    policy: &harness_policy::policy_file::PolicyFile,
+    workspace_root: &str,
+    writable_outside_policy: &[String],
+) -> Result<harness_policy::transition::TransitionGraph, SpawnDaemonError> {
+    let input = policy.transition_graph_input(Some(workspace_root), writable_outside_policy);
+    harness_policy::transition::TransitionGraph::build(&input)
+        .map_err(|e| protocol_err(format!("transition policy was rejected: {e}")))
+}
+
 /// 制御パイプへ接続し、`Shutdown`か切断まで要求を処理し続ける。
 ///
 /// # パイプ名を検証する理由（P-01）
@@ -236,6 +252,7 @@ pub fn serve(
             policy,
             workspace_root,
             domains,
+            writable_outside_policy,
         } => {
             // **harnessと同じ関数を通る**（`protocol_version_mismatch`のdoc）。
             // 片側だけが検査すると、検査していない側から古いバイナリが入れる。
@@ -247,12 +264,10 @@ pub fn serve(
             // 要求を受け付ける瞬間を作らないのが、宣言を`Hello`に載せた理由そのものである
             // （`plans/DESIGN-MAC-PROTOCOL.md` §12.1）。
             //
-            // **通常はここで落ちない。** 同じ検査は`policy_file::load`に配線されており
-            // harness側が先に落ちる。ここで落ちるのは版の食い違いを意味するので、
+            // **通常はここで落ちない。** 同じ検査は`policy_file::load_for_session`に配線されており
+            // harness側が同じ入力で先に落ちる。ここで落ちるのは版の食い違いを意味するので、
             // 黙って空のグラフへ倒さない（`B-10`）。
-            let input = policy.transition_graph_input(Some(workspace_root.as_str()));
-            let graph = harness_policy::transition::TransitionGraph::build(&input)
-                .map_err(|e| protocol_err(format!("transition policy was rejected: {e}")))?;
+            let graph = graph_from_hello(&policy, &workspace_root, &writable_outside_policy)?;
             // [段階6c] 拒否の待ち行列も**同じ`workspace_root`から導出する**。
             // 置き場のパスを電文で受け取らないのは、昇格した書き手が後から来るためである
             // （§10.2・`P-01`。`client::hello_request`のdocが対になっている）。
@@ -2633,5 +2648,62 @@ mod handle_rights_tests {
                  一時停止で頼んだ呼び出し元は`ResumeThread`を撃つ"
             );
         }
+    }
+}
+
+/// [残課題 サンドボックス周辺 #65] `Hello`の`writable_outside_policy`が**Daemonの検査へ届く**こと。
+///
+/// harness側の検査（`policy_file::load_for_session`）は`harness-policy`のテストが固定している。
+/// ここで測るのはDaemon側の入口で、欄を受け取ったまま検査へ渡し忘れると、
+/// **Daemonだけが緩い判定でグラフを組み、しかもharness側が先に通しているので症状が出ない**。
+#[cfg(test)]
+mod hello_graph_tests {
+    use super::*;
+
+    /// ワークスペースの外にあるプログラムを、引数と作業ディレクトリごと固定した辺を1本持つ宣言。
+    fn fixed_edge_policy() -> harness_policy::policy_file::PolicyFile {
+        serde_json::from_str(
+            r#"{
+              "schema_version": 2,
+              "domains": [
+                {
+                  "name": "shell",
+                  "process": {
+                    "transitions": [
+                      {
+                        "exe":  { "literal": "C:\\tools\\gen.exe" },
+                        "argv": { "literal": "\"C:\\tools\\gen.exe\" --check" },
+                        "cwd":  "C:\\ws",
+                        "to":   "shell"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }"#,
+        )
+        .expect("the fixture is a valid policy.json")
+    }
+
+    /// **禁止側**: 固定したプログラムが`policy.json`の外で書込を許した場所の下にあれば、
+    /// `Hello`ごと失敗させる（要求受付パイプを1本も作らない）。
+    #[test]
+    fn a_fixed_program_under_a_place_writable_outside_the_policy_fails_the_hello() {
+        let error = graph_from_hello(&fixed_edge_policy(), r"C:\ws", &[r"C:\tools".to_string()])
+            .expect_err("the daemon must see the same writable places as harness");
+        let text = error.to_string();
+        assert!(
+            text.contains("which this domain can write") && text.contains("c:/tools"),
+            "the rejection should name the writable place: {text}"
+        );
+    }
+
+    /// **許可側（対）**: 同じ宣言は、その場所を渡さなければ組める——拒否したのは
+    /// 渡した一覧であって、辺の形ではない。
+    #[test]
+    fn the_same_policy_builds_when_no_writable_place_covers_the_program() {
+        graph_from_hello(&fixed_edge_policy(), r"C:\ws", &[]).expect(r"nothing covers C:\tools");
+        graph_from_hello(&fixed_edge_policy(), r"C:\ws", &[r"C:\other".to_string()])
+            .expect(r"a writable place elsewhere does not cover C:\tools\gen.exe");
     }
 }

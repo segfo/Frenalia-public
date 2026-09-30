@@ -42,7 +42,7 @@ fn press(app: &mut App, code: KeyCode) {
 fn declared_rows(ws: &Path) -> Vec<transition_listing::Row> {
     let file = policy_file::load(ws).expect("policy.jsonが読めない");
     let text = ws.to_string_lossy().into_owned();
-    let input = file.transition_graph_input(Some(&text));
+    let input = file.transition_graph_input(Some(&text), &[]);
     transition_listing::rows(&input, ENTRY_DOMAIN).expect("一覧が作れない")
 }
 

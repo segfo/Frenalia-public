@@ -1124,6 +1124,10 @@ fn run_pass2<'a>(
         policy: crate::policy_file::load(request.workspace_root)
             .map_err(|e| RecordNetError::SpawnDaemon(e.to_string()))?,
         workspace_root: request.workspace_root.to_string_lossy().into_owned(),
+        // [残課題 サンドボックス周辺 #65] **パス2は`policy.json`の外で書込を許さない**
+        // ——`--fs-allow`も`settings.json`も読まず、付けるのは記録中のドメインの宣言だけで、
+        // それは宣言として既に検査の視野に入っている。したがって空が正しい。
+        writable_outside_policy: Vec::new(),
         // [#55] **パス2は遷移先ドメインを用意しない。**
         //
         // ここが記録しているのは「このコマンドが何へ触るか」であって、

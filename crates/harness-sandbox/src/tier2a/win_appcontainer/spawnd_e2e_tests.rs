@@ -247,6 +247,8 @@ fn setup_with_transitions_and_domains(
         crate::tier2a::spawnd::TransitionPolicy {
             policy,
             workspace_root: canonical.to_string_lossy().into_owned(),
+            // このテストは`--fs-allow`も`settings.json`も通らないので、宣言の外の書込場所は無い。
+            writable_outside_policy: Vec::new(),
             domains,
         },
         child_process_policy,

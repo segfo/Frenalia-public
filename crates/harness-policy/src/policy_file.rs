@@ -427,12 +427,22 @@ impl PolicyFile {
 
     /// 遷移の判定器へ渡す「ドメインの見え方」。
     ///
-    /// `caller_writable_root`はワークスペースルート——**宣言だけを見るとここが抜ける**。
-    /// 固定したargvが指すスクリプトがワークスペースの中にあれば、呼び出し元がそれを
+    /// 「呼び出し元から書ける場所」として、宣言の外にあるものを2つ受ける——**宣言だけを見ると
+    /// ここが抜ける**。固定したargvが指すスクリプトがそこにあれば、呼び出し元がそれを
     /// 書き換えられるので固定の意味が無くなる（`plans/DESIGN-MAC.md` §19.1）。
+    ///
+    /// - `workspace_root`: ワークスペースルート
+    /// - `writable_outside_policy`: **`policy.json`の外で書込を許した場所**
+    ///   （`settings.json`の`fs.read_write`・`--fs-allow <path>:rw`。残課題 サンドボックス周辺 #65）。
+    ///   これを持つのは`harness.exe`だけで、ポリシーエディタは`--fs-allow`も`settings.json`も
+    ///   読まないので空を渡す
+    ///
+    /// **どちらも既定値を持たない。** 呼び出し元ごとに何を渡すかを選ばせる——既定があると、
+    /// 新しい呼び出し元が選ばずに通れてしまい、その経路だけ検査が黙って緩くなる。
     pub fn transition_graph_input<'a>(
         &'a self,
-        caller_writable_root: Option<&'a str>,
+        workspace_root: Option<&'a str>,
+        writable_outside_policy: &'a [String],
     ) -> GraphInput<'a> {
         GraphInput {
             domains: self
@@ -450,7 +460,10 @@ impl PolicyFile {
                     process: &domain.process,
                 })
                 .collect(),
-            caller_writable_roots: caller_writable_root.into_iter().collect(),
+            caller_writable_roots: workspace_root
+                .into_iter()
+                .chain(writable_outside_policy.iter().map(String::as_str))
+                .collect(),
         }
     }
 
@@ -495,7 +508,30 @@ pub fn path(workspace_root: &Path) -> PathBuf {
 ///
 /// 黙って空にすると、承認済みのルールが消えたまま「承認できました」と言い続けることになる
 /// （そのままパス2を走らせると、開くべき穴が開いていない状態で動く）。B-10。
+///
+/// **`policy.json`の外で書込を許した場所を持たない呼び出し元のための形**である
+/// （ポリシーエディタ。`--fs-allow`も`settings.json`も読まない）。
+/// それを持つ`harness.exe`は[`load_for_session`]を使う。
 pub fn load(workspace_root: &Path) -> Result<PolicyFile, PolicyFileError> {
+    load_for_session(workspace_root, &[])
+}
+
+/// [`load`]と同じだが、遷移の編集時検査に**`policy.json`の外で書込を許した場所**も数える
+/// （[`PolicyFile::transition_graph_input`]の`writable_outside_policy`）。
+///
+/// # なぜ要るのか（残課題 サンドボックス周辺 #65）
+///
+/// 固定した遷移は、固定値が指すファイルを呼び出し元が書き換えられないことを前提にしている
+/// （`plans/DESIGN-MAC.md` §19.1）。`settings.json`の`fs.read_write`や`--fs-allow <path>:rw`で
+/// 書込を許した場所は宣言に現れないので、ここで渡さないと検査が見落とす——そこに置いた
+/// 遷移先のプログラムを、ワークスペース内のコードが書き換えて遷移先の権限で走らせられる。
+///
+/// **Daemonへも同じ一覧を渡すこと**（`TransitionPolicy::writable_outside_policy`）。
+/// 片側だけに渡すと、2つのプロセスの検査が別の入力を見る。
+pub fn load_for_session(
+    workspace_root: &Path,
+    writable_outside_policy: &[String],
+) -> Result<PolicyFile, PolicyFileError> {
     let path = path(workspace_root);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -526,10 +562,11 @@ pub fn load(workspace_root: &Path) -> Result<PolicyFile, PolicyFileError> {
         });
     }
     // **編集時検査をここへ置く理由**: 検査を書いても呼ぶ人が居なければ、手で書いた危険な辺が
-    // 素通りする（`B-01`: 対の片方だけ実装しない）。`load`は`policy.json`を読む唯一の関数なので、
-    // ここを通せば読む側の全経路が通る。宣言画面は書く前に**同じ関数**を呼ぶ。
+    // 素通りする（`B-01`: 対の片方だけ実装しない）。この関数は`policy.json`を読む唯一の関数
+    // （[`load`]もここへ委譲する）なので、ここを通せば読む側の全経路が通る。
+    // 宣言画面は書く前に**同じ検査関数**（`transition::check_all`）を呼ぶ。
     let workspace = workspace_root.to_string_lossy();
-    let input = file.transition_graph_input(Some(workspace.as_ref()));
+    let input = file.transition_graph_input(Some(workspace.as_ref()), writable_outside_policy);
     let rejected = match transition::check_all(&input) {
         Ok(rejections) => rejections.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
         Err(e) => vec![e.to_string()],

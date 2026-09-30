@@ -44,8 +44,9 @@ pub(super) fn should_expose(
 pub(super) fn facts_from_policy(
     policy: &harness_policy::policy_file::PolicyFile,
     workspace_root: &str,
+    writable_outside_policy: &[String],
 ) -> TransitionFacts {
-    let input = policy.transition_graph_input(Some(workspace_root));
+    let input = policy.transition_graph_input(Some(workspace_root), writable_outside_policy);
     let from_domain = harness_policy::policy_file::ENTRY_DOMAIN;
     // 宣言が壊れているならDaemonも起動していない（`TransitionGraph::build`が落ちる）ので、
     // ここで失敗したときは**空の一覧**にする。**空は「起こせるものが無い」**であり、
@@ -73,6 +74,36 @@ pub(super) fn facts_from_policy(
         from_domain: from_domain.to_string(),
         programs,
     }
+}
+
+/// [残課題 サンドボックス周辺 #65] **`policy.json`の外で書込を許した場所**の一覧。
+/// 遷移の編集時検査が「呼び出し元から書ける場所」として数える
+/// （`harness_policy::policy_file::load_for_session`のdoc）。
+///
+/// 入力は`settings.json`の`fs.*`と`--fs-allow`を合成済みの一覧で、書込を含むもの
+/// （`FsAccess::is_read_write`＝`ReadWrite`/`ReadWriteExec`）の付与ルートを返す。
+///
+/// # 付与した結果ではなく、宣言から取る
+///
+/// 付与に失敗した穴も数える——検査は厳しい側に倒す。**CoWモードでも数える**:
+/// CoWでは`:rw`の実ACEが読取へ降格され書込は差分層へ向かうが、既存の検査は
+/// ワークスペースもCoWに関係なく「書ける」と数えているので、それに揃える。
+///
+/// # `#30`で読み直すこと
+///
+/// いまこの一覧に入るのは`settings.json`と`--fs-allow`由来だけである。
+/// **`policy.json`の`fs`を`harness.exe`が読んでこの一覧の元へ流し込むようになったら
+/// （`docs/INDEX.md`の未実装機能 サンドボックス周辺 #30）、その分はここから除くこと**
+/// ——宣言は宣言として既に検査の視野にあり、ここへ入れると遷移先ドメインの書込宣言まで
+/// 「入口から書ける」と数えられ、正当な辺が拒否される。
+pub(super) fn writable_outside_policy(
+    fs_passthrough: &[harness_sandbox::FsPassthrough],
+) -> Vec<String> {
+    fs_passthrough
+        .iter()
+        .filter(|fp| fp.access.is_read_write())
+        .map(|fp| fp.path.to_string_lossy().into_owned())
+        .collect()
 }
 
 #[cfg(test)]
@@ -142,7 +173,7 @@ mod tests {
         let policy: harness_policy::policy_file::PolicyFile =
             serde_json::from_value(json).expect("parse");
 
-        let facts = facts_from_policy(&policy, "C:/ws");
+        let facts = facts_from_policy(&policy, "C:/ws", &[]);
 
         assert_eq!(facts.from_domain, harness_policy::policy_file::ENTRY_DOMAIN);
         assert_eq!(facts.programs.len(), 1);
@@ -157,7 +188,39 @@ mod tests {
     #[test]
     fn a_policy_without_transitions_yields_an_empty_list_not_a_missing_one() {
         let policy = harness_policy::policy_file::PolicyFile::default();
-        let facts = facts_from_policy(&policy, "C:/ws");
+        let facts = facts_from_policy(&policy, "C:/ws", &[]);
         assert!(facts.programs.is_empty());
+    }
+
+    fn passthrough(path: &str, access: harness_sandbox::FsAccess) -> harness_sandbox::FsPassthrough {
+        harness_sandbox::FsPassthrough {
+            path: std::path::PathBuf::from(path),
+            access,
+            forced: false,
+            scope: harness_policy::GrantScope::Recursive,
+        }
+    }
+
+    /// [残課題 サンドボックス周辺 #65] **許可側**: 書込を含む穴は、遷移の検査へ
+    /// 「呼び出し元から書ける場所」として渡る。`ReadWriteExec`も書込を含む
+    /// ——ここが落ちると、`:rw`と実行の宣言を同じルートへ畳んだ瞬間に検査から消える。
+    #[test]
+    fn places_opened_for_writing_are_handed_to_the_transition_check() {
+        let list = writable_outside_policy(&[
+            passthrough(r"C:\tools", harness_sandbox::FsAccess::ReadWrite),
+            passthrough(r"C:\cache", harness_sandbox::FsAccess::ReadWriteExec),
+        ]);
+        assert_eq!(list, vec![r"C:\tools".to_string(), r"C:\cache".to_string()]);
+    }
+
+    /// **禁止側（対）**: 読むだけ・読んで実行するだけの穴は入れない。入れると、
+    /// 読取専用で開けた場所にある固定したプログラムまで「書き換えられる」として拒否される。
+    #[test]
+    fn places_opened_only_for_reading_or_running_are_not_counted_as_writable() {
+        let list = writable_outside_policy(&[
+            passthrough(r"C:\sdk", harness_sandbox::FsAccess::Read),
+            passthrough(r"C:\bin", harness_sandbox::FsAccess::ReadExec),
+        ]);
+        assert!(list.is_empty(), "read-only places leaked in: {list:?}");
     }
 }

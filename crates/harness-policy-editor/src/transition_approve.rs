@@ -271,8 +271,13 @@ pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApp
     }
 
     // **書く前に検査する。** ここで落ちれば`policy.json`は元のままである。
+    //
+    // **`policy.json`の外で書込を許した場所は空で渡す**——エディタはそれを知らない
+    // （`--fs-allow`はharnessの起動ごとの指定で、書く時点では原理的に分からない）。
+    // したがって固定した遷移は、ここを通っても`harness.exe`の起動時に初めて拒否されることがある
+    // （残課題 サンドボックス周辺 #65。`policy_file::load_for_session`のdoc）。
     let workspace = req.workspace_root.to_string_lossy();
-    let input = file.transition_graph_input(Some(workspace.as_ref()));
+    let input = file.transition_graph_input(Some(workspace.as_ref()), &[]);
     let rejected = match transition::check_all(&input) {
         Ok(rejections) => rejections.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
         Err(e) => vec![e.to_string()],

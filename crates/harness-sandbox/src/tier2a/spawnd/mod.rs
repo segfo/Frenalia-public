@@ -128,7 +128,12 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// 注入だけ行うので、**別ドメインへ移った子が差分層を読めないまま起動して成功する**
 /// ——そのとき子は変更前の中身を黙って読む（BUG-180の症状そのもの）。
 /// 倒れる向きが「拒否」ではなく「嘘の見え方」なので、版の一致で止める。
-pub const PROTOCOL_VERSION: u32 = 7;
+/// **8へ上げたのは残課題 サンドボックス周辺 #65である。** [`ControlRequest::Hello`]が
+/// **`policy.json`の外で書込を許した場所**（`writable_outside_policy`）を運ぶようになった。
+/// 古いDaemonのバイナリはこの欄を読まないので、**Daemonの遷移の検査だけがその場所を
+/// 「書けない」と見る**——固定した遷移の先を呼び出し元が書き換えられても通してしまう向きで、
+/// 検査が黙って緩くなるので版の一致で止める。
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// 相手が名乗った制御プロトコルの版を判定する。合わなければ理由の文面を返す。
 ///
@@ -293,12 +298,12 @@ pub struct ChildHandles {
 
 /// [段階6b] Daemonを起こすときに渡す遷移ポリシー一式。
 ///
-/// # なぜ2つを1つの型で受けるのか
+/// # なぜまとめて1つの型で受けるのか
 ///
-/// 判定できるグラフを組むには**宣言とワークスペースルートの両方**が要る
-/// （後者は「固定値が呼び出し元から書ける場所にあるか」の検査に使う。
+/// 判定できるグラフを組むには**宣言・ワークスペースルート・`policy.json`の外で書込を許した場所**
+/// が揃って要る（後の2つは「固定値が呼び出し元から書ける場所にあるか」の検査に使う。
 /// `harness_policy::transition::GraphInput::caller_writable_roots`のdoc）。
-/// 別々の引数にすると、片方だけ渡して**検査の一部が黙って効かない**構成が作れてしまう。
+/// 別々の引数にすると、一部だけ渡して**検査の一部が黙って効かない**構成が作れてしまう。
 ///
 /// # 誰が作るか
 ///
@@ -309,6 +314,13 @@ pub struct ChildHandles {
 pub struct TransitionPolicy {
     pub policy: harness_policy::policy_file::PolicyFile,
     pub workspace_root: String,
+    /// [残課題 サンドボックス周辺 #65] **`policy.json`の外で書込を許した場所**
+    /// （`settings.json`の`fs.read_write`・`--fs-allow <path>:rw`）。
+    ///
+    /// harness側が`policy_file::load_for_session`へ渡したのと**同じ一覧**を入れる——
+    /// 2つのプロセスの検査が別の入力を見ると、Daemonだけが緩い判定でグラフを組む。
+    /// ポリシーエディタは宣言の外で書込を許す経路を持たないので空である。
+    pub writable_outside_policy: Vec<String>,
     /// [#55] このセッションで**用意できた**遷移先ドメインの実体
     /// （`ControlRequest::Hello::domains`のdocが意味を持つ）。
     ///
@@ -326,6 +338,8 @@ impl TransitionPolicy {
         Self {
             policy: harness_policy::policy_file::PolicyFile::default(),
             workspace_root: workspace_root.into(),
+            // 宣言が無ければ固定した遷移も無いので、検査に渡す書込場所も要らない。
+            writable_outside_policy: Vec::new(),
             // 宣言が無ければ遷移先も無い。**空は「用意できなかった」と同じ扱い**で、
             // Daemonは別ドメインへの遷移を断る（fail-closed）。
             domains: Vec::new(),
@@ -395,6 +409,15 @@ pub enum ControlRequest {
         /// （用意する側が1ドメイン1件で作る）。
         #[serde(default)]
         domains: Vec<DomainSpec>,
+        /// [残課題 サンドボックス周辺 #65] **`policy.json`の外で書込を許した場所**
+        /// （[`TransitionPolicy::writable_outside_policy`]）。`workspace_root`と同じく
+        /// **編集時検査の入力である**——宣言には現れないが、呼び出し元はそこへ書ける。
+        ///
+        /// **`serde(default)`を付けない。** `domains`と違い、この欄が空であることは
+        /// 「検査が緩くなる」向きに倒れる（書ける場所を書けないと見る）。欄の無い電文を
+        /// 黙って空として受け付けると、その緩さが症状を出さずに成立する
+        /// （[`RedirectorSpec::Cow`]の`diff_layer_capability_sid`と同じ姿勢）。
+        writable_outside_policy: Vec<String>,
     },
     /// トップレベルのプロセスを起こす（§12「harnessもSpawn Daemon経由でspawnを依頼する」）。
     ///

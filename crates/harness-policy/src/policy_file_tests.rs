@@ -252,6 +252,73 @@ fn the_workspace_root_is_handed_to_the_checker_as_a_caller_writable_place() {
     }
 }
 
+/// ワークスペースの**外**にあるプログラムを、引数と作業ディレクトリごと固定した辺を1本書く。
+fn write_fixed_edge_outside_the_workspace(ws: &Path) {
+    let cwd = ws.to_string_lossy().replace('\\', "\\\\");
+    write_policy(
+        ws,
+        &format!(
+            r#"{{
+              "schema_version": {POLICY_SCHEMA_VERSION},
+              "domains": [
+                {{
+                  "name": "shell",
+                  "process": {{
+                    "transitions": [
+                      {{
+                        "exe":  {{ "literal": "C:\\tools\\gen.exe" }},
+                        "argv": {{ "literal": "\"C:\\tools\\gen.exe\" --check" }},
+                        "cwd":  "{cwd}",
+                        "to":   "shell"
+                      }}
+                    ]
+                  }}
+                }}
+              ]
+            }}"#
+        ),
+    );
+}
+
+/// [残課題 サンドボックス周辺 #65] **`policy.json`の外で書込を許した場所**
+/// （`settings.json`の`fs.read_write`・`--fs-allow <path>:rw`）も、呼び出し元が書ける場所である。
+/// 固定したプログラムがその下にあれば拒否し、**どの書ける場所に当たったか**を文面に出す
+/// ——宣言のどこにも書込が無いので、根を出さないと理由が辿れない。
+#[test]
+fn a_fixed_value_under_a_place_made_writable_outside_the_policy_is_rejected() {
+    let ws = workspace();
+    write_fixed_edge_outside_the_workspace(ws.path());
+
+    let err = load_for_session(ws.path(), &[r"C:\tools".to_string()])
+        .expect_err("a fixed program under a writable place must not load");
+    match err {
+        PolicyFileError::RejectedTransitions { reason, .. } => {
+            assert!(
+                reason.contains("which this domain can write"),
+                "the reason should say the caller can rewrite it: {reason}"
+            );
+            assert!(
+                reason.contains("c:/tools"),
+                "the reason should name the writable place it lies under: {reason}"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+/// 上の対（許可側）。**同じ`policy.json`**が、書ける場所を渡さなければ通り、
+/// 別の場所を指す書ける場所を渡しても通る——拒否したのは渡した一覧であって、
+/// 辺そのものの形ではないことを固定する（B-35）。
+#[test]
+fn the_same_fixed_edge_loads_when_no_writable_place_covers_it() {
+    let ws = workspace();
+    write_fixed_edge_outside_the_workspace(ws.path());
+
+    load(ws.path()).expect("without places writable outside the policy, the edge is fine");
+    load_for_session(ws.path(), &[r"C:\other".to_string()])
+        .expect("a writable place elsewhere does not cover C:\\tools\\gen.exe");
+}
+
 /// 未来のスキーマ版は**解釈しようとしない**（知らないフィールドを落として書き戻すと、
 /// 新しい版で足した承認が黙って消える）。
 #[test]

@@ -242,12 +242,14 @@ impl DeclaredEdges {
     /// `policy.json`から組み立てる。
     ///
     /// `workspace_root`は、宣言の検査が「呼び出し元が書ける場所」を知るために要る（§19.1）。
+    /// **`policy.json`の外で書込を許した場所は渡さない**——エディタはそれを持たない
+    /// （`--fs-allow`も`settings.json`も読まない。`policy_file::load`のdoc）。
     pub fn build(
         file: &PolicyFile,
         workspace_root: &str,
         from_domain: &str,
     ) -> Result<Self, GraphError> {
-        let input = file.transition_graph_input(Some(workspace_root));
+        let input = file.transition_graph_input(Some(workspace_root), &[]);
         let graph = TransitionGraph::build(&input)?;
         let rows = transition_listing::rows(&input, from_domain)?;
         let edges = file

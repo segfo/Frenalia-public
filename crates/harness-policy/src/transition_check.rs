@@ -153,10 +153,15 @@ impl GraphFacts<'_> {
         }
 
         // (i) 固定値が指すファイルは、呼び出し元から書けない場所にあること（§19.1）。
-        for path in self.caller_writable_fixed_paths(view, edge) {
+        //
+        // **どの書ける場所に当たったかを文面に出す。** 書ける場所は宣言の外からも来る
+        // （`settings.json`・`--fs-allow`。残課題 サンドボックス周辺 #65）ので、
+        // 根を出さないと、宣言のどこにも書込が無いのに拒否された理由が辿れない（`B-10`）。
+        for (path, root) in self.caller_writable_fixed_paths(view, edge) {
             reasons.push(format!(
-                "the fixed value points at {path:?}, which this domain can write: fixing the \
-                 arguments is pointless if the caller can rewrite what they point at"
+                "the fixed value points at {path:?}, which this domain can write (it lies under \
+                 {root:?}): fixing the arguments is pointless if the caller can rewrite what \
+                 they point at"
             ));
         }
 
@@ -164,19 +169,24 @@ impl GraphFacts<'_> {
     }
 
     /// 固定値（exeのリテラルと、literal argvの中のパスらしいトークン）のうち、
-    /// **呼び出し元が書ける場所にあるもの**。
+    /// **呼び出し元が書ける場所にあるもの**と、それを覆っている書ける場所の組。
     ///
     /// # この検査が見ていない範囲（P-11）
     ///
     /// - 見ているのは**宣言された書込権限**と、呼び出し側が渡した
-    ///   [`GraphInput::caller_writable_roots`]だけである。宣言の外で書ける場所は見ていない
+    ///   [`GraphInput::caller_writable_roots`]だけである。後者に何が入るかはホストが決める——
+    ///   `harness.exe`はワークスペースと`policy.json`の外で書込を許した場所
+    ///   （`settings.json`の`fs.read_write`・`--fs-allow <path>:rw`）を渡し、ポリシーエディタは
+    ///   ワークスペースだけを渡す（エディタは宣言の外で書込を許す経路を持たない）
+    /// - パスの比較は綴りの畳み込み（区切りと大小）だけで、`..`・8.3形式の短い名前・
+    ///   シンボリックリンクとジャンクションは解決しない
     /// - 保証するのは「呼び出し元から書けない場所にある」ことだけで、
     ///   **そのファイルを別の経路で書ける主体が居ないこと**は検査していない
     fn caller_writable_fixed_paths(
         &self,
         view: &DomainView<'_>,
         edge: &TransitionEdge,
-    ) -> Vec<String> {
+    ) -> Vec<(String, String)> {
         if !is_fully_fixed(edge) {
             // 固定していない辺には、そもそも守るべき固定値が無い。
             return Vec::new();
@@ -192,7 +202,10 @@ impl GraphFacts<'_> {
         let writable = self.caller_writable_roots(view.name);
         candidates
             .into_iter()
-            .filter(|path| writable.iter().any(|root| path_covered_by(root, path)))
+            .filter_map(|path| {
+                let root = writable.iter().find(|root| path_covered_by(root, &path))?;
+                Some((path, root.clone()))
+            })
             .collect()
     }
 
