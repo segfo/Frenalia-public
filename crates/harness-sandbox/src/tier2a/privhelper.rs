@@ -596,9 +596,11 @@ pub use server::serve;
 /// この9関数（`run_overlapped`・`connect_with_timeout`・`write_all_timeout`・
 /// `read_exact_timeout`・`write_framed_timeout`・`read_framed_timeout`・
 /// `user_only_security_attributes`・`unique_pipe_name`・`current_user_sid_string`）は
-/// `tier2a::netfilterd`・`tier3::vmsandboxd`にもコピーとして存在し、共通モジュールへ
-/// 1本化する予定である（`docs/CODE-STRUCTURE-RULES.md`規則5）。統合の前後で振る舞いが
-/// 変わっていないことを示す基準としてここに置く（規則6）。統合後はテストごと共通モジュールへ移す。
+/// かつて`tier2a::netfilterd`・`tier3::vmsandboxd`・`dev-elevated-runner`にもコピーとして
+/// 存在し、いまは`crate::win_pipe_ipc`の1本だけである（`docs/CODE-STRUCTURE-RULES.md`規則5）。
+/// 統合の前後で振る舞いが変わっていないことを示す基準としてここに置いた（規則6）。
+/// 共通モジュールへ移す案は残っている（`pipe_names_are_unique_and_prefixed_for_this_mechanism`が
+/// privhelper固有の接頭辞を見ているので、純粋な移動にはならない）。
 ///
 /// 既存の`framed_message_roundtrips_over_a_real_named_pipe`（`netfilterd`/`vmsandboxd`側）は
 /// write→readが対称でありさえすれば通るため、**ワイヤ上のバイト列が変わったことを検出できない**。

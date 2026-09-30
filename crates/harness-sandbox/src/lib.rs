@@ -63,9 +63,9 @@ pub mod win_common;
 mod cancel_descendants;
 
 /// 名前付きパイプIPCの下回り（DACL・オーバーラップドI/O・長さプレフィックス・フレーミング）。
-/// `tier2a::privhelper`・`tier2a::netfilterd`・`harness-sandbox-vm`の`vmsandboxd`が共有する
-/// ため、どの`tierN`にも属さずここに置く。`harness-sandbox-vm`から参照されるため`pub`
-/// （`docs/CODE-STRUCTURE-RULES.md`規則4）。
+/// `tier2a::privhelper`・`tier2a::netfilterd`・`harness-sandbox-vm`の`vmsandboxd`・
+/// 開発用の`dev-elevated-runner`が共有するため、どの`tierN`にも属さずここに置く。
+/// 後の2つから参照されるため`pub`（`docs/CODE-STRUCTURE-RULES.md`規則4）。
 #[cfg(windows)]
 pub mod win_pipe_ipc;
 

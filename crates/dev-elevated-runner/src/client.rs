@@ -11,9 +11,11 @@ mod scheduled_task;
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
-    use dev_elevated_runner::win::{
-        current_user_sid_string, pipe_name_for_current_user, read_framed_timeout, wide,
-        write_framed_timeout,
+    use dev_elevated_runner::win::pipe_name_for_current_user;
+    // 名前付きパイプIPCの下回りは`harness_sandbox::win_pipe_ipc`が持つ（常駐役と同じ実装）。
+    use harness_sandbox::win_common::wide;
+    use harness_sandbox::win_pipe_ipc::{
+        current_user_sid_string, read_framed_timeout, write_framed_timeout,
     };
     use dev_elevated_runner::{check_tests_actually_ran, validate_target, RunRequest, RunResponse};
     use windows::core::PCWSTR;

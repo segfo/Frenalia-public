@@ -352,7 +352,9 @@ pub fn launch(request: &PrivhelperLaunchRequest, repo_root: &Path) -> Result<u32
 /// 環境変数もフラグも要らない。
 #[cfg(windows)]
 pub fn request_privhelper_launch(pipe_name: &str, launcher_dir: &Path) -> Result<(), String> {
-    use crate::win::{pipe_name_for_current_user, read_framed_timeout, wide, write_framed_timeout};
+    use crate::win::pipe_name_for_current_user;
+    use harness_sandbox::win_common::wide;
+    use harness_sandbox::win_pipe_ipc::{read_framed_timeout, write_framed_timeout};
     use crate::{RunRequest, RunResponse};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::CloseHandle;

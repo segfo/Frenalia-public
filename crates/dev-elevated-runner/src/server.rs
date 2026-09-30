@@ -16,9 +16,13 @@
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
-    use dev_elevated_runner::win::{
-        connect_with_timeout, pipe_name_for_current_user, read_framed_timeout,
-        user_only_security_attributes, wide, write_framed_timeout,
+    use dev_elevated_runner::win::pipe_name_for_current_user;
+    // 名前付きパイプIPCの下回り（呼び出しユーザー専有のDACL・フレーミング）は
+    // `harness_sandbox::win_pipe_ipc`が持つ（依頼役と同じ実装）。
+    use harness_sandbox::win_common::wide;
+    use harness_sandbox::win_pipe_ipc::{
+        connect_with_timeout, current_user_sid_string, read_framed_timeout,
+        user_only_security_attributes, write_framed_timeout,
     };
     use dev_elevated_runner::{RunRequest, RunResponse, IDLE_SHUTDOWN};
     use windows::core::PCWSTR;
@@ -38,7 +42,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let sid = match dev_elevated_runner::win::current_user_sid_string() {
+    let sid = match current_user_sid_string() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("dev-elevated-runnerd: failed to resolve current user SID: {e}");
