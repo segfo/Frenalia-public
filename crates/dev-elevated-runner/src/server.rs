@@ -18,7 +18,7 @@
 fn main() -> std::process::ExitCode {
     use dev_elevated_runner::win::pipe_name_for_current_user;
     // 名前付きパイプIPCの下回り（呼び出しユーザー専有のDACL・フレーミング）は
-    // `harness_sandbox::win_pipe_ipc`が持つ（依頼役と同じ実装）。
+    // `harness_sandbox::win_pipe_ipc`が持つ（クライアントと同じ実装）。
     use harness_sandbox::win_common::wide;
     use harness_sandbox::win_pipe_ipc::{
         connect_with_timeout, current_user_sid_string, read_framed_timeout,

@@ -1382,7 +1382,7 @@ mod tests {
     }
 }
 
-/// 依頼役・常駐役・`privhelper_broker`が共有する、このランナー固有の部品。
+/// クライアント・デーモン・`privhelper_broker`が共有する、このランナー固有の部品。
 ///
 /// **名前付きパイプIPCの下回り（呼び出しユーザー専有のDACL・オーバーラップドI/O・
 /// タイムアウト付きのフレーミング）はここに置かない。** `harness_sandbox::win_pipe_ipc`
@@ -1392,7 +1392,7 @@ mod tests {
 pub mod win {
     use super::PIPE_NAME_PREFIX;
 
-    /// 常駐役のパイプ名。ユーザーごとに1つで、依頼役はこの決定的な名前で常駐役を探す。
+    /// デーモンのパイプ名。ユーザーごとに1つで、クライアントはこの決定的な名前でデーモンを探す。
     pub fn pipe_name_for_current_user() -> windows::core::Result<String> {
         Ok(format!(
             "{PIPE_NAME_PREFIX}{}",
