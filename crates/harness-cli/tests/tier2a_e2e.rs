@@ -11144,13 +11144,21 @@ fn a_cross_domain_child_sees_the_callers_staged_workspace_under_cow() {
     let ex = cow_exclusive();
     let before = ex.list_cow_sessions();
     let ws = case_dir(CASE);
-    std::fs::write(ws.join("edited.txt"), format!("{ORIGINAL}\n"))
+    std::fs::write(ws.join("edited.txt"), format!("{ORIGINAL}\r\n"))
         .unwrap_or_else(|e| panic!("edited.txtを置けなかった: {e}"));
-    std::fs::write(ws.join("gone.txt"), format!("{GONE}\n"))
+    std::fs::write(ws.join("gone.txt"), format!("{GONE}\r\n"))
         .unwrap_or_else(|e| panic!("gone.txtを置けなかった: {e}"));
     let findstr = declare_findstr_in_another_domain(&ws, CASE);
 
     // **`findstr`へ渡すパスは`\`区切りにする**（`/`で始まるトークンを自分のオプションとして食う）。
+    //
+    // **`findstr`には`/x`（行全体が一致したときだけ見つかった扱い）を付ける**（2026-09-30に実機で踏んだ）。
+    // `findstr`はファイル名を受け取るとディレクトリを名前で絞って一覧し、返ったものを全部読む。
+    // CoWの下ではその一覧が壊れていて（[BUG-181](../../../docs/bugs/BUG-181.md)）、絞った名前の後ろに
+    // 差分層の管理用ファイル（デバッグログ等）まで返る。デバッグログには`findstr`自身のコマンドライン
+    // ——つまり検索語——が書かれているので、`/x`無しでは**どの語を探しても「見つかった」になる**
+    // （存在しない語`ZZZNOTPRESENTZZZ`でも終了コード0だった）。`/x`ならログの行は一致しない。
+    // 行全体で比べるので、置くファイルは`\r\n`で終える。
     let dir = ws.display().to_string();
     let edited = format!("{dir}\\edited.txt");
     let gone = format!("{dir}\\gone.txt");
@@ -11161,11 +11169,11 @@ fn a_cross_domain_child_sees_the_callers_staged_workspace_under_cow() {
          $e = Get-Content -LiteralPath '{edited}' -Raw; \
          Write-Output ('SHELL_EDITED=' + $(if ($e -match '{STAGED}') {{'STAGED'}} else {{'OTHER'}})); \
          Write-Output ('SHELL_GONE=' + (Test-Path -LiteralPath '{gone}')); \
-         findstr /c:{STAGED} '{edited}' | Out-Null; \
+         findstr /x /c:{STAGED} '{edited}' | Out-Null; \
          Write-Output ('CHILD_STAGED_RC=' + $LASTEXITCODE); \
-         findstr /c:{ORIGINAL} '{edited}' | Out-Null; \
+         findstr /x /c:{ORIGINAL} '{edited}' | Out-Null; \
          Write-Output ('CHILD_ORIGINAL_RC=' + $LASTEXITCODE); \
-         findstr /c:{GONE} '{gone}' | Out-Null; \
+         findstr /x /c:{GONE} '{gone}' | Out-Null; \
          Write-Output ('CHILD_GONE_RC=' + $LASTEXITCODE)"
     );
     let arm = run_arm_collecting_denials_in(&ws, CASE, "tier2a-cow", true, &script, CASE, &[])
@@ -11299,10 +11307,12 @@ fn a_cross_domain_child_does_not_inherit_ext_capture() {
     let before = ex.list_cow_sessions();
     let ws = case_dir(CASE);
     let outside = fs_allow_case_dir("cow-ext");
-    std::fs::write(ws.join("inside.txt"), format!("{INSIDE}\n"))
+    std::fs::write(ws.join("inside.txt"), format!("{INSIDE}\r\n"))
         .unwrap_or_else(|e| panic!("inside.txtを置けなかった: {e}"));
     let findstr = declare_findstr_in_another_domain(&ws, CASE);
 
+    // `findstr`へ`/x`を付ける理由は[`a_cross_domain_child_sees_the_callers_staged_workspace_under_cow`]と
+    // 同じ（CoWの下の名前を絞った一覧に差分層の管理用ファイルが混ざる。BUG-181）。
     let ext = format!("{}\\ext.txt", outside.display());
     let inside = format!("{}\\inside.txt", ws.display());
     let script = format!(
@@ -11310,9 +11320,9 @@ fn a_cross_domain_child_does_not_inherit_ext_capture() {
          Set-Content -LiteralPath '{ext}' -Value '{EXT}'; \
          $x = Get-Content -LiteralPath '{ext}' -Raw; \
          Write-Output ('SHELL_EXT=' + $(if ($x -match '{EXT}') {{'OK'}} else {{'MISSING'}})); \
-         findstr /c:{EXT} '{ext}' | Out-Null; \
+         findstr /x /c:{EXT} '{ext}' | Out-Null; \
          Write-Output ('CHILD_EXT_RC=' + $LASTEXITCODE); \
-         findstr /c:{INSIDE} '{inside}' | Out-Null; \
+         findstr /x /c:{INSIDE} '{inside}' | Out-Null; \
          Write-Output ('CHILD_INSIDE_RC=' + $LASTEXITCODE)"
     );
     let allow = format!(r"{}\**:rw", outside.display());
