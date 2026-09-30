@@ -34,13 +34,15 @@
 /// 昇格ヘルパーの起動側・受信側に共通するガード（T-21/D-44、監査シンクのパス検証）。
 /// **windows専用ではない**（パス検証は純粋で全プラットフォームでテストできる）。
 pub mod elevated_launch;
-pub mod manifest;
-pub mod overlay;
+// `manifest`・`overlay`・`overlay_hunks`・`read_scope`は、外部がルートの`pub use`（下）
+// 経由でしか使わないのでモジュール自体は公開しない（`docs/CODE-STRUCTURE-RULES.md`規則4）。
+pub(crate) mod manifest;
+pub(crate) mod overlay;
 /// オーバーレイ変更のハンク単位レビュー（材料の計算）と部分適用。`overlay`本体から分けた
 /// のは1ファイル1,000行の上限（`docs/CODE-STRUCTURE-RULES.md`規則1）と、
 /// 「1エントリ全体を適用する」既存経路と「ハンクを選んで合成する」経路が別の責務のため。
-pub mod overlay_hunks;
-pub mod read_scope;
+pub(crate) mod overlay_hunks;
+pub(crate) mod read_scope;
 pub mod resolve;
 pub mod secret_env;
 /// セッションID → オーバーレイの置き場、の写像。起動時（`harness-cli`）とセッション切替時

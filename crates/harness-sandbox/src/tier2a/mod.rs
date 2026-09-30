@@ -16,7 +16,7 @@
 //! | `wfp` | Windows Filtering Platformの薄いラッパ。`netfilterd`（昇格側）からのみ使う |
 //! | `loopback_exemption` | AppContainer loopback exemption（マシン全体で1本）のプロセス跨ぎ所有権管理（D-36） |
 //! | [`session_profile`] | セッション単位のAppContainerプロファイル名・生存マーカー・台帳・孤児回収（D-37） |
-//! | [`mcp_profile`] | MCPサーバごとのAppContainerプロファイル名と、信頼境界での名前検証（D-38） |
+//! | `mcp_profile` | MCPサーバごとのAppContainerプロファイル名と、信頼境界での名前検証（D-38） |
 //!
 //! 設計正本は`plans/DESIGN-SANDBOX-APPPOLICY.md`、CoWモード（D-30）は
 //! `plans/AppContainerベース Copy-on-Write ワークスペース設計書.md`。
@@ -29,11 +29,19 @@ pub mod session_profile;
 /// windows専用にしない（名前生成と検証は純粋関数）。
 ///
 /// **信頼境界が見る統合判定（`is_harness_profile_name`）もここが持つ。**
-pub mod mcp_profile;
+///
+/// クレート外からは使われていないので公開しない（`docs/CODE-STRUCTURE-RULES.md`規則4）。
+/// 下の`domain_profile`・`grant_audit`も同じ。
+///
+/// **非Windowsでは未使用の警告を黙らせる。** 本番の呼び出し元（プロファイルの列挙・
+/// 昇格側の名前検証）がすべて`#[cfg(windows)]`の中にあり、非Windowsでは単体テストの
+/// ためだけにコンパイルしている。`pub`だった間はこの状態が警告に出ていなかった。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod mcp_profile;
 
 /// 遷移先ドメインごとのAppContainerプロファイル名（`plans/DESIGN-MAC-BROKER.md` §22.9）。
 /// `mcp_profile`と同じ形・同じ理由でwindows専用にしない。
-pub mod domain_profile;
+pub(crate) mod domain_profile;
 
 /// CoWセッションを起こす前に、Redirector DLL 2本（x64・WOW64用x86）の**版がそろっているか**を
 /// 検算する。`session_profile`と同じ理由でwindows専用にしない（走査と突き合わせは純粋関数で、
@@ -42,7 +50,11 @@ pub mod redirector_identity;
 
 /// 「付与したACEが台帳に載っているか」の自己検証（BUG-101欠陥①）。突き合わせの判定は
 /// 純粋関数なので、`session_profile`と同じ理由でwindows専用にしない（DACLの実測だけがcfg分岐）。
-pub mod grant_audit;
+///
+/// 非Windowsで未使用の警告を黙らせる理由は`mcp_profile`と同じ（記録の呼び出し元が
+/// ACEを付ける側、つまり`#[cfg(windows)]`の中にしか無い）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod grant_audit;
 
 /// 付与したtraverse ACEの記録。**windows専用ではない**（`harness fs list`のような表示系
 /// コマンドが非Windowsでも空台帳を表示できるよう、全プラットフォームでコンパイルする）。

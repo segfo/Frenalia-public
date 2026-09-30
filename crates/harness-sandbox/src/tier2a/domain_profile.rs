@@ -84,6 +84,13 @@ pub fn is_domain_profile_name(name: &str) -> bool {
 ///
 /// **`None`は「この族の名前ではない」**。形が違うものへ推測で印を当てない——
 /// 当てると、他人の入れ物を自分のものとして回収することになる。
+///
+/// **[暫定] 現在はテストからしか呼ばれていない。** 持ち主の判定の唯一の入口である
+/// `session_profile::token_of_profile`がこの族を解釈しないため、上の「GCが使う」は
+/// まだ配線されていない（`docs/STATUS.md`「サンドボックス周辺 #63」、読解のみで未再現）。
+/// モジュールを`pub(crate)`へ絞ったことで死にコードとして見えたので`allow`を付けてある。
+/// **#63を直してこの関数が呼ばれるようになった日に、`allow`を外すこと。**
+#[allow(dead_code)]
 pub fn token_of_domain_profile(name: &str) -> Option<&str> {
     if !is_domain_profile_name(name) {
         return None;
