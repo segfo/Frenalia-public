@@ -11169,6 +11169,11 @@ fn a_cross_domain_child_sees_the_callers_staged_workspace_under_cow() {
          $e = Get-Content -LiteralPath '{edited}' -Raw; \
          Write-Output ('SHELL_EDITED=' + $(if ($e -match '{STAGED}') {{'STAGED'}} else {{'OTHER'}})); \
          Write-Output ('SHELL_GONE=' + (Test-Path -LiteralPath '{gone}')); \
+         function Names($a) {{ ($a | ForEach-Object {{ [IO.Path]::GetFileName($_) }}) -join '|' }}; \
+         Write-Output ('LIST_TXT=' + (Names ([IO.Directory]::GetFiles('{dir}', '*.txt')))); \
+         Write-Output ('LIST_EDITED=' + (Names ([IO.Directory]::GetFiles('{dir}', 'edited.txt')))); \
+         Write-Output ('LIST_GONE=' + (Names ([IO.Directory]::GetFiles('{dir}', 'gone.txt')))); \
+         Write-Output ('LIST_ALL=' + (Names ([IO.Directory]::GetFileSystemEntries('{dir}')))); \
          findstr /x /c:{STAGED} '{edited}' | Out-Null; \
          Write-Output ('CHILD_STAGED_RC=' + $LASTEXITCODE); \
          findstr /x /c:{ORIGINAL} '{edited}' | Out-Null; \
@@ -11235,6 +11240,46 @@ fn a_cross_domain_child_sees_the_callers_staged_workspace_under_cow() {
         failures.push(format!(
             "遷移先の子が**呼び出し元の消したファイルを開けた**（RC={child_gone}）。\
              削除の記録（差分層の台帳）を読めず、元の中身が見えている（BUG-180）"
+        ));
+    }
+
+    // --- [BUG-181] 入口のシェルが見るディレクトリ一覧（`.NET`の一覧APIは`NtQueryDirectoryFileEx`を通る） ---
+    // 直す前は`*.txt`で0件、`edited.txt`で絞ると2回目以降に別のファイルが並び、根の一覧に
+    // 差分層の帳簿（`.harness-cow-*`）が見えた（`plans/mac-spike/RESULTS.md` §S77が同じ呼び方で観測）。
+    let list_txt = script_cell(&arm.text, "LIST_TXT=");
+    let list_edited = script_cell(&arm.text, "LIST_EDITED=");
+    let list_gone = script_cell(&arm.text, "LIST_GONE=");
+    let list_all = script_cell(&arm.text, "LIST_ALL=");
+    eprintln!(
+        "[{CASE}] 一覧: *.txt={list_txt} edited.txt={list_edited} gone.txt={list_gone} 全部={list_all}"
+    );
+    if list_txt != "edited.txt" {
+        failures.push(format!(
+            "`*.txt`の一覧が`edited.txt`だけになっていない（{list_txt:?}）。DOS用の記号（`<.txt`）を\
+             照合できていないか、消した`gone.txt`が見えている（BUG-181）"
+        ));
+    }
+    if list_edited != "edited.txt" {
+        failures.push(format!(
+            "`edited.txt`で絞った一覧が1件になっていない（{list_edited:?}）。2回目以降の問い合わせで\
+             絞り込みが外れている（BUG-181）"
+        ));
+    }
+    if !list_gone.is_empty() {
+        failures.push(format!("消した`gone.txt`が一覧に出る（{list_gone:?}）"));
+    }
+    let all: Vec<&str> = list_all.split('|').filter(|n| !n.is_empty()).collect();
+    if !all.contains(&"edited.txt") || all.contains(&"gone.txt") {
+        failures.push(format!(
+            "根の一覧が論理的な見え方と違う（{list_all:?}）。`edited.txt`は在り`gone.txt`は無いはず"
+        ));
+    }
+    if let Some(leaked) = all
+        .iter()
+        .find(|n| n.starts_with(".harness-cow-") || n.eq_ignore_ascii_case("_ext"))
+    {
+        failures.push(format!(
+            "根の一覧に差分層の帳簿か外の置き場が見える（{leaked}）（BUG-181）: {list_all:?}"
         ));
     }
 

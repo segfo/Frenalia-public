@@ -103,6 +103,10 @@ pub(super) fn merge_dir_entries(
     };
 
     for (name, meta) in diff_layer_entries {
+        // 帳簿と外の置き場は差分層の根にしか無い（`rel_prefix`が空＝ワークスペースの根を一覧している）。
+        if rel_prefix.is_empty() && is_diff_layer_bookkeeping(&name) {
+            continue;
+        }
         if deleted.contains(&child_rel(&name)) {
             continue;
         }
@@ -124,10 +128,180 @@ pub(super) fn merge_dir_entries(
         .collect()
 }
 
-/// DOSワイルドカード（`*`＝任意長・`?`＝任意1文字）の簡易大小無視マッチ。`NtQueryDirectoryFile`
-/// の`FileName`引数（例: `Get-ChildItem -Filter *.txt`）に対応するための簡略実装——短縮名
-/// （8.3形式）の特殊扱い等、DOSワイルドカードの厳密な歴史的仕様までは再現しない
-/// （既知の簡略化、Stage 0で観測された実クエリが`*`単体のみだった場合はこの関数自体使われない）。
+/// 差分層の根に置かれるCoW自身の帳簿と、ワークスペース外への変更の置き場（`_ext`）か（BUG-181）。
+///
+/// どちらもワークスペースの中身ではないので、ワークスペースの根の一覧に見せない。帳簿の判定は
+/// 変更一覧の走査（`store::scan_diff_layer_content_files`）と同じ規則
+/// （[`harness_change_ledger::COW_METADATA_PREFIX`]）を使う——名前の一覧をもう1つ作らない。
+///
+/// **限界**: `_ext`はこの接頭辞の規則に従っていない名前なので、ワークスペースの根に`_ext`という
+/// ディレクトリを新しく作ると、それも一覧から隠れる（差分層の同じ場所を外の置き場と共有しているため。
+/// 名前の衝突そのものは`docs/STATUS.md`の残課題が持つ）。
+pub(super) fn is_diff_layer_bookkeeping(name: &str) -> bool {
+    name.starts_with(harness_change_ledger::COW_METADATA_PREFIX) || name.eq_ignore_ascii_case("_ext")
+}
+
+/// `NtQueryDirectoryFile(Ex)`の`FileName`（絞り込みの式）に名前が一致するか（BUG-181）。
+///
+/// **照合はOS自身の`RtlIsNameInExpression`に任せる。** Win32（`FindFirstFileEx`）は`*.txt`を
+/// `<.txt`、`a?c`を`a>c`、`x.*`を`x"*`のようにDOS用の記号へ書き換えてからNTへ渡す
+/// （実測は`plans/mac-spike/RESULTS.md` §S78）。`*`と`?`しか知らない照合では`<`が入った時点で
+/// 1件も一致しなかった。ファイルシステムと同じ関数を呼べば、記号の意味を自前で写し取らずに済む。
+///
+/// `filter`は[`upcase_filter`]で大文字化済みであること（`IgnoreCase`を立てて呼ぶときの約束）。
+pub(super) fn name_matches_filter(filter: &[u16], name: &[u16]) -> bool {
+    match rtl_is_name_in_expression() {
+        Some(is_name_in_expression) => {
+            let expression = unicode_string_of(filter);
+            let name = unicode_string_of(name);
+            unsafe {
+                is_name_in_expression(
+                    &expression,
+                    &name,
+                    windows::Win32::Foundation::BOOLEAN(1),
+                    std::ptr::null(),
+                )
+            }
+            .as_bool()
+        }
+        // ntdllが必ず持つ関数なので通常は来ない。来たら`*`と`?`だけの照合へ落とす
+        // （DOS用の記号は近い意味へ読み替える。境界の周りでは完全には一致しない）。
+        None => wildcard_match(
+            &String::from_utf16_lossy(filter)
+                .replace('<', "*")
+                .replace('>', "?")
+                .replace('"', "."),
+            &String::from_utf16_lossy(name),
+        ),
+    }
+}
+
+/// 絞り込みの式を大文字化する。大文字化はOSの表（`RtlUpcaseUnicodeChar`）で行う——
+/// ファイルシステムの大小無視と同じ意味にするため。
+pub(super) fn upcase_filter(units: &[u16]) -> Vec<u16> {
+    units
+        .iter()
+        .map(|&c| unsafe { windows::Wdk::System::SystemServices::RtlUpcaseUnicodeChar(c) })
+        .collect()
+}
+
+type RtlIsNameInExpressionFn = unsafe extern "system" fn(
+    *const windows::Win32::Foundation::UNICODE_STRING,
+    *const windows::Win32::Foundation::UNICODE_STRING,
+    windows::Win32::Foundation::BOOLEAN,
+    *const u16,
+) -> windows::Win32::Foundation::BOOLEAN;
+
+/// `ntdll!RtlIsNameInExpression`（`windows`クレートは出していない）。1度だけ引いて覚える。
+fn rtl_is_name_in_expression() -> Option<RtlIsNameInExpressionFn> {
+    static ADDR: OnceLock<Option<usize>> = OnceLock::new();
+    let addr = (*ADDR.get_or_init(|| {
+        unsafe { crate::init::resolve_ntdll_export("RtlIsNameInExpression") }.map(|p| p as usize)
+    }))?;
+    Some(unsafe { std::mem::transmute::<usize, RtlIsNameInExpressionFn>(addr) })
+}
+
+/// 借りた`u16`の並びを、読むだけの`UNICODE_STRING`として渡す（名前も式も短いので長さは切り詰めで足りる）。
+fn unicode_string_of(units: &[u16]) -> windows::Win32::Foundation::UNICODE_STRING {
+    let bytes = (units.len() * 2).min(u16::MAX as usize & !1) as u16;
+    windows::Win32::Foundation::UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: windows::core::PWSTR(units.as_ptr() as *mut u16),
+    }
+}
+
+/// 今回の問い合わせで使う位置と絞り込みを決める（BUG-181）。Windowsの約束に合わせる——
+/// 絞り込みの名前は、そのハンドルで最初の問い合わせと、最初からやり直す問い合わせでだけ受け取る
+/// （続きの問い合わせでは`FileName`がNULLで届くことを実測した。§S78）。
+///
+/// | 前の状態 | やり直すか | 使う位置 | 使う絞り込み |
+/// |---|---|---|---|
+/// | 無い（最初の問い合わせ） | どちらでも | 0 | 渡されたもの（無ければ絞らない） |
+/// | 在る | やり直す | 0 | 渡されていればそれ、無ければ前のもの |
+/// | 在る | 続き | 前の位置 | 前のもの（渡された`FileName`は見ない） |
+pub(super) fn next_query_state(
+    previous: Option<&DirQueryState>,
+    requested: Option<Vec<u16>>,
+    restart_scan: bool,
+) -> DirQueryState {
+    match previous {
+        None => DirQueryState {
+            next: 0,
+            filter: requested,
+        },
+        Some(prev) if restart_scan => DirQueryState {
+            next: 0,
+            filter: requested.or_else(|| prev.filter.clone()),
+        },
+        Some(prev) => prev.clone(),
+    }
+}
+
+/// 1回の問い合わせへの答え（状態・書いたバイト数・次に覚えておく状態）。
+pub(super) struct DirQueryAnswer {
+    pub status: NTSTATUS,
+    pub bytes_written: usize,
+    pub state: DirQueryState,
+}
+
+/// 絞り込む前のマージ済み一覧`merged`から、1回の問い合わせへの答えを組む（BUG-181）。
+/// フックの本体（[`try_merged_dir_query`]）は、グローバルな設定とハンドルの表を引いてからこれを呼ぶ。
+pub(super) fn answer_dir_query(
+    merged: Vec<MergedEntry>,
+    previous: Option<&DirQueryState>,
+    requested: Option<Vec<u16>>,
+    restart_scan: bool,
+    class: FILE_INFORMATION_CLASS,
+    return_single_entry: bool,
+    out_buf: &mut [u8],
+) -> DirQueryAnswer {
+    let first_query = previous.is_none() || restart_scan;
+    let state = next_query_state(previous, requested, restart_scan);
+    let visible: Vec<MergedEntry> = match &state.filter {
+        None => merged,
+        Some(filter) => merged
+            .into_iter()
+            .filter(|e| name_matches_filter(filter, &e.name))
+            .collect(),
+    };
+    if state.next >= visible.len() {
+        // 本物のファイルシステムは、絞り込みに1件も当たらなければ最初の問い合わせで
+        // 「該当するファイルが無い」を返し、「もう無い」は読み終えた後にだけ返す（§S78で実測）。
+        let status = if first_query && visible.is_empty() && state.filter.is_some() {
+            STATUS_NO_SUCH_FILE
+        } else {
+            STATUS_NO_MORE_FILES
+        };
+        return DirQueryAnswer {
+            status,
+            bytes_written: 0,
+            state,
+        };
+    }
+    let (bytes_written, consumed) =
+        marshal_entries(out_buf, class, &visible, state.next, return_single_entry);
+    if consumed == 0 {
+        // 先頭1件すら入らないバッファ長（NT既定の「バッファ不足」応答）。位置は進めないが、
+        // 絞り込みは覚える——大きいバッファで撃ち直す続きの問い合わせは`FileName`を渡さない。
+        return DirQueryAnswer {
+            status: STATUS_BUFFER_OVERFLOW,
+            bytes_written: 0,
+            state,
+        };
+    }
+    DirQueryAnswer {
+        status: NTSTATUS(0),
+        bytes_written,
+        state: DirQueryState {
+            next: state.next + consumed,
+            filter: state.filter,
+        },
+    }
+}
+
+/// `*`＝任意長・`?`＝任意1文字だけを知る簡易な大小無視の照合。`RtlIsNameInExpression`を
+/// 引けないときの予備としてだけ使う（[`name_matches_filter`]）。
 pub(super) fn wildcard_match(pattern: &str, name: &str) -> bool {
     if pattern.is_empty() || pattern == "*" {
         return true;
@@ -348,48 +522,29 @@ pub(crate) unsafe fn try_merged_dir_query(
     if merged.is_empty() && dir_merge::read_entries(&base_layer_dir).is_empty() {
         return None;
     }
-    let pattern = unsafe { filename_filter_string(file_name) };
-    let merged: Vec<dir_merge::MergedEntry> = if pattern.is_empty() {
-        merged
-    } else {
-        merged
-            .into_iter()
-            .filter(|e| dir_merge::wildcard_match(&pattern, &String::from_utf16_lossy(&e.name)))
-            .collect()
-    };
-    let mut cursors = dir_query_cursor().lock().unwrap();
-    let start = if restart_scan {
-        0
-    } else {
-        *cursors.get(&handle_key).unwrap_or(&0)
-    };
-    if start >= merged.len() {
-        unsafe {
-            (*io_status_block).Anonymous.Status = STATUS_NO_MORE_FILES;
-            (*io_status_block).Information = 0;
-        }
-        return Some(STATUS_NO_MORE_FILES);
-    }
+    let requested =
+        unsafe { filename_filter_units(file_name) }.map(|units| dir_merge::upcase_filter(&units));
+    let previous = dir_query_cursor().lock().unwrap().get(&handle_key).cloned();
     let buf_len = length as usize;
     let out_buf = unsafe { std::slice::from_raw_parts_mut(file_information as *mut u8, buf_len) };
-    let (bytes_written, consumed) = dir_merge::marshal_entries(
-        out_buf,
+    let answer = dir_merge::answer_dir_query(
+        merged,
+        previous.as_ref(),
+        requested,
+        restart_scan,
         file_information_class,
-        &merged,
-        start,
         return_single_entry,
+        out_buf,
     );
-    if consumed == 0 {
-        // 先頭1件すら入らないバッファ長（NT既定の「バッファ不足」応答）。
-        return Some(STATUS_BUFFER_OVERFLOW);
-    }
-    cursors.insert(handle_key, start + consumed);
-    drop(cursors);
+    dir_query_cursor()
+        .lock()
+        .unwrap()
+        .insert(handle_key, answer.state);
     unsafe {
-        (*io_status_block).Anonymous.Status = NTSTATUS(0);
-        (*io_status_block).Information = bytes_written;
+        (*io_status_block).Anonymous.Status = answer.status;
+        (*io_status_block).Information = answer.bytes_written;
     }
-    Some(NTSTATUS(0))
+    Some(answer.status)
 }
 
 pub(crate) unsafe extern "system" fn hooked_nt_query_directory_file(
@@ -505,22 +660,21 @@ pub(crate) fn dir_query_roots(cfg: &Config, rel_str: &str) -> Option<(PathBuf, P
     }
 }
 
-/// `NtQueryDirectoryFile`の`FileName`（ワイルドカードフィルタ、任意）引数をRustの`String`へ。
-/// NULLまたは空なら「フィルタ無し」を表す空文字列を返す（`dir_merge::wildcard_match`は
-/// 空パターンを常に一致として扱う）。
-pub(crate) unsafe fn filename_filter_string(
+/// `NtQueryDirectoryFile(Ex)`の`FileName`（絞り込みの式、任意）引数を、届いたままの`u16`の並びで写す。
+/// NULLまたは空なら`None`（この問い合わせは絞り込みを渡していない）。**文字列へ直さない**——
+/// 対にならないサロゲートを置き換えると、照合する式が別物になる。
+pub(crate) unsafe fn filename_filter_units(
     us: *const windows::Win32::Foundation::UNICODE_STRING,
-) -> String {
+) -> Option<Vec<u16>> {
     if us.is_null() {
-        return String::new();
+        return None;
     }
     let us = unsafe { &*us };
     if us.Buffer.is_null() || us.Length == 0 {
-        return String::new();
+        return None;
     }
     let len_u16 = (us.Length as usize) / 2;
-    let slice = unsafe { std::slice::from_raw_parts(us.Buffer.0, len_u16) };
-    String::from_utf16_lossy(slice)
+    Some(unsafe { std::slice::from_raw_parts(us.Buffer.0, len_u16) }.to_vec())
 }
 
 /// 孫プロセスへ再注入が失敗した/未完了だった場合の警告を`.harness-cow-warnings.jsonl`へ
@@ -553,3 +707,7 @@ pub(crate) fn append_warning_kind(cfg: &Config, kind: &str, message: &str) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dir_merge_tests.rs"]
+mod tests;

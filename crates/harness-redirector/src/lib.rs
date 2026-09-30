@@ -116,7 +116,8 @@ use windows::Wdk::Storage::FileSystem::{
 };
 use windows::Win32::Foundation::{
     CloseHandle, BOOL, HANDLE, HMODULE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_BUFFER_OVERFLOW,
-    STATUS_NO_MORE_FILES, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, WAIT_EVENT,
+    STATUS_NO_MORE_FILES, STATUS_NO_SUCH_FILE, STATUS_OBJECT_NAME_COLLISION,
+    STATUS_OBJECT_NAME_NOT_FOUND, WAIT_EVENT,
 };
 use windows::Win32::Storage::FileSystem::WriteFile;
 use windows::Win32::Storage::FileSystem::{

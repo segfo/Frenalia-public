@@ -296,9 +296,24 @@ pub(crate) fn delete_pending() -> &'static Mutex<HashSet<isize>> {
 /// マージ結果自体は毎回`std::fs::read_dir`から再計算するため、呼び出しの合間にディレクトリの
 /// 中身が変化すると位置がずれ得るが、これは許容する既知の簡略化とする（同期的な単一セッション
 /// 内での列挙という想定スコープでは実害が薄い）。
-pub(crate) fn dir_query_cursor() -> &'static Mutex<HashMap<isize, usize>> {
-    static C: OnceLock<Mutex<HashMap<isize, usize>>> = OnceLock::new();
+///
+/// **位置だけでなく絞り込みもハンドルごとに覚える**（BUG-181）。Windowsは絞り込みの名前
+/// （`FileName`）を**最初の問い合わせ（と最初からやり直す問い合わせ）でしか渡さず**、続きの
+/// 問い合わせではNULLを渡す——絞り込みはOSがハンドルに紐づけて覚えている状態である。
+/// 呼び出しごとの引数だけを見て絞ると、2回目から絞らない一覧の続きを返してしまう。
+pub(crate) fn dir_query_cursor() -> &'static Mutex<HashMap<isize, DirQueryState>> {
+    static C: OnceLock<Mutex<HashMap<isize, DirQueryState>>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 1つのディレクトリハンドルについて、マージ済み列挙のどこまで返したかと、どの絞り込みで絞るか。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DirQueryState {
+    /// 次に返すマージ済みエントリの先頭インデックス（絞り込んだ後の一覧の中の位置）。
+    pub next: usize,
+    /// 絞り込みの式（`FileName`をそのまま大文字化したUTF-16）。`None`なら絞らない。
+    /// Win32がNTへ渡す前にDOS用の記号（`<`・`>`・`"`）へ書き換えた後の形で持つ。
+    pub filter: Option<Vec<u16>>,
 }
 
 /// パスごとの「このセッションで最初に触った瞬間の実workspace側ハッシュ」キャッシュ
