@@ -10,7 +10,7 @@
 //!
 //! ここは安い方の口を1つに束ね、**効かなくなる条件を型と実装の側で潰す**ためのモジュールである。
 //!
-//! # 実測で分かったこと（2026-08-25、`acl_propagation_probe_tests`）
+//! # 実測で分かったこと（2026-08-25。記録は`plans/mac-spike/RESULTS.md` §S11、測ったプローブは消した）
 //!
 //! **rootのDACLを`SetKernelObjectSecurity`（伝播しない口）で書いたあとに
 //! `SetNamedSecurityInfoW`（伝播する口）で同じ宛先SID・同じ継承フラグのACEを書くと、

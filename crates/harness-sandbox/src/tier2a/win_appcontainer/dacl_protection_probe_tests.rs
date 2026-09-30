@@ -193,8 +193,8 @@ fn probe_root() -> std::path::PathBuf {
 // 比較できる形にしてある——件数が同じでも中身が入れ替わっていれば、
 // 「Administratorsを失っていない」とは言えないため。
 //
-// **実体は`test_support`へ移した**——`acl_dacl_size_limit_tests`（DACLの上限に当たったとき
-// 無言で切り捨てられるか）が2箇所目の利用者になったため（`docs/CODE-STRUCTURE-RULES.md`規則5）。
+// **実体は`test_support`にある**（2箇所目の利用者ができたときに移した。
+// `docs/CODE-STRUCTURE-RULES.md`規則5。利用者の一覧は`test_support`の同関数のdoc）。
 use super::test_support::describe_dacl_aces;
 
 // 継承由来フラグを落とす部品（候補C）は`test_support`が持つ。**BUG-145のプローブが

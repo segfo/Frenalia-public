@@ -464,21 +464,17 @@ pub(super) fn build_wide_tree(root: &std::path::Path, count: usize, fanout: usiz
 /// `count`個のファイルを、`root`直下の`k`本の枝それぞれを`depth`段に重ねた**森**へ均等に撒く。
 /// 実ノード数（ディレクトリ＋ファイル＋root）を返す。
 ///
-/// **[`build_wide_tree`]と[`build_chain_tree`]の両方を含む一般形である。** 前者は`depth = 1`
-/// （k本の枝が1段に並ぶ）、後者は`k = 1`（1本の枝がdepth段に重なる）に当たる。
-/// **両方の軸を同時に動かしたい測定のために足した**——BUG-145の案A（配布をroot直下の子ごとに
-/// 分割する）の費用は「直下の子の数」と「深さ」の両方に依存し得るのに、
-/// 既存の2つはどちらか片方しか振れない。
+/// **[`build_wide_tree`]を含む一般形である。** あちらは`depth = 1`（k本の枝が1段に並ぶ）に当たる。
+/// **直下の子の数と深さを同時に動かしたい測定のために足した**——BUG-145の案A（配布をroot直下の
+/// 子ごとに分割する）の費用は、その両方に依存し得る。
 ///
 /// 枝の1段目だけ`d{j:03}`で名前を分け、2段目以降は`d`で重ねる。ファイルは
 /// **`k * depth`個のディレクトリ全部へ順に**撒くので、最深段にも必ずファイルが載る
 /// （浅いところだけ届いて深いところが落ちる形を拾えるようにするため）。
 ///
-/// # [`build_chain_tree`]は委譲していない（**意図的**）
-///
-/// あちらは全段の名前が1文字で、**深さとパス長の関係そのものが測定の前提**である
-/// （深さ`N`でパス長が`2N`しか伸びない＝N=64まではMAX_PATHの内側、という腕の組み方）。
-/// この関数へ委譲すると1段目が`d000`になってその関係が崩れるので、別のまま残す。
+/// かつては1本の枝だけをdepth段に重ねる`build_chain_tree`（全段の名前が1文字で、深さと
+/// パス長の関係そのものを測定の前提にしていた）と並んでいた。あちらは唯一の使い手だった
+/// 残課題#20の測定M3-cと一緒に、2026-09-30に消した（`acl_baseline_cost_tests`の冒頭）。
 pub(super) fn build_forest_tree(
     root: &std::path::Path,
     count: usize,
@@ -504,41 +500,6 @@ pub(super) fn build_forest_tree(
         std::fs::write(&path, b"x").expect("write tree file");
     }
     1 + k * depth + count
-}
-
-/// `count`個のファイルを、`root`から**一列にネストした**`depth`段のディレクトリへ均等に撒く。
-/// 実ノード数（ディレクトリ＋ファイル＋root）を返す。
-///
-/// **[`build_wide_tree`]と対になる形である。** あちらは`fanout`個のディレクトリを**1段に並べ**、
-/// こちらは同じ個数を**一列に重ねる**。`build_chain_tree(root, F, N)`と
-/// `build_wide_tree(root, F, N)`は**ノード数・ディレクトリ数・ファイル数が完全に一致**し、
-/// 違うのは深さだけになる——**そうしておかないと、伝播コストの差を「深さのせい」と言えない**
-/// （ノード数が違えば、それだけで時間は動く）。
-///
-/// **段の名前を1文字固定にしてあるのは、深さと一緒にパス文字列長が動かないようにするため。**
-/// 深さ`N`のパス長は`2N`文字ぶんしか伸びないので、`C:\harness-Tier2a-verify-*`を起点にすると
-/// **N=64まではWindowsの伝統的なパス長上限（MAX_PATH=260）の内側**に収まる。
-/// N=128はその外側へ出る——**そこでは深さとパス長という2つの変数が同時に動く**ので、
-/// 差が出てもどちらのせいかは言えない（結果を書くときに限定詞を落とさないこと）。
-///
-/// ACL側は[`crate::win_common::long_path_wide`]が`\\?\`を付けるので上限の外でも書けるが、
-/// **救済walkが使うディレクトリ走査（`collect_dirs_and_files`）と撤収が同じように通るかは
-/// 別の事実**である。深い腕を測るときは、時間だけでなく「届いたか」「剥がせたか」も見ること。
-pub(super) fn build_chain_tree(root: &std::path::Path, count: usize, depth: usize) -> usize {
-    assert!(depth >= 1, "a chain needs at least one directory level");
-    std::fs::create_dir_all(root).expect("create tree root");
-    let mut levels = Vec::with_capacity(depth);
-    let mut cursor = root.to_path_buf();
-    for _ in 0..depth {
-        cursor = cursor.join("d");
-        std::fs::create_dir_all(&cursor).expect("create chain level");
-        levels.push(cursor.clone());
-    }
-    for i in 0..count {
-        let path = levels[i % depth].join(format!("f{i:06}.txt"));
-        std::fs::write(&path, b"x").expect("write tree file");
-    }
-    1 + depth + count
 }
 
 /// `dacl`（自前バッファ上のコピー）の全ACEから継承由来のフラグ（`INHERITED_ACE`）を落とす。
@@ -578,9 +539,8 @@ pub(super) unsafe fn strip_inherited_ace_flags(
 /// **件数だけでなくtrusteeとマスクまで**比較できる形にしてある——件数が同じでも中身が
 /// 入れ替わっていれば「元の許可を失っていない」とは言えないため。
 ///
-/// `docs/CODE-STRUCTURE-RULES.md`規則5により、`dacl_protection_probe_tests`（保護DACLの
-/// 耐久確認）と`acl_dacl_size_limit_tests`（DACLの上限で無言の切り捨てが起きるか）の
-/// 2箇所から使うのでここ1箇所に置く。元は前者のprivate定義だった。
+/// 複数のテストモジュールから使うので、`docs/CODE-STRUCTURE-RULES.md`規則5によりここ1箇所に置く
+/// （元は`dacl_protection_probe_tests`のprivate定義だった。利用者は`rg describe_dacl_aces`で数える）。
 pub(super) fn describe_dacl_aces(path: &std::path::Path) -> windows::core::Result<Vec<String>> {
     use std::ffi::c_void;
     use windows::core::PCWSTR;

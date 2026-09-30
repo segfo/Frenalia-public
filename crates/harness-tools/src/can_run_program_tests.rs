@@ -96,7 +96,9 @@ async fn a_query_with_no_match_points_back_to_the_listing() {
 /// （`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2の撤去一覧5点目）。
 ///
 /// 出さないと、一覧に出ているのに撃つと拒否される——**モデルから見て最も分かりにくい形**になる。
-/// §22.9が着地したらこのテストごと消す（暫定が残っていることを固定するためだけに在る）。
+/// **撤去一覧の5点目を消したらこのテストごと消す**（暫定が残っていることを固定するためだけに在る）。
+/// 以前は「§22.9が着地したら」と書いていたが、§22.9の骨格は2026-09-20に着地し、5点目は
+/// 安全な向きに外れる暫定として**意図して残されている**（同設計書の撤去一覧）。
 #[tokio::test]
 async fn a_program_that_cannot_be_started_yet_says_so() {
     let ctx = ctx_with(vec![program(r"C:\bin\node.exe", false)]);
