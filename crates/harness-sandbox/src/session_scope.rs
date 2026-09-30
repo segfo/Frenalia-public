@@ -123,9 +123,32 @@ pub fn cow_profile_diff_layer_root() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "harness").map(|d| d.data_local_dir().join("cow"))
 }
 
-/// 差分層の根をどこに取るかの計画（[`plan_cow_diff_layer_root`]の答え）。
+/// ワークスペースのボリュームへ追従する置き場の種類（D-81の規則の入力）。
+///
+/// D-81の規則は差分層のために作ったが、**同じ理由で同じ追従が要る置き場がもう1つある**——
+/// D-110 (i) のレビュー用worktree（`harness-review`）。規則を2つ持つと片方だけ直って
+/// 静かにずれる（`bug-pattern-rules` B-05）ので、置き場ごとに違うのは根の名前と
+/// 理由の文言に出す呼び名だけにして、判定は[`plan_per_volume_root`]の1本に通す。
+#[derive(Debug, Clone, Copy)]
+pub struct PerVolumePlacement<'a> {
+    /// ボリュームのルート直下に作る根の名前（[`PER_VOLUME_COW_DIRNAME`]など）。
+    pub per_volume_dirname: &'a str,
+    /// 理由の文言で使う呼び名（例: `CoW diff area`）。
+    pub what: &'a str,
+    /// ワークスペースがボリュームのルートだったときの拒否文の頭（どのコマンドの拒否かを示す）。
+    pub refusal_prefix: &'a str,
+}
+
+/// CoW差分層の置き場（D-81）。
+pub const COW_DIFF_LAYER_PLACEMENT: PerVolumePlacement<'static> = PerVolumePlacement {
+    per_volume_dirname: PER_VOLUME_COW_DIRNAME,
+    what: "CoW diff area",
+    refusal_prefix: "--sandbox tier2a-cow: ",
+};
+
+/// 根をどこに取るかの計画（[`plan_per_volume_root`]の答え）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CowDiffLayerRootPlan {
+pub enum PerVolumeRootPlan {
     /// ワークスペースがプロファイルと同じボリュームにある。従来どおり`%LOCALAPPDATA%`。
     Profile,
     /// ワークスペースが別のボリュームにある。そのボリュームのルート直下へ置く。
@@ -133,6 +156,9 @@ pub enum CowDiffLayerRootPlan {
     /// 別ボリュームだが、そこに根を置くべきではない。`%LOCALAPPDATA%`へ戻す（理由付き）。
     ProfileFallback(String),
 }
+
+/// 差分層の根をどこに取るかの計画（[`plan_cow_diff_layer_root`]の答え）。
+pub type CowDiffLayerRootPlan = PerVolumeRootPlan;
 
 /// 2つのボリュームのマウントポイントが同じものを指すか。
 ///
@@ -176,39 +202,63 @@ pub fn plan_cow_diff_layer_root(
     profile_volume: &Path,
     workspace_volume_is_remote: bool,
 ) -> Result<CowDiffLayerRootPlan, String> {
+    plan_per_volume_root(
+        workspace_root,
+        workspace_volume,
+        profile_volume,
+        workspace_volume_is_remote,
+        COW_DIFF_LAYER_PLACEMENT,
+    )
+}
+
+/// [`plan_cow_diff_layer_root`]の規則を、置き場の種類（[`PerVolumePlacement`]）を引数に取って
+/// 適用する本体。規則の説明は[`plan_cow_diff_layer_root`]のdocが正本。
+pub fn plan_per_volume_root(
+    workspace_root: &Path,
+    workspace_volume: &Path,
+    profile_volume: &Path,
+    workspace_volume_is_remote: bool,
+    placement: PerVolumePlacement<'_>,
+) -> Result<PerVolumeRootPlan, String> {
     if same_volume(workspace_root, workspace_volume) {
         return Err(format!(
-            "--sandbox tier2a-cow: the workspace is a volume root ({}); the copy-on-write diff \
-             area would have to live inside the workspace itself. Point --cwd at a subdirectory.",
-            workspace_root.display()
+            "{}the workspace is a volume root ({}); the {} would have to live inside the \
+             workspace itself. Point --cwd at a subdirectory.",
+            placement.refusal_prefix,
+            workspace_root.display(),
+            placement.what,
         ));
     }
     if same_volume(workspace_volume, profile_volume) {
-        return Ok(CowDiffLayerRootPlan::Profile);
+        return Ok(PerVolumeRootPlan::Profile);
     }
     // **ネットワーク共有のルートに根を掘らない。** そこは他人と共有している場所であり、
     // そもそもCoWはリモートのボリューム上では成立しない（[`cow_volume_gate`]が後で拒否する）。
     // ここで作ってしまうと、**起動を拒否する直前に共有のルートへディレクトリを1つ残す**
     // ——置き場を決める側と境界を検算する側で順序が逆なので、ここでも止める必要がある。
     if workspace_volume_is_remote {
-        return Ok(CowDiffLayerRootPlan::ProfileFallback(format!(
-            "{} is on a network location, so no diff area root is created there",
-            workspace_volume.display()
+        return Ok(PerVolumeRootPlan::ProfileFallback(format!(
+            "{} is on a network location, so no {} root is created there",
+            workspace_volume.display(),
+            placement.what,
         )));
     }
-    Ok(CowDiffLayerRootPlan::PerVolume(
-        workspace_volume.join(PER_VOLUME_COW_DIRNAME),
+    Ok(PerVolumeRootPlan::PerVolume(
+        workspace_volume.join(placement.per_volume_dirname),
     ))
 }
 
-/// [`cow_diff_layer_root_for_workspace`]の答え。**降格したことを黙らせないために2値で返す**。
+/// [`per_volume_root_for_workspace`]の答え。**降格したことを黙らせないために2値で返す**。
 #[derive(Debug, Clone)]
-pub struct CowDiffLayerRoot {
+pub struct PerVolumeRoot {
     pub root: PathBuf,
     /// ワークスペースのボリューム上に根を作れず`%LOCALAPPDATA%`へ戻した理由。
     /// `Some`なら**呼び出し側は必ず表示する**（`bug-pattern-rules` B-09）。
     pub fell_back: Option<String>,
 }
+
+/// [`cow_diff_layer_root_for_workspace`]の答え。
+pub type CowDiffLayerRoot = PerVolumeRoot;
 
 /// このワークスペース向けの差分層の根を決めて、使える状態にする（D-81）。
 ///
@@ -237,6 +287,49 @@ pub fn cow_diff_layer_root_for_workspace(
          HOME/USERPROFILE set?)"
             .to_string()
     })?;
+    per_volume_root_for_workspace(workspace_root, profile_root, COW_DIFF_LAYER_PLACEMENT)
+}
+
+/// [`cow_diff_layer_root_for_workspace`]の本体。置き場の種類と、降格先の根（`%LOCALAPPDATA%`側）を
+/// 引数に取る。規則を選んだうえで、ボリューム側を選んだなら根を作り、作れなければ降格する。
+pub fn per_volume_root_for_workspace(
+    workspace_root: &Path,
+    profile_root: PathBuf,
+    placement: PerVolumePlacement<'_>,
+) -> Result<PerVolumeRoot, String> {
+    let chosen = choose_per_volume_root(workspace_root, &profile_root, placement)?;
+    if chosen.root == profile_root {
+        return Ok(chosen);
+    }
+    match std::fs::create_dir_all(&chosen.root) {
+        Ok(()) => Ok(chosen),
+        Err(e) => Ok(PerVolumeRoot {
+            fell_back: Some(format!(
+                "could not create {} ({e}); keeping the {} under %LOCALAPPDATA%, which means it \
+                 will NOT go away with the volume",
+                chosen.root.display(),
+                placement.what,
+            )),
+            root: profile_root,
+        }),
+    }
+}
+
+/// D-81の規則で根を**選ぶだけ**で、何も作らない（[`per_volume_root_for_workspace`]の前半）。
+///
+/// 作らない版が要るのは、**後始末がどちらの根に置いたかを当て直す**ためである——ボリューム側に
+/// 置けずに`%LOCALAPPDATA%`へ降格したかどうかは作った時点でしか分からないので、消す側は
+/// 両方の候補を知る必要がある。選ぶために根を作ってしまうと、後始末のたびにボリュームの
+/// ルートへディレクトリを生やす。
+pub fn choose_per_volume_root(
+    workspace_root: &Path,
+    profile_root: &Path,
+    placement: PerVolumePlacement<'_>,
+) -> Result<PerVolumeRoot, String> {
+    let profile = |fell_back: Option<String>| PerVolumeRoot {
+        root: profile_root.to_path_buf(),
+        fell_back,
+    };
 
     #[cfg(windows)]
     {
@@ -245,67 +338,43 @@ pub fn cow_diff_layer_root_for_workspace(
             // どのボリュームか分からないなら、従来の置き場のままにする。**「同じボリューム」と
             // 決めつけない**——決めつけるとワークスペース側のルートに根を作ろうとして、
             // 見当違いの場所へディレクトリを生やす。
-            return Ok(CowDiffLayerRoot {
-                root: profile_root,
-                fell_back: Some(format!(
-                    "could not determine which volume {} lives on; keeping the CoW diff area \
-                     under %LOCALAPPDATA%",
-                    workspace_root.display()
-                )),
-            });
+            return Ok(profile(Some(format!(
+                "could not determine which volume {} lives on; keeping the {} under \
+                 %LOCALAPPDATA%",
+                workspace_root.display(),
+                placement.what,
+            ))));
         };
-        let Some(profile_volume) = crate::win_common::volume_mount_point_of(&profile_root) else {
-            return Ok(CowDiffLayerRoot {
-                root: profile_root,
-                fell_back: Some(
-                    "could not determine which volume %LOCALAPPDATA% lives on; keeping the CoW \
-                     diff area there"
-                        .to_string(),
-                ),
-            });
+        let Some(profile_volume) = crate::win_common::volume_mount_point_of(profile_root) else {
+            return Ok(profile(Some(format!(
+                "could not determine which volume %LOCALAPPDATA% lives on; keeping the {} there",
+                placement.what,
+            ))));
         };
         // ネットワーク越しかどうかは**置き場を決める前**に要る（`plan_cow_diff_layer_root`のdoc）。
         // 採れなかったときは「リモートかもしれない」側＝根を作らない側へ倒す。
         let workspace_is_remote = crate::win_common::volume_capability(&workspace_volume)
             .map(|c| c.is_remote)
             .unwrap_or(true);
-        match plan_cow_diff_layer_root(
+        match plan_per_volume_root(
             workspace_root,
             &workspace_volume,
             &profile_volume,
             workspace_is_remote,
+            placement,
         )? {
-            CowDiffLayerRootPlan::Profile => Ok(CowDiffLayerRoot {
-                root: profile_root,
+            PerVolumeRootPlan::Profile => Ok(profile(None)),
+            PerVolumeRootPlan::ProfileFallback(reason) => Ok(profile(Some(reason))),
+            PerVolumeRootPlan::PerVolume(root) => Ok(PerVolumeRoot {
+                root,
                 fell_back: None,
             }),
-            CowDiffLayerRootPlan::ProfileFallback(reason) => Ok(CowDiffLayerRoot {
-                root: profile_root,
-                fell_back: Some(reason),
-            }),
-            CowDiffLayerRootPlan::PerVolume(root) => match std::fs::create_dir_all(&root) {
-                Ok(()) => Ok(CowDiffLayerRoot {
-                    root,
-                    fell_back: None,
-                }),
-                Err(e) => Ok(CowDiffLayerRoot {
-                    root: profile_root,
-                    fell_back: Some(format!(
-                        "could not create {} ({e}); keeping the CoW diff area under \
-                         %LOCALAPPDATA%, which means it will NOT go away with the volume",
-                        root.display()
-                    )),
-                }),
-            },
         }
     }
     #[cfg(not(windows))]
     {
-        let _ = workspace_root;
-        Ok(CowDiffLayerRoot {
-            root: profile_root,
-            fell_back: None,
-        })
+        let _ = (workspace_root, placement);
+        Ok(profile(None))
     }
 }
 
@@ -1205,6 +1274,32 @@ mod tests {
         let err = plan_cow_diff_layer_root(Path::new(r"D:\"), &vol(r"D:\"), &vol(r"C:\"), false)
             .expect_err("the diff area would have to live inside the workspace");
         assert!(err.contains("volume root"), "理由を名指しすること: {err}");
+    }
+
+    /// 同じ規則を差分層以外の置き場（D-110 (i) のレビュー用worktree）へ使うとき、
+    /// 変わるのは根の名前と文言だけで、判定は差分層と同じであること。
+    #[test]
+    fn another_placement_follows_the_same_rule_under_its_own_root_name() {
+        const REVIEW: PerVolumePlacement<'static> = PerVolumePlacement {
+            per_volume_dirname: ".harness-review",
+            what: "review worktree",
+            refusal_prefix: "harness review: ",
+        };
+        let plan = |ws: &str, ws_volume: &str| {
+            plan_per_volume_root(Path::new(ws), &vol(ws_volume), &vol(r"C:\"), false, REVIEW)
+        };
+        let on_d = vol(r"D:\").join(".harness-review");
+        assert_eq!(
+            plan(r"D:\work\proj", r"D:\"),
+            Ok(PerVolumeRootPlan::PerVolume(on_d))
+        );
+        assert_eq!(
+            plan(r"C:\work\proj", r"C:\"),
+            Ok(PerVolumeRootPlan::Profile)
+        );
+        let err = plan(r"D:\", r"D:\").expect_err("a volume root is refused for every placement");
+        assert!(err.starts_with("harness review: "), "{err}");
+        assert!(err.contains("review worktree"), "{err}");
     }
 
     // --- ボリュームがACLを保持できるかの検問（D-81 / Part B） ---

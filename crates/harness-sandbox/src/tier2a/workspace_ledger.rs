@@ -448,10 +448,59 @@ pub fn write_cow_session_meta(diff_layer_dir: &Path, workspace_root: &Path, sess
         review: previous.as_ref().and_then(|p| p.review.clone()),
         diff_layer_root_fell_back: previous.and_then(|p| p.diff_layer_root_fell_back),
     };
-    if let Ok(json) = serde_json::to_string_pretty(&meta) {
-        let _ = std::fs::write(diff_layer_dir.join(COW_SESSION_META_FILENAME), json);
-    }
+    let _ = store_cow_session_meta(diff_layer_dir, &meta);
 }
+
+/// セッションメタのレビュー状態（D-80/D-110）だけを書き換える。他の欄はそのまま残す。
+///
+/// 書くのは`harness-review`である。**メタが無い・読めないなら書かずに`Err`を返す**——
+/// 読めないメタを上書きすると、判定不能（＝回収しない）だったものが判定可能へ変わる
+/// （[`write_cow_session_meta`]と同じ理由）。無いメタを作らないのは、どのワークスペースの
+/// 差分層かという記録を、レビューの側が推測で埋めることになるためである。
+///
+/// **このメタは差分層の中にあり、サンドボックスの子が書ける。** ここへ書いた値は
+/// GCへの目印（「回収するな」）としてだけ読むこと。`review_ref`を読んで何かを消す用途には
+/// 使えない——子が`refs/heads/main`と書けば、それを信じた後始末が本物の枝を消す。
+pub fn set_cow_review_state(
+    diff_layer_dir: &Path,
+    review: Option<CowReviewState>,
+) -> Result<(), String> {
+    let mut meta = match read_cow_session_meta(diff_layer_dir) {
+        CowMetaRead::Ok(meta) => meta,
+        CowMetaRead::Absent => {
+            return Err(format!(
+                "{}: no CoW session metadata to record the review state in",
+                diff_layer_dir.display()
+            ))
+        }
+        CowMetaRead::Unreadable(why) => {
+            return Err(format!(
+                "the CoW session metadata is unreadable, left as is: {why}"
+            ))
+        }
+    };
+    meta.review = review;
+    store_cow_session_meta(diff_layer_dir, &meta).map_err(|e| {
+        format!(
+            "{}: could not write the CoW session metadata: {e}",
+            diff_layer_dir.display()
+        )
+    })
+}
+
+/// セッションメタを書く**唯一の口**（`code-structure-rules` §5.1: 作る側と書き換える側を
+/// 同じ実装に通す）。一時ファイルへ書いてから置き換えるので、途中で落ちても
+/// 半分だけ書かれたメタ（＝読めないメタ）は残らない。一時ファイルの名前は
+/// `.harness-cow-`で始まるので、差分層の中身の走査（`COW_METADATA_PREFIX`）には数えられない。
+fn store_cow_session_meta(diff_layer_dir: &Path, meta: &CowSessionMeta) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(meta).map_err(std::io::Error::other)?;
+    let tmp = diff_layer_dir.join(COW_SESSION_META_TMP_FILENAME);
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, diff_layer_dir.join(COW_SESSION_META_FILENAME))
+}
+
+/// [`store_cow_session_meta`]が置き換えの前に書く一時ファイル。
+const COW_SESSION_META_TMP_FILENAME: &str = ".harness-cow-session.json.tmp";
 
 /// セッションメタを読む。**`Absent`と`Unreadable`を区別して返す**（[`CowMetaRead`]のdoc参照）。
 pub fn read_cow_session_meta(diff_layer_dir: &Path) -> CowMetaRead {
@@ -1065,5 +1114,54 @@ mod cow_gc_tests {
         let json = serde_json::to_string(&meta).unwrap();
         let back: CowSessionMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(back.review, meta.review);
+    }
+
+    fn pending(at: u64) -> CowReviewState {
+        CowReviewState::Pending {
+            review_ref: "refs/harness/review/session-x/".into(),
+            fetched_at_unix_secs: at,
+        }
+    }
+
+    /// レビュー状態だけが変わり、由来の欄（どのワークスペースか・いつ作ったか）は残る。
+    /// その後に再開（`write_cow_session_meta`がもう一度走る）しても、レビュー待ちは消えない。
+    #[test]
+    fn recording_the_review_state_keeps_the_rest_and_survives_a_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cow_session_meta(dir.path(), Path::new(r"C:\ws"), "session-x");
+        let before = read_cow_session_meta(dir.path()).ok().cloned().unwrap();
+
+        set_cow_review_state(dir.path(), Some(pending(7))).unwrap();
+        let after = read_cow_session_meta(dir.path()).ok().cloned().unwrap();
+        assert_eq!(after.review, Some(pending(7)));
+        assert_eq!(after.workspace_root, before.workspace_root);
+        assert_eq!(after.created_at_unix_secs, before.created_at_unix_secs);
+
+        write_cow_session_meta(dir.path(), Path::new(r"C:\ws"), "session-x");
+        let resumed = read_cow_session_meta(dir.path()).ok().cloned().unwrap();
+        assert_eq!(resumed.review, Some(pending(7)));
+
+        set_cow_review_state(dir.path(), None).unwrap();
+        let cleared = read_cow_session_meta(dir.path()).ok().cloned().unwrap();
+        assert_eq!(cleared.review, None);
+        assert!(
+            !dir.path().join(COW_SESSION_META_TMP_FILENAME).exists(),
+            "置き換えの一時ファイルが残っている"
+        );
+    }
+
+    /// 読めないメタは上書きしない（バイト列が変わらない）。無いメタは作らない。
+    #[test]
+    fn the_review_state_is_never_written_over_an_unreadable_or_missing_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(COW_SESSION_META_FILENAME);
+        let broken = br#"{"session_id":"s","some_future_field":1}"#;
+        std::fs::write(&path, broken).unwrap();
+        assert!(set_cow_review_state(dir.path(), Some(pending(1))).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), broken);
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(set_cow_review_state(empty.path(), Some(pending(1))).is_err());
+        assert!(!empty.path().join(COW_SESSION_META_FILENAME).exists());
     }
 }

@@ -7,7 +7,8 @@
 //! （`shell.rs`のモデル実行・`resolve.rs`の内部`git merge-file`）を無改造のまま保つ。
 
 /// harnessが起動する全`git`（`run_shell`経由のモデル実行・`resolve.rs`の内部`git merge-file`・
-/// Recallのcheckpoint git履歴化の3経路）へ適用する、自動発火経路だけを潰すenv（D-06/D-14b、
+/// Recallのcheckpoint git履歴化・`harness-review`のレビュー経路の4経路）へ適用する、
+/// 自動発火経路だけを潰すenv（D-06/D-14b、
 /// `plans/DESIGN-SANDBOX-APPPOLICY.md` §5.2）。`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
 /// `GIT_CONFIG_VALUE_n`（git 2.31+）は`-c`と同じ最高優先度の設定として扱われ、攻撃者が書き換える
 /// `.git/config`では上書きできない。
@@ -28,7 +29,10 @@
 ///
 /// **Recallのようにこの機構の外側で新しくgitを起動する経路を追加するときは、必ずここを通す**
 /// （`bug-pattern-rules` B-06「不変条件を変えたなら全経路を数えたか」——「harnessが起動する
-/// git全てがハードニング済み」という不変条件を成立させる呼び出し元は現在3箇所）。
+/// git全てがハードニング済み」という不変条件を成立させる呼び出し元は現在4箇所。
+/// 4箇所目の`harness-review`（`launcher.rs`）は、このenvに加えて**エージェントの`.git`を
+/// git dirとして一度も渡さない**構造で D-110 (vi) を守っている——このenvだけでは
+/// `.git/config`を無効にできないため）。
 pub fn hardening_env() -> Vec<(String, String)> {
     vec![
         ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),

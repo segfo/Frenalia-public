@@ -208,6 +208,8 @@ fn parse_args() -> Args {
     let mut bench_outside: Option<String> = None;
     let mut bench_dll: Option<String> = None;
     let mut bench_iters: usize = 20_000;
+    let mut bench_first_touch: Option<String> = None;
+    let mut bench_rewrite: Option<String> = None;
     let mut console_write: Option<String> = None;
     let mut console_read = false;
     let mut console_ctrl_break = false;
@@ -316,6 +318,8 @@ fn parse_args() -> Args {
             "--open-bench" => bench_inside = Some(next()),
             "--open-bench-outside" => bench_outside = Some(next()),
             "--open-bench-dll" => bench_dll = Some(next()),
+            "--open-bench-first-touch" => bench_first_touch = Some(next()),
+            "--open-bench-rewrite" => bench_rewrite = Some(next()),
             "--open-bench-iters" => {
                 if let Ok(v) = next().parse::<usize>() {
                     bench_iters = v.max(1);
@@ -391,6 +395,8 @@ fn parse_args() -> Args {
         outside: bench_outside,
         iters: bench_iters,
         dll: bench_dll,
+        first_touch: bench_first_touch,
+        rewrite: bench_rewrite,
     });
 
     Args {

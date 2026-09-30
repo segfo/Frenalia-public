@@ -1143,6 +1143,11 @@ mod jit_grant_cost_tests;
 #[cfg(all(windows, test))]
 mod lazy_hook_overhead_tests;
 
+/// **copy-up の写しを一時名で作ってから置くようにした費用**（`plans/mac-spike/RESULTS.md` §S76）。
+/// 初めて書くファイルごとに名前の変更が1回増える。非昇格で回す。**判定が出たら削除する**。
+#[cfg(all(windows, test))]
+mod copy_up_cost_tests;
+
 /// **制限SID（`SidsToRestrict`）を指定したトークンで非管理者のまま子を起こせるか**
 /// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」5番＝案A-3の前提）。
 /// BUG-003が確かめた特権免除の特例は制限SIDが`None`のときの実測なので、非空でも

@@ -1,0 +1,30 @@
+[package]
+name = "harness-review"
+version.workspace = true
+edition.workspace = true
+
+# D-80/D-110 のレビュー経路（差分層の`.git`→ハーネスが組む一時リポジトリ→本物の
+# `refs/harness/review/<session-id>/…`へ fetch→レビュー用 worktree）。TUI と CLI の両方が
+# 同じ関数を呼ぶので、両者より下（`harness-cli`は`harness-tui`へ依存している）に置く。
+
+[dependencies]
+harness-core = { path = "../harness-core" }
+harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
+harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
+# 差分層は子が書ける。`Dir`を差分層に根を置いて開き、ハンドルから相対で辿る
+# （`harness-sandbox`のジェイルと同じ道具・同じ版）。
+cap-std = "4.0.2"
+directories = "6"
+# ゆるいオブジェクト（1ファイル1オブジェクトの zlib 圧縮）を展開して、名前（SHA-1）と
+# 中身が一致するかを検算するためだけに使う。最終的な検算は fetch 側の git（fsckObjects）が
+# 行うが、そこへ渡す前に「形式を検査したオブジェクトだけ」にするのが D-110 (vi) である。
+flate2 = "1"
+sha1 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3.27.0"
+thiserror = "2"
+which = "7"
+
+[dev-dependencies]
+tempfile = "3.27.0"
