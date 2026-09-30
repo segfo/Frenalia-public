@@ -1,30 +1,19 @@
 //! harness-grant-ledger: 「このマシンに対して実際に行った付与」を追跡する台帳の共通機構。
 //!
 //! `%APPDATA%\harness\config\*.json`（Windows。`directories::ProjectDirs::config_dir()`）に
-//! 置かれる次の4台帳が本クレートの`Ledger<T>`を共有する。
+//! 置かれる台帳が本クレートの`Ledger<T>`を共有する。
 //!
-//! | 台帳 | 記録する内容 | 所有モジュール |
-//! |---|---|---|
-//! | `fs-passthrough-ledger.json` | `--fs-allow`/`settings.json`で付与したACE | `harness-cli` |
-//! | `traverse-grant-ledger.json` | ドライブルート/祖先へのtraverse ACE（D10の巻き戻し用） | `harness-sandbox` |
-//! | `tier3-vm-ledger.json` | Hyper-V VM・差分VHDX・SMB共有 | `harness-sandbox` |
-//! | `workspace-grant-ledger.json` | preflightが付与したworkspaceの継承ACE（一覧表示用） | `harness-sandbox` |
+//! **どの台帳が在って、どれが消えると回収不能になるかは[`CONFIG_DIR_LEDGERS`]が持つ。**
+//! 各行の理由（何を記録し、消えると何が起きるか）は`docs/DEV-ENVIRONMENT.md`
+//! 「クリーンアップ時に絶対に消してはいけないファイル」が正本である。
+//! **件数も名前もここへ書き写さない**——2026-09-30の棚卸しで、同じ件数が5つの文書で
+//! 3/4/5/6/8と全部違っており、このモジュールdocは6と書いて2本を落としていた。
 //!
-//! `Ledger<T>`はこの4台帳以外にも使われる。**性質が違うもの**が2つある。
-//!
-//! | 台帳 | 記録する内容 | 消えたときに起きること |
-//! |---|---|---|
-//! | `appcontainer-session-ledger.json` | セッション/MCPサーバのプロファイルとACE付与先（D-37/D-38） | 接頭辞によるGC経路へ縮退（`session_profile`のdoc参照） |
-//! | `mcp-approval-ledger.json` | **ユーザーがどのMCPサーバ宣言を起動してよいと決めたか**（D-39） | 全サーバが未承認扱いになり再承認が要るだけ（fail-closed） |
-//!
-//! 後者は「実マシンへ加えた変更」ではなく**判断の記録**なので、消えても孤立した穴は残らない。
-//! だからクリーンアップ禁止ファイル（下記）には含めない。
+//! 分け方だけを言うと、**実マシンへ加えた変更を追跡するもの**（消えると孤立したACEやVMが残る）と、
+//! **判断の記録**（消えても未承認へ戻るだけでfail-closed）の2種類がある。前者が保護対象になる。
 //!
 //! **`harness-change-ledger`とは別物**である。あちらは1セッション内のCoW変更（どのファイルを
 //! 書き換えたか）を記録する揮発的なもので、こちらは**実マシンへ加えた永続的な変更**を記録する。
-//! こちらの3ファイル（`fs-passthrough`・`traverse-grant`・`tier3-vm`）は、消えると
-//! 「付与した記憶はあるが記録が無い」孤立した穴が実マシンに残るため、`CLAUDE.md`が
-//! クリーンアップ禁止ファイルとして名指ししている。
 //!
 //! ## 誤削除防止の2層
 //!
@@ -254,9 +243,86 @@ pub fn config_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "harness").map(|d| d.config_dir().to_path_buf())
 }
 
+/// `config_dir()`に置く台帳1本の素性。
+///
+/// `protected`は**「消えると回収不能になるか」**であって「台帳かどうか」ではない。
+/// 判定の根拠と各行の意味は[`docs/DEV-ENVIRONMENT.md`]「クリーンアップ時に絶対に
+/// 消してはいけないファイル」が正本で、**ここへ文章を複製しない**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigDirLedger {
+    /// `config_dir()`直下のファイル名。
+    pub file_name: &'static str,
+    /// 消えると実マシンへ孤立した副作用が残るなら`true`。
+    pub protected: bool,
+}
+
+/// `config_dir()`に置くことを許した台帳の全件。
+///
+/// **この配列が「何本あるか」のコード側の正本である。** 文書側の正本は
+/// `docs/DEV-ENVIRONMENT.md`で、あちらは各行の理由を持ち、こちらは名前と保護の要否だけを持つ。
+/// **件数を文書へ書き写さない**——2026-09-30の棚卸しで、同じ件数が5つの文書で
+/// 3/4/5/6/8と全部違っていた（`docs/STATUS.md`残課題「サンドボックス周辺 #33」）。
+///
+/// 増やすときは**ここと`DEV-ENVIRONMENT.md`の表を同じコミットで**直す。
+///
+/// # この機構が守らないもの
+///
+/// 歯があるのは**「未登録の名前で台帳を作れない」の1点だけ**である。次の3つは守らない。
+///
+/// 1. **文書との一致を検査しない。** `DEV-ENVIRONMENT.md`の表だけ古くなっても、テストは緑のまま。
+///    片方だけ直せる経路が残っている（それでも件数の正本が1つになったので、ずれても
+///    「どちらが正しいか」は決まる）。
+/// 2. **既存8本の名前を、テストが再検査しているわけではない。** 本クレートの
+///    `in_config_dir_accepts_every_registered_ledger`が回すのはこの配列の中身であって、
+///    各クレートが持つファイル名の定数ではない。**定数の側を書き換えて登録を直さなければ、
+///    落ちるのはその経路が実際に走ったときである**（起動時か、その機構のテスト）。
+///    追加の検査を置いていないのは、`pub`を増やして規約4（可視性）と衝突させるより、
+///    落ちる場所が遅れることを受け入れる方を選んだため。
+/// 3. **`config_dir()`の外にある台帳は視野に入らない**（`%ProgramData%`の
+///    `loopback-exemption-ledger.json`）。あちらは消えても次のセッションが引き取る。
+pub const CONFIG_DIR_LEDGERS: &[ConfigDirLedger] = &[
+    ConfigDirLedger { file_name: "fs-passthrough-ledger.json", protected: true },
+    ConfigDirLedger { file_name: "traverse-grant-ledger.json", protected: true },
+    ConfigDirLedger { file_name: "tier3-vm-ledger.json", protected: true },
+    ConfigDirLedger { file_name: "workspace-grant-ledger.json", protected: true },
+    ConfigDirLedger { file_name: "workspace-capability-ledger.json", protected: true },
+    ConfigDirLedger { file_name: "appcontainer-session-ledger.json", protected: false },
+    ConfigDirLedger { file_name: "mcp-approval-ledger.json", protected: false },
+    ConfigDirLedger { file_name: "run-approval-ledger.json", protected: false },
+];
+
+/// `config_dir()`に置く台帳として登録済みか。
+pub fn is_registered_config_dir_ledger(file_name: &str) -> bool {
+    CONFIG_DIR_LEDGERS.iter().any(|l| l.file_name == file_name)
+}
+
+/// 消えると回収不能になる台帳のファイル名だけを返す。
+pub fn protected_config_dir_ledgers() -> impl Iterator<Item = &'static str> {
+    CONFIG_DIR_LEDGERS
+        .iter()
+        .filter(|l| l.protected)
+        .map(|l| l.file_name)
+}
+
 impl<T> Ledger<T> {
     /// `%APPDATA%\harness\config\<file_name>`を指す台帳を作る。
+    ///
+    /// # Panics
+    ///
+    /// `file_name`が[`CONFIG_DIR_LEDGERS`]に無いときに落ちる。**これはプログラマの誤りであり、
+    /// 実行時の入力ではない。** 落とす理由は、台帳を1本増やしたのに保護一覧へ登録しないと
+    /// **クリーンアップの巻き添えで消える側に静かに入る**ためである——そして消えたことは
+    /// 無言で、症状は「剥がせないACEが実マシンに残る」という形で後から出る。
+    ///
+    /// テストで`%APPDATA%`を汚さずに台帳を作るときは[`Ledger::at_path`]を使う（登録は要らない）。
     pub fn in_config_dir(file_name: &str, lock_name: Option<&str>) -> Self {
+        assert!(
+            is_registered_config_dir_ledger(file_name),
+            "{file_name} is not registered in harness_grant_ledger::CONFIG_DIR_LEDGERS. \
+             台帳を1本増やしたなら、その配列と docs/DEV-ENVIRONMENT.md の保護対象の表を\
+             同じコミットで直すこと（消えたときに何が回収不能になるかを書く）。\
+             テスト用の一時台帳なら Ledger::at_path を使う。"
+        );
         Self {
             path: config_dir().map(|dir| dir.join(file_name)),
             lock_name: lock_name.map(str::to_owned),
@@ -733,12 +799,52 @@ mod tests {
 
     #[test]
     fn in_config_dir_points_at_the_named_file_under_the_harness_config_dir() {
-        let ledger: Ledger<TestLedger> = Ledger::in_config_dir("example-ledger.json", None);
+        // 登録済みの名前を使う（`in_config_dir`は未登録の名前で落ちる）。パスを組むだけで
+        // ファイルには触れないので、実マシンの台帳は読み書きしない。
+        let ledger: Ledger<TestLedger> = Ledger::in_config_dir("fs-passthrough-ledger.json", None);
         // `ProjectDirs`が解決できない環境（CI等）では`None`。解決できるなら末尾が一致する。
         if let Some(path) = ledger.path() {
-            assert_eq!(path.file_name().unwrap(), "example-ledger.json");
+            assert_eq!(path.file_name().unwrap(), "fs-passthrough-ledger.json");
             assert!(path.parent().unwrap().ends_with("config"));
         }
+    }
+
+    /// 保護一覧の登録漏れを機構で止める（#33）。**許可側と拒否側を対で持つ**——
+    /// 拒否側だけだと、`in_config_dir`が常に落ちる実装でも合格する（`B-35`）。
+    #[test]
+    fn in_config_dir_accepts_every_registered_ledger() {
+        for entry in CONFIG_DIR_LEDGERS {
+            let ledger: Ledger<TestLedger> = Ledger::in_config_dir(entry.file_name, None);
+            if let Some(path) = ledger.path() {
+                assert_eq!(path.file_name().unwrap(), entry.file_name);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is not registered")]
+    fn in_config_dir_refuses_an_unregistered_ledger_name() {
+        let _: Ledger<TestLedger> = Ledger::in_config_dir("brand-new-ledger.json", None);
+    }
+
+    /// 名前の重複は「登録したつもりで別の行を見ていた」を作る。
+    #[test]
+    fn config_dir_ledgers_are_unique() {
+        let mut names: Vec<&str> = CONFIG_DIR_LEDGERS.iter().map(|l| l.file_name).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), before, "CONFIG_DIR_LEDGERSにファイル名の重複がある");
+    }
+
+    /// `at_path`は登録を要求しない（テストが`%APPDATA%`を汚さずに台帳を作るための注入点）。
+    /// **ここが閉まっていると、上の拒否側を避ける道が無くなってテストが書けなくなる。**
+    #[test]
+    fn at_path_does_not_require_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger: Ledger<TestLedger> = Ledger::at_path(tmp.path().join("whatever.json"), None);
+        ledger.update(|l| l.entries.push("x".to_string()));
+        assert_eq!(ledger.load().entries, vec!["x"]);
     }
 
     /// R-01: 名前付きロックが実際に並行`update`を直列化することの確認（`traverse-grant`・
