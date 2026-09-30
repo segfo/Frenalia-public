@@ -1382,6 +1382,12 @@ mod tests {
     }
 }
 
+// 【使い捨て】下の`win`（名前付きパイプIPCの複製）を消す前に、共有モジュール
+// `harness_sandbox::win_pipe_ipc`と同じ振る舞いであることを固定する（規則6）。
+// 複製を消すコミットでファイルごと消す（規則2）。
+#[cfg(all(windows, test))]
+mod pipe_ipc_equivalence_tests;
+
 #[cfg(windows)]
 pub mod win {
     use super::*;
