@@ -1,6 +1,6 @@
 //! 単一ACL writerの回帰。**昇格しない**——ACEを書くのはテスト自身が作ったツリーだけで、
 //! 宛先SIDは[`capability_sid_from_name`]（純粋導出）＝台帳にもプロファイルにも何も残さない
-//! （`jit_grant_cost_tests`と同じ方針）。
+//! （`plans/mac-spike/RESULTS.md` §S13の測定と同じ方針）。
 
 use windows::Win32::Security::{CONTAINER_INHERIT_ACE, OBJECT_INHERIT_ACE};
 

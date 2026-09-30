@@ -58,9 +58,12 @@
 //! `docs/CODE-STRUCTURE-RULES.md`規則2（一回性の調査実験をテストとして残さない）。
 //! 層1を採用するなら、そのときの回帰テストは**本番機構の側に**書き直す。
 //!
-//! **消す時期は「判定が出たら」より遅い。** N2・N6・N7がこの器（`n2_*`の往復と
-//! `dev-elevated-runner`の`n2-loopback-exemption-add`／`-remove`）をそのまま再利用したので、
-//! **層1を実装し終えたら`n1_*`・`n2_*`・`n6_*`・`n7_*`と2ターゲットをまとめて削除する**。
+//! **消す時期は「判定が出たら」より遅い。** N2・N6・N7がこの器（`n2_*`の往復と、
+//! 付与・撤収の`n2_loopback_exemption_add`／`_remove`）をそのまま再利用したので、
+//! **層1を実装し終えたら`n1_*`・`n2_*`・`n6_*`・`n7_*`をまとめて削除する**。
+//! **付与・撤収の2関数に専用の昇格キーは無い**（`KNOWN_TARGETS`に一度も登録されていない）。
+//! 測り直すときは、関数名へ完全一致で絞ったキーを付与用・撤収用の2本足してから撃つ。
+//! `e2e-loopback-exemption`のフィルタはこの2関数に当たらないよう`tier2a::loopback_exemption::`へ絞ってある。
 //! そのとき要る回帰テスト（隔離が効くこと・撤収で消えること・失効確認が通ること）は本番機構の側に
 //! 書き直す。（この条件は以前はN7の引き継ぎ資料が持っていた。資料は役目を終えて削除し、ここへ移した。
 //! 棚卸しの記録は`docs/refactor/2026-08-19-spike-test-inventory.md`。）
@@ -2067,10 +2070,8 @@ Write-Output ("RESIDUE_USER_STORE=" + $n)
 ///
 /// ## 使い方
 ///
-/// ```text
-/// target\debug\dev-elevated-run.exe n2-loopback-exemption-add
-/// target\debug\dev-elevated-run.exe n2-loopback-exemption-remove
-/// ```
+/// 昇格して回す。**専用のキーは`KNOWN_TARGETS`に無い**ので、撃つ前にこの関数名へ完全一致で
+/// 絞ったキー（付与用・撤収用の2本）を足す（モジュール冒頭のdoc）。
 ///
 /// 付与と撤収を**環境変数ではなく別のテストに分けてある**のは、`dev-elevated-run`が
 /// 昇格側プロセスへ呼び出し元の環境変数を引き継ぐ保証が無いためである。
@@ -2123,13 +2124,13 @@ fn n2_loopback_exemption(remove: bool) {
 }
 
 #[test]
-#[ignore = "要管理者。`dev-elevated-run.exe n2-loopback-exemption-add`から回すこと"]
+#[ignore = "要管理者。専用の昇格キーは未登録（モジュール冒頭のdoc）"]
 fn n2_loopback_exemption_add() {
     n2_loopback_exemption(false);
 }
 
 #[test]
-#[ignore = "要管理者。`dev-elevated-run.exe n2-loopback-exemption-remove`から回すこと"]
+#[ignore = "要管理者。専用の昇格キーは未登録（モジュール冒頭のdoc）"]
 fn n2_loopback_exemption_remove() {
     n2_loopback_exemption(true);
 }
@@ -2154,7 +2155,7 @@ fn n2_loopback_exemption_remove() {
 /// AppContainerは自マシン宛の接続を既定で落とすので、`CheckNetIsolation LoopbackExempt -a`が
 /// 要る（**要管理者**）。テストからは撃たない——昇格したテストからAppContainer子を起こすと
 /// 親トークンが管理者になり、測っている世界が実運用と変わる（B-08）。
-/// **`dev-elevated-run n2-loopback-exemption-add`／`-remove`で付与・撤収する**——
+/// **付与・撤収は`n2_loopback_exemption_add`／`_remove`を昇格で回す**（専用のキーは未登録。モジュール冒頭のdoc）——
 /// 条件は「テストか」でも「自分が`sudo`を打つか」でもなく**「昇格が起きるか」**である（`CLAUDE.md`）。
 /// `CheckNetIsolation`を`sudo`で直に撃つと、**何を変えたかがコードに残らず撤収の対も書かれない**。
 /// （この行の旧版は当時のN1引き継ぎ（役目を終えて削除済み）の①案Bを引いて「単体で`sudo`」と書いており、
@@ -2183,8 +2184,8 @@ fn n2_do_real_runtimes_trust_the_per_container_store() {
     eprintln!("[N2-L1] profile={N2_PROFILE} package_sid={pkg_sid}");
     eprintln!(
         "[N2-L1] loopback exemptionが要る（package_sid={pkg_sid}）。未設定なら次で付与すること:\n  \
-         target\\debug\\dev-elevated-run.exe n2-loopback-exemption-add\n  \
-         （測定後は必ず `... n2-loopback-exemption-remove`。マシン全体で1本の共有リスト＝BUG-053）"
+         n2_loopback_exemption_add を昇格で回す（専用のキーは未登録。モジュール冒頭のdoc）\n  \
+         （測定後は必ず n2_loopback_exemption_remove。マシン全体で1本の共有リスト＝BUG-053）"
     );
 
     // 撤収を、作る前に登録する（B-01）。
@@ -3410,15 +3411,12 @@ for name in ('ROOT', 'CA'):
 ///
 /// プロファイル名も[`N2_PROFILE`]をそのまま使う——loopback exemptionは*package SID*に対して
 /// 足すもので、SIDはプロファイル名から決定的に導出される。名前を変えると
-/// `dev-elevated-run n2-loopback-exemption-add`を撃ち直す羽目になる。
+/// 付与（`n2_loopback_exemption_add`）を撃ち直す羽目になる。
 ///
 /// # loopback exemptionが要る（**要管理者**。測定本体は非昇格）
 ///
-/// ```text
-/// target\debug\dev-elevated-run.exe n2-loopback-exemption-add
-/// （ここで本テストを非昇格で回す）
-/// target\debug\dev-elevated-run.exe n2-loopback-exemption-remove
-/// ```
+/// 付与（`n2_loopback_exemption_add`を昇格で）→ 本テストを非昇格で → 撤収
+/// （`n2_loopback_exemption_remove`を昇格で）の順。専用の昇格キーは未登録（モジュール冒頭のdoc）。
 #[test]
 #[ignore = "実AppContainer＋loopback exemption＋外で立てたTLSサーバが要る。非昇格・--test-threads=1で走らせること"]
 fn n6_do_the_remaining_six_runtimes_trust_the_per_container_store() {

@@ -1058,12 +1058,6 @@ mod mac_spike_capability_tests;
 #[cfg(all(windows, test))]
 mod mac_spike_daemon_tests;
 
-/// **T4（残課題#20の分流）**: サンドボックスの子が、本番が今まさに開いている
-/// privhelperの要求受付パイプへ届くかを測る。結果は`plans/handoff-issue-20/T4.md`。
-/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
-#[cfg(all(windows, test))]
-mod t4_privhelper_pipe_reach_tests;
-
 /// **D-79の受け入れ測定（M2）**: ワークスペース内の実行を宣言制にする実装を入れたら本当に
 /// 止まるのか（継承ACEの2本割りが「ディレクトリは辿れる／ファイルは実行できない」を
 /// 表現できるか）と、その実行時コスト。測り方と結果は`plans/mac-spike/RESULTS.md` §S9（M2）。
@@ -1105,7 +1099,8 @@ mod unc_reach_spike_tests;
 /// （ドメイン遷移の足回り）に書かれた「重い」という**推定を実測へ置き換える**ためのもので、
 /// あわせて残課題#32（伝播が既存子孫へ届かない疑い）を確定/否定する。
 /// **非昇格で回す**（ACEを書くのはテスト自身が作ったツリーだけ）。
-/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
+/// **一回性の測定だったが、残す**（`docs/CODE-STRUCTURE-RULES.md`規則2の例外）——うち2本が
+/// 残課題#32の回帰になった。どれを残しどれを消せるかの内訳はファイル冒頭の表が持つ。
 #[cfg(all(windows, test))]
 mod acl_baseline_cost_tests;
 
@@ -1123,39 +1118,18 @@ mod acl_creation_inheritance_eligibility_tests;
 #[cfg(all(windows, test))]
 mod workspace_prepare_tests;
 
-/// **遅延実体化（JIT）でACEを1件ずつ配るときの1件あたり費用**
-/// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」1番）。
-/// 事前配布（§S12-1の86.5 µs/ノード）に対する損益分岐——「触る割合が何%を切れば
-/// JITのほうが安いか」——を出すためのもの。**非昇格で回す**。
-/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
-#[cfg(all(windows, test))]
-mod jit_grant_cost_tests;
-
 // **削除済み（2026-08-27）**: 一回性の費用測定3本（`docs/CODE-STRUCTURE-RULES.md`規則2）。
 // どれも判定が出たので消した。**測り方と数字は`plans/mac-spike/RESULTS.md`が持つ**——
 // 作成時継承の限界費用（T-3＝§S18）・ハンドル手渡しの1件あたり（T-5＝§S20）・
 // 部分木を外したときの浮き（§S22）。復元が要るならこのコミットの親から取る。
-/// **Redirector DLLのフックが、成功するopen 1回へ上乗せする時間**（D-88の着手条件）。
-/// Lazy ACE fault-inはフックの無いDirectRwへフックを新設するので、払う相手は
-/// 「faultした回数」（§S21の実測で503件）ではなく**成功も含めた全openの回数**
-/// （同じく144,967〜218,841回）である。**非昇格で回し、ACEも台帳も1バイトも触らない**。
-/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
-#[cfg(all(windows, test))]
-mod lazy_hook_overhead_tests;
-
-/// **copy-up の写しを一時名で作ってから置くようにした費用**（`plans/mac-spike/RESULTS.md` §S76）。
-/// 初めて書くファイルごとに名前の変更が1回増える。非昇格で回す。**判定が出たら削除する**。
-#[cfg(all(windows, test))]
-mod copy_up_cost_tests;
-
-/// **制限SID（`SidsToRestrict`）を指定したトークンで非管理者のまま子を起こせるか**
-/// （`plans/HANDOFF-FS-BOUNDARY-STATIC-ACE.md`の「次に測ること」5番＝案A-3の前提）。
-/// BUG-003が確かめた特権免除の特例は制限SIDが`None`のときの実測なので、非空でも
-/// 効くかを対照つきで測る。**非昇格で回す**（昇格すると特権を持ってしまい区別が付かない）。
-/// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。
-#[cfg(all(windows, test))]
-mod restricted_sid_probe_tests;
-
+//
+// **削除済み（2026-09-30）**: 判定の出た一回性の測定5本（同じ規則2）。数字と判定は記録が持つ——
+// JITの1件あたり費用（`jit_grant_cost_tests`＝§S13）・制限SID案A-3の成立性
+// （`restricted_sid_probe_tests`＝§S14、不成立）・フックがopen 1回へ上乗せする時間
+// （`lazy_hook_overhead_tests`＝§S25）・copy-upの一時名化の費用（`copy_up_cost_tests`＝§S76）は
+// `plans/mac-spike/RESULTS.md`、privhelperの受付パイプへの到達（`t4_privhelper_pipe_reach_tests`）は
+// `plans/handoff-issue-20/T4.md`。T4専用だったプローブのモード2つ（パイプ名の列挙・
+// 未使用の名前でのパイプ作成）も同時に外した。復元が要るならこのコミットの親から取る。
 /// **両モードのcapability SID宛ACEを1回で同時に配ったとき、`ro`側の子から
 /// 書けてしまわないか**（分流`plans/handoff/fs-boundary-cost/T-1.md`、実測は§S16）。
 /// 費用側は§S15-1が「1回にまとめれば無料」と実測済みなので、残る問いは安全性だけである。

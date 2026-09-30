@@ -23,10 +23,9 @@
 //! さらに**同じプロセスを両系統で同時に観測する**——別々に走らせると「プロセスが動かなかった」と
 //! 「フィールドが無い」を区別できない。
 //!
-//! 実行（要管理者権限。ETWリアルタイムセッション＋private system logger）:
-//! ```text
-//! dev-elevated-run.exe spike-etw-argv
-//! ```
+//! 実行には管理者権限が要る（ETWリアルタイムセッション＋private system logger）。
+//! **専用の昇格キーは`KNOWN_TARGETS`に登録していない**——撃つなら、フィルタをこのモジュール名
+//! （`policy_learnd::etw::argv_capture_spike_tests`）へ絞ったキーを先に足す。
 //!
 //! 使い捨てスパイクの位置付け（`docs/CODE-STRUCTURE-RULES.md`規則2）——結論が出たら
 //! このファイルは削除し、実測値は`plans/etw-spike/RESULTS.md` §22（測定の正本）へ残す。
@@ -112,7 +111,7 @@ fn find_marker<'a>(starts: &'a [MofProcessStart], marker: &str) -> Option<&'a Mo
 /// ——これが無いと「フィールドが無い」と「プロセスを見ていない」を区別できない。
 #[cfg(windows)]
 #[test]
-#[ignore = "requires administrator rights (two ETW sessions); run via dev-elevated-run.exe spike-etw-argv"]
+#[ignore = "requires administrator rights (two ETW sessions); no runner key is registered (see the module doc)"]
 fn mof_process_events_carry_the_command_line_that_manifest_events_lack() {
     use crate::tier1::win_restricted;
 
@@ -333,7 +332,7 @@ fn mof_process_events_carry_the_command_line_that_manifest_events_lack() {
 /// 同一性の根拠にならない。
 #[cfg(windows)]
 #[test]
-#[ignore = "requires administrator rights (two ETW sessions); run via dev-elevated-run.exe spike-etw-argv"]
+#[ignore = "requires administrator rights (two ETW sessions); no runner key is registered (see the module doc)"]
 fn the_two_sessions_correlation_keys_side_by_side() {
     use super::mof::{EVENT_TYPE_PROCESS_DC_START, EVENT_TYPE_PROCESS_START};
     use super::session::{
@@ -657,7 +656,7 @@ fn the_two_sessions_correlation_keys_side_by_side() {
 /// **痕跡が無い**ことの証明ではない。
 #[cfg(windows)]
 #[test]
-#[ignore = "requires administrator rights (ETW system logger); run via dev-elevated-run.exe spike-etw-argv"]
+#[ignore = "requires administrator rights (ETW system logger); no runner key is registered (see the module doc)"]
 fn where_exactly_is_the_command_line_truncated() {
     /// Rustの`Command`が組み立てる綴りは `"cmd.exe" /c echo <arg>`。前置部分は18 UTF-16単位
     /// （全てASCII）。この前提はASCII側の64単位プローブが逐語一致することで毎回検算される。
@@ -873,7 +872,7 @@ fn where_exactly_is_the_command_line_truncated() {
 /// 答えられない。
 #[cfg(windows)]
 #[test]
-#[ignore = "requires administrator rights (ETW) and creates an AppContainer profile; run via dev-elevated-run.exe spike-etw-argv"]
+#[ignore = "requires administrator rights (ETW) and creates an AppContainer profile; no runner key is registered (see the module doc)"]
 fn mof_process_events_carry_the_command_line_for_appcontainer_children() {
     use super::session::{
         ProviderProbeSession, EVENT_ID_PROCESS_START, KERNEL_PROCESS_KEYWORD_PROCESS,
@@ -1062,7 +1061,7 @@ fn mof_process_events_carry_the_command_line_for_appcontainer_children() {
 /// **測定の結論（argvが取れるか）は変わらない**——これは費用見積りの入力である。
 #[cfg(windows)]
 #[test]
-#[ignore = "requires administrator rights (ETW); run via dev-elevated-run.exe spike-etw-argv"]
+#[ignore = "requires administrator rights (ETW); no runner key is registered (see the module doc)"]
 fn can_the_system_process_provider_be_enabled_on_a_normal_session() {
     use super::session::try_enable_provider;
     use windows::Win32::System::Diagnostics::Etw::SystemProcessProviderGuid;

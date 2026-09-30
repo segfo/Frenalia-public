@@ -12,8 +12,8 @@
 //! # なぜ単独のファイル・単独のターゲットなのか
 //!
 //! **実マシンへの影響が最大の測定**である（他ツールと枠を奪い合う）。M1・M2・M5と同じ
-//! モジュールへ置くと、`spike-etw-argv`を回すたびに8本張ることになるので分けてある。
-//! 実行は`dev-elevated-run.exe spike-etw-logger-slots`（要管理者権限）。
+//! モジュールへ置くと、argvのスパイクを回すたびに8本張ることになるので分けてある。
+//! 要管理者権限。**専用の昇格キーは`KNOWN_TARGETS`に登録していない**——撃つなら、フィルタをこのモジュール名へ絞ったキーを先に足す。
 //!
 //! # 安全のための取り決め（**これを外すと他ツールの計測を壊す**）
 //!
@@ -64,7 +64,7 @@ fn leftover_sessions(query: &str) -> Vec<String> {
 /// **本命**: 枠が埋まったとき`StartTraceW`が返す値は、他の失敗と区別できるか。
 #[cfg(windows)]
 #[test]
-#[ignore = "requires administrator rights and fills the machine's private system logger slots; run via dev-elevated-run.exe spike-etw-logger-slots"]
+#[ignore = "requires administrator rights and fills the machine's private system logger slots; no runner key is registered (see the module doc)"]
 fn what_does_starttrace_return_when_the_system_logger_slots_are_full() {
     use super::session::EtwFsSession;
 

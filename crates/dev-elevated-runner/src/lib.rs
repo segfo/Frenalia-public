@@ -666,22 +666,6 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "policy_learnd::etw::spike_tests",
         ],
     ),
-    // ポリシー設定モード(Tier1)構想向け: Kernel-Network/DNS-ClientのETW実現性スパイク
-    // (plans/POLICY-EDITOR-TOMOYO-DIG.md)。
-    (
-        "spike-etw-net",
-        &[
-            "test",
-            "-p",
-            "harness-sandbox",
-            "--lib",
-            "--",
-            "--ignored",
-            "--test-threads=1",
-            "--nocapture",
-            "policy_learnd::etw::network_spike_tests",
-        ],
-    ),
     // ポリシー定義モード(Tier1)構想向け: record-allモードで、package SID無しのTier1
     // プロセスツリーがharness_pid起点の親子継承だけで正しく相関・帰属できるかの実機スパイク
     // (plans/POLICY-EDITOR-TOMOYO-DIG.md、`tier1-proxy-luminous-marshmallow.md`)。
@@ -808,6 +792,9 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "policy_learnd::argv_e2e_tests",
         ],
     ),
+    // フィルタはモジュールへ絞る。`loopback`の1語で束ねていたときは、証明書ストアのスパイクにある
+    // 付与用と撤収用の関数（`n2_loopback_exemption_add`／`_remove`）まで名前順に続けて走らせていた
+    // （付与と撤収を別のキーに分ける理由が、フィルタの部分一致で崩れる）。
     (
         "e2e-loopback-exemption",
         &[
@@ -819,7 +806,7 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--ignored",
             "--test-threads=1",
             "--nocapture",
-            "loopback",
+            "tier2a::loopback_exemption::",
         ],
     ),
     // 中断された`etw-fs-allow-reach`が残したプローブツリー（`C:\harness-fsallow-<pid>`）を掃く。
@@ -1021,8 +1008,7 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     // 拒否されました`を確認済み）。本セッションで再ビルドが必要な対象はharness本体側だけ。
     // D-81の検証用NTFSボリューム（VHD）。**作成と撤収を別ターゲットにしてある**——
     // 昇格側プロセスへ呼び出し元の環境変数が引き継がれる保証が無いので、1つのターゲットに
-    // 引数で向きを渡すと「撤収したつもりで作成していた」という無言の取り違えになる
-    // （`n2-loopback-exemption-add`／`-remove`と同じ理由）。
+    // 引数で向きを渡すと「撤収したつもりで作成していた」という無言の取り違えになる。
     (
         "vhd-ntfs-create",
         &[
@@ -1055,7 +1041,7 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     // 接続要求を**どの部品がどの理由で捨てているか**を`pktmon`に名指しさせる。
     // **開始・報告・停止を3つのキーに分けてある**——昇格側プロセスへ呼び出し元の環境変数が
     // 引き継がれる保証が無いので、1つのキーに向きを渡すと「停止したつもりで開始していた」
-    // という無言の取り違えになる（`n2-loopback-exemption-add`／`-remove`と同じ理由）。
+    // という無言の取り違えになる（`vhd-ntfs-create`／`-remove`と同じ理由）。
     // **監視セッションとフィルタは実マシンに残る共有状態なので、`-start`を撃ったら
     // 必ず`-stop`を撃つこと。**
     (

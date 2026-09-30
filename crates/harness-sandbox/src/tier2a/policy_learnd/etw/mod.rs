@@ -27,11 +27,10 @@ pub mod volumes;
 #[path = "spike_tests.rs"]
 mod spike_tests;
 
-/// ネットワーク可視化(`Kernel-Network`/`DNS-Client`)の実現性スパイク。
-/// `plans/POLICY-EDITOR-TOMOYO-DIG.md`のポリシー設定モード(Tier1)構想向けの調査。
-#[cfg(all(windows, test))]
-#[path = "network_spike_tests.rs"]
-mod network_spike_tests;
+// **削除済み（2026-09-30）**: ネットワーク可視化（`Kernel-Network`/`DNS-Client`）の実現性スパイク
+// `network_spike_tests`（判定は是。確定した事実は`plans/POLICY-EDITOR-TOMOYO-DIG.md`「実機スパイクで
+// 確定した事実」、削除の判断は`docs/refactor/2026-08-19-spike-test-inventory.md`）。昇格キー
+// `spike-etw-net`も同時に外した。復元が要るならこのコミットの親から取る。
 
 /// `docs/STATUS.md`「既知の未検証項目」#1〜#5を実測する。**assertより観測値の出力が主目的**。
 #[cfg(all(windows, test))]
@@ -89,8 +88,8 @@ mod tier1_record_all_spike_tests;
 /// （`plans/PLAN-MAC-RECURSIVE-DESCENDANTS.md`決定14・未解決#8）。マニフェスト側には
 /// コマンドラインのフィールドが無いので、MOF側の`Process`クラスで測る。
 ///
-/// **モジュール名は`KNOWN_TARGETS`の`spike-etw-argv`のフィルタ文字列と一致していなければ
-/// ならない**（改名するとBUG-056と同じ「0件マッチ」が再発する）。
+/// **専用の昇格キーは`KNOWN_TARGETS`に登録していない。** 撃つときにキーを足すなら、
+/// フィルタ文字列をこのモジュール名と一致させる（ずれるとBUG-056と同じ「0件マッチ」になる）。
 #[cfg(all(windows, test))]
 #[path = "argv_capture_spike_tests.rs"]
 mod argv_capture_spike_tests;
@@ -99,8 +98,8 @@ mod argv_capture_spike_tests;
 /// （`plans/PLAN-MAC-ARGV-MEASUREMENTS.md` M4）。**実マシンへの影響が最大の測定**なので、
 /// argvスパイクと同居させず単独のターゲットで回す。
 ///
-/// **モジュール名は`KNOWN_TARGETS`の`spike-etw-logger-slots`のフィルタ文字列と一致していなければ
-/// ならない**（改名するとBUG-056と同じ「0件マッチ」が再発する）。
+/// **専用の昇格キーは`KNOWN_TARGETS`に登録していない。** 撃つときにキーを足すなら、
+/// フィルタ文字列をこのモジュール名と一致させる（ずれるとBUG-056と同じ「0件マッチ」になる）。
 #[cfg(all(windows, test))]
 #[path = "logger_slot_spike_tests.rs"]
 mod logger_slot_spike_tests;

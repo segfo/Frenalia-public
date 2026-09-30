@@ -30,14 +30,6 @@ pub struct ReachSpec {
     pub pipes: Vec<String>,
     /// 同名パイプの**追加インスタンス**を作れるか（サーバ偽装、§10.1）。
     pub create_pipe_instances: Vec<String>,
-    /// パイプの名前空間（`\\.\pipe\*`）を**列挙**できるか（T4）。
-    /// 一意な名前が「秘密」として成立しているかどうかがこれで決まる——列挙できるなら、
-    /// 名前の推測不能性は防御に数えられない（DACLだけが境界になる）。
-    pub enumerate_pipes: bool,
-    /// **まだ存在しない**名前でパイプを作れるか（名前の先取り＝占拠、T4）。
-    /// [`create_pipe_instances`](Self::create_pipe_instances)が「既にある的への相乗り」なのに対し、
-    /// こちらは「harnessが後から使う名前を先に取る」——別の問いなので別の的として測る。
-    pub create_new_pipes: Vec<String>,
     /// `type:name`形式の名前付きカーネルオブジェクト（`mutex` / `event` / `section` / `job`）。
     pub objects: Vec<String>,
 }
@@ -224,120 +216,6 @@ fn probe_pipe_instance(name: &str) -> Value {
     attempt("pipe-create-instance", name, "PIPE_ACCESS_DUPLEX", true, 0)
 }
 
-/// パイプの名前空間を列挙できるか（T4）。`\\.\pipe\*`を`FindFirstFileW`で走査する。
-///
-/// **開けるかどうかとは別の問い**である。DACLで開けなくても、名前が見えるなら
-/// 「一意な名前だから推測できない」という前提は成立しない。逆に列挙できなければ、
-/// サンドボックス内から的の名前を知る経路が1つ減る（**塞がっている根拠にはしない**——
-/// 名前は親から環境変数・引数・ファイル経由でも漏れうる）。
-///
-/// 名前そのものは返さず、**件数と接頭辞の内訳**だけを返す。名前にはセッション固有の
-/// 値が入りうるので、測定ログへ丸ごと落とさない。
-#[cfg(windows)]
-fn probe_pipe_enumerate() -> Value {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::GetLastError;
-    use windows::Win32::Storage::FileSystem::{
-        FindClose, FindFirstFileW, FindNextFileW, WIN32_FIND_DATAW,
-    };
-
-    let pattern = wide(r"\\.\pipe\*");
-    let mut data = WIN32_FIND_DATAW::default();
-    let find = unsafe { FindFirstFileW(PCWSTR(pattern.as_ptr()), &mut data) };
-    let find = match find {
-        Ok(h) => h,
-        Err(_) => {
-            let mut report = attempt("pipe-enumerate", r"\\.\pipe\*", "FindFirstFileW", false, {
-                unsafe { GetLastError() }.0
-            });
-            report["total"] = json!(0);
-            report["harness_prefixed"] = json!(0);
-            report["privhelper_prefixed"] = json!(0);
-            return report;
-        }
-    };
-
-    let mut total = 0u32;
-    let mut harness_prefixed = 0u32;
-    let mut privhelper_prefixed = 0u32;
-    loop {
-        let name_len = data
-            .cFileName
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(data.cFileName.len());
-        let name = String::from_utf16_lossy(&data.cFileName[..name_len]);
-        total += 1;
-        if name.starts_with("harness-") {
-            harness_prefixed += 1;
-            if name.starts_with("harness-privhelper-") {
-                privhelper_prefixed += 1;
-            }
-        }
-        if unsafe { FindNextFileW(find, &mut data) }.is_err() {
-            break;
-        }
-    }
-    unsafe {
-        let _ = FindClose(find);
-    }
-
-    let mut report = attempt("pipe-enumerate", r"\\.\pipe\*", "FindFirstFileW", true, 0);
-    report["total"] = json!(total);
-    report["harness_prefixed"] = json!(harness_prefixed);
-    report["privhelper_prefixed"] = json!(privhelper_prefixed);
-    report
-}
-
-/// **まだ存在しない**名前でパイプを作れるか（名前の先取り、T4）。
-///
-/// `FILE_FLAG_FIRST_PIPE_INSTANCE`を付ける——付けないと「既にある同名パイプへ相乗りした」
-/// 場合も成功が返り、[`probe_pipe_instance`]と区別が付かなくなる。成功＝**その名前は空いていて、
-/// 自分が最初のインスタンスを取った**という一意な意味になる。
-///
-/// 作れた場合、サンドボックス内プロセスはharnessが後から使う名前を先に取れる。それが
-/// 何を引き起こすか（本体側の作成が落ちて止まるだけか、昇格側を騙せるか）は**この測定では
-/// 決まらない**——ここで測るのは「取れるか」だけである。
-#[cfg(windows)]
-fn probe_pipe_create_new(name: &str) -> Value {
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, GetLastError};
-    use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
-    use windows::Win32::System::Pipes::{
-        CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
-    };
-
-    let name_w = wide(name);
-    let handle = unsafe {
-        CreateNamedPipeW(
-            PCWSTR(name_w.as_ptr()),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,
-            4096,
-            4096,
-            0,
-            None,
-        )
-    };
-    let access = "PIPE_ACCESS_DUPLEX|FIRST_PIPE_INSTANCE";
-    if handle.is_invalid() {
-        return attempt(
-            "pipe-create-new",
-            name,
-            access,
-            false,
-            unsafe { GetLastError() }.0,
-        );
-    }
-    // **測定なので占拠したままにしない。** 即座に閉じる（閉じ忘れると、この後に本体が
-    // 同じ名前を使う経路を無関係に壊す）。
-    unsafe {
-        let _ = CloseHandle(handle);
-    }
-    attempt("pipe-create-new", name, access, true, 0)
-}
-
 /// `type:name`（`mutex` / `event` / `section` / `job`）を開く。
 #[cfg(windows)]
 fn probe_named_object(spec: &str) -> Value {
@@ -406,12 +284,6 @@ pub fn run(spec: &ReachSpec) -> Value {
     }
     for pipe in &spec.create_pipe_instances {
         attempts.push(probe_pipe_instance(pipe));
-    }
-    if spec.enumerate_pipes {
-        attempts.push(probe_pipe_enumerate());
-    }
-    for pipe in &spec.create_new_pipes {
-        attempts.push(probe_pipe_create_new(pipe));
     }
     for object in &spec.objects {
         attempts.push(probe_named_object(object));
