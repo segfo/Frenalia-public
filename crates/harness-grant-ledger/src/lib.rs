@@ -230,9 +230,9 @@ pub struct Ledger<T> {
 
 /// harnessのユーザースコープ設定ディレクトリ（`%APPDATA%\harness\config`）。
 ///
-/// **ここはharnessの制御面である。** 付与済みACEの台帳（`fs-passthrough-ledger.json`・
-/// `traverse-grant-ledger.json`・`tier3-vm-ledger.json`）とMCPの承認台帳
-/// （`mcp-approval-ledger.json`、D-39）が入っており、サンドボックスから書けると
+/// **ここはharnessの制御面である。** 付与済みACEの台帳と、何を起動・実行してよいかの
+/// 承認の台帳が入っており（一覧は[`CONFIG_DIR_LEDGERS`]。件数と名前はここへ書かない）、
+/// サンドボックスから書けると
 /// **自分の許可を書き換えられる**（P-08。`<workspace>/.harness`と同じ性質だが、
 /// **綴りが全く違うので同じ判定では拾えない**）。
 ///

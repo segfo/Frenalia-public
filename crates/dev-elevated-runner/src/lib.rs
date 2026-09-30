@@ -1,8 +1,8 @@
-//! `dev-elevated-runner`の共有部分（プロトコル型・入力検証・パイプIPCヘルパー）。
-//! IPCヘルパーは`crates/harness-sandbox/src/tier2a/netfilterd.rs`と同型のパターン（overlapped I/O・
-//! タイムアウト付きread/write・現在ユーザSID限定DACL）を複製したもの。ライフサイクルが
-//! 異なる（本クレートは多数のクライアント接続を順番に受け続ける、netfilterdは1セッション
-//! 2往復で終了）ため、netfilterd.rs自身のdocコメントに倣い汎用化せず複製する。
+//! `dev-elevated-runner`の共有部分（プロトコル型・入力検証・このランナー固有のパイプ名）。
+//!
+//! 名前付きパイプIPCの下回り（overlapped I/O・タイムアウト付きread/write・現在ユーザSID限定の
+//! DACL）は持たない。`harness_sandbox::win_pipe_ipc`（privhelper・netfilterd・vmsandboxdと共有）を
+//! 直接使う（下の`mod win`のdoc）。
 
 use serde::{Deserialize, Serialize};
 
