@@ -18,15 +18,18 @@
 
 #![cfg(all(windows, feature = "e2e-mock"))]
 
+mod support;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use harness_core::{BlockKind, CompletionRequest, StopReason, StreamEvent, Usage};
+use support::{harness_exe, run_named_case, CaseFn, HarnessRun};
 
+/// このテストバイナリの置き場の根。`recall_e2e.rs`とは**意図して別の根**にしてある
+/// （あちらは全ケース緑のときに根ごと消す。理由の全文は`support`のdoc）。
 const CASE_ROOT: &str = r"C:\harness-e2e";
-
-type CaseFn = fn() -> Result<(), String>;
 
 /// CoWセッションを作る／読むケース専用。**排他の証（[`CowExclusive`]）を引数で要求する**
 /// ので、排他ガードを取らずに書くことができない（BUG-135）。
@@ -37,10 +40,6 @@ type CowCaseFn = fn(&CowExclusive) -> Result<(), String>;
 /// fs passthrough台帳を触るケース。**排他ガードを引数で受け取る**——受け取れない形にすると、
 /// 呼ぶ側が排他ガードを取り忘れても書けてしまう（[`CowCaseFn`]と同じ理由、BUG-135）。
 type FsLedgerCaseFn = fn(&FsLedgerExclusive) -> Result<(), String>;
-
-fn harness_exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_harness"))
-}
 
 /// `tools/tier1a_net_e2e/README.md`のcase-matrixバイナリ。`cargo build -p tier2a-net-e2e`が
 /// 事前に必要（`docs/DEV-ENVIRONMENT.md`参照）。`harness`と同じ`target/<profile>/`直下にある
@@ -53,9 +52,7 @@ fn net_probe_exe() -> PathBuf {
 }
 
 fn scratch_dir() -> PathBuf {
-    let dir = Path::new(CASE_ROOT).join("_scratch");
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
+    support::scratch_dir(Path::new(CASE_ROOT))
 }
 
 /// ケース専用のRecall記憶データルート（`HARNESS_TEST_RECALL_DATA_ROOT`）。書込み先を決める側と
@@ -67,12 +64,12 @@ fn recall_data_root(scratch: &Path, case_name: &str) -> PathBuf {
 
 /// ケース専用ワークスペース。既存があれば作り直す（前回失敗の残骸を引き継がない）。
 fn case_dir(name: &str) -> PathBuf {
-    let dir = Path::new(CASE_ROOT).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create case workspace");
-    dir
+    support::case_dir(Path::new(CASE_ROOT), name)
 }
 
+/// ツール呼び出しだけを返すターン。**使用量は0で報告する**（このファイルの模擬応答の慣習）。
+/// `recall_e2e.rs`の同名の関数は使用量を「入力100・出力20」で報告するので共有していない
+/// （`support`のdoc）。
 fn tool_use_turn(id: &str, name: &str, input: serde_json::Value) -> Vec<StreamEvent> {
     vec![
         StreamEvent::BlockStart {
@@ -179,21 +176,13 @@ fn scripted_shell_rule_args(turns: &[Vec<StreamEvent>]) -> Vec<String> {
     out
 }
 
-struct HarnessRun {
-    status: std::process::ExitStatus,
-    stdout: String,
-    stderr: String,
-    record_path: PathBuf,
-    /// 起動の期限（[`Driver::Lmstudio`]の`deadline`）を過ぎて、こちらから止めたか。
-    /// **止めた回の`status`は失敗だが、製品が失敗したのではない**——読む側が取り違えないよう
-    /// 別の欄にしてある。mock の起動は期限を持たないので常に`false`。
-    timed_out: bool,
-}
-
 /// 実`harness.exe`を`--provider mock`で起動する（Q1〜Q2: out-of-process統一、
 /// featureゲート下のモック経路）。`--permission-mode accept-all --dangerously-allow`は
 /// 台本化されたrun_shellをheadlessで実行するために必須（Defaultモードだと
 /// Exec種別のrun_shellは拒否される、既存`headless_output.rs`参照）。
+///
+/// `recall_e2e.rs`の同名の関数とは起動の約束（権限モード・出力形式・プロンプト）が違うので
+/// 共有していない（`support`のdoc）。
 fn run_harness(
     ws: &Path,
     turns: &[Vec<StreamEvent>],
@@ -862,18 +851,6 @@ fn cleanup_on_success(ws: &Path, sessions: &[&str], case_name: &str) {
     let _ = std::fs::remove_file(scratch.join(format!("{case_name}-turns.json")));
     let _ = std::fs::remove_file(scratch.join(format!("{case_name}-requests.jsonl")));
     let _ = std::fs::remove_dir_all(recall_data_root(&scratch, case_name));
-}
-
-fn run_named_case<F: FnOnce() -> Result<(), String>>(name: &str, f: F) -> bool {
-    let result = f();
-    let passed = result.is_ok();
-    let record = serde_json::json!({
-        "case": name,
-        "passed": passed,
-        "error": result.err(),
-    });
-    println!("{record}");
-    passed
 }
 
 // ============================================================================
@@ -7001,6 +6978,9 @@ fn phase_text_turn(value: serde_json::Value) -> Vec<StreamEvent> {
 
 /// Investigateのターン。**計画のJSONとツール呼び出しを同じメッセージで返す**
 /// （mockの`schema_with_tools:true`により`CallKind::Fused`になる）。
+///
+/// `recall_e2e.rs`の同名の関数とは計画の形が違う（こちらはJSONの計画で呼び出しIDを変える）
+/// ので共有していない（`support`のdoc）。
 fn plan_and_tool_turn(id: &str, tool: &str, input: serde_json::Value) -> Vec<StreamEvent> {
     vec![
         StreamEvent::BlockStart {

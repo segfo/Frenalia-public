@@ -22,31 +22,25 @@
 
 #![cfg(all(windows, feature = "e2e-mock"))]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use harness_core::{BlockKind, StopReason, StreamEvent, Usage};
+use support::{harness_exe, run_named_case, CaseFn, HarnessRun};
 
+/// このテストバイナリの置き場の根。**全ケース緑のときに根ごと消す**（実行ドライバの末尾）ので、
+/// `tier2a_e2e.rs`の根とは意図して分けてある（理由の全文は`support`のdoc）。
 const CASE_ROOT: &str = r"C:\harness-e2e\recall";
 
-type CaseFn = fn() -> Result<(), String>;
-
-fn harness_exe() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_harness"))
-}
-
 fn scratch_dir() -> PathBuf {
-    let dir = Path::new(CASE_ROOT).join("_scratch");
-    std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
+    support::scratch_dir(Path::new(CASE_ROOT))
 }
 
 /// ケース専用ワークスペース。既存があれば作り直す（前回失敗の残骸を引き継がない）。
 fn case_dir(name: &str) -> PathBuf {
-    let dir = Path::new(CASE_ROOT).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create case workspace");
-    dir
+    support::case_dir(Path::new(CASE_ROOT), name)
 }
 
 /// ケース専用の記憶データルート。**ここがあるので実`%APPDATA%`を汚さない**。
@@ -87,6 +81,9 @@ fn text_turn(text: &str) -> Vec<StreamEvent> {
 }
 
 /// ツール呼び出しだけを返すターン（素朴ループ＝`--cognition off`用）。
+///
+/// 使用量はこのファイルの他のターンと同じく`done`で「入力100・出力20」と報告する。
+/// `tier2a_e2e.rs`の同名の関数は0で報告するので共有していない（`support`のdoc）。
 fn tool_use_turn(id: &str, name: &str, input: serde_json::Value) -> Vec<StreamEvent> {
     vec![
         StreamEvent::BlockStart {
@@ -106,6 +103,9 @@ fn tool_use_turn(id: &str, name: &str, input: serde_json::Value) -> Vec<StreamEv
 }
 
 /// Investigateターン: 計画（JSON）とツール呼び出しを同じメッセージで返す（`CallKind::Fused`）。
+///
+/// `tier2a_e2e.rs`の同名の関数とは形が違う（こちらは計画の文を引数で受け、呼び出しIDを固定する）
+/// ので共有していない（`support`のdoc）。
 fn plan_and_tool_turn(plan: &str, tool: &str, input: serde_json::Value) -> Vec<StreamEvent> {
     vec![
         StreamEvent::BlockStart {
@@ -191,13 +191,6 @@ fn hiv_turns_with_recall(picks: serde_json::Value) -> Vec<Vec<StreamEvent>> {
 
 // ------------------------------------------------------------ harnessの起動
 
-struct HarnessRun {
-    status: std::process::ExitStatus,
-    stdout: String,
-    stderr: String,
-    record_path: PathBuf,
-}
-
 struct RunSpec<'a> {
     ws: &'a Path,
     data_root: &'a Path,
@@ -214,6 +207,10 @@ struct RunSpec<'a> {
 ///
 /// `jsonl`にするのは`AgentEvent`を1行ずつstdoutへ出させるため——**`text`モードでは
 /// `MemoryRecalled`/`MemoryCheckpointed`が1行も出ない**（`harness_cli::run_headless`）。
+///
+/// `tier2a_e2e.rs`の同名の関数とは起動の約束（権限モード・出力形式・プロンプト・環境変数）が
+/// 違うので共有していない。とくにプロンプトは、こちらではゴール文として記憶の検索に掛かるので
+/// 結果を左右する（`support`のdoc）。
 fn run_harness(spec: RunSpec<'_>) -> HarnessRun {
     let scratch = scratch_dir();
     let turns_path = scratch.join(format!("{}-turns.json", spec.case_name));
@@ -262,6 +259,8 @@ fn run_harness(spec: RunSpec<'_>) -> HarnessRun {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         record_path,
+        // 模擬プロバイダの起動は期限を持たない（`support::HarnessRun`のdoc）。
+        timed_out: false,
     }
 }
 
@@ -428,16 +427,6 @@ fn seed_workspace(ws: &Path) {
         "let mut cmd = Command::new(\"powershell.exe\");",
     )
     .expect("seed shell.rs");
-}
-
-fn run_named_case<F: FnOnce() -> Result<(), String>>(name: &str, f: F) -> bool {
-    let result = f();
-    let passed = result.is_ok();
-    println!(
-        "{}",
-        serde_json::json!({ "case": name, "passed": passed, "error": result.err() })
-    );
-    passed
 }
 
 // ============================================================================
