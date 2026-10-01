@@ -401,12 +401,20 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
             keys.push("↑↓ 選択".to_string());
             keys.push("Space 取り消しを予約".to_string());
             keys.push("A 全件".to_string());
+            // [D-112] 未承認の宣言があるときだけ出す（無いときに押しても何も起きない）。
+            if !app.declared_approval.not_approved.is_empty() {
+                keys.push("y このマシンで承認を予約".to_string());
+            }
             keys.push("r 読み直し".to_string());
-            if app.unapproved.is_empty() {
-                keys.push("a 確定".to_string());
-            } else {
-                // 予約件数を出す（何件消えるのかが確定の直前まで見えている必要がある）。
-                keys.push(format!("a 確定（{}件を取り消し）", app.unapproved.len()));
+            let reserved = app.declared_approval.reserved.len();
+            match (reserved, app.unapproved.len()) {
+                (0, 0) => keys.push("a 確定".to_string()),
+                // 予約件数を出す（何件が変わるのかが確定の直前まで見えている必要がある）。
+                (0, removing) => keys.push(format!("a 確定（{removing}件を取り消し）")),
+                (approving, 0) => keys.push(format!("a 確定（{approving}件を承認）")),
+                (approving, removing) => {
+                    keys.push(format!("a 確定（{approving}件を承認・{removing}件を取り消し）"))
+                }
             }
         }
     }
@@ -466,7 +474,10 @@ harness-policy-editor — LLMを介さずに「このコマンドに何を許す
   Space  取り消しを予約（ドメインの行なら配下をまとめて）
   A      全ドメインの全宣言を予約（**一括承認はありませんが一括取り消しはあります**——
          禁じているのは読まずに権限を「与える」ことで、減らす向きは安全側だからです）
-  a      確定（差分を見てから y）
+  y      このマシンで未承認の宣言を、承認する予約に入れる（配下をまとめて。全件を一度に選ぶ
+         キーはありません）。リポジトリに同梱されていた・手で書いた・承認台帳ができる前に
+         承認した宣言には、このマシンで承認するまで許可が付きません（行に印が出ます）
+  a      確定（差分を見てから y。承認と取り消しを1回で書きます）
   [x]=宣言されている（このまま残る）  [ ]=取り消しを予約した
   **取り消してもACLはその場では変わりません。** 付与がパス2の開始時なので、撤収も
   次のパス2の開始時に走ります（プロセス終了時の撤収も従来どおりです）。

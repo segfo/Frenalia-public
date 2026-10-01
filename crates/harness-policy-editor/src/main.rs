@@ -186,6 +186,32 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// [D-112] **既に`policy.json`にあるファイル宣言を、このマシンで承認する。**
+    ///
+    /// リポジトリに同梱されていた宣言・手で書いた宣言・承認台帳ができる前に承認した宣言は、
+    /// このマシンで承認するまで許可が付かない（`harness.exe`でも、`record-net`でも）。
+    /// 承認する宣言は1件ずつ名指しする——**全件を承認するショートハンドは無い**（決定51）。
+    /// 候補の承認と同じ検査（`--require-sandbox`との矛盾・広すぎる値・候補にしない規則）を通す。
+    #[command(name = "approve-declared")]
+    ApproveDeclared {
+        /// 宣言があるドメイン名。
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// 承認するFS宣言の値（`policy.json`に書かれている綴り）。繰り返して複数指定できる。
+        #[arg(long, required = true)]
+        fs: Vec<String>,
+        /// `--fs`のaccess種別（`read`/`read_write`/`read_exec`）。
+        #[arg(long)]
+        access: String,
+        /// 承認を`--require-sandbox`の宣言と突き合わせる（none/write-containment/confidential）。
+        #[arg(long)]
+        require_sandbox: Option<String>,
+        /// 確認済みとして書き込む（非対話では必須）。
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -243,6 +269,21 @@ fn main() -> ExitCode {
             yes,
         ),
         Some(Command::Sessions { workspace }) => run_sessions(workspace),
+        Some(Command::ApproveDeclared {
+            domain,
+            workspace,
+            fs,
+            access,
+            require_sandbox,
+            yes,
+        }) => run_approve_declared(
+            &domain,
+            workspace,
+            &fs,
+            &access,
+            require_sandbox.as_deref(),
+            yes,
+        ),
         Some(Command::Unapprove {
             domain,
             workspace,
@@ -1116,6 +1157,114 @@ fn run_unapprove(
     }
 }
 
+/// [D-112] `approve-declared`: 既に`policy.json`にあるファイル宣言を、このマシンで承認する。
+fn run_approve_declared(
+    domain: &str,
+    workspace: Option<PathBuf>,
+    values: &[String],
+    access: &str,
+    require_sandbox: Option<&str>,
+    yes: bool,
+) -> ExitCode {
+    use harness_policy::generalize::SettingsKey;
+    use harness_policy_editor::approve_declared;
+    use harness_policy_editor::unapprove::UnapproveTarget;
+
+    let Some(require_sandbox) = resolve_require_sandbox(require_sandbox) else {
+        return ExitCode::FAILURE;
+    };
+    // 語彙は`unapprove --access`と同じ（新しい綴りを作らない）。
+    let key = match access {
+        "read" => SettingsKey::FsRead,
+        "read_write" => SettingsKey::FsReadWrite,
+        "read_exec" => SettingsKey::FsReadExec,
+        other => {
+            eprintln!("--access は read / read_write / read_exec のいずれかです（指定: {other}）");
+            return ExitCode::FAILURE;
+        }
+    };
+    let workspace_root = resolve_workspace(workspace);
+    let targets: Vec<UnapproveTarget> = values
+        .iter()
+        .map(|value| UnapproveTarget {
+            domain: domain.to_string(),
+            key,
+            value: value.clone(),
+        })
+        .collect();
+    let plan = match approve_declared::plan(&workspace_root, &targets, require_sandbox) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!(
+        "{}:",
+        harness_policy_editor::policy_file::path(&workspace_root).display()
+    );
+    if !plan.approve.is_empty() {
+        println!("  このマシンで承認する宣言 {}件:", plan.approve.len());
+        for target in &plan.approve {
+            println!("    + [{}] {} {}", target.domain, target.key.dotted(), target.value);
+        }
+    }
+    for target in &plan.already {
+        println!(
+            "  = [{}] {} {}（承認済みでした）",
+            target.domain,
+            target.key.dotted(),
+            target.value
+        );
+    }
+    // **断った宣言と無かった指定を黙らない**（B-09）。「承認しました」だけを見せると、
+    // 綴りの間違いや検査で止まった宣言に許可が付くと思い込む。
+    for (target, reason) in &plan.refused {
+        println!(
+            "  ✗ [{}] {} {}: {reason}",
+            target.domain,
+            target.key.dotted(),
+            target.value
+        );
+    }
+    for target in &plan.not_found {
+        println!(
+            "  ? [{}] {} {}（policy.jsonにありません）",
+            target.domain,
+            target.key.dotted(),
+            target.value
+        );
+    }
+    // **部分適用しない**（`approve`と同じ判断）。名指しした宣言の1件でも断る・無いなら何も書かない
+    // ——指定の誤りを直してから撃ち直す方が、一部だけ通った状態より読み違えにくい。
+    if !plan.refused.is_empty() || !plan.not_found.is_empty() {
+        eprintln!("承認できない指定があるので、何も書いていません");
+        return ExitCode::FAILURE;
+    }
+    if plan.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    println!();
+    println!(
+        "承認すると、次の record-net と harness.exe の起動でこの宣言に許可（ACE）が付きます。"
+    );
+    if !confirm_write(yes) {
+        println!("何も書いていません");
+        return ExitCode::FAILURE;
+    }
+    match approve_declared::commit(&workspace_root, &plan) {
+        Ok(count) => {
+            println!("このマシンで{count}件を承認しました");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// CLIの引数から取り消し対象を組み立てる。組み立てに失敗した理由は文字列で返す。
 fn collect_unapprove_targets(
     file: &harness_policy_editor::PolicyFile,
@@ -1334,6 +1483,7 @@ fn print_overview() {
     println!("  sessions                    記録セッションの一覧");
     println!("  show [<id>] [--net]         記録を読み直して候補を表示する（記録し直さない）");
     println!("  unapprove --domain <name> --fs <値> --access <種別> | --net <ドメイン> | --all");
+    println!("  approve-declared --domain <name> --fs <値> --access <種別>  policy.jsonにある宣言をこのマシンで承認する");
     println!("                              承認済み宣言を取り消す（ACLは次のパス2開始時に撤収）");
     println!();
     println!("記録と閲覧は独立したコマンドです。記録し終えてから編集へ進む一方通行ではなく、");

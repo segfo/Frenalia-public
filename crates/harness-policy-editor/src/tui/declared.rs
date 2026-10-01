@@ -19,6 +19,14 @@
 //! 理由は[`crate::unapprove`]のモジュールdocにある（付与がパス2開始時なので、撤収も同じ
 //! ライフサイクル点に置く）。この画面が変えるのは`policy.json`だけで、確定してもUACは出ない。
 //!
+//! # [D-112] このマシンでの承認（`y`）
+//!
+//! `policy.json`には、このマシンで承認していない宣言も入り得る（リポジトリに同梱されていたもの・
+//! 手で書いたもの・承認台帳ができる前に承認したもの）。それらには許可が付かないので、行に
+//! 「このマシンで未承認」と出し、`y`で配下の未承認の宣言を承認の予約に入れる（`a`で確定）。
+//! 確定は[`crate::approve_declared`]を通るので、候補の承認と同じ検査（`--require-sandbox`・
+//! 広すぎる値・候補にしない規則）が掛かり、断ったものは確認の画面に理由ごと出る。
+//!
 //! # 一括取り消しがあるのに一括承認が無いのは意図的
 //!
 //! D-42が禁じているのは「読まずに権限を**与える**」ことである。こちらは権限を**減らす**向きなので
@@ -31,6 +39,16 @@ use crate::tui::checkbox_tree;
 use crate::tui::proposal_tree::{ProposalTree, TreeItem};
 use crate::tui::state::{Action, App, Confirm, Modal, Screen};
 use crate::unapprove::{self, UnapproveTarget};
+
+/// [D-112] 宣言画面の「このマシンでの承認」の状態（`App::declared_approval`）。
+#[derive(Debug, Default)]
+pub struct DeclaredApprovalState {
+    /// このマシンで未承認のファイル宣言。**[`App::reload_declared`]が作り直す**（描画のたびに
+    /// 台帳を読まない）。
+    pub not_approved: std::collections::BTreeSet<UnapproveTarget>,
+    /// 承認を予約した宣言（`y`）。`not_approved`に入っているものだけが入る。
+    pub reserved: std::collections::BTreeSet<UnapproveTarget>,
+}
 
 impl App {
     /// `policy.json`を読み直して木を組み立てる。**取り消しの予約は保つ**——読み直しは
@@ -54,6 +72,33 @@ impl App {
         let alive: std::collections::BTreeSet<UnapproveTarget> =
             self.declared.iter().cloned().collect();
         self.unapproved.retain(|target| alive.contains(target));
+
+        // [D-112] このマシンで未承認の宣言を数え直す。予約は**まだ未承認のもの**だけ残す
+        // （別の経路で承認済みになった宣言を、もう一度承認する予約として持ち歩かない）。
+        let approvals = crate::approval_store::approval_store().load();
+        let workspace_key =
+            harness_sandbox::tier2a::policy_approval::approval_workspace_key(&self.workspace_root);
+        self.declared_approval.not_approved = self
+            .declared
+            .iter()
+            .filter(|target| {
+                target.key.fs_access().is_some_and(|access| {
+                    !approvals.is_approved_for_key(
+                        &workspace_key,
+                        harness_sandbox::tier2a::policy_approval::DeclarationRef {
+                            domain: &target.domain,
+                            value: &target.value,
+                            access,
+                        },
+                    )
+                })
+            })
+            .cloned()
+            .collect();
+        let not_approved = &self.declared_approval.not_approved;
+        self.declared_approval
+            .reserved
+            .retain(|target| not_approved.contains(target));
     }
 
     /// 宣言の木を組み立て直す。**候補画面と同じ`ProposalTree`**を使う。
@@ -106,11 +151,12 @@ impl App {
             KeyCode::Left => self.collapse_or_ascend_declared(),
             KeyCode::Char(' ') => self.toggle_declared_subtree(),
             KeyCode::Char('A') => self.reserve_all_declared(),
+            KeyCode::Char('y') => self.toggle_declared_approval_subtree(),
             KeyCode::Char('r') => {
                 self.reload_declared();
                 self.status = "policy.jsonを読み直しました".to_string();
             }
-            KeyCode::Char('a') => self.request_unapproval(),
+            KeyCode::Char('a') => self.request_declared_changes(),
             _ => {}
         }
         None
@@ -185,6 +231,46 @@ impl App {
         }
     }
 
+    /// [D-112] 選択中のノードの配下で**このマシンで未承認の宣言**を、承認の予約に入れる／外す。
+    ///
+    /// 候補画面の`Space`と同じく配下をまとめて選ぶが、**全件を一度に選ぶキーは無い**
+    /// （決定51: 一括承認は許さない）。
+    fn toggle_declared_approval_subtree(&mut self) {
+        let Some(node) = self.selected_declared_node() else {
+            self.status = "宣言がありません（policy.jsonは空です）".to_string();
+            return;
+        };
+        let targets: Vec<UnapproveTarget> = self
+            .declared_tree
+            .subtree_proposals(node)
+            .iter()
+            .filter_map(|i| self.declared.get(*i))
+            .filter(|t| self.declared_approval.not_approved.contains(*t))
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            // **何も起きない理由を言う**（B-32）。
+            self.status = "この配下に、このマシンで未承認の宣言はありません".to_string();
+            return;
+        }
+        let label = self.declared_tree.node(node).path.clone();
+        let all_reserved = targets
+            .iter()
+            .all(|t| self.declared_approval.reserved.contains(t));
+        if all_reserved {
+            for target in &targets {
+                self.declared_approval.reserved.remove(target);
+            }
+            self.status = format!("{label} の配下 {}件の承認をやめました", targets.len());
+        } else {
+            let count = targets.len();
+            for target in targets {
+                self.declared_approval.reserved.insert(target);
+            }
+            self.status = format!("{label} の配下 {count}件をこのマシンで承認します（aで確定）");
+        }
+    }
+
     /// 全ドメインの全宣言を取り消し予約する（モジュールdocの「一括取り消し」）。
     fn reserve_all_declared(&mut self) {
         if self.declared.is_empty() {
@@ -198,13 +284,26 @@ impl App {
         self.status = format!("全{count}件を取り消します（aで確定 / Spaceで個別に戻せます）");
     }
 
-    /// 取り消しの確認ダイアログを出す（**まだ書かない**）。
-    fn request_unapproval(&mut self) {
-        if self.unapproved.is_empty() {
-            self.status = "取り消す宣言をスペースで選んでください（Aで全件、Spaceで配下まとめて）"
+    /// 承認と取り消しの確認ダイアログを出す（**まだ書かない**）。
+    fn request_declared_changes(&mut self) {
+        if self.unapproved.is_empty() && self.declared_approval.reserved.is_empty() {
+            self.status = "取り消す宣言をスペースで、このマシンで承認する宣言をyで選んでください\
+                           （Aで全件取り消し、Spaceとyは配下まとめて）"
                 .to_string();
             return;
         }
+        // [D-112] 承認の分。断った宣言は**確認の画面に理由ごと出す**（黙って落とさない、B-10）。
+        let approval_lines = match self.declared_approval_plan() {
+            Ok(plan) => declared_approval_lines(&plan),
+            Err(e) => {
+                self.modal = Some(Modal {
+                    title: "承認できません（何も書いていません）".to_string(),
+                    lines: e.to_string().lines().map(str::to_string).collect(),
+                    confirm: Confirm::ReadOnly,
+                });
+                return;
+            }
+        };
         let targets: Vec<UnapproveTarget> = self.unapproved.iter().cloned().collect();
         let plan = match unapprove::plan(&self.workspace_root, &targets) {
             Ok(plan) => plan,
@@ -225,7 +324,10 @@ impl App {
             ),
             String::new(),
         ];
-        lines.push(format!("取り消す宣言 {}件:", plan.removed.len()));
+        lines.extend(approval_lines);
+        if !plan.removed.is_empty() {
+            lines.push(format!("取り消す宣言 {}件:", plan.removed.len()));
+        }
         for target in &plan.removed {
             lines.push(format!(
                 "  - [{}] {} {}",
@@ -246,22 +348,71 @@ impl App {
                     .to_string(),
             );
         }
-        lines.push(String::new());
-        // 文言の持ち主は`unapprove`（表示側で書き写さない）。
-        lines.extend(crate::unapprove::ACE_NOTICE.lines().map(str::to_string));
+        if !plan.removed.is_empty() {
+            lines.push(String::new());
+            // 文言の持ち主は`unapprove`（表示側で書き写さない）。
+            lines.extend(crate::unapprove::ACE_NOTICE.lines().map(str::to_string));
+        }
 
         self.modal = Some(Modal {
-            title: format!("この{}件を取り消しますか？", plan.removed.len()),
+            title: "この内容で書きますか？".to_string(),
             lines,
-            confirm: Confirm::Unapproval,
+            confirm: Confirm::DeclaredChanges,
         });
         self.modal_scroll = 0;
     }
 
-    /// 確認後に実際に書く。**`plan`は作り直す**——ダイアログを見ている間に`policy.json`が
+    /// [D-112] 承認の予約から、承認の内容を決める（**何も書かない**）。
+    fn declared_approval_plan(
+        &self,
+    ) -> Result<crate::approve_declared::DeclaredApprovalPlan, crate::approve_declared::ApproveDeclaredError>
+    {
+        let targets: Vec<UnapproveTarget> =
+            self.declared_approval.reserved.iter().cloned().collect();
+        if targets.is_empty() {
+            return Ok(Default::default());
+        }
+        crate::approve_declared::plan(&self.workspace_root, &targets, self.require_sandbox)
+    }
+
+    /// 確認後に実際に書く——**承認を先に、取り消しを後に**書く。同じ宣言を両方で予約していたら
+    /// 取り消しが勝つ（`unapprove::commit`が承認も消す）。権限を減らす側が後に来る順序にしてある。
+    pub(crate) fn commit_declared_changes(&mut self) {
+        let mut notes = Vec::new();
+        if !self.declared_approval.reserved.is_empty() {
+            // **`plan`は作り直す**（下の取り消しと同じ理由）。
+            match self
+                .declared_approval_plan()
+                .and_then(|plan| {
+                    let refused = plan.refused.len() + plan.not_found.len();
+                    crate::approve_declared::commit(&self.workspace_root, &plan)
+                        .map(|count| (count, refused))
+                }) {
+                Ok((count, refused)) => {
+                    self.declared_approval.reserved.clear();
+                    notes.push(format!("{count}件をこのマシンで承認しました"));
+                    if refused > 0 {
+                        notes.push(format!("{refused}件は承認しませんでした（確認の画面の理由を参照）"));
+                    }
+                }
+                // **書けなかったことを黙らない。** 取り消しは続けて試みる（独立した操作である）。
+                Err(e) => notes.push(format!("承認は失敗しました: {e}")),
+            }
+        }
+        if !self.unapproved.is_empty() {
+            self.commit_unapproval();
+            notes.push(self.status.clone());
+        } else {
+            self.reload_declared();
+            self.refresh_declared_overlay();
+        }
+        self.status = notes.join("／");
+    }
+
+    /// 取り消しを書く。**`plan`は作り直す**——ダイアログを見ている間に`policy.json`が
     /// 別の経路（CLI・手編集）で変わっていた場合に、古い読み込み結果で上書きしないため
     /// （編集画面の承認と同じ作法）。
-    pub(crate) fn commit_unapproval(&mut self) {
+    fn commit_unapproval(&mut self) {
         let targets: Vec<UnapproveTarget> = self.unapproved.iter().cloned().collect();
         let plan = match unapprove::plan(&self.workspace_root, &targets) {
             Ok(plan) => plan,
@@ -291,3 +442,46 @@ impl App {
         }
     }
 }
+
+/// [D-112] 確認の画面の「承認」の部分。**断ったものと無かったものも理由ごと出す**（B-09）。
+fn declared_approval_lines(plan: &crate::approve_declared::DeclaredApprovalPlan) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !plan.approve.is_empty() {
+        lines.push(format!("このマシンで承認する宣言 {}件:", plan.approve.len()));
+        for target in &plan.approve {
+            lines.push(format!(
+                "  + [{}] {} {}",
+                target.domain,
+                target.key.dotted(),
+                target.value
+            ));
+        }
+        lines.push(
+            "  （承認すると、次のパス2とharness.exeの起動でこの宣言に許可が付きます）".to_string(),
+        );
+    }
+    for (target, reason) in &plan.refused {
+        lines.push(format!(
+            "  ✗ 承認しない: [{}] {} {}: {reason}",
+            target.domain,
+            target.key.dotted(),
+            target.value
+        ));
+    }
+    for target in &plan.not_found {
+        lines.push(format!(
+            "  ? policy.jsonに無い: [{}] {} {}",
+            target.domain,
+            target.key.dotted(),
+            target.value
+        ));
+    }
+    if !lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+#[cfg(test)]
+#[path = "declared_tests.rs"]
+mod declared_tests;

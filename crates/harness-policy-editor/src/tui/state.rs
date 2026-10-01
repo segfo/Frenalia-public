@@ -487,8 +487,9 @@ pub enum Confirm {
     ReadOnly,
     /// 候補の承認（と、同時に予約された宣言の取り消し）を書く。編集画面の`a`。
     Approval,
-    /// 宣言の取り消しだけを書く。宣言画面の`a`。
-    Unapproval,
+    /// 宣言画面の`a`。**このマシンでの承認（`y`で予約した分）と宣言の取り消し（`Space`で予約した分）**を
+    /// 書く。編集画面の`Approval`が承認と取り消しを1回で確定するのと同じ形にしてある。
+    DeclaredChanges,
     /// [段階⑦] 遷移の宣言を足す／消す。承認待ち画面の遷移タブの`a`。
     ///
     /// **`Approval`と分けてあるのは、書く先も確認の文面も違うから**である
@@ -784,6 +785,9 @@ pub struct App {
     /// 一般化の度合いやaccessの巡回で振り直されないので、画面をまたいでも意味が変わらない。
     /// 編集画面の`[x]`を外す操作もここへ入れる（両画面で同じ予約集合を共有する）。
     pub unapproved: BTreeSet<crate::unapprove::UnapproveTarget>,
+    /// [D-112] 宣言画面の「このマシンでの承認」の状態（未承認の宣言と、承認の予約）。
+    /// 中身は`tui::declared`が持つ（このファイルへ状態を広げない、上の`pending`と同じ理由）。
+    pub declared_approval: crate::tui::declared::DeclaredApprovalState,
     /// `Esc`を最後に押した時刻。**2回連続で押されたか**を判定するためだけに持つ
     /// （[`is_double_esc`]）。`Esc`以外のキーが来たら捨てる。
     pub last_esc: Option<std::time::Instant>,
@@ -875,6 +879,7 @@ impl App {
             declared_expanded: HashSet::new(),
             declared_row: 0,
             unapproved: BTreeSet::new(),
+            declared_approval: Default::default(),
             last_esc: None,
             declared_domain: None,
         };
@@ -1716,7 +1721,7 @@ impl App {
                 // **何を書くのかはモーダルが持っている**（開いた画面を推測しない）。
                 match kind {
                     Some(Confirm::Approval) => self.commit_approval(),
-                    Some(Confirm::Unapproval) => self.commit_unapproval(),
+                    Some(Confirm::DeclaredChanges) => self.commit_declared_changes(),
                     Some(Confirm::Transition) => self.commit_transition(),
                     Some(Confirm::ReadOnly) | None => {}
                 }

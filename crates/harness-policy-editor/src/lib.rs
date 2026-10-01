@@ -93,6 +93,7 @@
 
 pub mod aggregate;
 pub mod approval_store;
+pub mod approve_declared;
 pub mod approve;
 pub mod audit_tail;
 /// **候補にしてはいけないパスの判定**（[BUG-103](../../../docs/bugs/BUG-103.md)）。

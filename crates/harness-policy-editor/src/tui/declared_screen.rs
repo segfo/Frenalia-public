@@ -26,8 +26,10 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedbac
 /// 戻り値はratatuiが選択を見せるために定めた表示開始位置（呼び出し側が保存する）。
 fn draw_tree(frame: &mut Frame, area: Rect, app: &App) -> usize {
     let title = format!(
-        " 承認済みの宣言: {}件（取り消し予約 {}件）／policy.json ",
+        " 承認済みの宣言: {}件（このマシンで未承認 {}件・承認予約 {}件・取り消し予約 {}件）／policy.json ",
         app.declared.len(),
+        app.declared_approval.not_approved.len(),
+        app.declared_approval.reserved.len(),
         app.unapproved.len()
     );
     let block = Block::default()
@@ -85,6 +87,18 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &App) -> usize {
                             "  ← 取り消します",
                             Style::default().fg(Color::Red),
                         ));
+                    } else if app.declared_approval.reserved.contains(target) {
+                        extra.push(Span::styled(
+                            "  ← このマシンで承認します",
+                            Style::default().fg(Color::Green),
+                        ));
+                    } else if app.declared_approval.not_approved.contains(target) {
+                        // [D-112] **許可が付かないことを行そのものに出す。** 出さないと、
+                        // 宣言にあるのに読めない理由がどこにも見えない。
+                        extra.push(Span::styled(
+                            "  （このマシンで未承認——許可は付きません。yで承認）",
+                            Style::default().fg(Color::Yellow),
+                        ));
                     }
                 }
             }
@@ -117,6 +131,13 @@ fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
     let mut text = String::new();
     if app.unapproved.is_empty() {
         text.push_str("→←で展開／Spaceでこの配下をまとめて取り消し予約／Aで全件／aで確定。\n");
+        if !app.declared_approval.not_approved.is_empty() {
+            text.push_str(&format!(
+                "このマシンで未承認の宣言が{}件あります（リポジトリに同梱・手書き・以前の承認）。\
+                 許可は付きません。yで配下をまとめて承認を予約できます。\n",
+                app.declared_approval.not_approved.len()
+            ));
+        }
     } else {
         // **強調の記号を文字として書かない。** 端末では`**`はそのまま星印として出る
         // （2026-09-19に遷移の画面で実機確認し、写した元のこちらも直した）。
