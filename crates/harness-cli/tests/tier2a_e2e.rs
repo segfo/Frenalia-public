@@ -20,6 +20,12 @@
 
 mod support;
 
+/// [#30・D-112] `policy.json`のファイル宣言への付与と撤収（付与と撤収が別のキーの対）。
+/// **このファイルは1万行を超えているので、新しい試験は子モジュールへ置く**
+/// （`docs/CODE-STRUCTURE-RULES.md`規則1）。子モジュールなので、ここの非公開の部品をそのまま使える。
+#[path = "tier2a_e2e/policy_declarations.rs"]
+mod policy_declarations;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -618,6 +624,11 @@ fn parse_json_stdout(run: &HarnessRun) -> Result<Outcome, String> {
 // 交差して書込が失敗する、(ii) 片方が読んだ古い内容を書き戻して相手のタグを復活させる、
 // の2つが起きる。**規約を機構へ変える**のが[`FsLedgerExclusive`]で、台帳を読む/書く手段を
 // その排他ガードのメソッドだけにしてある（(a)と同じ形）。
+//
+// **一覧に載らない共有資源**: `%APPDATA%\harness\config\policy-approval-ledger.json`（#30の承認台帳）。
+// 読み書きは製品の`PolicyApprovalStore`だけを通り、その`Ledger::update`が名前付きミューテックスで
+// 直列化する。各試験は自分のワークスペースの鍵しか触らないので、試験側の排他は取らない
+// （理由の全文は`policy_declarations`のモジュールdoc）。
 //
 // **[`CowExclusive`]とは別のロックにしてある。** 守っている資源が違い、いま台帳を触る
 // 2本はどちらもCoWセッションを作らないので、両方を同時に取るテストは存在しない

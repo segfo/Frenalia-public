@@ -37,6 +37,9 @@ pub const IDLE_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(30
 /// 新しいテストターゲットが必要になったら、このテーブルへ1行追加する（コード変更が要る、
 /// 実行時の任意入力では増やせない）。
 pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
+    // 全件。**ただし`policy.json`のファイル宣言の付与と撤収の対（`e2e-policy-fs-grant`／`-revoke`）は
+    // 外す**——付与のテストが残した状態を撤収のテストが取り消す**順序を持つ対**なので、全件を並行に
+    // 回すと撤収が先に走り得て（前提が無いので）赤になり、付与の残した状態も残る。
     (
         "e2e-all",
         &[
@@ -48,6 +51,8 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--",
             "--ignored",
             "--nocapture",
+            "--skip",
+            "policy_declarations::",
         ],
     ),
     (
@@ -238,6 +243,42 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--ignored",
             "--nocapture",
             "a_cross_domain_child_does_not_inherit_ext_capture",
+        ],
+    ),
+    // [#30・D-112、残課題 サンドボックス周辺 #71] `harness.exe`が`policy.json`のファイル宣言へ
+    // 許可を付ける経路の実機E2E（`crates/harness-cli/tests/tier2a_e2e/policy_declarations.rs`）。
+    // **付与と撤収を別のキーにしてある**（`CLAUDE.md`「開発コマンド」節）。付与のキーはACEと承認を
+    // **残して**終わり、撤収のキーがそれを製品の取り消し（承認を外して起動し直す＝自動撤収）で消して、
+    // 消えたことを確かめる。**必ず付与→撤収の順に撃つ**（撤収のキーは前提が無ければ赤になる）。
+    //
+    // **フィルタはモジュールのパスまで書く**（部分一致なので、`grant_`だけだと他の試験の名前に
+    // 当たり得る。`::`を含めると付与と撤収が互いを拾わない）。
+    (
+        "e2e-policy-fs-grant",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "policy_declarations::grant_",
+        ],
+    ),
+    (
+        "e2e-policy-fs-revoke",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "policy_declarations::revoke_",
         ],
     ),
     // [⑤を既定へ入れる準備①] **既定の遷移宣言一式の一次データ**を測る。実務に近い台本を
