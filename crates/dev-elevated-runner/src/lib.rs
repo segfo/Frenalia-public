@@ -37,6 +37,9 @@ pub const IDLE_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(30
 /// 新しいテストターゲットが必要になったら、このテーブルへ1行追加する（コード変更が要る、
 /// 実行時の任意入力では増やせない）。
 pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
+    // 全件。**ただし`policy.json`のファイル宣言の付与と撤収の対（`e2e-policy-fs-grant`／`-revoke`）は
+    // 外す**——付与のテストが残した状態を撤収のテストが取り消す**順序を持つ対**なので、全件を並行に
+    // 回すと撤収が先に走り得て（前提が無いので）赤になり、付与の残した状態も残る。
     (
         "e2e-all",
         &[
@@ -48,6 +51,8 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--",
             "--ignored",
             "--nocapture",
+            "--skip",
+            "policy_declarations::",
         ],
     ),
     (
@@ -238,6 +243,42 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--ignored",
             "--nocapture",
             "a_cross_domain_child_does_not_inherit_ext_capture",
+        ],
+    ),
+    // [#30・D-112、残課題 サンドボックス周辺 #71] `harness.exe`が`policy.json`のファイル宣言へ
+    // 許可を付ける経路の実機E2E（`crates/harness-cli/tests/tier2a_e2e/policy_declarations.rs`）。
+    // **付与と撤収を別のキーにしてある**（`CLAUDE.md`「開発コマンド」節）。付与のキーはACEと承認を
+    // **残して**終わり、撤収のキーがそれを製品の取り消し（承認を外して起動し直す＝自動撤収）で消して、
+    // 消えたことを確かめる。**必ず付与→撤収の順に撃つ**（撤収のキーは前提が無ければ赤になる）。
+    //
+    // **フィルタはモジュールのパスまで書く**（部分一致なので、`grant_`だけだと他の試験の名前に
+    // 当たり得る。`::`を含めると付与と撤収が互いを拾わない）。
+    (
+        "e2e-policy-fs-grant",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "policy_declarations::grant_",
+        ],
+    ),
+    (
+        "e2e-policy-fs-revoke",
+        &[
+            "test",
+            "-p",
+            "harness-cli",
+            "--features",
+            "e2e-mock",
+            "--",
+            "--ignored",
+            "--nocapture",
+            "policy_declarations::revoke_",
         ],
     ),
     // [⑤を既定へ入れる準備①] **既定の遷移宣言一式の一次データ**を測る。実務に近い台本を
@@ -704,6 +745,9 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     // 起こすため管理者権限と外部への到達性が要る（`crates/harness-policy-editor/tests/
     // record_net_e2e.rs`）。**2本目は対のテスト**で、生ソケットがWFPに落とされることを
     // 確かめる——落とされないなら1本目の「到達できた」は強制の証明にならない。
+    //
+    // **`harness_grants::`（#71の4点目）は外す**——付与側が残した状態を撤収側が片付ける順序を持つ対で、
+    // `e2e-mock`付きの`harness.exe`も要る（下の`e2e-policy-editor-keeps-harness-grants`の注記）。
     (
         "e2e-policy-editor-pass2",
         &[
@@ -716,6 +760,47 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--ignored",
             "--test-threads=1",
             "--nocapture",
+            "--skip",
+            "harness_grants::",
+        ],
+    ),
+    // [#71の4点目・BUG-184] パス2（`record-net`）を`harness.exe`と同じワークスペースで回しても、
+    // `harness.exe`が付けた許可（`--fs-allow`と承認済みの`policy.json`の宣言）が残ることを測る
+    // （`crates/harness-policy-editor/tests/record_net_e2e/harness_grants.rs`）。
+    // **付与側と撤収側を別のキーにしてある**（`CLAUDE.md`「開発コマンド」節）。付与側（`keep_`）は
+    // `harness.exe`を動かしたままパス2を回して3つの置き場のACEと承認を**残して**終わり、撤収側（`revoke_`）は
+    // 動いていない状態のパス2で「どこからも外れた宣言」だけが消えることを確かめ、製品の取り消しで片付ける。
+    // **必ず付与側→撤収側の順に撃つ。** 撃つ前に`cargo build --workspace`→
+    // `cargo build -p harness-cli --features e2e-mock`の順でビルドしておくこと（`e2e-mock`付きの
+    // `harness.exe`が要る。無ければ試験が手順付きで落ちる）。
+    (
+        "e2e-policy-editor-keeps-harness-grants",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "record_net_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "harness_grants::keep_",
+        ],
+    ),
+    (
+        "e2e-policy-editor-revokes-stale-grants",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "record_net_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "harness_grants::revoke_",
         ],
     ),
     // 上の`e2e-policy-editor-pass2`のうち**FS側の1本だけ**を撃つ。承認したFS宣言が実DACLへ

@@ -21,16 +21,20 @@
 //! 8. **強制モード（`--enforce-net`、決定64）は宣言した通信先だけを通し、宣言の外を断る**
 //!    ——同じ実行で許可側と禁止側を両方測り、候補が断られた宛先だけになることを確かめる
 //!    （[`enforcing_pass2_allows_only_the_declared_domain_and_proposes_the_refused_one`]）
+//! 9. **同じワークスペースの`harness.exe`の許可がパス2で消えない**（BUG-184）——子モジュール[`harness_grants`]
 //!
 //! # このテストが触らないもの（正直に書く）
 //!
 //! ネットワーク側の3本は`policy.json`の`fs`を**空**にしてある。workspace外のFSルールを
 //! 入れるとこのマシンの実ACLと`fs-passthrough-ledger.json`を書き換えることになり、
-//! ネットワークを測るテストの副作用としては重すぎる。**FS側を測るのは7番の1本だけ**で、
-//! そちらは`%TEMP%`配下の一時ディレクトリに閉じている（`--fs-allow`経由の同じ機構は
-//! CLI側の既存E2Eが別に通している）。
+//! ネットワークを測るテストの副作用としては重すぎる。**FS側を測るのは7番と9番だけ**で、
+//! 7番は`%TEMP%`配下の一時ディレクトリに閉じている（`--fs-allow`経由の同じ機構は
+//! CLI側の既存E2Eが別に通している）。9番が実マシンへ書くものと撃ち方は子モジュールのdocが持つ。
 
 #![cfg(windows)]
+
+#[path = "record_net_e2e/harness_grants.rs"] // 1,000行に近いので子モジュールへ置く（規則1）
+mod harness_grants;
 
 use std::path::Path;
 use std::process::Command;
