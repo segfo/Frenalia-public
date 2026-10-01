@@ -423,6 +423,35 @@ fn the_sweep_only_ever_looks_next_to_the_running_executable() {
 // [§22.9の前提] 宛先が宣言のcapabilityへ移ったこと
 // ---------------------------------------------------------------------------
 
+/// Redirector DLLの宛先を**このテストの中で発行し**、引き終わるまで記録が捨てられない
+/// 区間の中で`f`を走らせる。`f`が受け取るのは発行の結果（DLLが隣に無い構成では空）。
+///
+/// # なぜ自分で発行するのか（[BUG-187](../../../../docs/bugs/BUG-187.md)）
+///
+/// 発行は実台帳への書込で、**DLL 1本ごとに別の更新**である（`issue_redirector_dll_capabilities`）。
+/// 発行を同じバイナリの別のテスト（や別のワークツリーで同時に走る同じテスト）に任せて
+/// 引くだけにすると、**x64だけ発行済みでx86がまだ**という途中の状態を読み得る。
+/// その状態は、DLLの置き場が新しい（新しいビルド出力先・`harness fs prune`の後）ときに毎回訪れる。
+///
+/// # なぜ`SHARED_CAPABILITY_LOCK`の中で行うのか
+///
+/// 台帳から記録を**落とす**側もある。セッションの撤収（`end_session`・`gc_dead_sessions`）は、
+/// 剥がし終えたDLLの宛先の名前を台帳から捨てる。発行してから引くまでの間にそれが走ると、
+/// 引けない・次の発行で別の名前になる。製品の`preflight`は同じ理由で
+/// 「引く・付ける・記録する」をこの錠の中で行っており（BUG-165）、撤収側もこの錠を握ってから
+/// 捨てるので、ここで握っていれば区間の途中で捨てられない。
+///
+/// **守らないもの**: この錠を握らずに記録を落とす経路（`harness fs prune`・宣言の撤収）は止めない。
+/// どちらも手で撃つ操作で、DLLの記録を落とすのはDLLそのものが消えたときなどに限られる。
+fn with_redirector_dll_capabilities_issued<R>(
+    f: impl FnOnce(&[(std::path::PathBuf, Result<String, String>)]) -> R,
+) -> R {
+    harness_grant_ledger::with_named_lock(
+        crate::tier2a::session_profile::SHARED_CAPABILITY_LOCK,
+        || f(&issue_redirector_dll_capabilities()),
+    )
+}
+
 /// **発行してから引ける。** 引けないと、子のトークンへ積むものが無くなり注入が失敗する。
 ///
 /// ここが測っているのは`preflight`（発行する側）と`launch`（引く側）が**同じ鍵**を使って
@@ -431,17 +460,18 @@ fn the_sweep_only_ever_looks_next_to_the_running_executable() {
 /// 「積み忘れ」と区別が付かない。**実機で踏んだ**（2026-09-19、`spawn-daemon`が5本落ちた）。
 #[test]
 fn the_dll_capability_can_be_looked_up_with_the_same_key_it_was_issued_with() {
-    let issued = issue_redirector_dll_capabilities();
-    if issued.is_empty() {
-        // DLLが隣に無いビルド構成では測れない（`redirector_dll_paths`は`exists()`で絞る）。
-        return;
-    }
-    let looked_up = redirector_dll_capability_sids();
-    assert_eq!(
-        looked_up.len(),
-        issued.iter().filter(|(_, r)| r.is_ok()).count(),
-        "発行した鍵で引けない。子のトークンへ積むものが無くなり、注入が必ず失敗する"
-    );
+    with_redirector_dll_capabilities_issued(|issued| {
+        if issued.is_empty() {
+            // DLLが隣に無いビルド構成では測れない（`redirector_dll_paths`は`exists()`で絞る）。
+            return;
+        }
+        let looked_up = redirector_dll_capability_sids();
+        assert_eq!(
+            looked_up.len(),
+            issued.iter().filter(|(_, r)| r.is_ok()).count(),
+            "発行した鍵で引けない。子のトークンへ積むものが無くなり、注入が必ず失敗する"
+        );
+    });
 }
 
 /// **発行元はワークスペースではない**——同じDLLなら、どのワークスペースから呼んでも同じ宛先。
@@ -455,29 +485,48 @@ fn the_dll_capability_can_be_looked_up_with_the_same_key_it_was_issued_with() {
 ///
 /// **実際に踏んだ**（2026-09-19）。最初の実装はワークスペースを鍵に入れており、実機のE2Eを
 /// 1周しただけで`harness_redirector.dll`に36本、x86側に4本の孤立ACEが積み上がった。
+///
+/// # 引く前に自分で発行する（[BUG-187](../../../../docs/bugs/BUG-187.md)）
+///
+/// 以前は発行を隣のテストに任せて引くだけだったので、DLLの置き場が新しいと
+/// (1) 隣より先に引けば空で`return`し、**何も測らずに緑**になり、
+/// (2) 隣の発行の途中（x64だけ発行済み）を引けば**1本対2本で落ちた**。
+/// 理由と錠の範囲は[`with_redirector_dll_capabilities_issued`]のdoc。
 #[test]
 fn the_dll_capability_does_not_depend_on_which_workspace_asks_for_it() {
-    let first = redirector_dll_capability_sids();
-    if first.is_empty() {
-        return;
-    }
-    // 2回引いても同じ宛先が返る（発行元がプロセスやワークスペースで変わらないことの検算）。
-    let second = redirector_dll_capability_sids();
-    let text = |sids: &[crate::win_common::OwnedSid]| -> Vec<String> {
-        sids.iter()
-            .map(|s| crate::win_common::sid_to_string(s.as_psid()).expect("sid to string"))
-            .collect()
-    };
-    assert_eq!(
-        text(&first),
-        text(&second),
-        "同じDLLに対して違う宛先が返っている。ACEが際限なく積み上がる形である"
-    );
-    assert_eq!(
-        first.len(),
-        redirector_dll_paths().len(),
-        "DLL 1本につき宛先は1つに収束していなければならない"
-    );
+    with_redirector_dll_capabilities_issued(|issued| {
+        if issued.is_empty() {
+            // DLLが隣に無いビルド構成では測れない（`redirector_dll_paths`は`exists()`で絞る）。
+            return;
+        }
+        // 前提: 発行そのものが通っている。ここで落ちるなら、測りたい性質の判定まで進んでいない。
+        for (dll, result) in issued {
+            if let Err(e) = result {
+                panic!(
+                    "前提が崩れている: {} の宛先を発行できなかった: {e}",
+                    dll.display()
+                );
+            }
+        }
+        // 2回引いても同じ宛先が返る（発行元がプロセスやワークスペースで変わらないことの検算）。
+        let first = redirector_dll_capability_sids();
+        let second = redirector_dll_capability_sids();
+        let text = |sids: &[crate::win_common::OwnedSid]| -> Vec<String> {
+            sids.iter()
+                .map(|s| crate::win_common::sid_to_string(s.as_psid()).expect("sid to string"))
+                .collect()
+        };
+        assert_eq!(
+            text(&first),
+            text(&second),
+            "同じDLLに対して違う宛先が返っている。ACEが際限なく積み上がる形である"
+        );
+        assert_eq!(
+            first.len(),
+            redirector_dll_paths().len(),
+            "DLL 1本につき宛先は1つに収束していなければならない"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
