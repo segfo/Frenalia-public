@@ -30,6 +30,7 @@
 use std::path::Path;
 
 use harness_policy::generalize::SettingsKey;
+use harness_sandbox::tier2a::policy_approval::DeclarationRef;
 
 use crate::policy_file::{self, PolicyDomain, PolicyFile, PolicyFileError};
 
@@ -54,6 +55,19 @@ pub struct UnapproveTarget {
     pub domain: String,
     pub key: SettingsKey,
     pub value: String,
+}
+
+impl UnapproveTarget {
+    /// 承認台帳（D-112）を引く鍵の形。**ネットワークの宣言は台帳の対象外なので`None`**。
+    ///
+    /// 取り消し・宣言の承認・付け替えの3つが台帳を引くので、変換を1箇所に置く（規則5.0）。
+    pub fn declaration(&self) -> Option<DeclarationRef<'_>> {
+        self.key.fs_access().map(|access| DeclarationRef {
+            domain: &self.domain,
+            value: &self.value,
+            access,
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,18 +154,10 @@ pub fn commit(workspace_root: &Path, plan: &UnapprovePlan) -> Result<bool, Unapp
         return Ok(false);
     }
     policy_file::save(workspace_root, &plan.file)?;
-    let declarations: Vec<harness_sandbox::tier2a::policy_approval::DeclarationRef<'_>> = plan
+    let declarations: Vec<DeclarationRef<'_>> = plan
         .removed
         .iter()
-        .filter_map(|target| {
-            target.key.fs_access().map(|access| {
-                harness_sandbox::tier2a::policy_approval::DeclarationRef {
-                    domain: &target.domain,
-                    value: &target.value,
-                    access,
-                }
-            })
-        })
+        .filter_map(UnapproveTarget::declaration)
         .collect();
     if !declarations.is_empty() {
         let left = crate::approval_store::approval_store().revoke(workspace_root, &declarations);
@@ -172,7 +178,10 @@ pub fn commit(workspace_root: &Path, plan: &UnapprovePlan) -> Result<bool, Unapp
 /// 値の比較は**大文字小文字を無視する**——Windowsのパスは大文字小文字を区別せず、
 /// ドメイン名（`net.allow_domains`）もDNS上区別しない。区別すると、画面に出ている行を
 /// 指定したのに「無い」と言われる。
-fn remove_value(domain: &mut PolicyDomain, key: SettingsKey, value: &str) -> bool {
+///
+/// **付け替え（[`crate::reassign`]）の「元の値を消す」半分もこれを通す**——消す規則を2つ持つと、
+/// 取り消しなら消える綴りが付け替えでは残る（`CODE-STRUCTURE-RULES`§5.0）。
+pub(crate) fn remove_value(domain: &mut PolicyDomain, key: SettingsKey, value: &str) -> bool {
     let bucket = match key {
         SettingsKey::NetAllowDomains => &mut domain.net.allow_domains,
         SettingsKey::FsRead => &mut domain.fs.read,

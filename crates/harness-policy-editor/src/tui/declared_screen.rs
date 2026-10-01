@@ -14,9 +14,10 @@ use crate::tui::checkbox_tree::{self, Mark};
 use crate::tui::state::App;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
-    // 説明欄は「操作の案内1行＋未承認の案内（折り返して最大2行）＋取り消しの注記4行」が入る高さ
-    // （枠の2行を足して9）。足りないと注記の末尾が黙って切れる。
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(9)]).split(area);
+    // 説明欄は「操作の案内（折り返して最大2行）＋未承認の案内（折り返して最大2行）＋
+    // 取り消しの注記4行」が入る高さ（枠の2行を足して10）。足りないと注記の末尾が黙って切れる。
+    // 付け替えのキー（`c`・`R`）を案内へ足したときに1行増やした。
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(10)]).split(area);
     let declared_list_offset = draw_tree(frame, chunks[0], app);
     draw_notes(frame, chunks[1], app);
     crate::tui::DrawFeedback {
@@ -28,10 +29,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedbac
 /// 戻り値はratatuiが選択を見せるために定めた表示開始位置（呼び出し側が保存する）。
 fn draw_tree(frame: &mut Frame, area: Rect, app: &App) -> usize {
     let title = format!(
-        " 承認済みの宣言: {}件（このマシンで未承認 {}件・承認予約 {}件・取り消し予約 {}件）／policy.json ",
+        " 承認済みの宣言: {}件（このマシンで未承認 {}件・承認予約 {}件・付け替え予約 {}件・取り消し予約 {}件）／policy.json ",
         app.declared.len(),
         app.declared_approval.not_approved.len(),
         app.declared_approval.reserved.len(),
+        // キー案内の`a 確定（…）`と同じく、取り消しが勝つ分を除いた実際に書く件数で数える。
+        app.declared_reassign.effective(&app.unapproved).len(),
         app.unapproved.len()
     );
     let block = Block::default()
@@ -76,14 +79,36 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &App) -> usize {
                 .declared_expanded
                 .contains(&app.declared_tree.node(node).path);
 
+            // 付け替えの予約の印。**`c`・`R`が効くのはこの行自身の宣言（1件のとき）**なので、
+            // 配下を持つディレクトリの行でも、その行自身の宣言を付け替えるなら出す。
+            // 取り消しを予約した宣言では出さない——確定では取り消しが勝つので、出すと書かれない
+            // 付け替えが見えてしまう（`DeclaredReassignState::effective`）。
+            let own = &app.declared_tree.node(node).proposals;
+            let reassign_span = (own.len() == 1)
+                .then(|| app.declared.get(own[0]))
+                .flatten()
+                .filter(|target| !app.unapproved.contains(*target))
+                .and_then(|target| app.declared_reassign.reserved.get(target))
+                .map(|(key, value)| {
+                    Span::styled(
+                        format!("  → {} {} に付け替えます", key.dotted(), value),
+                        Style::default().fg(Color::Magenta),
+                    )
+                });
+
             // この画面固有の追記＝ドメイン名とキー（葉のときだけ）。
             let mut extra = Vec::new();
+            if under.len() != 1 {
+                extra.extend(reassign_span.clone());
+            }
             if under.len() == 1 {
                 if let Some(target) = app.declared.get(under[0]) {
                     extra.push(Span::styled(
                         format!("  [{}] {}", target.domain, target.key.dotted()),
                         Style::default().fg(Color::Gray),
                     ));
+                    // 承認の印と**並べて**出す（同じ行で`y`と`c`を両方予約できる）。
+                    extra.extend(reassign_span);
                     if app.unapproved.contains(target) {
                         extra.push(Span::styled(
                             "  ← 取り消します",
@@ -132,7 +157,10 @@ fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default().borders(Borders::ALL).title(" この画面 ");
     let mut text = String::new();
     if app.unapproved.is_empty() {
-        text.push_str("→←で展開／Spaceでこの配下をまとめて取り消し予約／Aで全件／aで確定。\n");
+        text.push_str(
+            "→←で展開／Spaceでこの配下をまとめて取り消し予約／Aで全件／\
+             cで種類・Rで ** を付け替え（1行ずつ）／aで確定。\n",
+        );
         if !app.declared_approval.not_approved.is_empty() {
             text.push_str(&format!(
                 "このマシンで未承認の宣言が{}件あります（リポジトリに同梱・手書き・以前の承認）。\

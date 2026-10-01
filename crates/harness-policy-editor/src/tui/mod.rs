@@ -417,16 +417,29 @@ fn screen_keys(app: &App) -> Vec<String> {
             if !app.declared_approval.not_approved.is_empty() {
                 keys.push("y このマシンで承認を予約".to_string());
             }
+            // 付け替え（1行ずつ）。キーは候補画面の`c`・`R`と同じ。
+            keys.push("c 種類を変える".to_string());
+            keys.push("R ** の付け外し".to_string());
             keys.push("r 読み直し".to_string());
-            let reserved = app.declared_approval.reserved.len();
-            match (reserved, app.unapproved.len()) {
-                (0, 0) => keys.push("a 確定".to_string()),
-                // 予約件数を出す（何件が変わるのかが確定の直前まで見えている必要がある）。
-                (0, removing) => keys.push(format!("a 確定（{removing}件を取り消し）")),
-                (approving, 0) => keys.push(format!("a 確定（{approving}件を承認）")),
-                (approving, removing) => {
-                    keys.push(format!("a 確定（{approving}件を承認・{removing}件を取り消し）"))
-                }
+            // 予約件数を出す（何件が変わるのかが確定の直前まで見えている必要がある）。
+            // 付け替えは取り消しが勝つ分を除いた、実際に書く件数で数える。
+            let counts = [
+                (app.declared_approval.reserved.len(), "承認"),
+                (
+                    app.declared_reassign.effective(&app.unapproved).len(),
+                    "付け替え",
+                ),
+                (app.unapproved.len(), "取り消し"),
+            ];
+            let parts: Vec<String> = counts
+                .iter()
+                .filter(|(count, _)| *count > 0)
+                .map(|(count, what)| format!("{count}件を{what}"))
+                .collect();
+            if parts.is_empty() {
+                keys.push("a 確定".to_string());
+            } else {
+                keys.push(format!("a 確定（{}）", parts.join("・")));
             }
         }
     }
@@ -553,7 +566,12 @@ harness-policy-editor — LLMを介さずに「このコマンドに何を許す
   y      このマシンで未承認の宣言を、承認する予約に入れる（配下をまとめて。全件を一度に選ぶ
          キーはありません）。リポジトリに同梱されていた・手で書いた・承認台帳ができる前に
          承認した宣言には、このマシンで承認するまで許可が付きません（行に印が出ます）
-  a      確定（差分を見てから y。承認と取り消しを1回で書きます）
+  c      宣言の種類を変える（read→read_write→read_exec の巡回。1行ずつ）
+  R      宣言の ** を付け外し（付ける＝配下すべて／外す＝そのパスだけ）
+         承認済みなら承認済みのまま、未承認なら未承認のまま付け替わります
+         承認と同じ検査を通します（広すぎる値などにはできません）
+         ** を外しても配下の継承ACEは残ることがあります（確定の画面に出ます）
+  a      確定（差分を見てから y。承認・付け替え・取り消しを1回で書きます）
   [x]=宣言されている（このまま残る）  [ ]=取り消しを予約した
   **取り消してもACLはその場では変わりません。** 付与済みのACEは、次にパス2を開始したとき、
   または harness.exe を起動したときに撤収されます（そのワークスペースが使用中のときは
@@ -598,7 +616,8 @@ harness-policy-editor — LLMを介さずに「このコマンドに何を許す
   宣言どおりに走らせて確かめる専用の画面はありません。パス2の「強制」で行います。
   強制で効くのはこの試験実行の中だけで、harness.exe 本体はまだ policy.json の
   net.allow_domains で通信を許しません（本体では settings.json の net.allow_domains が効く）。
-  policy.jsonの削除・編集も未実装で、減らすときは手で編集してください（追記のみ）。
+  policy.jsonのパスそのものの書き換えは未実装です（種類と ** は宣言画面の c・R で
+  付け替えられ、宣言の取り消しは宣言画面の Space で予約できます）。
 
 CLIも同じことができます: record / approve / record-net / show / sessions
 ";

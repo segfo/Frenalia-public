@@ -65,6 +65,34 @@ pub enum ApproveDeclaredError {
     NotRecorded(String),
 }
 
+/// このマシンで承認してよい値かを見る検査一式（モジュールdocの「候補の承認と同じ検査を通す」）。
+///
+/// **宣言の承認（[`plan`]）と宣言の付け替え（[`crate::reassign`]）が同じこれを通す。** 付け替えは
+/// 承認済みの宣言を別の値へ書き換える入口なので、検査を別に持つと「`y`なら断る値を付け替えで作れる」
+/// 形になる（B-05・B-20: 判定は1箇所）。
+pub(crate) struct ApprovalChecks {
+    require_sandbox: RequireSandbox,
+    exclusion: crate::exclusion::ExclusionRules,
+    grants: harness_sandbox::tier2a::policy_grants::GrantContext,
+}
+
+impl ApprovalChecks {
+    pub(crate) fn for_workspace(workspace_root: &Path, require_sandbox: RequireSandbox) -> Self {
+        Self {
+            require_sandbox,
+            exclusion: crate::exclusion::ExclusionRules::for_session(workspace_root),
+            grants: harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(
+                workspace_root,
+            ),
+        }
+    }
+
+    /// 承認しない理由（承認してよいなら`None`）。中身は[`refusal`]。
+    pub(crate) fn refusal(&self, target: &UnapproveTarget) -> Option<String> {
+        refusal(target, self.require_sandbox, &self.exclusion, &self.grants)
+    }
+}
+
 /// 承認の内容を決める（**何も書かない**）。
 pub fn plan(
     workspace_root: &Path,
@@ -74,9 +102,7 @@ pub fn plan(
     let file = policy_file::load(workspace_root)?;
     let approvals = crate::approval_store::approval_store().load();
     let workspace_key = approval_workspace_key(workspace_root);
-    let exclusion = crate::exclusion::ExclusionRules::for_session(workspace_root);
-    let grants =
-        harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(workspace_root);
+    let checks = ApprovalChecks::for_workspace(workspace_root, require_sandbox);
 
     let mut out = DeclaredApprovalPlan::default();
     for target in targets {
@@ -88,23 +114,11 @@ pub fn plan(
             ));
             continue;
         };
-        // **`policy.json`に書いてあるとおりの綴り**を使う——照合（`is_approved`）は完全一致なので、
-        // 指定の大文字小文字が違うと「承認したのに付かない」になる。探すのは`unapprove`と同じく
-        // 大文字小文字を無視して。
-        let stored = file
-            .domain(&target.domain)
-            .and_then(|domain| bucket(domain, target.key).iter().find(|v| v.eq_ignore_ascii_case(&target.value)))
-            .cloned();
-        let Some(value) = stored else {
+        let Some(target) = stored_spelling(&file, target) else {
             out.not_found.push(target.clone());
             continue;
         };
-        let target = UnapproveTarget {
-            domain: target.domain.clone(),
-            key: target.key,
-            value,
-        };
-        if let Some(reason) = refusal(&target, require_sandbox, &exclusion, &grants) {
+        if let Some(reason) = checks.refusal(&target) {
             out.refused.push((target, reason));
             continue;
         }
@@ -158,6 +172,28 @@ fn refusal(
     breadth::check(&proposal).message().map(str::to_string)
 }
 
+/// 指定した宣言を、**`policy.json`に書いてあるとおりの綴り**で引き直す（無ければ`None`）。
+///
+/// 照合（`is_approved`）は完全一致なので、指定の大文字小文字が違う綴りで記録すると「承認したのに
+/// 付かない」になる。探すのは`unapprove`と同じく大文字小文字を無視して。
+/// **付け替え（[`crate::reassign`]）も同じこれを通す**——承認を引き継ぐかどうかを、ここで引いた
+/// 綴りで台帳に問い合わせるため。
+pub(crate) fn stored_spelling(
+    file: &crate::PolicyFile,
+    target: &UnapproveTarget,
+) -> Option<UnapproveTarget> {
+    let domain = file.domain(&target.domain)?;
+    let value = bucket(domain, target.key)
+        .iter()
+        .find(|v| v.eq_ignore_ascii_case(&target.value))?
+        .clone();
+    Some(UnapproveTarget {
+        domain: target.domain.clone(),
+        key: target.key,
+        value,
+    })
+}
+
 fn bucket(domain: &crate::PolicyDomain, key: SettingsKey) -> &[String] {
     match key {
         SettingsKey::FsRead => &domain.fs.read,
@@ -175,13 +211,7 @@ pub fn commit(
     let declarations: Vec<DeclarationRef<'_>> = plan
         .approve
         .iter()
-        .filter_map(|target| {
-            target.key.fs_access().map(|access| DeclarationRef {
-                domain: &target.domain,
-                value: &target.value,
-                access,
-            })
-        })
+        .filter_map(UnapproveTarget::declaration)
         .collect();
     if declarations.is_empty() {
         return Ok(0);
