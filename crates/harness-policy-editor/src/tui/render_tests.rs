@@ -272,3 +272,134 @@ fn the_transition_tab_renders_with_candidates() {
         render(&app, width, height);
     }
 }
+
+// ---------------------------------------------------------------------------
+// キー案内の行（最下行）。**折り返さないので、幅が足りないと末尾から切れる。**
+// ---------------------------------------------------------------------------
+
+/// 空白を落とす。`TestBackend`は全角1文字を2セル（文字＋空セル）で持つので、
+/// 素の連結だと「終 了」になる。区切りの`  |  `は`|`になる。
+fn squash(text: &str) -> String {
+    text.split_whitespace().collect()
+}
+
+/// `width`桁で描いたときの最下行（キー案内）を、空白を落として返す。
+fn key_hint_row(app: &App, width: u16) -> String {
+    let height = 30u16;
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    terminal
+        .draw(|frame| {
+            draw(frame, app);
+        })
+        .expect("描画は落ちてはいけない");
+    let start = usize::from(width) * usize::from(height - 1);
+    squash(
+        &terminal.backend().buffer().content()[start..]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>(),
+    )
+}
+
+/// キー案内の項目が違う画面を全部並べる（承認待ちは3タブそれぞれ）。
+fn apps_on_every_screen(ws: &std::path::Path) -> Vec<(&'static str, App)> {
+    let app = || App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+    let record = app();
+    let mut edit = app();
+    edit.screen = Screen::Edit;
+    let mut observed = app();
+    observed.screen = Screen::Edit;
+    observed.pending.tab = transition::Tab(transition::PendingTab::TransitionsObserved);
+    let mut denied = app();
+    denied.screen = Screen::Edit;
+    denied.pending.tab = transition::Tab(transition::PendingTab::TransitionsDenied);
+    let mut declared = app();
+    declared.screen = Screen::Declared;
+    vec![
+        ("記録", record),
+        ("承認待ち・FS/ネット", edit),
+        ("承認待ち・遷移（観測から）", observed),
+        ("承認待ち・遷移（拒否から）", denied),
+        ("宣言", declared),
+    ]
+}
+
+/// **禁止側**: 狭い端末でも、ヘルプと終了の案内は消えない。
+///
+/// # 壊れた状態を一文で
+///
+/// **画面ごとの項目が多いと、ヘルプと終了の案内から先に画面の外へ出る。** 共通の案内を
+/// 末尾に足していたので、切れるのはいつもそこだった。実機（全画面に近い幅）の遷移タブで
+/// `… | F2 タブ切替 | Esc 戻る | F4`と切れ、`Esc×2 終了`が見えなかった（2026-10-01）。
+/// `Esc×2`は案内しないと見つけられない操作である（`COMMON_KEYS`のdoc）。
+#[test]
+fn the_help_and_quit_hints_survive_a_narrow_terminal_on_every_screen() {
+    let ws = workspace();
+    for (screen, app) in apps_on_every_screen(ws.path()) {
+        for width in [80u16, 100, 120, 160] {
+            let row = key_hint_row(&app, width);
+            for hint in COMMON_KEYS {
+                assert!(
+                    row.contains(&squash(hint)),
+                    "{screen}の画面を{width}桁で描くと「{hint}」が見えない:\n{row}"
+                );
+            }
+        }
+    }
+}
+
+/// **許可側**（`B-35`）: 全部収まる幅では、画面ごとの項目が**今までどおり全部・同じ順で**出る。
+///
+/// 「共通の案内を残す」は、画面ごとの項目を常に削る実装でも満たせてしまう。だから
+/// 収まるときの1行が直す前と1文字も変わらないことを、行全体の一致で固定する。
+#[test]
+fn every_screen_hint_is_shown_in_order_when_the_terminal_is_wide_enough() {
+    let ws = workspace();
+    for (screen, app) in apps_on_every_screen(ws.path()) {
+        let keys = screen_keys(&app);
+        assert!(!keys.is_empty(), "{screen}の画面に固有の案内が1つも無い");
+        let expected: Vec<&str> = keys.iter().map(String::as_str).chain(COMMON_KEYS).collect();
+        assert_eq!(
+            key_hint_row(&app, 400),
+            squash(&expected.join(KEY_SEPARATOR)),
+            "{screen}の画面: 収まる幅なのに案内が変わっている"
+        );
+    }
+}
+
+/// 収まらないときは**画面ごとの項目を後ろから丸ごと落とし、落とした件数を出す。**
+///
+/// 後ろから落とすのは、画面ごとの並びが「押す頻度と重要度」の順だからである
+/// （遷移タブの並びのコメント）。**先頭（遷移タブなら`Space`）は残る**ことと、
+/// 項目の途中で切れていないこと（行が「先頭からk件・`… 他N件`・共通の案内」の形に
+/// ぴったり一致すること）を見る。件数を出すのは、省略したことを黙らないためである
+/// （`record_screen`の警告枠の`… 他 N行`と同じ）。
+#[test]
+fn a_narrow_terminal_drops_screen_hints_from_the_tail_and_says_how_many() {
+    let ws = workspace();
+    for (screen, app) in apps_on_every_screen(ws.path()) {
+        let keys = screen_keys(&app);
+        let row = key_hint_row(&app, 100);
+        let expected = |kept: usize| -> String {
+            let omitted = format!("… 他{}件", keys.len() - kept);
+            let line: Vec<&str> = keys[..kept]
+                .iter()
+                .map(String::as_str)
+                .chain(std::iter::once(omitted.as_str()))
+                .chain(COMMON_KEYS)
+                .collect();
+            squash(&line.join(KEY_SEPARATOR))
+        };
+        let full: Vec<&str> = keys.iter().map(String::as_str).chain(COMMON_KEYS).collect();
+        if row == squash(&full.join(KEY_SEPARATOR)) {
+            // 100桁に全部収まる画面（今日の記録画面）は落とすものが無い。
+            continue;
+        }
+        let kept = (0..keys.len()).find(|&kept| expected(kept) == row);
+        assert!(
+            matches!(kept, Some(k) if k >= 1),
+            "{screen}の画面を100桁で描いた行が「先頭から1件以上・… 他N件・共通の案内」の形に\
+             なっていない:\n{row}"
+        );
+    }
+}

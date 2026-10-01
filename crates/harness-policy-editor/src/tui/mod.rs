@@ -333,8 +333,11 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// 押せるキーだけを出す。**効かない操作を案内しない**（B-32）。
-fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
+/// 画面ごとのキー案内。押せるキーだけを出す。**効かない操作を案内しない**（B-32）。
+///
+/// 全画面に共通の案内（[`COMMON_KEYS`]）はここに含めない——幅が足りないときの扱いが
+/// 違うからである（[`fit_key_hints`]）。
+fn screen_keys(app: &App) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
     match app.screen {
         Screen::Record => {
@@ -427,18 +430,73 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
             }
         }
     }
-    keys.push("F4 ヘルプ".to_string());
-    // **Esc×2は案内しないと見つけられない。** 単押しは画面遷移なので、二度押しが終了である
-    // ことは画面から推測できない。
-    keys.push("Esc×2 終了".to_string());
-    keys.push("Ctrl+C 終了".to_string());
+    keys
+}
+
+/// 全画面に共通のキー案内。画面ごとの項目の後ろに並べる。
+///
+/// **Esc×2は案内しないと見つけられない。** 単押しは画面遷移なので、二度押しが終了である
+/// ことは画面から推測できない。
+const COMMON_KEYS: [&str; 3] = ["F4 ヘルプ", "Esc×2 終了", "Ctrl+C 終了"];
+
+/// キー案内の項目の区切り。
+const KEY_SEPARATOR: &str = "  |  ";
+
+fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(Line::styled(
-            keys.join("  |  "),
+            fit_key_hints(&screen_keys(app), area.width as usize),
             Style::default().fg(Color::DarkGray),
         )),
         area,
     );
+}
+
+/// キー案内の1行を`width`桁に収める。
+///
+/// # 共通の案内（ヘルプ・終了）は削らない（2026-10-01、実機で見つけた）
+///
+/// この行は折り返さず、幅が足りないと**末尾から黙って切れる**。以前は共通の案内を
+/// 画面ごとの項目の後ろへそのまま足していたので、**画面ごとの項目が多いほど、ヘルプと
+/// 終了の案内から先に消えた**——承認待ちの遷移タブは約200桁を要し、全画面に近い幅でも
+/// `… | Esc 戻る | F4`で切れて`Esc×2 終了`が見えなかった。
+///
+/// だから収まらないときは、**画面ごとの項目を後ろから丸ごと落とし**、落とした件数を
+/// `… 他N件`で出してから共通の案内を置く。
+///
+/// - **後ろから落とす**のは、画面ごとの並びが「押す頻度と重要度」の順だからである
+///   （遷移タブの並びのコメント。並び順がそのまま「消えてよい順」になっている）。
+/// - **項目の途中で切らない。** `F4`だけが残るような切れ方は、別のキーに読める。
+/// - **件数を出す**のは、省略したことを黙らないためである（`record_screen`の警告枠の
+///   `… 他 N行`と同じ。B-09）。落とした項目はヘルプ（`F4`）に載っている。
+///
+/// 全部収まるときは以前と1文字も変わらない。共通の案内そのものより狭い端末では、
+/// 共通の案内も末尾から切れる（描画が落ちないことだけを保つ）。
+fn fit_key_hints(screen: &[String], width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    let line = |kept: &[String], omitted: Option<&str>| -> String {
+        kept.iter()
+            .map(String::as_str)
+            .chain(omitted)
+            .chain(COMMON_KEYS)
+            .collect::<Vec<_>>()
+            .join(KEY_SEPARATOR)
+    };
+    let full = line(screen, None);
+    if full.width() <= width {
+        return full;
+    }
+    // 画面ごとの項目を後ろから1件ずつ落とし、収まった時点で止める。
+    for kept in (0..screen.len()).rev() {
+        let omitted = format!("… 他{}件", screen.len() - kept);
+        let fitted = line(&screen[..kept], Some(&omitted));
+        if fitted.width() <= width {
+            return fitted;
+        }
+    }
+    // 画面ごとの項目を全部落としても収まらない幅。共通の案内だけを出す。
+    line(&[], None)
 }
 
 fn draw_help(frame: &mut Frame, area: Rect) {
