@@ -15,7 +15,7 @@ use ratatui::Frame;
 use crate::transition_candidates::{Candidate, Declared, Source};
 use crate::tui::checkbox_tree::Mark;
 use crate::tui::state::App;
-use crate::tui::transition::{PendingFilter, PendingTab};
+use crate::tui::transition::{Counts, PendingFilter, PendingTab};
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
     // 下の枠を**8行**にしてある（枠線2＋中身6）。中身はACEの注記2行・予約の案内1行・
@@ -33,12 +33,16 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedbac
 /// 戻り値はratatuiが選択を見せるために定めた表示開始位置（呼び出し側が保存する）。
 fn draw_list(frame: &mut Frame, area: Rect, app: &App) -> usize {
     let tab = app.pending.tab.0;
-    let (pending, total) = app.pending.counts(tab);
+    let counts = app.pending.counts(tab);
     // **件数を必ず見出しに出す**——「無い」と「隠している」が区別できないと、
-    // 黙って捨てているのと同じである（`B-09`）。
+    // 黙って捨てているのと同じである（`B-09`）。**3段とも出す**——いま見ていない段の件数が
+    // 無いと、却下したものが消えたのか隠れているのか分からない。
     let title = format!(
-        " {}: 保留中 {pending}件 / 全{total}件（表示: {}） ",
+        " {}: 保留中 {}件 / 却下済み {}件 / 全{}件（表示: {}） ",
         tab.label(),
+        counts.pending,
+        counts.dismissed,
+        counts.total,
         app.pending.filter.label()
     );
     let block = Block::default()
@@ -49,7 +53,7 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App) -> usize {
     let visible = app.pending.visible();
     if visible.is_empty() {
         frame.render_widget(
-            Paragraph::new(empty_text(tab, app.pending.filter, total))
+            Paragraph::new(empty_text(tab, app.pending.filter, counts))
                 .wrap(Wrap { trim: false })
                 .block(block),
             area,
@@ -116,7 +120,49 @@ fn row_line<'a>(
 }
 
 /// チェックの記号と、行末に足す注記。
+///
+/// **却下した行は`[ ]`**——却下は「起こせない」ままにしておく決定なので、記号の意味
+/// （`[x]`＝確定すると起こせる）と食い違わない。却下の状態は行末の言葉で言う（決定60）。
 fn mark_and_tail<'a>(app: &App, candidate: &Candidate) -> (Mark, Vec<Span<'a>>) {
+    let (mark, mut tail) = declared_mark_and_tail(app, candidate);
+    tail.extend(dismissal_tail(app, candidate));
+    (mark, tail)
+}
+
+/// 却下印と却下の予約の注記。
+fn dismissal_tail<'a>(app: &App, candidate: &Candidate) -> Vec<Span<'a>> {
+    let pending = &app.pending;
+    if pending.is_dismiss_reserved(candidate) {
+        return vec![Span::styled(
+            "  ← 却下します".to_string(),
+            Style::default().fg(Color::Magenta),
+        )];
+    }
+    if !pending.is_dismissed(candidate) {
+        return Vec::new();
+    }
+    if pending.is_undismiss_reserved(candidate) || pending.is_reserved(candidate) {
+        // 承認を予約した却下済みの行も、確定で印が外れる（`reserved_dismissals`）。
+        return vec![Span::styled(
+            "  ← 却下を取り消します".to_string(),
+            Style::default().fg(Color::Yellow),
+        )];
+    }
+    // **宣言が後から入った行の古い印は、宣言が優先していることを言う**（決定62の(5)）。
+    // 隠すと、宣言を取り消した日に理由の分からないまま「却下済み」へ戻って見える。
+    let text = if candidate.is_approvable() {
+        "  却下済み"
+    } else {
+        "  却下印あり（宣言が優先）"
+    };
+    vec![Span::styled(
+        text.to_string(),
+        Style::default().fg(Color::DarkGray),
+    )]
+}
+
+/// 宣言の状態から決まる記号と注記。
+fn declared_mark_and_tail<'a>(app: &App, candidate: &Candidate) -> (Mark, Vec<Span<'a>>) {
     match &candidate.declared {
         Declared::No | Declared::UnknownSourceDomain => {
             if app.pending.is_reserved(candidate) {
@@ -269,11 +315,22 @@ fn truncate(value: &str, max: usize) -> String {
 }
 
 /// 行が1つも無いときの文面。**「本当に無い」と「フィルタで隠れている」を区別する**（`B-09`）。
-fn empty_text(tab: PendingTab, filter: PendingFilter, total: usize) -> String {
-    if total > 0 && filter == PendingFilter::Pending {
+fn empty_text(tab: PendingTab, filter: PendingFilter, counts: Counts) -> String {
+    if filter == PendingFilter::Dismissed {
         return format!(
-            "保留中の候補はありません（全{total}件はすべて宣言済みです）。\n\
-             f を押すと「全部」になり、宣言済みも出ます。"
+            "却下した候補はありません（全{}件・保留中 {}件）。\n\
+             保留中の行で x を押して a で確定すると、ここへ移ります。\n\
+             却下は表示だけの印で、policy.json も ACL も変わりません。",
+            counts.total, counts.pending
+        );
+    }
+    if counts.total > 0 && filter == PendingFilter::Pending {
+        return format!(
+            "保留中の候補はありません（全{}件のうち 却下済み {}件・宣言済みなど {}件）。\n\
+             f を押すと「却下済み」→「全部」の順に切り替わり、隠れているものが出ます。",
+            counts.total,
+            counts.dismissed,
+            counts.total - counts.dismissed
         );
     }
     match tab {
@@ -304,15 +361,21 @@ fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
     // 文言の持ち主は`transition_approve`（表示側で書き写さない、`B-05`）。
     let mut text = format!("{}\n", crate::transition_approve::ACE_NOTICE);
 
-    let reserved = app.pending.approve.len();
-    let removing = app.pending.remove.len();
-    if reserved == 0 && removing == 0 {
-        text.push_str("Spaceで選ぶ／uで引数の広さを切替／fで表示の切替／rで読み直し／aで確定。\n");
+    let pending = &app.pending;
+    if pending.reserved_count() == 0 {
+        text.push_str(
+            "Spaceで選ぶ／xで却下／uで引数の広さ／fで表示の切替／rで読み直し／aで確定。\n",
+        );
     } else {
         // **強調の記号を文字として書かない。** 端末では`**`はそのまま星印として出る
         // （2026-09-19に実機で確認）。強調が要るなら色か記号で表す。
         text.push_str(&format!(
-            "許可 {reserved}件・取り消し {removing}件を予約中（aを押すまで何も書きません）。\n"
+            "許可 {}件・取り消し {}件・却下 {}件・却下の取り消し {}件を予約中\
+             （aを押すまで何も書きません）。\n",
+            pending.approve.len(),
+            pending.remove.len(),
+            pending.dismiss.len(),
+            pending.undismiss.len()
         ));
     }
 

@@ -65,6 +65,9 @@ mod stderr_capture;
 mod text_input;
 /// [段階⑦] 承認待ち画面（`F2`）の遷移2タブの状態遷移。
 pub mod transition;
+/// [段階⑦] 遷移タブで却下した候補の印（`dismissed.json`）。**表示だけに効く**
+/// （強制・`policy.json`・ACL・モデルへの注記のどれにも効かない）。読み書きするのはこの画面だけ。
+pub mod transition_dismissed;
 mod transition_screen;
 mod worker;
 
@@ -366,17 +369,21 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
         // `a 確定` が画面の外へ出ており、**予約したものを書き込むキーだけが見えない**
         // という形になっていた。だから状態を変える2つ（`Space`・`a`）を先頭へ置き、
         // 文言も短くしてある。切り捨てそのものは全画面に共通の性質で、ここでは直していない。
+        // 却下（`x`）も予約を変えるキーなので`a`の直後に置く。まとめての却下（`X`）は頻度が
+        // 低いので`f`の後ろ——**まとめて承認するキーは無い**（決定62・決定51）。
         Screen::Edit if app.pending.tab.0.is_transition() => {
             keys.push("Space 選ぶ/外す".to_string());
-            let reserved = app.pending.approve.len() + app.pending.remove.len();
+            let reserved = app.pending.reserved_count();
             if reserved == 0 {
                 keys.push("a 確定".to_string());
             } else {
                 // 予約件数を出す（何件書かれるのかが確定の直前まで見えている必要がある）。
                 keys.push(format!("a 確定（{reserved}件）"));
             }
+            keys.push("x 却下/戻す".to_string());
             keys.push("u 引数の広さ".to_string());
             keys.push(format!("f 表示: {}", app.pending.filter.label()));
+            keys.push("X 表示中を却下".to_string());
             keys.push("↑↓ 選択".to_string());
             keys.push("r 読み直し".to_string());
             keys.push("F2 タブ切替".to_string());
@@ -463,7 +470,12 @@ harness-policy-editor — LLMを介さずに「このコマンドに何を許す
   u      引数の広さを切り替える（既定は「任意の引数」。観測された引数だけに絞れます）
          **コマンドラインが切り詰められている疑いがある観測は絞れません**
          ——切れた値で宣言すると、二度と一致しない辺になります。
-  f      表示（保留中のみ ⇄ 全部）   r 読み直し   a 確定
+  x      却下する／却下を取り消す（「許可しない」と決めた印。a で確定すると
+         .harness/transitions/dismissed.json に残り、次からは保留中に出ません）
+  X      表示中の保留中をまとめて却下（まとめて承認するキーはありません）
+         却下は表示だけの印です。policy.json も ACL も変わらず、強制中の拒否も
+         止まりません。f で「却下済み」を開けば、Space で許可・x で保留中へ戻せます。
+  f      表示（保留中 → 却下済み → 全部）   r 読み直し   a 確定
   [x]=確定するとこのプログラムを起こせる  [ ]=起こせない  [-]=この行からは操作できない
   **いまは「同じドメインの中で起こす」宣言しか書けません（暫定）。** 別ドメインへ分けるには
   そのドメインの実体を作る機構が要り、まだありません。代償は確定の前に出ます。

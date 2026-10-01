@@ -35,6 +35,7 @@
 //!
 //! - **候補の組み立てと「もう宣言済みか」**: [`crate::transition_candidates`]
 //! - **書く／消す**: [`crate::transition_approve`]
+//! - **却下印（`dismissed.json`）の読み書き**: [`super::transition_dismissed`]
 //! - **描画**: [`super::transition_screen`]
 
 use std::collections::BTreeSet;
@@ -49,6 +50,7 @@ use crate::transition_candidates::{
 };
 use crate::tui::checkbox_tree;
 use crate::tui::state::{Action, App, Confirm, Modal, Screen};
+use crate::tui::transition_dismissed::{self, Dismissals};
 
 /// 承認待ち画面（`F2`）のタブ。**決定62**。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,20 +93,26 @@ impl PendingTab {
     }
 }
 
-/// 一覧に何を出すか。**件数を必ず見出しに出す**こと——「無い」と「隠している」が
-/// 区別できないと、黙って捨てているのと同じである（`B-09`、決定29と同じ形）。
+/// 一覧に何を出すか。`f`で「保留中 → 却下済み → 全部」を巡回する（決定62）。
 ///
-/// # 却下済みの段がまだ無い
+/// **件数を必ず見出しに出す**こと——「無い」と「隠している」が区別できないと、
+/// 黙って捨てているのと同じである（`B-09`、決定29と同じ形）。3段の件数は[`PendingState::counts`]が持つ。
 ///
-/// 決定62は「保留中 → 却下済み → 全部」の3段を巡回すると定めているが、
-/// **却下印（`dismissed.json`）の永続化はまだ実装していない**（段階⑦の残り）。
-/// 無い段を空で出すと「却下したものが消えた」と読まれるので、**段そのものを置かない**。
+/// # 3つの段は重ならない
+///
+/// 「保留中」と「却下済み」は、どちらも**まだ宣言されていない**行（[`Candidate::is_approvable`]）を
+/// 却下印の有無で2つに割ったものである。宣言済みの行は**却下印が残っていても**どちらにも入らず、
+/// 「全部」にだけ出る——宣言されているかどうかは`policy.json`と判定器が答える正本で、
+/// 却下印は表示の好みにすぎない（決定62「却下印の永続化を実装した」の(5)）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PendingFilter {
-    /// まだ宣言されていないものだけ。**既定はこちら**——一覧を開いた人が最初に見たいのは
-    /// 「まだ決めていないもの」である。
+    /// まだ宣言されておらず、却下もしていないものだけ。**既定はこちら**——一覧を開いた人が
+    /// 最初に見たいのは「まだ決めていないもの」である。
     #[default]
     Pending,
+    /// 却下したもの（まだ宣言されていないもの）だけ。**ここで選び直せる**——`Space`で承認を、
+    /// `x`で却下の取り消しを予約できる（却下を片方向の操作にしない）。
+    Dismissed,
     /// 宣言済みも含めて全部。
     All,
 }
@@ -113,16 +121,29 @@ impl PendingFilter {
     pub fn label(self) -> &'static str {
         match self {
             PendingFilter::Pending => "保留中のみ",
+            PendingFilter::Dismissed => "却下済み",
             PendingFilter::All => "全部",
         }
     }
 
     fn next(self) -> Self {
         match self {
-            PendingFilter::Pending => PendingFilter::All,
+            PendingFilter::Pending => PendingFilter::Dismissed,
+            PendingFilter::Dismissed => PendingFilter::All,
             PendingFilter::All => PendingFilter::Pending,
         }
     }
+}
+
+/// 見出しに出す件数（3段それぞれ）。**「無い」と「隠している」を区別する**（`B-09`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// まだ宣言されておらず、却下もしていない。
+    pub pending: usize,
+    /// まだ宣言されておらず、却下した。
+    pub dismissed: usize,
+    /// 全部（宣言済み・パターンに覆われている等も含む）。
+    pub total: usize,
 }
 
 /// 候補の同一性＝**観測された`(exe, argv)`の組**。
@@ -168,6 +189,13 @@ pub struct PendingState {
     /// 取り消しの予約（**宣言に書かれている辺**で指す）。
     pub remove: BTreeSet<EdgeRef>,
     pub filter: PendingFilter,
+    /// いまの却下印（`dismissed.json`）。**読めなかったら空**で、理由は`notes`に出る。
+    pub dismissed: Dismissals,
+    /// 却下の予約。**承認の予約（`approve`）とは同じ行に同時に立たない**——片方を立てると
+    /// もう片方を外す（「許す」と「許さない」を同時に予約させない）。
+    pub dismiss: BTreeSet<CandidateKey>,
+    /// 却下の取り消しの予約（保留中へ戻す）。
+    pub undismiss: BTreeSet<CandidateKey>,
 }
 
 /// [`PendingState::tab`]の既定を`FsNet`にするための薄い包み。
@@ -192,10 +220,30 @@ impl PendingState {
         };
         all.iter()
             .filter(|c| match self.filter {
-                PendingFilter::Pending => c.is_approvable(),
+                PendingFilter::Pending => c.is_approvable() && !self.is_dismissed(c),
+                PendingFilter::Dismissed => c.is_approvable() && self.is_dismissed(c),
                 PendingFilter::All => true,
             })
             .collect()
+    }
+
+    /// この候補は却下印を持っているか（**宣言済みかどうかは見ない**。段の振り分けは[`Self::visible`]）。
+    ///
+    /// 遷移元は画面が辺を書く先（[`ENTRY_DOMAIN`]）で比べる——承認と同じ3つ組である
+    /// （`transition_dismissed`のモジュールdoc）。
+    pub fn is_dismissed(&self, candidate: &Candidate) -> bool {
+        self.dismissed
+            .contains(ENTRY_DOMAIN, &candidate.exe, &candidate.argv)
+    }
+
+    /// この候補は却下を予約されているか。
+    pub fn is_dismiss_reserved(&self, candidate: &Candidate) -> bool {
+        self.dismiss.contains(&CandidateKey::of(candidate))
+    }
+
+    /// この候補は却下の取り消しを予約されているか。
+    pub fn is_undismiss_reserved(&self, candidate: &Candidate) -> bool {
+        self.undismiss.contains(&CandidateKey::of(candidate))
     }
 
     /// いま選ばれている行の位置（タブごとに覚える）。
@@ -231,12 +279,26 @@ impl PendingState {
     }
 
     /// 見出しに出す件数（**「無い」と「隠している」を区別する**。`B-09`）。
-    pub fn counts(&self, tab: PendingTab) -> (usize, usize) {
+    ///
+    /// 振り分けは[`Self::visible`]と同じ条件である——別の条件で数えると、見出しの件数と
+    /// `f`で切り替えた先の行数が食い違う。
+    pub fn counts(&self, tab: PendingTab) -> Counts {
         let all = match tab {
             PendingTab::TransitionsDenied => &self.denied,
             _ => &self.observed,
         };
-        (all.iter().filter(|c| c.is_approvable()).count(), all.len())
+        let undecided = all.iter().filter(|c| c.is_approvable());
+        let dismissed = undecided.clone().filter(|c| self.is_dismissed(c)).count();
+        Counts {
+            pending: undecided.count() - dismissed,
+            dismissed,
+            total: all.len(),
+        }
+    }
+
+    /// 予約の件数（承認・取り消し・却下・却下の取り消し）。**キーの案内と下の枠が同じ数を出す。**
+    pub fn reserved_count(&self) -> usize {
+        self.approve.len() + self.remove.len() + self.dismiss.len() + self.undismiss.len()
     }
 }
 
@@ -295,7 +357,29 @@ impl App {
                     Vec::new()
                 }
             };
+        // 却下印。**読めなくても一覧は出す**——印は表示だけに効くので、空として扱えば
+        // 保留中に多く出る側へ倒れるだけで、権限は1つも増えない。**ただし黙らせない**（`B-10`）。
+        self.pending.dismissed = match transition_dismissed::load(&workspace_root) {
+            Ok(dismissed) => dismissed,
+            Err(e) => {
+                notes.push(format!(
+                    "却下印を読めないので、却下したものも保留中に出しています。\
+                     直すか消すまで却下は保存できません（{e}）"
+                ));
+                Dismissals::default()
+            }
+        };
         self.pending.notes = notes;
+
+        // 却下の予約のうち、**もう印の状態が予約どおりになっているもの**を落とす
+        // （別のエディタが先に同じものを却下した・取り消した場合に、何も変えない予約が残らない）。
+        let dismissed = self.pending.dismissed.clone();
+        self.pending
+            .dismiss
+            .retain(|k| !dismissed.contains(ENTRY_DOMAIN, &k.exe, &k.argv));
+        self.pending
+            .undismiss
+            .retain(|k| dismissed.contains(ENTRY_DOMAIN, &k.exe, &k.argv));
 
         // 消えた宣言への取り消し予約を落とす（別経路で消えていた場合に、消せない予約が残らない）。
         let alive: BTreeSet<EdgeRef> = self
@@ -336,6 +420,12 @@ impl App {
             KeyCode::PageUp => checkbox_tree::move_row(self.pending.row_mut(), rows, -10),
             KeyCode::PageDown => checkbox_tree::move_row(self.pending.row_mut(), rows, 10),
             KeyCode::Char(' ') => self.toggle_selected_transition(),
+            // **却下は`x`、表示中をまとめて却下は`X`**（決定62「却下印の永続化を実装した」の(1)）。
+            // `d`にしないのは、同じ`F2`の「FS/ネット」タブで`d`が「この行自身も選ぶ」＝**許可を
+            // 足す向き**だからである。同じ画面のタブ間で向きが逆になるキーを増やさない
+            // （決定62が挙げた問題2「`a`が画面によって正反対」と同じ形を作らない）。
+            KeyCode::Char('x') => self.toggle_selected_dismissal(),
+            KeyCode::Char('X') => self.reserve_visible_dismissals(),
             KeyCode::Char('u') => self.toggle_selected_argv_width(),
             KeyCode::Char('f') => {
                 self.pending.filter = self.pending.filter.next();
@@ -378,8 +468,19 @@ impl App {
                     self.pending.narrow.remove(&key);
                     self.status = format!("{} の承認をやめました", candidate.exe_file_name());
                 } else {
+                    // **「許す」と「許さない」を同時に予約させない。**
+                    self.pending.dismiss.remove(&key);
                     self.pending.approve.insert(key);
-                    self.status = format!("{} を許します（aで確定）", candidate.exe_file_name());
+                    // 却下済みの行を選び直したときは、確定で却下印も外れることを言う
+                    // （[`Self::reserved_dismissals`]が承認した行の印を外す）。
+                    self.status = if self.pending.is_dismissed(&candidate) {
+                        format!(
+                            "{} を許します（aで確定すると却下印も外れます）",
+                            candidate.exe_file_name()
+                        )
+                    } else {
+                        format!("{} を許します（aで確定）", candidate.exe_file_name())
+                    };
                 }
             }
             Declared::ByThisEdge { .. } => {
@@ -452,19 +553,166 @@ impl App {
         );
     }
 
-    /// 承認・取り消しの内容を組み立てて確認ダイアログを出す（**まだ書かない**）。
-    fn request_transition_commit(&mut self) {
-        let (approve, remove) = self.reserved_edges();
-        if approve.is_empty() && remove.is_empty() {
-            self.status =
-                "Spaceで選んでから a を押してください（選んだものが1件もありません）".to_string();
+    /// 選択中の行を却下する／却下をやめる／却下を取り消す（**予約。書くのは`a`の確定**）。
+    ///
+    /// - 保留中の行: 却下を予約する（もう一度押すとやめる）。承認の予約が立っていたら外す
+    /// - 却下済みの行: 却下の取り消しを予約する（保留中へ戻す。もう一度押すとやめる）
+    /// - 宣言済みなど承認の対象でない行: 却下するものが無いので、**理由を言う**（`B-32`）
+    fn toggle_selected_dismissal(&mut self) {
+        let Some(candidate) = self.selected_candidate() else {
+            self.status = no_rows_message(self.pending.filter);
+            return;
+        };
+        let key = CandidateKey::of(&candidate);
+        let name = candidate.exe_file_name().to_string();
+        // 印があれば、宣言済みかどうかに関わらず外せる（宣言が後から入った行の古い印も消せる）。
+        if self.pending.is_dismissed(&candidate) {
+            if self.pending.undismiss.remove(&key) {
+                self.status = format!("{name} の却下の取り消しをやめました");
+            } else {
+                self.pending.undismiss.insert(key);
+                self.status = format!("{name} の却下を取り消します（aで確定すると保留中へ戻ります）");
+            }
             return;
         }
+        if !candidate.is_approvable() {
+            self.status = if candidate.is_removable() {
+                format!("{name} は宣言済みなので却下できません（許可を外すなら Space で取り消しを予約）")
+            } else {
+                format!("{name} は承認の対象ではないので、却下するものがありません")
+            };
+            return;
+        }
+        if self.pending.dismiss.remove(&key) {
+            self.status = format!("{name} の却下をやめました");
+            return;
+        }
+        // **「許す」と「許さない」を同時に予約させない。**
+        let was_approving = self.pending.approve.remove(&key);
+        self.pending.narrow.remove(&key);
+        self.pending.dismiss.insert(key);
+        self.status = format!(
+            "{name} を却下します（aで確定。f で「却下済み」にすると見られ、選び直せます）{}",
+            if was_approving {
+                "。承認の予約は外しました"
+            } else {
+                ""
+            }
+        );
+    }
+
+    /// 表示中の保留中の行を**まとめて**却下する（予約）。
+    ///
+    /// **一括却下は許し、一括承認は許さない**（決定62。決定51の非対称——減らす向きを面倒にすると
+    /// 安全な回復手段が失われ、増やす向きを楽にすると読まずに与えることになる）。
+    /// 却下は権限を増やす向きではない。
+    ///
+    /// **承認を予約している行は飛ばす**（ユーザーが明示的に「許す」と選んだものを、まとめての
+    /// 操作で黙って裏返さない）。飛ばした件数は言う。
+    fn reserve_visible_dismissals(&mut self) {
+        let targets: Vec<CandidateKey> = self
+            .pending
+            .visible()
+            .into_iter()
+            .filter(|c| c.is_approvable() && !self.pending.is_dismissed(c))
+            .map(CandidateKey::of)
+            .collect();
+        let mut added = 0usize;
+        let mut skipped_approving = 0usize;
+        for key in targets {
+            if self.pending.approve.contains(&key) {
+                skipped_approving += 1;
+                continue;
+            }
+            if self.pending.dismiss.insert(key) {
+                added += 1;
+            }
+        }
+        self.status = match (added, skipped_approving) {
+            (0, 0) => "表示中に、却下できる保留中の候補がありません".to_string(),
+            (added, 0) => {
+                format!("表示中の保留中 {added}件を却下します（aで確定 / x で個別に戻せます）")
+            }
+            (added, skipped) => format!(
+                "表示中の保留中 {added}件を却下します（aで確定 / x で個別に戻せます）。\
+                 承認を予約中の{skipped}件は除きました"
+            ),
+        };
+    }
+
+    /// 承認・取り消し・却下の内容を組み立てて確認ダイアログを出す（**まだ書かない**）。
+    fn request_transition_commit(&mut self) {
+        let (approve, remove) = self.reserved_edges();
+        let (dismiss, undismiss) = self.reserved_dismissals();
+        let has_policy = !approve.is_empty() || !remove.is_empty();
+        let has_dismissals = !dismiss.is_empty() || !undismiss.is_empty();
+        if !has_policy && !has_dismissals {
+            self.status = "Spaceで選ぶか x で却下してから a を押してください\
+                           （選んだものが1件もありません）"
+                .to_string();
+            return;
+        }
+        // **却下印が読めないなら、ここで止める**（何も書かない。`transition_approve`の
+        // 「部分適用しない」と同じ判断）。承認だけを書きたいなら、却下の予約を外せば通る。
+        if has_dismissals {
+            if let Err(e) = transition_dismissed::load(&self.workspace_root) {
+                self.modal = Some(Modal {
+                    title: "却下印を書けません（何も書いていません）".to_string(),
+                    lines: vec![
+                        e.to_string(),
+                        String::new(),
+                        "壊れたファイルは上書きしません。直すか消すと保存できます。".to_string(),
+                        "承認・取り消しだけを書くなら、x で却下の予約を外してください。"
+                            .to_string(),
+                    ],
+                    confirm: Confirm::ReadOnly,
+                });
+                return;
+            }
+        }
+
+        let mut lines = Vec::new();
+        let mut count = 0usize;
+        if has_policy {
+            let Some(policy_lines) = self.transition_plan_lines(&approve, &remove, &mut count)
+            else {
+                return;
+            };
+            lines.extend(policy_lines);
+        }
+        if has_dismissals {
+            if !lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines.extend(transition_dismissed::confirmation_lines(
+                &self.workspace_root,
+                ENTRY_DOMAIN,
+                &dismiss,
+                &undismiss,
+            ));
+            count += dismiss.len() + undismiss.len();
+        }
+
+        self.modal = Some(Modal {
+            title: format!("この{count}件を書きますか？"),
+            lines,
+            confirm: Confirm::Transition,
+        });
+        self.modal_scroll = 0;
+    }
+
+    /// `policy.json`へ書く分の明細。**書けないならダイアログを出して`None`**（何も書かない）。
+    fn transition_plan_lines(
+        &mut self,
+        approve: &[EdgeRef],
+        remove: &[EdgeRef],
+        count: &mut usize,
+    ) -> Option<Vec<String>> {
         let request = TransitionRequest {
             workspace_root: &self.workspace_root,
             from_domain: ENTRY_DOMAIN,
-            approve: &approve,
-            remove: &remove,
+            approve,
+            remove,
             record_session: None,
             now_unix_ms: now_unix_ms(),
         };
@@ -476,9 +724,10 @@ impl App {
                     lines: e.to_string().lines().map(str::to_string).collect(),
                     confirm: Confirm::ReadOnly,
                 });
-                return;
+                return None;
             }
         };
+        *count += plan.added.len() + plan.removed.len();
 
         let mut lines = vec![
             format!("{}:", policy_file::path(&self.workspace_root).display()),
@@ -530,62 +779,122 @@ impl App {
                     .map(str::to_string),
             );
         }
-
-        self.modal = Some(Modal {
-            title: format!(
-                "この{}件を書きますか？",
-                plan.added.len() + plan.removed.len()
-            ),
-            lines,
-            confirm: Confirm::Transition,
-        });
-        self.modal_scroll = 0;
+        Some(lines)
     }
 
     /// 確認後に実際に書く。
     ///
     /// **`plan`は作り直す**——ダイアログを見ている間に`policy.json`が別の経路
     /// （CLI・手編集）で変わっていた場合に、古い読み込み結果で上書きしないため
-    /// （候補画面・宣言画面と同じ作法）。
+    /// （候補画面・宣言画面と同じ作法）。却下印も同じで、**画面が持っている一覧ではなく、
+    /// 書く直前に読み直したファイルへ予約の差分を当てる**（[`transition_dismissed::update`]）。
+    ///
+    /// # 書く順序
+    ///
+    /// (1) 却下印が読めるかを確かめる → (2) `policy.json` → (3) 却下印。
+    /// 2つのファイルを1回で不可分には書けないので、**落ちやすい方を先に確かめて、
+    /// 書く前に落ちれば何も書いていない**形にする。(3)だけが落ちたときは、`policy.json`は
+    /// 書けたことと、却下の予約が残っていることを言う（黙って片方だけ書いたことにしない、`B-09`）。
     pub(crate) fn commit_transition(&mut self) {
         let (approve, remove) = self.reserved_edges();
-        let request = TransitionRequest {
-            workspace_root: &self.workspace_root,
-            from_domain: ENTRY_DOMAIN,
-            approve: &approve,
-            remove: &remove,
-            record_session: None,
-            now_unix_ms: now_unix_ms(),
-        };
-        let plan = match transition_approve::plan(&request) {
-            Ok(plan) => plan,
-            Err(e) => {
-                self.status = format!("書けませんでした: {e}");
+        let (dismiss, undismiss) = self.reserved_dismissals();
+        let has_policy = !approve.is_empty() || !remove.is_empty();
+        let has_dismissals = !dismiss.is_empty() || !undismiss.is_empty();
+
+        if has_dismissals {
+            if let Err(e) = transition_dismissed::load(&self.workspace_root) {
+                self.status = format!("却下印を書けませんでした（何も書いていません）: {e}");
                 return;
             }
-        };
-        match transition_approve::commit(&self.workspace_root, &plan) {
-            Ok(true) => {
-                self.status = format!(
+        }
+
+        let mut done: Vec<String> = Vec::new();
+        if has_policy {
+            let request = TransitionRequest {
+                workspace_root: &self.workspace_root,
+                from_domain: ENTRY_DOMAIN,
+                approve: &approve,
+                remove: &remove,
+                record_session: None,
+                now_unix_ms: now_unix_ms(),
+            };
+            let plan = match transition_approve::plan(&request) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    self.status = format!("書けませんでした（何も書いていません）: {e}");
+                    return;
+                }
+            };
+            match transition_approve::commit(&self.workspace_root, &plan) {
+                Ok(true) => done.push(format!(
                     "遷移の宣言を更新しました（許可 {}件 / 取り消し {}件。ACLは変わりません）",
                     plan.added.len(),
                     plan.removed.len()
-                );
-                self.pending.approve.clear();
-                self.pending.narrow.clear();
-                self.pending.remove.clear();
-                self.reload_transitions();
+                )),
+                Ok(false) => done.push(
+                    "変わるものがありませんでした（policy.jsonは書いていません）".to_string(),
+                ),
+                Err(e) => {
+                    self.status =
+                        format!("policy.jsonを書けませんでした（何も書いていません）: {e}");
+                    return;
+                }
             }
-            Ok(false) => {
-                self.status =
-                    "変わるものがありませんでした（policy.jsonは書いていません）".to_string();
-                self.pending.approve.clear();
-                self.pending.narrow.clear();
-                self.pending.remove.clear();
-                self.reload_transitions();
-            }
-            Err(e) => self.status = format!("policy.jsonを書けませんでした: {e}"),
+            self.pending.approve.clear();
+            self.pending.narrow.clear();
+            self.pending.remove.clear();
         }
+
+        if has_dismissals {
+            match transition_dismissed::update(
+                &self.workspace_root,
+                ENTRY_DOMAIN,
+                &dismiss,
+                &undismiss,
+                now_unix_ms(),
+            ) {
+                Ok(applied) => {
+                    done.push(if applied.wrote {
+                        format!(
+                            "却下 {}件 / 却下の取り消し {}件を保存しました\
+                             （表示だけの印です。policy.jsonとACLは変わりません）",
+                            applied.added, applied.removed
+                        )
+                    } else {
+                        "却下印は変わりませんでした（別のエディタが先に同じ操作をしていました）"
+                            .to_string()
+                    });
+                    self.pending.dismiss.clear();
+                    self.pending.undismiss.clear();
+                }
+                // **予約は残す**——もう一度 a を押せば同じものを書きに行ける。
+                Err(e) => done.push(format!(
+                    "却下印は書けませんでした（却下の予約は残してあります）: {e}"
+                )),
+            }
+        }
+
+        self.status = done.join("。");
+        self.reload_transitions();
+    }
+
+    /// 予約から、却下印へ足す／外すものを組み立てる。
+    ///
+    /// **承認を予約した行に却下印があれば、それも外す。** 却下したものを選び直して許したなら、
+    /// 最後の判断は「許す」であって、宣言を後で取り消したときに「却下済み」として戻ってくるのは
+    /// その判断と食い違う。外すのは**いま印がある行だけ**（確認ダイアログの件数を実際に変わる数に合わせる）。
+    fn reserved_dismissals(&self) -> (BTreeSet<CandidateKey>, BTreeSet<CandidateKey>) {
+        let dismiss = self.pending.dismiss.clone();
+        let mut undismiss = self.pending.undismiss.clone();
+        undismiss.extend(
+            self.pending
+                .observed
+                .iter()
+                .chain(self.pending.denied.iter())
+                .filter(|c| self.pending.is_reserved(c) && self.pending.is_dismissed(c))
+                .map(CandidateKey::of),
+        );
+        (dismiss, undismiss)
     }
 
     /// 予約から、実際に書く／消す辺を組み立てる。
@@ -624,8 +933,11 @@ fn push_read_notes(notes: &mut Vec<String>, what: &str, dropped: u64, skipped: u
 /// 行が1つも無いときに言うこと。**フィルタで隠れているのか、本当に無いのかを区別する**（`B-09`）。
 fn no_rows_message(filter: PendingFilter) -> String {
     match filter {
-        PendingFilter::Pending => {
-            "保留中の候補がありません（f で「全部」にすると宣言済みも出ます）".to_string()
+        PendingFilter::Pending => "保留中の候補がありません（f で切り替えると、却下したもの・\
+                                   宣言済みも出ます）"
+            .to_string(),
+        PendingFilter::Dismissed => {
+            "却下した候補はありません（保留中の行で x を押すと、ここへ移ります）".to_string()
         }
         PendingFilter::All => {
             "候補がありません（パス1で記録すると、起きたプロセスがここへ出ます）".to_string()
