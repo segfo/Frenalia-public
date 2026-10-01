@@ -27,6 +27,10 @@
 
 use std::path::{Path, PathBuf};
 
+// 配下判定と`.harness`の判定は、許可の一覧を作る側（`policy_grants`）と同じ関数を通す（B-05）。
+// 候補に出さない範囲と、宣言から許可を付けない範囲が別の規則で引かれると食い違う。
+use harness_sandbox::tier2a::policy_grants::{is_harness_control_path, is_under};
+
 /// 候補にしなかった理由。**数え分けるためにあるので、混ぜない**（B-09/B-32:
 /// どの理由で候補が消えたのかを説明できない文言にしない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,8 +79,7 @@ impl ExclusionRules {
             temp_root: Some(std::env::temp_dir()),
             // 台帳の置き場は`<config_dir>`だが、除外は**その親**（`%APPDATA%\harness`）で掛ける
             // ——harnessが将来ここへ別のサブディレクトリを作っても、制御面である事実は同じ。
-            harness_user_dir: harness_grant_ledger::config_dir()
-                .and_then(|dir| dir.parent().map(Path::to_path_buf)),
+            harness_user_dir: harness_sandbox::tier2a::policy_grants::harness_user_dir(),
             msix_packages_root: std::env::var_os("LOCALAPPDATA")
                 .map(|local| PathBuf::from(local).join("Packages")),
         }
@@ -112,7 +115,7 @@ impl ExclusionRules {
             return Some(Excluded::HarnessControlDir);
         }
         if let Some(harness_dir) = self.harness_user_dir.as_deref() {
-            if crate::approve::is_under(path, harness_dir) {
+            if is_under(path, harness_dir) {
                 return Some(Excluded::HarnessControlDir);
             }
         }
@@ -133,7 +136,7 @@ impl ExclusionRules {
         //      `C:/Users/segfo/AppData/Local/Packages`が`fs.read`と`fs.read_write`で宣言されており、
         //      最初の掃除でも残っていた（一般化後の値は元の値と別物、という当たり前の見落とし）。
         if let Some(packages) = self.msix_packages_root.as_deref() {
-            if crate::approve::is_under(path, packages) {
+            if is_under(path, packages) {
                 return Some(Excluded::MsixPackageData);
             }
         }
@@ -144,7 +147,7 @@ impl ExclusionRules {
         // 4. このセッションのworkspace配下（D-54でツリー全体へRWX付与済み）。承認しても
         //    得るものが無く、逆にセッション台帳へ載って`end_session`が
         //    `revoke_ace_recursive`（実測30.8秒）を回すことになる。
-        if crate::approve::is_under(path, &self.workspace_root) {
+        if is_under(path, &self.workspace_root) {
             return Some(Excluded::SessionWorkspace);
         }
         // 5. `%TEMP%`配下。名前にPID・時刻・乱数を含む刹那的なパスの巣で、**次回は存在しない**。
@@ -152,23 +155,12 @@ impl ExclusionRules {
         //    他アプリの一時ファイルへの読み書き削除を渡すことであり（P-01）、しかも
         //    撤収はツリー全walkなので剥がしきれない（BUG-103の実測）。
         if let Some(temp_root) = self.temp_root.as_deref() {
-            if crate::approve::is_under(path, temp_root) {
+            if is_under(path, temp_root) {
                 return Some(Excluded::EphemeralTemp);
             }
         }
         None
     }
-}
-
-/// `.harness`（harnessの制御ディレクトリ）配下のパスか。
-///
-/// パス**要素**として`.harness`を持つかで判定する。前方一致で
-/// `<このworkspace>/.harness`だけを見ると、記録対象が別のリポジトリを走査したときに
-/// そちらの`.harness`を拾ってしまう——どのworkspaceのものであれ、harnessの制御
-/// ディレクトリへの許可を提案してよい理由は無い。
-pub fn is_harness_control_path(path: &str) -> bool {
-    path.split(['/', '\\'])
-        .any(|component| component.eq_ignore_ascii_case(".harness"))
 }
 
 /// harness自身のAppContainerプロファイル（`%LOCALAPPDATA%\Packages\<プロファイル名>`）配下か。

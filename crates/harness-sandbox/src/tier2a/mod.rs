@@ -69,6 +69,10 @@ pub mod fs_passthrough_ledger;
 /// windows専用にしない（名前の導出・台帳・検証は純粋関数で、CSPRNGだけがcfg分岐する）。
 pub mod workspace_capability;
 
+/// [#30] `policy.json`のファイル宣言から、許可を付ける一覧を作る（ポリシーエディタの試験実行と
+/// `harness.exe`が同じ関数を通る）。純粋関数なのでwindows専用にしない。
+pub mod policy_grants;
+
 /// `.harness/transitions/`へ積む記録の共通部品（段階6c・6d）。**拒否（Spawn Daemonが書く）と
 /// 候補（収集器が書く）で数え方を揃えるためにここに置く**——同じ画面が両方を読むので、
 /// 片方だけ`count`の意味が違うと読み手が取り違える。`spawnd`と同じ理由でwindows専用にしない

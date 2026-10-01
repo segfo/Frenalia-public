@@ -99,7 +99,7 @@ fn generalization_never_folds_up_to_a_drive_root() {
 
 /// [D-62] **バージョン番号らしい要素をワイルドカードにしない。**
 ///
-/// ワイルドカードは畳み込みより footprint が広い。`approve::grant_root`は**最初の`*`の手前で
+/// ワイルドカードは畳み込みより footprint が広い。`policy_grants::GrantContext::grant_root`は**最初の`*`の手前で
 /// 切る**ので、`.../toolchains/*/bin`という値のACEは`.../toolchains`**全体**に付く
 /// ——観測していない全toolchainバージョンが対象になる。実際この開発機の台帳には、
 /// その結果として`C:/Users/segfo/.rustup/toolchains`が付与ルートとして残っていた。

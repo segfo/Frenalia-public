@@ -985,7 +985,7 @@ fn run_pass2<'a>(
     state: &mut TeardownState<'a>,
     on_event: &mut dyn FnMut(NetRecordEvent),
 ) -> Result<Pass2Inner, RecordNetError> {
-    let passthrough = passthrough_for_domain(request.domain, request.workspace_root);
+    let passthrough = passthrough_for_domain(request.domain, request.workspace_root, warnings, on_event);
     // **付与より先に、もう宣言されていない穴を閉じる。** 宣言を取り消しただけでは
     // このプロセスが既に開けたACEは残っており、同じプロセスで次のパス2を走らせると
     // 「取り消したのにまだ通る」ことになる（付与は`preflight`が宣言から毎回計算するので
@@ -1643,26 +1643,33 @@ fn drain_net_audit(
 
 /// ドメインのFSルールから`FsPassthrough`を作る。
 ///
-/// **workspace配下のパスは含めない**——Tier2aのworkspace grantが既に覆っているので、
-/// 同じツリーへ別の宛先SIDのACEを重ねる意味が無い（`preflight`の走査対象を無駄に増やすだけ）。
-/// 分類の規則は[`crate::approve`]の表示とそろえる（B-19: 綴りを揃える規則を2つ持たない）。
-fn passthrough_for_domain(domain: &PolicyDomain, workspace_root: &Path) -> Vec<FsPassthrough> {
-    // ルートの畳み込み（どれをworkspace外と見るか・重複したときどちらのaccessを採るか）は
-    // [`crate::approve::grant_roots`]が唯一の定義を持つ。承認時に「N件になります」と警告する
-    // のと同じ集合でなければ、警告した数と実際に待たされる数が食い違う（B-05）。
-    crate::approve::grant_roots(domain, workspace_root)
-        .into_iter()
-        .map(|(path, access, scope)| FsPassthrough {
-            path,
-            access,
-            // [D-63] 宣言値の書き方がそのまま付与範囲になる（`R`で付けた`/**`だけが再帰）。
-            scope,
-            // `--force-system-acl`（D-19）はポリシーエディタからは使わせない。
-            // システム保護パスへ`SeRestorePrivilege`で強制付与するのは、記録のついでに
-            // やってよい操作ではない（`harness fs`から明示的に行う）。
-            forced: false,
-        })
-        .collect()
+/// 変換は`harness_sandbox::tier2a::policy_grants`が唯一の定義を持つ——**`harness.exe`が
+/// 起動時に付ける一覧も同じ関数で作る**ので、ここで確かめた挙動がそのまま再現される（#30）。
+/// workspace配下のパスは含めない（Tier2aのworkspace grantが既に覆っている）。
+///
+/// **宣言にあるのに付けない値は、理由ごと見せる**（B-10）。黙って落とすと、
+/// 「承認したのに読めない」の原因が画面のどこにも出ない。
+fn passthrough_for_domain(
+    domain: &PolicyDomain,
+    workspace_root: &Path,
+    warnings: &mut Vec<String>,
+    on_event: &mut dyn FnMut(NetRecordEvent),
+) -> Vec<FsPassthrough> {
+    let grants = harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(workspace_root)
+        .domain_grants(domain);
+    for skipped in &grants.skipped {
+        warn(
+            format!(
+                "fs宣言 {} ({}) には許可を付けません: {}",
+                skipped.value,
+                skipped.access.settings_key(),
+                skipped.reason.describe()
+            ),
+            warnings,
+            on_event,
+        );
+    }
+    grants.passthrough
 }
 
 /// このドメインの宣言と付与結果から、コマンドの実行ファイルへ届くかを測る。

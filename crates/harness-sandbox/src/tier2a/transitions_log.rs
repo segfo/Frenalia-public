@@ -39,7 +39,7 @@ use std::sync::Mutex;
 /// 待ち行列の置き場（ワークスペースからの相対）。
 ///
 /// **`.harness`配下から動かさないこと。** 自己参照ループ——記録の産物が次の記録の候補に
-/// なること——を断っているのは`harness_policy_editor::exclusion::is_harness_control_path`で、
+/// なること——を断っているのは`crate::tier2a::policy_grants::is_harness_control_path`で、
 /// 同関数が見るのは**パス要素`.harness`だけ**である。ここを動かした瞬間、
 /// 記録そのものが「サンドボックスから触りたいファイル」の候補として提案され始める。
 const TRANSITIONS_DIR: &str = "transitions";

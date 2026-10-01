@@ -565,7 +565,7 @@ fn prepare_audit_sinks(
 /// [D-63] 宣言値から**ACEを実際に付けるオブジェクト**を求め、workspace基準で絶対化する。
 ///
 /// 切る位置は`harness_policy::normalize::literal_prefix`が唯一の定義を持つ（ポリシーエディタの
-/// `approve::grant_root`・幅の判定`breadth::check`と同じ関数）。ここで別に切ると、**判定した値と
+/// `policy_grants::GrantContext::grant_root`・幅の判定`breadth::check`と同じ関数）。ここで別に切ると、**判定した値と
 /// 付与する値が食い違う**（B-05）。
 ///
 /// 既に絶対パスなら`Path::join`はそれをそのまま採る（従来どおり）。

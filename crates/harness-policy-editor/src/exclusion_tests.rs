@@ -242,7 +242,8 @@ fn sandbox_profile_components_come_from_the_sandbox_crate() {
 /// 書き換えられない、かつ次回の記録の候補に自分自身が混ざらない）。
 ///
 /// **このテストがここに在る理由**: 2026-09-12に`policy_file`モジュールを
-/// `harness-policy`へ移したが、除外規則（[`is_harness_control_path`]）はこのクレートに残った。
+/// `harness-policy`へ移したが、除外規則（[`is_harness_control_path`]。2026-10-01に実体を
+/// `harness_sandbox::tier2a::policy_grants`へ移し、このクレートは呼ぶだけになった）はこちらから使う。
 /// **測っているのは2つの対**——置き場がどこかと、除外がそこを覆っているか——なので、
 /// 片方だけを向こうへ置くと分断される。**両方が見えるこちらへ移した。**
 #[test]

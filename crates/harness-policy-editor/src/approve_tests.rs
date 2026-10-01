@@ -269,51 +269,6 @@ fn repeating_an_id_does_not_accept_it_twice() {
     assert_eq!(plan.report.added.len(), 1);
 }
 
-/// ワイルドカードを含む値から、**実際にACEを付けるディレクトリ**を取り出す。
-#[test]
-fn the_grant_root_is_the_literal_prefix_before_any_wildcard() {
-    let ws = Path::new(r"C:\ws");
-
-    assert_eq!(
-        grant_root("C:/Users/x/.cargo/**", ws),
-        Some(std::path::PathBuf::from("C:/Users/x/.cargo"))
-    );
-    assert_eq!(
-        grant_root("C:/Users/x/.rustup/toolchains/*/bin", ws),
-        Some(std::path::PathBuf::from("C:/Users/x/.rustup/toolchains")),
-        "`*`を含む要素の1つ手前まで（`*`を含んだままのパスへACEは付けられない）"
-    );
-    assert_eq!(
-        grant_root("C:/Users/x/.cargo/config.toml", ws),
-        Some(std::path::PathBuf::from("C:/Users/x/.cargo/config.toml")),
-        "ワイルドカードが無ければそのまま"
-    );
-}
-
-/// **workspace配下は付与対象にしない**（Tier2aのworkspace grantが既に覆っている）。
-/// ここを間違えると、26万ノードのツリーへ別の宛先SIDのACEを重ねて撒くことになる。
-#[test]
-fn paths_inside_the_workspace_are_not_granted_again() {
-    let ws = Path::new(r"C:\ws");
-
-    assert_eq!(grant_root("C:/ws/src/**", ws), None);
-    assert_eq!(grant_root(r"C:\ws\target\debug", ws), None);
-    assert!(
-        grant_root("C:/ws2/src/**", ws).is_some(),
-        "接頭辞が一致するだけの別ディレクトリは付与対象（workspaceではない）"
-    );
-}
-
-/// ドライブ文字だけしか残らない値は付与対象にしない（事実上ドライブ全体への付与になる）。
-/// `breadth::check`が承認時に止めているはずだが、**変換側でも受け取らない**。
-#[test]
-fn a_value_that_reduces_to_a_drive_root_is_not_granted() {
-    let ws = Path::new(r"C:\ws");
-
-    assert_eq!(grant_root("C:/*", ws), None);
-    assert_eq!(grant_root("C:/", ws), None);
-}
-
 /// **壊れた`policy.json`の上に書き足さない。** 読めない状態で承認を続けると、既存の承認を
 /// 失ったファイルで上書きすることになる（B-10）。
 #[test]

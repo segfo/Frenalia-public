@@ -378,7 +378,7 @@ fn a_failed_append_is_rolled_back_so_the_next_denial_retries() {
 /// **置き場は`.harness`配下から動かさない。**
 ///
 /// 自己参照ループ（記録の産物が次の記録の候補になること）を断っているのは
-/// `harness_policy_editor::exclusion::is_harness_control_path`で、同関数が見るのは
+/// `crate::tier2a::policy_grants::is_harness_control_path`で、同関数が見るのは
 /// パス要素`.harness`だけである。**その照合は`harness-policy-editor`側のテストが持つ**
 /// （依存の向きが逆なのでここからは呼べない）。ここでは形だけを固定する。
 #[test]

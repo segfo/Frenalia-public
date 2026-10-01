@@ -472,7 +472,7 @@ fn warnings_for(group: &Group) -> Vec<String> {
 
     // 値にワイルドカードが入りうるのは、**ユーザーが手で書いた宣言**がpreflight由来の候補として
     // 戻ってくる経路だけである（D-62で一般化を廃止したので、harnessが`*`を作ることはない）。
-    // `approve::grant_root`は最初の`*`の手前で切るため、ACEはその親ディレクトリ全体に付く。
+    // `harness_sandbox::tier2a::policy_grants`の`grant_root`は最初の`*`の手前で切るため、ACEはその親ディレクトリ全体に付く。
     if group.value.contains('*') {
         warnings.push("contains a wildcard; review how wide it is before accepting".to_string());
     }
