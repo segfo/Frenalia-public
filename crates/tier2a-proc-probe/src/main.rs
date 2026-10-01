@@ -101,6 +101,7 @@ struct Args {
     make_symlink: Vec<String>,
     make_junction: Vec<String>,
     make_hardlink: Vec<String>,
+    write_dacl: Vec<String>,
     /// MAC設計§20項目1: プロセス生成の全経路を試し、どれが拒否されるかを報告する
     /// （`spawn_matrix`モジュールdoc参照）。値はマーカーファイルを書くディレクトリ。
     spawn_matrix: Option<String>,
@@ -200,6 +201,7 @@ fn parse_args() -> Args {
     let mut make_symlink: Vec<String> = Vec::new();
     let mut make_junction: Vec<String> = Vec::new();
     let mut make_hardlink: Vec<String> = Vec::new();
+    let mut write_dacl: Vec<String> = Vec::new();
     let mut spawn_matrix = None;
     // 空＝全部（既定）。指定すればその経路だけを撃つ。
     let mut spawn_matrix_methods: Vec<String> = Vec::new();
@@ -271,6 +273,7 @@ fn parse_args() -> Args {
             "--make-symlink" => make_symlink.push(next()),
             "--make-junction" => make_junction.push(next()),
             "--make-hardlink" => make_hardlink.push(next()),
+            "--write-dacl" => write_dacl.push(next()),
             // --- MACスパイク用（`plans/mac-spike/RESULTS.md`） ---
             "--spawn-matrix" => spawn_matrix = Some(next()),
             "--spawn-matrix-methods" => {
@@ -410,6 +413,7 @@ fn parse_args() -> Args {
         make_symlink,
         make_junction,
         make_hardlink,
+        write_dacl,
         spawn_matrix,
         spawn_matrix_methods,
         reach,
@@ -762,6 +766,23 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::to_string(&report).expect("try_runas report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if !args.write_dacl.is_empty() {
+        // **保護を先に掛ける**（`--redirection-trust` と併せて指定したとき）。
+        if let Some(mode) = &args.redirection_trust {
+            let applied = redirection_trust::run(mode, &[]);
+            println!(
+                "{}",
+                serde_json::to_string(&applied).expect("redirection_trust report must serialize")
+            );
+        }
+        let report = redirection_trust::write_dacl_identity(&args.write_dacl);
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("write_dacl report must serialize")
         );
         return ExitCode::SUCCESS;
     }

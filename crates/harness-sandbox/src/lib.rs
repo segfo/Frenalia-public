@@ -43,6 +43,9 @@ pub(crate) mod overlay;
 /// 「1エントリ全体を適用する」既存経路と「ハンクを選んで合成する」経路が別の責務のため。
 pub(crate) mod overlay_hunks;
 pub(crate) mod read_scope;
+/// [残課題#68] 自分自身のプロセスへ掛ける緩和策（管理者権限で動く補助プロセスが、
+/// サンドボックスの作ったリンクを辿らないようにする）。
+pub mod process_hardening;
 pub mod resolve;
 pub mod secret_env;
 /// セッションID → オーバーレイの置き場、の写像。起動時（`harness-cli`）とセッション切替時

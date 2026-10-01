@@ -11,6 +11,12 @@
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {
+    // [残課題#68] **引数を読むより先に掛ける。** このプロセスは管理者権限で動き、
+    // ワークスペース配下（サンドボックスの中のコードが書ける場所）のパスを開く。
+    // 一度掛けると外せないので、何かを開く前のここで1回だけ呼ぶ
+    // （掛ける相手と掛けない相手の一覧は`process_hardening`のモジュールdocが持つ）。
+    harness_sandbox::process_hardening::harden_elevated_helper("harness-vmsandboxd");
+
     let mut args = std::env::args().skip(1);
     let pipe_name = match args.next() {
         Some(p) => p,

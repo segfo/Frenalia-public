@@ -343,3 +343,78 @@ pub fn make_hardlink(specs: &[String]) -> Value {
 pub fn make_hardlink(_specs: &[String]) -> Value {
     json!({ "make_hardlink": [], "error": "windows only" })
 }
+
+/// アクセス制御リストを**読んでそのまま書き戻す**（`--write-dacl <パス>`、繰り返し可）。
+///
+/// # 何のための計器か
+///
+/// 管理者権限で動く`harness-privhelper.exe`は、ユーザーが`--fs-allow`で指定したパスへ
+/// `SetNamedSecurityInfoW`でアクセス制御リストを書く。**この関数はパスを辿る**ので、
+/// RedirectionGuardを掛けたときに、リンクを含むパスへ書けなくなるかを測る必要がある
+/// （`docs/STATUS.md`の残課題 サンドボックス周辺 #68の多層防御）。
+///
+/// # 対象は1ビットも変わらない
+///
+/// 読んだ内容をそのまま書き戻すので、成功しても中身は変わらない。権限を足して消す形にすると、
+/// 途中で落ちたときに足したものが残る（`harness-sandbox`の`can_write_dacl`と同じ理由）。
+///
+/// `last_error`の読み方: `0`＝書けた、`448`（`ERROR_UNTRUSTED_MOUNT_POINT`）＝
+/// RedirectionGuardが辿るのを断った、`5`＝アクセス拒否。
+#[cfg(windows)]
+pub fn write_dacl_identity(paths: &[String]) -> Value {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{GetLastError, LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+    let mut attempts = Vec::new();
+    for path in paths {
+        let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let (read_ok, read_error, wrote, write_error) = unsafe {
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            let read = GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                &mut descriptor,
+            );
+            if read.is_err() {
+                (false, read.0, false, 0u32)
+            } else {
+                let write = SetNamedSecurityInfoW(
+                    PCWSTR(wide.as_ptr()),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    Some(dacl),
+                    None,
+                );
+                let werr = if write.is_err() { write.0 } else { 0 };
+                let _ = LocalFree(HLOCAL(descriptor.0));
+                (true, 0, write.is_ok(), werr)
+            }
+        };
+        let _ = GetLastError;
+        attempts.push(json!({
+            "path": path,
+            "read_ok": read_ok,
+            "read_last_error": read_error,
+            "wrote": wrote,
+            "write_last_error": write_error,
+        }));
+    }
+    json!({ "write_dacl": attempts })
+}
+
+#[cfg(not(windows))]
+pub fn write_dacl_identity(_paths: &[String]) -> Value {
+    json!({ "write_dacl": [], "error": "windows only" })
+}
