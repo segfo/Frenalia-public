@@ -311,14 +311,15 @@ pub(super) fn stage_prepare_sandbox(
     // 受け付けない綴り（下の`retain`が弾く中間ワイルドカード）は**ここでも数えない**——
     // 付与しないパスを「このワークスペースが宣言している」と数えると、他の経路が付けた
     // 同名の台帳エントリを自動撤収から守ってしまう（参照カウントは付与と対でなければ嘘になる）。
-    let settings_fs_paths: std::collections::HashSet<String> = settings_fs_entries
-        .iter()
-        .filter(|(path, _)| !harness_policy::normalize::has_unsupported_wildcard(path))
-        .map(|(path, _)| {
-            grant_root_of(&workspace_root, path)
-                .to_string_lossy()
-                .into_owned()
-        })
+    //
+    // [#30] 数え方は`policy_grants::settings_declared_roots`が1つだけ持つ（ポリシーエディタの
+    // 試験実行の開始時の取り消しも同じ関数で数える。BUG-184）。
+    let settings_fs_paths: std::collections::HashSet<String> =
+        harness_sandbox::tier2a::policy_grants::settings_declared_roots(
+            &workspace_root,
+            &settings_fs_entries,
+        )
+        .into_iter()
         .collect();
     let mut fs_allow_raw: Vec<(String, harness_config::FsAccess)> = settings_fs_entries;
     for entry in &cli.fs_allow {
@@ -734,7 +735,8 @@ fn prepare_audit_sinks(
 ///
 /// 既に絶対パスなら`Path::join`はそれをそのまま採る（従来どおり）。
 fn grant_root_of(workspace_root: &Path, declared: &str) -> PathBuf {
-    workspace_root.join(harness_policy::normalize::literal_prefix(declared))
+    // [#30] 規則は`policy_grants::manual_grant_root`が1つだけ持つ（自動撤収の宣言集合を数える側と共有）。
+    harness_sandbox::tier2a::policy_grants::manual_grant_root(workspace_root, declared)
 }
 
 /// Streamable HTTPのセッションゲート（D-49）を、ユーザ層設定とCLIフラグから組み立てる。

@@ -69,16 +69,13 @@ pub(super) fn plan(
     approved: &dyn Fn(DeclarationRef<'_>) -> bool,
     transitions_enforced: bool,
 ) -> PolicyFsPlan {
-    let mut out = PolicyFsPlan::default();
-
     // 自動撤収の宣言集合は**全ドメイン**の承認済み宣言から作る。付与する範囲の条件で付けなかった
     // 回に「もう宣言されていない」と数えると、強制を有効にした次の回に付け直しになる。
-    for domain in &policy.domains {
-        for fp in ctx.domain_grants(domain, approved).passthrough {
-            out.declared_roots
-                .push(fp.path.to_string_lossy().into_owned());
-        }
-    }
+    // 数え方はポリシーエディタの開始時の取り消し（BUG-184）と同じ関数を通す。
+    let mut out = PolicyFsPlan {
+        declared_roots: ctx.declared_roots(policy, approved),
+        ..Default::default()
+    };
 
     if let Some(entry) = policy.domain(ENTRY_DOMAIN) {
         let grants = ctx.domain_grants(entry, approved);
