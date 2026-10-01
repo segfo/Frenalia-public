@@ -282,8 +282,8 @@ pub fn token_of_profile(name: &str) -> Option<&str> {
         "{}.",
         crate::tier2a::mcp_profile::MCP_PROFILE_PREFIX
     )) {
-        let (token, server_id) = suffix.rsplit_once('.')?;
-        return (!token.is_empty() && !server_id.is_empty()).then_some(token);
+        // 印は最初の`.`まで（BUG-189。切り方の正本は`split_session_token`）。
+        return crate::tier2a::mcp_profile::split_session_token(suffix).map(|(token, _)| token);
     }
     crate::tier2a::domain_profile::token_of_domain_profile(name)
 }
@@ -1846,6 +1846,21 @@ mod tests {
         assert_eq!(without_session(vec![other.clone()], "1234-5"), vec![other]);
     }
 
+    /// [BUG-189] ドメイン名に`.`があっても、自分の入れ物は自分の一部で、他人のものは他人のまま。
+    ///
+    /// 直す前は印を`1234-5.a`と読んだので、**自分の**`a.b`の入れ物が「走行中の他セッション」に
+    /// 数えられ、D-48のガード（`traverse_revoke_guard`）が自分の撤収を止めていた。
+    #[test]
+    fn a_dotted_domain_profile_is_sorted_by_the_token_before_the_first_dot() {
+        let own = "1234-5";
+        let mine = crate::tier2a::domain_profile::domain_profile_name_for(own, "a.b");
+        let other = crate::tier2a::domain_profile::domain_profile_name_for("999-1", "a.b");
+        assert_eq!(
+            without_session(vec![mine, other.clone()], own),
+            vec![other]
+        );
+    }
+
     // --- 残す側と撤収してよい側の名簿（`profile_names_by_liveness`） ---
     //
     // **どの族も両側を対で見る**（B-35）。片側だけだと、「全部を残す側に入れる」実装でも
@@ -1895,6 +1910,23 @@ mod tests {
     fn a_domain_profile_found_only_on_the_machine_is_sorted_by_its_owner() {
         let running = crate::tier2a::domain_profile::domain_profile_name_for("alive", "cargo");
         let orphan = crate::tier2a::domain_profile::domain_profile_name_for("dead", "cargo");
+        let existing = vec![running.clone(), orphan.clone()];
+        let live: HashSet<String> = ["alive".to_string()].into_iter().collect();
+
+        let (keep, revocable) = keep_and_revocable(&SessionLedger::default(), &existing, &live);
+        assert_eq!(keep, vec![running], "keep");
+        assert_eq!(revocable, vec![orphan], "revocable");
+    }
+
+    /// [BUG-189] 上と同じ判定を、`.`を含むドメイン名で。
+    ///
+    /// 直す前は印を`alive.a`と読み、その印のセッションは居ないので、**走行中のセッションの
+    /// 入れ物が「撤収してよい側」へ入っていた**（`harness fs revoke`が剥がしに行く名簿。
+    /// `harness-cli`の`fs_grants::workspace`）。
+    #[test]
+    fn a_dotted_domain_profile_found_only_on_the_machine_is_sorted_by_its_owner() {
+        let running = crate::tier2a::domain_profile::domain_profile_name_for("alive", "a.b");
+        let orphan = crate::tier2a::domain_profile::domain_profile_name_for("dead", "a.b");
         let existing = vec![running.clone(), orphan.clone()];
         let live: HashSet<String> = ["alive".to_string()].into_iter().collect();
 
@@ -2973,6 +3005,20 @@ mod tests {
         );
     }
 
+    /// [BUG-189] 上と同じ判定を、`.`を含むドメイン名で。直す前は走行中のセッションの入れ物も
+    /// 印を`running.a`と読んで「死んだセッションの孤児」として回収対象に入れていた。
+    #[test]
+    fn a_running_sessions_dotted_domain_profile_is_not_an_orphan() {
+        let orphan = crate::tier2a::domain_profile::domain_profile_name_for("orphan", "a.b");
+        let running = crate::tier2a::domain_profile::domain_profile_name_for("running", "a.b");
+        let existing = vec![orphan.clone(), running];
+        let live: HashSet<String> = ["running".to_string()].into_iter().collect();
+
+        let targets = plan_reclaim(&SessionLedger::default(), &existing, &liveness(&live));
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].profile_name, orphan);
+    }
+
     /// 台帳にあるMCPプロファイルを、実在プロファイル側で二重に数えない。
     #[test]
     fn a_dead_mcp_profile_is_reclaimed_once_even_if_both_sources_see_it() {
@@ -3030,6 +3076,14 @@ mod tests {
     fn session_token_is_stable_within_the_process() {
         assert_eq!(session_token(), session_token());
         assert!(current_profile_name().ends_with(session_token()));
+    }
+
+    /// [BUG-189] **印は`.`を含まない。** MCPサーバ用・遷移先ドメイン用の名前を印と残りへ
+    /// 最初の`.`で切る規則（`mcp_profile::split_session_token`）は、この1点に乗っている。
+    /// 印の形を変えて`.`が入ったら、ここが赤くなる——そのときは切り方を先に考え直すこと。
+    #[test]
+    fn the_session_token_never_contains_a_dot() {
+        assert!(!session_token().contains('.'), "{}", session_token());
     }
 
     /// **BUG-107の核心（禁止側）。** 他プロセスのセッションに属する名前は`OtherSession`である。
@@ -3099,6 +3153,44 @@ mod tests {
                 "cargo"
             )),
             ProfileOwner::ThisSession
+        );
+    }
+
+    /// **[BUG-189] 症状そのもの。** `.`を含むドメイン名の入れ物でも、持ち主は名前の中の印で決まる
+    /// （禁止側と許可側を対で置く、B-35）。
+    ///
+    /// 直す前は、自分の`a.b`の入れ物を`OtherSession("<印>.a")`と答えていた——`ensure_profile`が
+    /// 「別のセッションの入れ物」として作成を拒むので、`.`を含む遷移先ドメインは起動のたびに
+    /// 用意されず、その遷移は毎回断られていた。
+    #[test]
+    fn a_dotted_domain_profile_belongs_to_the_session_in_its_name() {
+        assert_eq!(
+            owner_of_profile(&crate::tier2a::domain_profile::domain_profile_name_for(
+                "999999-1", "a.b"
+            )),
+            ProfileOwner::OtherSession("999999-1")
+        );
+        assert_eq!(
+            owner_of_profile(&crate::tier2a::domain_profile::current_domain_profile_name(
+                "a.b"
+            )),
+            ProfileOwner::ThisSession
+        );
+    }
+
+    /// [BUG-189の横展開] MCPサーバ用の族も同じ切り方を通る。
+    ///
+    /// サーバidは宣言の検査（`harness_mcp::decl::is_valid_server_id`）が`[a-z0-9-]`に絞るので、
+    /// 製品が`.`入りのMCPプロファイルを作ることは今は無い。それでも名前の形は遷移先ドメインと
+    /// 同じなので、切り方を1つにしてある（片方だけ直ると、もう片方の検査が緩んだ日に同じ欠陥になる）。
+    #[test]
+    fn an_mcp_profile_with_a_dotted_id_still_yields_its_session_token() {
+        assert_eq!(
+            token_of_profile(&crate::tier2a::mcp_profile::mcp_profile_name_for(
+                "1234-5678",
+                "a.b"
+            )),
+            Some("1234-5678")
         );
     }
 }

@@ -188,13 +188,14 @@ fn a_narrowing_destination_with_declarations_can_be_written() {
 
 /// **禁止側**: 入れ物（AppContainerプロファイル）の名前にできない遷移先は、**書く前に**断る。
 ///
-/// 編集時検査は50文字・`.`可で通すが、`harness.exe`はセッションの印を足した名前で入れ物を作るので、
-/// 長い名前は起動時に用意できない。`.`は持ち主の判定が読み違える（`profile_name_problem`のdoc）。
+/// 編集時検査は50文字で通すが、`harness.exe`はセッションの印を足した名前で入れ物を作るので、
+/// 長い名前は起動時に用意できない（`profile_name_problem`のdoc）。`.`を含む名前はここに入らない
+/// ——持ち主の判定が最初の`.`で切るようになって通る（BUG-189。許可側は`transition_destination_tests`）。
 #[test]
 fn a_destination_that_cannot_become_a_profile_name_is_refused_before_writing() {
     let tmp = tempfile::tempdir().unwrap();
     let too_long = "x".repeat(40);
-    for bad in ["a.b", too_long.as_str(), "bad name", ""] {
+    for bad in ["a/b", too_long.as_str(), "bad name", ""] {
         match plan(&request_to(tmp.path(), bad, &[any("C:/curl.exe")], &[])) {
             Err(TransitionApproveError::DestinationName { to_domain, .. }) => {
                 assert_eq!(to_domain, bad)
@@ -215,7 +216,7 @@ fn removing_alone_does_not_look_at_the_destination() {
     let tmp = tempfile::tempdir().unwrap();
     approve_and_reload(tmp.path(), &[any("C:/git.exe")]);
 
-    let plan = plan(&request_to(tmp.path(), "a.b", &[], &[any("C:/git.exe")]))
+    let plan = plan(&request_to(tmp.path(), "bad name", &[], &[any("C:/git.exe")]))
         .expect("取り消しが遷移先の名前で止まった");
     assert_eq!(plan.removed.len(), 1);
 }

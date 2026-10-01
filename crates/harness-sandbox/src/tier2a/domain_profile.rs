@@ -69,12 +69,11 @@ pub fn is_domain_profile_name(name: &str) -> bool {
     };
     // `<印>.<ドメイン名>`の2つの部分が両方とも非空であること。区切りのドットが無い
     // （＝ドメイン名が無い）名前は、セッション全体を指す別物なので受け付けない。
-    let Some((token, domain)) = suffix.rsplit_once('.') else {
+    // ドメイン名は`.`を含み得るので、切るのは最初の`.`である（BUG-189）。
+    if crate::tier2a::mcp_profile::split_session_token(suffix).is_none() {
         return false;
-    };
-    !token.is_empty()
-        && !domain.is_empty()
-        && suffix.len() <= MAX_SUFFIX_LEN
+    }
+    suffix.len() <= MAX_SUFFIX_LEN
         && suffix
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
@@ -88,13 +87,17 @@ pub fn is_domain_profile_name(name: &str) -> bool {
 /// 呼ぶのは持ち主の判定の唯一の入口（`session_profile::token_of_profile`）だけである。
 /// 2026-09-30まではそこから呼ばれておらず、この族は回収と「残す側」の名簿から漏れていた
 /// （`docs/STATUS.md`「サンドボックス周辺 #63」）。
+///
+/// **印は最初の`.`まで**である（[BUG-189](../../../../docs/bugs/BUG-189.md)。切り方の正本は
+/// `mcp_profile::split_session_token`）。2026-10-01までは最後の`.`で切っていたので、
+/// `.`を含むドメイン名では自分の入れ物を「別のセッションのもの」と答え、`ensure_profile`が
+/// 作成を拒んでいた。
 pub fn token_of_domain_profile(name: &str) -> Option<&str> {
     if !is_domain_profile_name(name) {
         return None;
     }
     let suffix = name.strip_prefix(&format!("{DOMAIN_PROFILE_PREFIX}."))?;
-    let (token, _domain) = suffix.rsplit_once('.')?;
-    (!token.is_empty()).then_some(token)
+    crate::tier2a::mcp_profile::split_session_token(suffix).map(|(token, _domain)| token)
 }
 
 #[cfg(test)]
@@ -110,6 +113,27 @@ mod tests {
         assert!(name.starts_with(DOMAIN_PROFILE_PREFIX));
         assert!(is_domain_profile_name(&name));
         assert_eq!(token_of_domain_profile(&name), Some("1234-99"));
+    }
+
+    /// **[BUG-189] 禁止側。** ドメイン名に`.`があっても、印は**最初の**`.`までである。
+    ///
+    /// 最後の`.`で切ると`a.b`の`a`を印の一部と読み、持ち主を「別のセッション`1234-99.a`」と
+    /// 答える。`.`入りの名前は手で書かなくても現れる——`policy.json`の編集時検査が`.`を許し
+    /// （`harness_policy`の`check_domain_name`）、既定のドメイン名は`python3.11.exe`から
+    /// `python3.11`を作る（`harness_policy::policy_file::default_domain_name`）。
+    ///
+    /// 許可側（`.`を含まない名前）は上の`profile_names_carry_the_prefix_…`が見ている。
+    #[test]
+    fn a_dotted_domain_name_does_not_leak_into_the_session_token() {
+        for domain in ["a.b", "python3.11", "x.y.z"] {
+            let name = domain_profile_name_for("1234-99", domain);
+            assert!(is_domain_profile_name(&name), "{name}");
+            assert_eq!(
+                token_of_domain_profile(&name),
+                Some("1234-99"),
+                "the session token of {name}"
+            );
+        }
     }
 
     /// **信頼境界の検証**: 昇格側が受け取る名前として妥当なものだけを通す。

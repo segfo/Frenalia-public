@@ -196,6 +196,18 @@ fn a_short_plain_name_can_be_a_destination() {
     }
 }
 
+/// **許可側**: `.`を含む名前も使える（[BUG-189](../../../docs/bugs/BUG-189.md)）。
+///
+/// 持ち主の判定が名前の最後の`.`で印を切っていた間は、ここを暫定で断っていた。既定のドメイン名は
+/// `python3.11.exe`から`python3.11`を作る（`harness_policy::policy_file::default_domain_name`）ので、
+/// 断ると、記録した名前のままでは遷移先にできない。判定が最後の`.`で切る形へ戻ると、ここが赤くなる。
+#[test]
+fn a_dotted_name_can_be_a_destination() {
+    for good in ["a.b", "python3.11"] {
+        assert_eq!(profile_name_problem(good), None, "{good:?} が断られた");
+    }
+}
+
 /// **禁止側**: 入れ物の名前にできない名前は断る。長さの上限は持ち主の判定に聞いて数えるので、
 /// 上限ちょうどは通り、1文字超えると断られる。
 #[test]
@@ -207,20 +219,6 @@ fn names_that_cannot_become_a_profile_name_are_refused() {
     for bad in ["", "bad name", "a/b", "a*"] {
         assert!(profile_name_problem(bad).is_some(), "{bad:?} が通った");
     }
-}
-
-/// **【暫定の見張り】** `.`を含む名前は、`harness-sandbox`の持ち主の判定が最後の`.`で切るので断る。
-///
-/// # この試験が赤くなったら
-///
-/// `harness-sandbox`の`domain_profile::token_of_domain_profile`が直り、`.`を含むドメイン名でも
-/// 印を正しく読み戻すようになったということである。**エディタ側で消すものは無い**
-/// （`profile_name_problem`は判定を写さずに聞いている）ので、この期待を「通る」へ書き換え、
-/// `profile_name_problem`のdocの【暫定】の段落を消すこと。
-#[test]
-fn a_dotted_name_is_refused_while_the_owner_check_splits_at_the_last_dot() {
-    let problem = profile_name_problem("a.b").expect("「.」を含む名前が通った");
-    assert!(problem.contains('.'), "理由が「.」を名指ししていない: {problem}");
 }
 
 /// 最も長い印の形が、**このプロセスの本物の印と同じ形**（数字-数字）で、それより長くないこと。

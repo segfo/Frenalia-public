@@ -37,6 +37,25 @@ pub fn current_mcp_profile_name(server_id: &str) -> String {
     mcp_profile_name_for(crate::tier2a::session_profile::session_token(), server_id)
 }
 
+/// `<セッションの印>.<残り>`の形の接尾辞を、印と残りに分ける（MCPサーバ用・遷移先ドメイン用の
+/// 2族が使う。どちらも`<接頭辞>.<印>.<id>`の形である）。両方が空でないときだけ`Some`。
+///
+/// # 最初の`.`で切る（[BUG-189](../../../../docs/bugs/BUG-189.md)）
+///
+/// 印は`session_profile::session_token`が作る`<pid>-<unix秒>`で、**`.`を含まない**
+/// （試験`the_session_token_never_contains_a_dot`が固定している）。一方、残りは`.`を含み得る
+/// ——ドメイン名は`policy.json`の編集時検査が`.`を許し（`harness_policy`の`check_domain_name`）、
+/// 既定のドメイン名も`python3.11.exe`から`python3.11`を作る。かつてはここを**最後の**`.`で
+/// 切っていたので、`harness.domain.<印>.a.b`の`a`を印の一部と読み、持ち主を取り違えていた。
+///
+/// **切り方はここ1つに置く。** 名前の検証（`is_*_profile_name`）と持ち主の判定
+/// （`session_profile::token_of_profile`）が別々に切ると、片方だけ直ったときに
+/// 「信頼境界は通すが持ち主は読み違える」名前が生まれる。
+pub(crate) fn split_session_token(suffix: &str) -> Option<(&str, &str)> {
+    let (token, rest) = suffix.split_once('.')?;
+    (!token.is_empty() && !rest.is_empty()).then_some((token, rest))
+}
+
 /// harnessのMCPサーバプロファイル名か。
 ///
 /// **信頼境界を越えて受け取った名前の検証に使う**——昇格側（`privhelper`・`netfilterd`）は、
@@ -49,12 +68,10 @@ pub fn is_mcp_profile_name(name: &str) -> bool {
     };
     // `<token>.<server-id>`の2つの部分が両方とも非空であること。区切りのドットが無い
     // （＝サーバidが無い）名前は、セッション全体を指す別物なので受け付けない。
-    let Some((token, server_id)) = suffix.rsplit_once('.') else {
+    if split_session_token(suffix).is_none() {
         return false;
-    };
-    !token.is_empty()
-        && !server_id.is_empty()
-        && suffix.len() <= MAX_SUFFIX_LEN
+    }
+    suffix.len() <= MAX_SUFFIX_LEN
         && suffix
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
