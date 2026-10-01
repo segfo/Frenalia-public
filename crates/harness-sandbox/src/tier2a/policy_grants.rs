@@ -49,6 +49,9 @@ pub enum SkipReason {
     MiddleWildcard,
     /// 確定部分がドライブ直下まで戻る値（`C:/*`）。事実上ドライブ全体への付与になる。
     DriveRoot,
+    /// このマシンで承認されていない（D-112、`policy_approval`）。リポジトリに同梱された
+    /// `policy.json`の宣言は、ユーザーがこのマシンで承認するまで許可を付けない。
+    NotApprovedOnThisMachine,
 }
 
 impl SkipReason {
@@ -68,6 +71,11 @@ impl SkipReason {
             }
             SkipReason::DriveRoot => {
                 "the literal part reduces to a drive root, which would open the whole drive"
+            }
+            SkipReason::NotApprovedOnThisMachine => {
+                "not approved on this machine (a policy.json shipped with a repository is not \
+                 trusted until you approve each declaration in harness-policy-editor: the \
+                 declarations screen (F3), or `harness-policy-editor approve-declared`)"
             }
         }
     }
@@ -182,21 +190,46 @@ impl GrantContext {
     ///
     /// 引数は1ドメインである。2つのドメインの宣言を1本に畳むと、狭い側のドメインが
     /// 広い側の種類の許可を持つことになる。
-    pub fn domain_grants(&self, domain: &PolicyDomain) -> DomainGrants {
+    ///
+    /// # [D-112] このマシンで承認した宣言だけ
+    ///
+    /// `approved`は宣言1件（ドメイン・値・種類）が承認済みかを答える。製品の呼び出しは
+    /// `policy_approval::PolicyApprovalLedger::is_approved_for_key`をそのまま渡す。
+    /// 引数にしてあるのは、承認する**前**の画面（件数の警告）が「今回承認する値も承認済みと
+    /// みなした件数」を同じ関数で数えるためである——件数の定義をここ1つに保つ（B-05）。
+    /// 照合はワークスペースの外かどうかの判定の**後**に行う（ワークスペースの中と制御ディレクトリは、
+    /// 承認の有無に関係なく同じ扱いになる）。
+    pub fn domain_grants(
+        &self,
+        domain: &PolicyDomain,
+        approved: &dyn Fn(crate::tier2a::policy_approval::DeclarationRef<'_>) -> bool,
+    ) -> DomainGrants {
         let mut out = DomainGrants::default();
         for (value, access) in domain.fs.entries() {
+            let skip = |out: &mut DomainGrants, reason| {
+                out.skipped.push(SkippedDeclaration {
+                    value: value.to_string(),
+                    access,
+                    reason,
+                })
+            };
             let root = match self.grant_root(value) {
                 Ok(Some(root)) => root,
                 Ok(None) => continue,
                 Err(reason) => {
-                    out.skipped.push(SkippedDeclaration {
-                        value: value.to_string(),
-                        access,
-                        reason,
-                    });
+                    skip(&mut out, reason);
                     continue;
                 }
             };
+            let declaration = crate::tier2a::policy_approval::DeclarationRef {
+                domain: &domain.name,
+                value,
+                access,
+            };
+            if !approved(declaration) {
+                skip(&mut out, SkipReason::NotApprovedOnThisMachine);
+                continue;
+            }
             let granted = FsAccess::from_settings(access);
             let scope = harness_policy::normalize::declared_scope(value);
             match out.passthrough.iter_mut().find(|fp| fp.path == root) {

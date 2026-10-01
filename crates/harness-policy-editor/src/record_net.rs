@@ -1655,8 +1655,12 @@ fn passthrough_for_domain(
     warnings: &mut Vec<String>,
     on_event: &mut dyn FnMut(NetRecordEvent),
 ) -> Vec<FsPassthrough> {
+    // [D-112] このマシンで承認した宣言だけに付ける。`harness.exe`も同じ台帳・同じ関数で決める。
+    let approvals = crate::approval_store::approval_store().load();
+    let workspace_key =
+        harness_sandbox::tier2a::policy_approval::approval_workspace_key(workspace_root);
     let grants = harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(workspace_root)
-        .domain_grants(domain);
+        .domain_grants(domain, &|d| approvals.is_approved_for_key(&workspace_key, d));
     for skipped in &grants.skipped {
         warn(
             format!(

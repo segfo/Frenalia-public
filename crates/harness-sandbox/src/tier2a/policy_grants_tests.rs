@@ -16,6 +16,11 @@ fn ctx(ws: &Path) -> GrantContext {
     GrantContext::with_harness_user_dir(ws, Some(Path::new(USER_DIR)))
 }
 
+/// 承認の照合を外して変換だけを見るテスト用。製品の呼び出しは承認台帳を渡す。
+fn all_approved(_: crate::tier2a::policy_approval::DeclarationRef<'_>) -> bool {
+    true
+}
+
 fn workspace() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
@@ -42,7 +47,7 @@ fn entries_under_the_same_root_collapse_to_one_grant_root() {
         domain.fs.read.push(value.to_string());
     }
 
-    let grants = ctx(ws.path()).domain_grants(&domain);
+    let grants = ctx(ws.path()).domain_grants(&domain, &all_approved);
     assert_eq!(
         root_strings(&grants),
         vec![
@@ -66,7 +71,7 @@ fn the_widest_access_wins_for_a_shared_root() {
         .read_write
         .push("C:/Users/me/.cargo/x/**".to_string());
 
-    let grants = ctx(ws.path()).domain_grants(&domain);
+    let grants = ctx(ws.path()).domain_grants(&domain, &all_approved);
     assert_eq!(grants.passthrough.len(), 1);
     assert_eq!(grants.passthrough[0].access, FsAccess::ReadWrite);
 }
@@ -88,7 +93,7 @@ fn write_and_exec_on_the_same_root_are_combined_not_chosen_between() {
         .read_exec
         .push("C:/Users/me/.cargo/x/**".to_string());
 
-    let grants = ctx(ws.path()).domain_grants(&domain);
+    let grants = ctx(ws.path()).domain_grants(&domain, &all_approved);
     assert_eq!(grants.passthrough.len(), 1, "one root means one ACE");
     let access = grants.passthrough[0].access;
     assert_eq!(access, FsAccess::ReadWriteExec);
@@ -109,7 +114,7 @@ fn all_three_buckets_on_one_root_still_produce_a_single_grant() {
         bucket.push("C:/Users/me/.cargo/x/**".to_string());
     }
 
-    let grants = ctx(ws.path()).domain_grants(&domain);
+    let grants = ctx(ws.path()).domain_grants(&domain, &all_approved);
     assert_eq!(grants.passthrough.len(), 1);
     assert_eq!(grants.passthrough[0].access, FsAccess::ReadWriteExec);
 }
@@ -123,13 +128,13 @@ fn the_scope_comes_from_how_the_value_is_written() {
         .fs
         .read
         .push("C:/Users/me/.cargo/config.toml".to_string());
-    let grants = ctx(ws.path()).domain_grants(&object_only);
+    let grants = ctx(ws.path()).domain_grants(&object_only, &all_approved);
     assert_eq!(grants.passthrough[0].scope, GrantScope::Object);
 
     let mut both = PolicyDomain::new("b");
     both.fs.read.push("C:/Users/me/.cargo".to_string());
     both.fs.read.push("C:/Users/me/.cargo/**".to_string());
-    let grants = ctx(ws.path()).domain_grants(&both);
+    let grants = ctx(ws.path()).domain_grants(&both, &all_approved);
     assert_eq!(grants.passthrough.len(), 1);
     assert_eq!(
         grants.passthrough[0].scope,
@@ -149,9 +154,9 @@ fn each_domain_keeps_its_own_access_for_a_shared_root() {
     writer.fs.read_write.push("C:/data/**".to_string());
 
     let c = ctx(ws.path());
-    assert_eq!(c.domain_grants(&reader).passthrough[0].access, FsAccess::Read);
+    assert_eq!(c.domain_grants(&reader, &all_approved).passthrough[0].access, FsAccess::Read);
     assert_eq!(
-        c.domain_grants(&writer).passthrough[0].access,
+        c.domain_grants(&writer, &all_approved).passthrough[0].access,
         FsAccess::ReadWrite
     );
 }
@@ -165,7 +170,7 @@ fn paths_inside_the_workspace_are_neither_granted_nor_reported() {
     let mut domain = PolicyDomain::new("cargo");
     domain.fs.read.push(inside);
 
-    let grants = ctx(ws.path()).domain_grants(&domain);
+    let grants = ctx(ws.path()).domain_grants(&domain, &all_approved);
     assert!(grants.passthrough.is_empty());
     assert!(grants.skipped.is_empty());
 }
@@ -223,7 +228,7 @@ fn a_wildcard_in_the_middle_is_skipped_with_its_reason() {
         .read_exec
         .push("C:/Users/x/.rustup/toolchains/*/bin".to_string());
 
-    let grants = ctx(ws.path()).domain_grants(&domain);
+    let grants = ctx(ws.path()).domain_grants(&domain, &all_approved);
     assert!(grants.passthrough.is_empty(), "{:?}", grants.passthrough);
     assert_eq!(
         grants.skipped,
@@ -298,7 +303,56 @@ fn every_reason_has_a_description() {
         SkipReason::RelativePath,
         SkipReason::MiddleWildcard,
         SkipReason::DriveRoot,
+        SkipReason::NotApprovedOnThisMachine,
     ] {
         assert!(!reason.describe().is_empty(), "{reason:?}");
     }
+}
+
+/// [D-112] **このマシンで承認していない宣言には許可を付けない**（理由を添えて返す）。
+/// 対の側として、承認した宣言だけは付く（`B-35`）。
+#[test]
+fn only_declarations_approved_on_this_machine_are_granted() {
+    let ws = workspace();
+    let mut domain = PolicyDomain::new("cargo");
+    domain.fs.read.push("C:/approved/**".to_string());
+    domain.fs.read.push("C:/shipped/**".to_string());
+
+    let approved = |d: crate::tier2a::policy_approval::DeclarationRef<'_>| {
+        d.domain == "cargo" && d.value == "C:/approved/**"
+    };
+    let grants = ctx(ws.path()).domain_grants(&domain, &approved);
+    assert_eq!(root_strings(&grants), vec!["C:/approved"]);
+    assert_eq!(
+        grants.skipped,
+        vec![SkippedDeclaration {
+            value: "C:/shipped/**".to_string(),
+            access: harness_config::FsAccess::Read,
+            reason: SkipReason::NotApprovedOnThisMachine,
+        }]
+    );
+}
+
+/// 承認の照合は**ワークスペースの外かどうかの判定の後**に行う。ワークスペースの中は承認が無くても
+/// 黙って対象外（理由にしない）、制御ディレクトリは承認があっても付けない。
+#[test]
+fn approval_does_not_change_the_workspace_and_control_directory_rules() {
+    let ws = workspace();
+    let inside = format!("{}/src/**", ws.path().to_string_lossy().replace('\\', "/"));
+    let mut domain = PolicyDomain::new("cargo");
+    domain.fs.read.push(inside);
+    domain.fs.read.push("C:/repo/.harness/**".to_string());
+
+    let none_approved = |_: crate::tier2a::policy_approval::DeclarationRef<'_>| false;
+    let grants = ctx(ws.path()).domain_grants(&domain, &none_approved);
+    assert!(grants.passthrough.is_empty());
+    assert_eq!(grants.skipped.len(), 1, "{:?}", grants.skipped);
+    assert_eq!(grants.skipped[0].reason, SkipReason::ControlDirectory);
+
+    let grants = ctx(ws.path()).domain_grants(&domain, &all_approved);
+    assert!(
+        grants.passthrough.is_empty(),
+        "approval must not open the control directory: {:?}",
+        grants.passthrough
+    );
 }

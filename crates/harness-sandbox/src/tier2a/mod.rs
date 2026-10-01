@@ -73,6 +73,10 @@ pub mod workspace_capability;
 /// `harness.exe`が同じ関数を通る）。純粋関数なのでwindows専用にしない。
 pub mod policy_grants;
 
+/// [#30・D-112] `policy.json`のファイル宣言の、このマシンでの承認の台帳。リポジトリに同梱された
+/// 宣言は、承認するまで許可を付けない。台帳と照合は純粋なのでwindows専用にしない。
+pub mod policy_approval;
+
 /// `.harness/transitions/`へ積む記録の共通部品（段階6c・6d）。**拒否（Spawn Daemonが書く）と
 /// 候補（収集器が書く）で数え方を揃えるためにここに置く**——同じ画面が両方を読むので、
 /// 片方だけ`count`の意味が違うと読み手が取り違える。`spawnd`と同じ理由でwindows専用にしない

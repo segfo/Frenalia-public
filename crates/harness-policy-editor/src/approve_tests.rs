@@ -295,3 +295,76 @@ fn approving_on_top_of_a_corrupt_policy_file_fails_instead_of_overwriting_it() {
         "壊れたファイルを上書きもしない"
     );
 }
+
+/// [D-112] 承認すると、受け入れた値が**このマシンの承認台帳**へ記録される。
+#[test]
+fn committing_records_the_accepted_values_as_approved_on_this_machine() {
+    let ws = workspace();
+    let proposals = vec![proposal("fs-1", SettingsKey::FsRead, "C:/Users/x/.cargo/**")];
+    let accept = ids(&["fs-1"]);
+
+    let plan = plan(&request(ws.path(), &proposals, &accept)).expect("plan");
+    commit(ws.path(), &plan).expect("commit");
+
+    let approvals = crate::approval_store::approval_store().load();
+    assert!(approvals.is_approved(
+        ws.path(),
+        harness_sandbox::tier2a::policy_approval::DeclarationRef {
+            domain: "cargo",
+            value: "C:/Users/x/.cargo/**",
+            access: harness_config::FsAccess::Read,
+        }
+    ));
+}
+
+/// [D-112] **一括承認の抜け道を塞ぐ試験。** 同じドメインにリポジトリ同梱の未承認の宣言があっても、
+/// 候補を1件承認しただけでは**その宣言は承認されない**。`policy.json`全体を記録する実装だと、
+/// ここが落ちる。
+#[test]
+fn approving_one_candidate_does_not_approve_a_shipped_declaration_in_the_same_domain() {
+    let ws = workspace();
+    let mut shipped = crate::policy_file::PolicyDomain::new("cargo");
+    shipped.fs.read.push("C:/Users/x/.ssh/**".to_string());
+    crate::policy_file::save(
+        ws.path(),
+        &crate::policy_file::PolicyFile {
+            schema_version: crate::policy_file::POLICY_SCHEMA_VERSION,
+            domains: vec![shipped],
+        },
+    )
+    .expect("save the shipped policy");
+
+    let proposals = vec![proposal("fs-1", SettingsKey::FsRead, "C:/Users/x/.cargo/**")];
+    let accept = ids(&["fs-1"]);
+    let plan = plan(&request(ws.path(), &proposals, &accept)).expect("plan");
+    commit(ws.path(), &plan).expect("commit");
+
+    let saved = crate::policy_file::load(ws.path()).expect("load");
+    assert!(
+        saved.domain("cargo").unwrap().fs.read.iter().any(|v| v == "C:/Users/x/.ssh/**"),
+        "the shipped declaration is still in the file (approval does not delete it)"
+    );
+    let approvals = crate::approval_store::approval_store().load();
+    let declaration = |value| harness_sandbox::tier2a::policy_approval::DeclarationRef {
+        domain: "cargo",
+        value,
+        access: harness_config::FsAccess::Read,
+    };
+    assert!(approvals.is_approved(ws.path(), declaration("C:/Users/x/.cargo/**")));
+    assert!(
+        !approvals.is_approved(ws.path(), declaration("C:/Users/x/.ssh/**")),
+        "approving one candidate must not approve what the repository shipped"
+    );
+}
+
+/// ネットワークの宣言は承認台帳の対象外（台帳はファイル宣言だけを持つ）。
+#[test]
+fn approving_a_network_candidate_records_nothing_in_the_file_approval_ledger() {
+    let ws = workspace();
+    let proposals = vec![proposal("net-1", SettingsKey::NetAllowDomains, "crates.io")];
+    let accept = ids(&["net-1"]);
+    let plan = plan(&request(ws.path(), &proposals, &accept)).expect("plan");
+    commit(ws.path(), &plan).expect("commit");
+
+    assert!(crate::approval_store::approval_store().load().approvals.is_empty());
+}

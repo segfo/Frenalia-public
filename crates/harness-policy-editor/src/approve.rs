@@ -62,6 +62,15 @@ pub enum ApproveError {
     Refused(String),
     #[error(transparent)]
     PolicyFile(#[from] policy_file::PolicyFileError),
+    /// `policy.json`は書けたが、このマシンでの承認（D-112）を台帳へ記録できなかった。
+    ///
+    /// **成功と言わない。** 記録できなかった宣言は未承認のままなので、次の試験実行でも
+    /// `harness.exe`でも許可が付かない——「承認したのに効かない」の原因がここで出ないと辿れない。
+    #[error(
+        "policy.json には書きましたが、このマシンでの承認を台帳へ記録できませんでした: {0}\n\
+         これらの宣言は、承認し直すまで許可が付きません（台帳: %APPDATA%\\harness\\config\\policy-approval-ledger.json）"
+    )]
+    ApprovalNotRecorded(String),
 }
 
 /// 受理した提案のうち、その値がworkspaceのどちら側にあるか。
@@ -83,6 +92,8 @@ pub enum PathClass {
 #[derive(Debug)]
 pub struct ApprovePlan<'a> {
     pub accepted: Vec<&'a RuleProposal>,
+    /// 承認するドメイン（[`commit`]が承認台帳へ記録する鍵の1つ）。
+    pub domain: &'a str,
     /// 書き込む予定の内容（[`commit`]がそのまま保存する）。
     pub file: PolicyFile,
     pub report: MergeReport,
@@ -174,11 +185,22 @@ pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveErro
     // 実際に処理する数そのもの）。一般化して畳めば減らせる、という行動もここで伝える
     // ——数だけ出して「どうすればいいか」を書かないのは、警告として半分しか役に立たない（B-32）。
     // 件数の定義は付与の一覧を作る関数（`harness.exe`とパス2が共有する）が唯一持つ（B-05）。
+    // [D-112] 数えるのは**この承認の後に許可が付くもの**——既に承認済みの宣言と、いま承認する値。
+    let approvals = crate::approval_store::approval_store().load();
+    let workspace_key =
+        harness_sandbox::tier2a::policy_approval::approval_workspace_key(req.workspace_root);
+    let approved_after_commit = |d: harness_sandbox::tier2a::policy_approval::DeclarationRef<'_>| {
+        approvals.is_approved_for_key(&workspace_key, d)
+            || (d.domain == req.domain
+                && accepted
+                    .iter()
+                    .any(|p| p.value == d.value && p.key.fs_access() == Some(d.access)))
+    };
     let grant_roots = file
         .domain(req.domain)
         .map(|domain| {
             harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(req.workspace_root)
-                .domain_grants(domain)
+                .domain_grants(domain, &approved_after_commit)
                 .passthrough
                 .len()
         })
@@ -192,6 +214,7 @@ pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveErro
 
     Ok(ApprovePlan {
         accepted,
+        domain: req.domain,
         file,
         report,
         classes,
@@ -207,9 +230,52 @@ pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveErro
 const MANY_GRANT_ROOTS: usize = 100;
 
 /// [`plan`]の結果を実際に書き込む。
+///
+/// # [D-112] このマシンでの承認を記録するのは、**今回受け入れた値だけ**
+///
+/// `policy.json`全体を記録すると、候補を1件承認しただけで、同じファイルにある**同梱の
+/// 未承認の宣言まで承認したことになる**（一括承認の抜け道。決定51が禁じている形）。
+/// 記録は`policy.json`を書いた**後**に行う——先に記録して保存が落ちると、無い宣言の承認が残る。
 pub fn commit(workspace_root: &Path, plan: &ApprovePlan<'_>) -> Result<(), ApproveError> {
     policy_file::save(workspace_root, &plan.file)?;
+    let declarations = accepted_declarations(plan);
+    if declarations.is_empty() {
+        return Ok(());
+    }
+    let not_recorded =
+        crate::approval_store::approval_store().approve(workspace_root, &declarations);
+    if !not_recorded.is_empty() {
+        return Err(ApproveError::ApprovalNotRecorded(
+            not_recorded
+                .iter()
+                .map(|d| format!("{} ({}) in {}", d.value, d.access.settings_key(), d.domain))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
     Ok(())
+}
+
+/// 今回受け入れた提案のうち、ファイル宣言のもの（承認台帳の鍵の形）。
+///
+/// 値は提案の値そのまま——`merge_approved`は値を書き換えずに`policy.json`へ書くので、
+/// ここで記録する値と`policy.json`に書かれる値は同じ文字列になる（`R`で付けた`/**`も、
+/// 提案の側に合成済みで来る）。
+fn accepted_declarations<'p>(
+    plan: &'p ApprovePlan<'_>,
+) -> Vec<harness_sandbox::tier2a::policy_approval::DeclarationRef<'p>> {
+    plan.accepted
+        .iter()
+        .filter_map(|proposal| {
+            proposal.key.fs_access().map(|access| {
+                harness_sandbox::tier2a::policy_approval::DeclarationRef {
+                    domain: plan.domain,
+                    value: &proposal.value,
+                    access,
+                }
+            })
+        })
+        .collect()
 }
 
 /// 提案の値がworkspaceのどちら側にあるかを判定する。配下判定の実体は

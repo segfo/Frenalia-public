@@ -59,6 +59,15 @@ pub struct UnapproveTarget {
 pub enum UnapproveError {
     #[error(transparent)]
     PolicyFile(#[from] PolicyFileError),
+    /// `policy.json`からは消したが、このマシンでの承認（D-112）を台帳から消せなかった。
+    ///
+    /// **黙らない。** 承認が残ると、同じ値が後でリポジトリに同梱されて戻ってきたとき、
+    /// 承認済みとして許可が付く。
+    #[error(
+        "policy.json からは消しましたが、このマシンでの承認を台帳から消せませんでした: {0}\n\
+         同じ値が後で policy.json に戻ると承認済みとして扱われます（台帳: %APPDATA%\\harness\\config\\policy-approval-ledger.json）"
+    )]
+    ApprovalNotRevoked(String),
 }
 
 /// 1回の取り消しで何が消えるか。**「消した」と「元から無かった」を必ず区別する**（B-09）
@@ -123,11 +132,37 @@ pub fn plan(
 
 /// [`plan`]の結果を書く。**消えるものが無いときは書かない**——書くと`updated`時刻だけが動いて
 /// 「何かした」ように見える（B-09）。書いたかどうかを返す。
+///
+/// [D-112] 消した**ファイル宣言**の、このマシンでの承認も台帳から消す（`policy.json`を書いた後）。
 pub fn commit(workspace_root: &Path, plan: &UnapprovePlan) -> Result<bool, UnapproveError> {
     if plan.is_empty() {
         return Ok(false);
     }
     policy_file::save(workspace_root, &plan.file)?;
+    let declarations: Vec<harness_sandbox::tier2a::policy_approval::DeclarationRef<'_>> = plan
+        .removed
+        .iter()
+        .filter_map(|target| {
+            target.key.fs_access().map(|access| {
+                harness_sandbox::tier2a::policy_approval::DeclarationRef {
+                    domain: &target.domain,
+                    value: &target.value,
+                    access,
+                }
+            })
+        })
+        .collect();
+    if !declarations.is_empty() {
+        let left = crate::approval_store::approval_store().revoke(workspace_root, &declarations);
+        if !left.is_empty() {
+            return Err(UnapproveError::ApprovalNotRevoked(
+                left.iter()
+                    .map(|d| format!("{} ({}) in {}", d.value, d.access.settings_key(), d.domain))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+    }
     Ok(true)
 }
 

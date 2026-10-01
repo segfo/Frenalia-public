@@ -289,6 +289,7 @@ pub const CONFIG_DIR_LEDGERS: &[ConfigDirLedger] = &[
     ConfigDirLedger { file_name: "appcontainer-session-ledger.json", protected: false },
     ConfigDirLedger { file_name: "mcp-approval-ledger.json", protected: false },
     ConfigDirLedger { file_name: "run-approval-ledger.json", protected: false },
+    ConfigDirLedger { file_name: "policy-approval-ledger.json", protected: false },
 ];
 
 /// `config_dir()`に置く台帳として登録済みか。

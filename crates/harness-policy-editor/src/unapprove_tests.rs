@@ -402,3 +402,40 @@ fn cleaning_excluded_declarations_leaves_the_domain_and_the_rest_intact() {
         .any(|v| v.contains("AppData/Local/Temp")));
     assert_eq!(domain.net.allow_domains, vec!["crates.io".to_string()]);
 }
+
+/// [D-112] 取り消した宣言の**このマシンでの承認も消える**。消えないと、同じ値が後で
+/// リポジトリに同梱されて戻ってきたとき、承認済みとして許可が付く。対の側として、
+/// 取り消していない宣言の承認は残る（`B-35`）。
+#[test]
+fn removing_a_declaration_also_revokes_its_approval_but_keeps_the_others() {
+    use harness_sandbox::tier2a::policy_approval::DeclarationRef;
+    let ws = workspace_with(vec![cargo_domain()]);
+    let removed = DeclarationRef {
+        domain: "cargo",
+        value: "C:/Users/segfo/.cargo/bin/cargo.exe",
+        access: harness_config::FsAccess::ReadExec,
+    };
+    let kept = DeclarationRef {
+        domain: "cargo",
+        value: "C:/Users/segfo/.cargo/registry",
+        access: harness_config::FsAccess::Read,
+    };
+    let store = crate::approval_store::approval_store();
+    assert!(store.approve(ws.path(), &[removed, kept]).is_empty());
+
+    // 大文字小文字だけ違う指定でも、`policy.json`から消えるのと同じ範囲で承認も消える。
+    let plan = plan(
+        ws.path(),
+        &[target(
+            "cargo",
+            SettingsKey::FsReadExec,
+            "c:/users/segfo/.cargo/bin/CARGO.exe",
+        )],
+    )
+    .expect("plan");
+    assert!(commit(ws.path(), &plan).expect("commit"));
+
+    let approvals = store.load();
+    assert!(!approvals.is_approved(ws.path(), removed));
+    assert!(approvals.is_approved(ws.path(), kept));
+}
