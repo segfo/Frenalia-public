@@ -1528,12 +1528,15 @@ fn print_overview() {
     println!("記録と閲覧は独立したコマンドです。記録し終えてから編集へ進む一方通行ではなく、");
     println!("いつでも記録し直す・別の一般化度合いで見直すことができます。");
     println!();
-    println!("ACEが実際に付くのは record-net（パス2）だけです。approve は「次のパス2でこの穴を");
-    println!("開ける」という宣言を書くだけで、このマシンには何も残しません。");
+    println!("approve は policy.json へ宣言を書き、このマシンの承認台帳へ承認を記録するだけで、");
+    println!("ACLは触りません。ACEが付くのは、承認済みのファイル宣言を record-net（パス2）か");
+    println!("harness.exe の起動が読んだときです。");
     println!();
     println!("宣言どおりに走らせて確かめるのは record-net --enforce-net です。強制で効くのは");
     println!("この試験実行の中だけで、harness.exe本体はまだpolicy.jsonのnet.allow_domainsで");
     println!("通信を許しません（本体ではsettings.jsonのnet.allow_domainsが効きます）。");
     println!();
-    println!("まだ無いもの: policy.jsonの削除・編集操作。");
+    println!("宣言を直すには: 取り消しは unapprove か TUI の宣言画面の Space、ファイル宣言の");
+    println!("種類と ** の付け替えは TUI の宣言画面の c・R です。");
+    println!("まだ無いもの: policy.json のパスそのものの書き換えと、付け替えのコマンド。");
 }

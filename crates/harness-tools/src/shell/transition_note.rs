@@ -34,6 +34,7 @@
 use std::collections::BTreeSet;
 
 use harness_sandbox::tier2a::spawnd::transitions::{remedy, Denial, PendingRecord, Remedy};
+use harness_sandbox::tier2a::spawnd::DenyReason;
 
 use crate::can_run_program::CAN_RUN_PROGRAM_TOOL;
 
@@ -46,6 +47,8 @@ const MAX_NAMED_EXES: usize = 3;
 pub(super) fn note(records: &[PendingRecord]) -> Option<String> {
     let mut fixable: BTreeSet<String> = BTreeSet::new();
     let mut blocked: BTreeSet<String> = BTreeSet::new();
+    // 用意されていなかった遷移先ドメインの名前（`can_run_program`の「遷移先のドメイン`X`」と同じ語を出す）。
+    let mut unprepared_domains: BTreeSet<String> = BTreeSet::new();
     let mut unrelated: BTreeSet<String> = BTreeSet::new();
     let mut environment: BTreeSet<String> = BTreeSet::new();
     let mut dropped = 0u64;
@@ -67,6 +70,9 @@ pub(super) fn note(records: &[PendingRecord]) -> Option<String> {
             Remedy::FixTheEnvironment => &mut environment,
         };
         bucket.insert(file_name_of(&denial.exe));
+        if let DenyReason::TargetDomainNotProvisioned { to } = &denial.reason {
+            unprepared_domains.insert(to.clone());
+        }
     }
 
     let mut lines: Vec<String> = Vec::new();
@@ -78,9 +84,23 @@ pub(super) fn note(records: &[PendingRecord]) -> Option<String> {
         ));
     }
     if !blocked.is_empty() {
+        // 宣言は通っているが、遷移先のドメインがこのセッションでは用意されていない
+        // （`can_run_program`の「いまは起こせません」と同じ意味。2026-10-01まではここが
+        // 「harnessがまだ対応していない」と書いており、別ドメインへの遷移が入った後は事実と違った）。
+        //
+        // **用意されなかった理由は運ばない**（§10.1.2——拒否の値がどれだったかを持たない）。
+        // 理由が何であれ、直せるのはユーザーだけ（宣言の承認・遷移の強制・通信の宣言）なので、
+        // **宣言を足せとも承認しろとも言わない**——モデルにはどちらもできない。言うのは
+        // 「撃ち直しても変わらない」ことだけである。
+        let domains = if unprepared_domains.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", named(&unprepared_domains))
+        };
         lines.push(format!(
-            "[transition: denied starting {}; harness does not support this transition target \
-             yet, so declaring it will not help]",
+            "[transition: denied starting {}; the transition is declared, but its target domain{domains} \
+             is not prepared in this session — whether it can be prepared is decided by the user's \
+             settings, so retrying will not change the result]",
             named(&blocked)
         ));
     }
@@ -135,7 +155,6 @@ fn named(exes: &BTreeSet<String>) -> String {
 mod tests {
     use super::*;
     use harness_policy::transition::TransitionDenial;
-    use harness_sandbox::tier2a::spawnd::DenyReason;
 
     fn denial(exe: &str, reason: DenyReason) -> PendingRecord {
         PendingRecord::DeniedByDaemon(Denial {
@@ -195,9 +214,13 @@ mod tests {
         assert!(text.contains("unrelated to policy"), "{text}");
     }
 
-    /// harness側が未実装で断られたものは、**「宣言しても無駄」と言う**。
+    /// 遷移先のドメインが用意されていなくて断られたものは、**遷移先の名前と「撃ち直しても変わらない」**を言う。
+    ///
+    /// 別ドメインへの遷移は入っているので「harnessがまだ対応していない」は事実と違う
+    /// （2026-10-01の実機試験で、承認を外した遷移先への`findstr`がこの文面で返った）。
+    /// **モデルにできないこと（宣言を足す・承認する）を勧めない**——直せるのはユーザーだけである。
     #[test]
-    fn a_denial_waiting_on_harness_says_declaring_will_not_help() {
+    fn a_denial_for_an_unprepared_target_domain_says_retrying_will_not_help() {
         let text = note(&[denial(
             "C:/bin/bar.exe",
             DenyReason::TargetDomainNotProvisioned {
@@ -205,8 +228,38 @@ mod tests {
             },
         )])
         .expect("a note");
-        assert!(text.contains("will not help"), "{text}");
-        assert!(!text.contains(CAN_RUN_PROGRAM_TOOL), "{text}");
+        assert!(text.contains("bar.exe"), "{text}");
+        assert!(text.contains("build"), "遷移先のドメインを名指ししていない: {text}");
+        assert!(text.contains("not prepared in this session"), "{text}");
+        assert!(text.contains("retrying will not change"), "{text}");
+        for wrong in [
+            "does not support",
+            "yet",
+            "policy.json",
+            "declare the transition",
+            "approve",
+            CAN_RUN_PROGRAM_TOOL,
+        ] {
+            assert!(!text.contains(wrong), "{wrong:?}を言っている: {text}");
+        }
+    }
+
+    /// 遷移先の名前は**重複なく**、上限まで出す（`can_run_program`が1件ずつ名指しするのと同じ語）。
+    #[test]
+    fn unprepared_target_domains_are_named_once_each() {
+        let text = note(&[
+            denial(
+                "C:/bin/a.exe",
+                DenyReason::TargetDomainNotProvisioned { to: "iso".to_string() },
+            ),
+            denial(
+                "C:/bin/b.exe",
+                DenyReason::TargetDomainNotProvisioned { to: "iso".to_string() },
+            ),
+        ])
+        .expect("a note");
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert_eq!(text.matches("iso").count(), 1, "{text}");
     }
 
     /// 固定辺の前提が崩れて断られたものは、**宣言でもツールでもなく、ユーザーに頼め**と言う。

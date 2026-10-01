@@ -976,7 +976,7 @@ impl DenyReason {
             DenyReason::PidReused => "caller pid was reused by another process",
             DenyReason::Transition { denial } => denial.as_str(),
             DenyReason::TargetDomainNotProvisioned { .. } => {
-                "the target domain has no security context yet (per-domain profiles are not implemented)"
+                "the target domain was not prepared in this session (it is not in the table harness sent at startup)"
             }
             DenyReason::MalformedRequest => "malformed request",
             DenyReason::SpawnFailed => "the transition was allowed but the process could not be started",

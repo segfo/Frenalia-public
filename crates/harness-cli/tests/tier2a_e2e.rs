@@ -9295,7 +9295,9 @@ fn run_arm_collecting_denials_in(
                 // 「宣言を足せば通るのか」だけで、そこは`remedy`が唯一の定義を持つ（`B-05`）。
                 let label = match remedy(&d.reason) {
                     Remedy::FixTheDeclaration => "宣言を足せば通る",
-                    Remedy::BlockedUntilHarnessImplementsIt => "harness未実装。宣言しても通らない",
+                    Remedy::BlockedUntilHarnessImplementsIt => {
+                        "遷移先がこのセッションで用意されていない。宣言しても通らない"
+                    }
                     Remedy::NotAboutPolicy => "宣言と無関係。宣言しても通らない",
                     Remedy::FixTheEnvironment => {
                         "固定したファイルを呼び出し元が書き換えられる。宣言しても通らない"
@@ -11016,7 +11018,7 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
 
         // **用意できなかったなら、それは別の事実である。** 「狭いまま」と混ぜない。
         // **用意できなかったことは、起動時の警告で見る。** 本文に出るのは分類器が訳した
-        // 文面（「harness未実装」）なので、生の理由の綴りを探しても当たらない
+        // 文面（「遷移先がこのセッションで用意されていない」）なので、生の理由の綴りを探しても当たらない
         // ——2026-09-20にそれで素通りした。
         if flipped.harness_stderr.contains("will be refused") {
             failures.push(format!(

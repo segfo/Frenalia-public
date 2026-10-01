@@ -712,8 +712,9 @@ fn serve_request_connection(pipe: HANDLE, shared: &Arc<Shared>) {
 ///    文字列は同一でなければならない」と定めている——別々に組むと、2つの間に呼び出し元が
 ///    割り込める窓（TOCTOU）ができる。ここで組んだ値を判定にも生成にもそのまま渡す
 /// 3. **判定する**（`harness_policy::transition::TransitionGraph::resolve`）
-/// 4. **遷移先が呼び出し元と同じドメインかを見る**（暫定。
-///    [`DenyReason::TargetDomainNotProvisioned`]のdocに理由と外し方がある）
+/// 4. **遷移先ドメインの実体を決める**——自己ループなら呼び出し元の実体、別ドメインなら
+///    `Hello`で受け取った用意済みの表から引く。表に無ければ
+///    [`DenyReason::TargetDomainNotProvisioned`]で断る（§22.9の骨格。`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2）
 /// 5. 起こす（[`spawn_nested`]）
 fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedRequest<'_>) -> Served {
     // §8.2: **評価する文字列と起こす文字列を同一にする。**
