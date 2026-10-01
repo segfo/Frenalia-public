@@ -89,11 +89,67 @@ pub fn refuse_untrusted_links() -> Result<(), String> {
     Err("windows only".to_string())
 }
 
+/// この緩和策を掛けるかどうかを、ユーザー単位の設定から読む。
+///
+/// # なぜ起こす側から渡さず、このプロセスが自分で読むのか
+///
+/// **補助プロセスを起こす経路が1つではないからである。** `harness.exe`だけでなく
+/// `harness-policy-editor.exe`も同じ補助プロセス（netfilterd・policy-learnd）を起こす。
+/// 起こす側が値を運ぶ形にすると、**運ぶ処理を書いた経路でしか設定が効かない**
+/// ——実際、`harness.exe`側にだけ配線した版を実機で撃ったところ、ポリシーエディタ経由の起動では
+/// 設定が無視されていた（`B-06`: 同じ状態を作り得る経路を全部数える）。
+///
+/// **読む規則は`harness_user_config::load`ただ1つ**なので、読む場所が複数でも正本は1つである。
+/// `harness.exe`も起動時に同じ関数を呼ぶが、あちらの目的は**壊れていたら早く止める**ことで、
+/// 掛けるかどうかの判断はここで行う。
+///
+/// # 読めないときは掛ける
+///
+/// 設定ファイルを読めない（置き場を決められない・壊れている）ときは**掛ける側へ倒す**。
+/// 倒れる向きが「守る」側になるのが要点で、設定を読めなかったことを理由に守りを外さない。
+/// **ただし黙らない**——読めなかったことを診断ログへ1行書く。
+fn user_wants_the_mitigation() -> (bool, Option<String>) {
+    match harness_user_config::load() {
+        Ok(config) => (config.security.refuse_untrusted_links, None),
+        Err(e) => (
+            true,
+            Some(format!(
+                "could not read the user configuration ({e}); keeping the mitigation on"
+            )),
+        ),
+    }
+}
+
 /// [`refuse_untrusted_links`]を呼び、結果を標準エラーへ1行書く。
 ///
 /// 管理者権限で動く3つの補助プロセスが**同じ1行**を出すための共通の入口である
 /// （各`main`で文面を書くと、いつか片方だけ古くなる。`B-05`）。
+///
+/// # ユーザーが切っているときは掛けない
+///
+/// 判断の材料は`cli-defaults.toml`の`security.refuse_untrusted_links`で、
+/// **このプロセス自身が読む**（[`user_wants_the_mitigation`]）。
+/// **切った起動では診断ログへ1行残す**——守りが1枚減ったことが、後から障害を追う人に
+/// 見えないまま流れないようにする。
 pub fn harden_elevated_helper(process_name: &str) {
+    let (wanted, warning) = user_wants_the_mitigation();
+    if let Some(warning) = warning {
+        let message = format!("[{process_name}] warning: {warning}");
+        eprintln!("{message}");
+        log_to_privhelper_diagnostics(&message);
+    }
+    if !wanted {
+        let message = format!(
+            "[{process_name}] mitigation disabled by the user configuration \
+             (security.refuse_untrusted_links = false in cli-defaults.toml): this process may \
+             follow links created by non-administrators; the path checks before each write still apply"
+        );
+        eprintln!("{message}");
+        // **切ったことは必ず残す。** このプロセスの標準エラーはどこにも繋がらないので、
+        // ここへ書かないと「守りを1枚外して動いている」ことの記録が1つも無くなる。
+        log_to_privhelper_diagnostics(&message);
+        return;
+    }
     match refuse_untrusted_links() {
         Ok(()) => eprintln!(
             "[{process_name}] mitigation: refusing to follow links created by non-administrators"
@@ -164,6 +220,27 @@ mod tests {
             core::mem::size_of::<PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY>(),
             4,
             "the policy struct changed size; the call would be rejected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod toggle_tests {
+    /// **設定の既定は「守る」側である。**
+    ///
+    /// ここで測れるのは既定値だけで、**実際に掛かるかはこのテストプロセスでは測れない**
+    /// ——緩和策は一度掛けると外せないので、製品の関数をテストプロセスで呼べない
+    /// （実機の確認は`plans/mac-spike/RESULTS.md` §S83、計器は`tier2a-proc-probe`）。
+    ///
+    /// 設定ファイルの読み取り（壊れていたら拒否する・誤字を無視しない等）は
+    /// `harness-user-config`の単体テストが固定している。
+    #[test]
+    fn the_default_configuration_keeps_the_mitigation_on() {
+        assert!(
+            harness_user_config::UserConfig::default()
+                .security
+                .refuse_untrusted_links,
+            "既定を緩い側に置くと、設定ファイルを消しただけで守りが外れる"
         );
     }
 }

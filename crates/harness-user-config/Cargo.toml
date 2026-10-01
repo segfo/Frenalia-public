@@ -1,0 +1,18 @@
+[package]
+name = "harness-user-config"
+version.workspace = true
+edition.workspace = true
+
+# ユーザー単位の恒久設定（`cli-defaults.toml`）。**TOMLとユーザー層だけを扱う。**
+#
+# `harness-config`（`settings.json`）とは別クレートにしてある——あちらはJSONの階層マージ
+# （既定→ユーザー層→プロジェクト層→クランプ）専用で、こちらは層が1つ・形式がTOML・
+# 壊れていたら起動を止める、と規則が全部違う。混ぜると「どちらの規則で動くのか」が読めなくなる。
+
+[dependencies]
+directories = "6"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

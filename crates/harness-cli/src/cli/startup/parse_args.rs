@@ -73,6 +73,28 @@ pub(super) fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
         }
     }
 
+    // ユーザー単位の恒久設定（`%APPDATA%\harness\config\cli-defaults.toml`）を読む。
+    //
+    // **引数の解析より先に読む。** この設定は「コマンドラインのフラグが指定されていないときの
+    // 既定値」なので、フラグを解釈する前に手元へ無いと、どちらが優先かを後から組み直すことになる。
+    //
+    // **壊れていたら起動を止める**（ユーザー判断、2026-10-01）。`settings.json`は警告して続行するが、
+    // こちらが持つのは隔離の強さを決める値で、「書いたのに効いていない」状態で走り出すほうが高くつく。
+    // どこが壊れているかは`toml`のエラーが行と列で持っているので、そのまま出す。
+    //
+    // **ここで読むのは「壊れていたら早く止める」ためだけである。** 掛けるかどうかの判断は、
+    // 補助プロセス自身が同じ関数で読んで行う（`harness_sandbox::process_hardening`）
+    // ——補助プロセスを起こす経路は`harness.exe`だけでなくポリシーエディタにもあるので、
+    // 起こす側から値を運ぶ形にすると、運ぶ処理を書いた経路でしか設定が効かない（`B-06`）。
+    if let Err(e) = harness_user_config::load() {
+        eprintln!("error: {e}");
+        eprintln!(
+            "note: fix the file, or delete it to start again from the defaults \
+             (it is written back automatically when missing)"
+        );
+        return Err(ExitCode::FAILURE);
+    }
+
     let mut cli = Cli::parse();
 
     let workspace_root = match cli.cwd.clone() {

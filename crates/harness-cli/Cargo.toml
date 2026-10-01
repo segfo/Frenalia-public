@@ -32,6 +32,7 @@ dotenvy = "0.15.7"
 harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 harness-cognition = { version = "0.1.0", path = "../harness-cognition" }
 harness-config = { version = "0.1.0", path = "../harness-config" }
+harness-user-config = { version = "0.1.0", path = "../harness-user-config" }
 harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
 harness-engine = { version = "0.1.0", path = "../harness-engine" }

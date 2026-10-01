@@ -13,6 +13,7 @@ harness-config = { version = "0.1.0", path = "../harness-config" }
 harness-core = { version = "0.1.0", path = "../harness-core" }
 harness-policy = { version = "0.1.0", path = "../harness-policy" }
 harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
+harness-user-config = { version = "0.1.0", path = "../harness-user-config" }
 harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
 # D-NN（T-B）: Redirector DLL の版の刻印。build script が期待値を焼くのに使い、
 # 実行時はマーカーの綴り（`BUILD_ID_MARKER`）と桁数だけを使う。**マーカーを2箇所で綴らない**
