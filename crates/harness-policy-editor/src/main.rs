@@ -86,11 +86,18 @@ enum Command {
     ///
     /// **ここで初めてACEが付く**（`preflight`経由）。Tier2aへ着地しない場合とWFPが立たない
     /// 場合は中止する——強制の無い観測を「記録できた」と言わないため。
+    ///
+    /// 既定は通信先を全部許して記録する。`--enforce-net`を付けると、`policy.json`の
+    /// `net.allow_domains`に一致する通信先だけを許し、ほかは断る（決定64）。
     #[command(name = "record-net")]
     RecordNet {
         /// 承認済みのドメイン名（`approve --domain`で使ったもの）。
         #[arg(long)]
         domain: String,
+        /// 通信を宣言どおりに強制する（`policy.json`の`net.allow_domains`だけを許し、ほかは断る）。
+        /// 候補には断られた宛先だけが出る。省略時は通信先を全部許して記録する。
+        #[arg(long)]
+        enforce_net: bool,
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// 作業ディレクトリ（既定: policy.jsonに記録されたcwd、無ければworkspace）。
@@ -240,12 +247,13 @@ fn main() -> ExitCode {
         }) => run_record(cwd, workspace, timeout, limit, &command),
         Some(Command::RecordNet {
             domain,
+            enforce_net,
             workspace,
             cwd,
             timeout,
             limit,
             command,
-        }) => run_record_net(&domain, workspace, cwd, timeout, limit, &command),
+        }) => run_record_net(&domain, enforce_net, workspace, cwd, timeout, limit, &command),
         Some(Command::Show {
             session,
             workspace,
@@ -480,6 +488,7 @@ fn run_record(
 #[allow(clippy::too_many_arguments)]
 fn run_record_net(
     domain_name: &str,
+    enforce_net: bool,
     workspace: Option<PathBuf>,
     cwd: Option<PathBuf>,
     timeout: Option<u64>,
@@ -487,7 +496,13 @@ fn run_record_net(
     command: &[String],
 ) -> ExitCode {
     use harness_policy_editor::record_net::{
-        NetRecordEvent, RecordNetRequest, SessionGrants, SharedNetfilter, SharedSpawnDaemon,
+        NetMode, NetRecordEvent, RecordNetRequest, SessionGrants, SharedNetfilter,
+        SharedSpawnDaemon,
+    };
+    let net_mode = if enforce_net {
+        NetMode::Declared
+    } else {
+        NetMode::RecordAll
     };
 
     // パス2が開けた穴の寿命は**このプロセスの寿命**（D-37）。早期returnの各点でも必ず撤収が
@@ -563,6 +578,7 @@ fn run_record_net(
         .unwrap_or_else(|| workspace_root.clone());
 
     eprintln!("パス2（Tier2aでのドメイン記録）");
+    eprintln!("通信の扱い: {}", net_mode.label());
     eprintln!("ドメイン: {domain_name}");
     eprintln!("コマンド: {command}");
     eprintln!("作業ディレクトリ: {}", cwd.display());
@@ -581,6 +597,7 @@ fn run_record_net(
         wfp: &wfp,
         collector: &collector,
         spawn_daemon: &spawn_daemon,
+        net_mode,
     };
 
     let mut net_count = 0u64;
@@ -651,7 +668,14 @@ fn run_record_net(
         NetRecordEvent::CollectorStopped { written } => {
             eprintln!("収集器が畳みました（書込 {written}件）")
         }
-        NetRecordEvent::ProxyStarted(addr) => eprintln!("Local Proxy: {addr}（全許可・記録用）"),
+        NetRecordEvent::ProxyStarted {
+            addr,
+            mode,
+            allowed,
+        } => eprintln!(
+            "{}",
+            harness_policy_editor::record_net::proxy_started_line(addr, mode, allowed)
+        ),
         NetRecordEvent::FakeDnsStarted(addr) => eprintln!("Fake DNS: {addr}"),
         NetRecordEvent::WfpEnforced { reused } => {
             eprintln!(
@@ -708,6 +732,7 @@ fn run_record_net(
             &outcome.fs_aggregate,
             outcome.collector_started,
             outcome.etw_available,
+            outcome.net_mode,
         )
     );
     println!();
@@ -723,6 +748,12 @@ fn run_record_net(
                 "**コマンドは異常終了しています（exit {code}）。** 記録した候補は不完全な可能性が\n\
                  あります——FSの穴が足りない、またはWFPが必要な通信を落としたことが原因かもしれません。"
             );
+            if outcome.net_mode == NetMode::Declared {
+                println!(
+                    "強制モードなので、宣言の外の通信先を中継プロキシか名前解決が断ったことも原因になり得ます\n\
+                     （断られた宛先は上の通信の候補一覧に出ています）。"
+                );
+            }
         }
     }
     println!(
@@ -740,6 +771,7 @@ fn run_record_net(
 #[allow(clippy::too_many_arguments)]
 fn run_record_net(
     _domain_name: &str,
+    _enforce_net: bool,
     _workspace: Option<PathBuf>,
     _cwd: Option<PathBuf>,
     _timeout: Option<u64>,
@@ -806,7 +838,11 @@ fn run_show(
     // 見る場所が1つも無くなる（TUIの編集画面も同じ理由で両方を出す）。
     let show_net = net || manifest.pass == 2;
     if show_net {
-        let aggregate = harness_policy_editor::net_aggregate::from_log(&dir.net_audit_log_path());
+        // 候補の取り込み口はその記録を走らせたモードで決まる（決定64）。欄が無い古い記録は記録モード。
+        let aggregate = harness_policy_editor::net_aggregate::from_log(
+            &dir.net_audit_log_path(),
+            manifest.net_mode(),
+        );
         print!(
             "{}",
             harness_policy_editor::net_aggregate::render(&aggregate, limit)
@@ -826,6 +862,7 @@ fn run_show(
                 &fs,
                 manifest.collector_started,
                 manifest.etw_available,
+                manifest.net_mode(),
             )
         );
         // **候補一覧は収集器の生死で隠さない。** かつては`collector_started`で囲っていたが、
@@ -1480,11 +1517,13 @@ fn print_overview() {
     println!(
         "  record-net --domain <name>  Tier2aで実行し、接続したドメインを記録する（UAC 最大2回）"
     );
+    println!("             [--enforce-net]  通信をpolicy.jsonのnet.allow_domainsだけに絞り、ほかは断る");
     println!("  sessions                    記録セッションの一覧");
     println!("  show [<id>] [--net]         記録を読み直して候補を表示する（記録し直さない）");
     println!("  unapprove --domain <name> --fs <値> --access <種別> | --net <ドメイン> | --all");
-    println!("  approve-declared --domain <name> --fs <値> --access <種別>  policy.jsonにある宣言をこのマシンで承認する");
     println!("                              承認済み宣言を取り消す（ACLは次のパス2開始時に撤収）");
+    println!("  approve-declared --domain <name> --fs <値> --access <種別>");
+    println!("                              policy.jsonにある宣言をこのマシンで承認する");
     println!();
     println!("記録と閲覧は独立したコマンドです。記録し終えてから編集へ進む一方通行ではなく、");
     println!("いつでも記録し直す・別の一般化度合いで見直すことができます。");
@@ -1492,6 +1531,9 @@ fn print_overview() {
     println!("ACEが実際に付くのは record-net（パス2）だけです。approve は「次のパス2でこの穴を");
     println!("開ける」という宣言を書くだけで、このマシンには何も残しません。");
     println!();
-    println!("まだ無いもの: 「テスト」画面（policy.jsonの宣言だけを許可して走らせ、想定外の");
-    println!("拒否を見る＝ポリシー強制モードでの検証）と、policy.jsonの削除・編集操作。");
+    println!("宣言どおりに走らせて確かめるのは record-net --enforce-net です。強制で効くのは");
+    println!("この試験実行の中だけで、harness.exe本体はまだpolicy.jsonのnet.allow_domainsで");
+    println!("通信を許しません（本体ではsettings.jsonのnet.allow_domainsが効きます）。");
+    println!();
+    println!("まだ無いもの: policy.jsonの削除・編集操作。");
 }

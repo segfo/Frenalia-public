@@ -739,6 +739,25 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_runs",
         ],
     ),
+    // ポリシーエディタ決定64: パス2の強制モード（`record-net --enforce-net`）が、宣言した通信先だけを
+    // 中継プロキシで通し、宣言の外を断り、断った宛先だけを候補にすることを**同じ実行の許可側と禁止側**で
+    // 測る。`e2e-policy-editor-pass2`にも含まれるが、別の口にするのは`e2e-policy-editor-exec-ace`と
+    // 同じ理由（1要素＝1測定）。フィルタはテスト関数名と一致させる（0件マッチは非0で落ちる）。
+    (
+        "e2e-policy-editor-enforce-net",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "record_net_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "enforcing_pass2_allows_only_the_declared_domain_and_proposes_the_refused_one",
+        ],
+    ),
     // D-56: 昇格daemonの寿命をプロセスへ合わせたときの**機構E2E**。実daemonを
     // `apply → clear → apply → teardown`と駆動し、各段でWFPフィルタの実件数を数える
     // （`crates/harness-sandbox/src/tier2a/netfilterd.rs`の`reuse_e2e`）。

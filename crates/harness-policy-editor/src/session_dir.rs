@@ -65,6 +65,43 @@ fn default_pass() -> u8 {
     1
 }
 
+/// [決定64] パス2で**通信をどう扱ったか**。
+///
+/// パス2には2つの使い方がある——まだ宣言していない通信先を**1回で集める**ための記録と、
+/// 宣言したとおりに走らせて**宣言の外で断られるものが無いか**を確かめる検証である。
+/// 前者は通信先を全部許さないと最初の1件で止まって集められず、後者は全部許すと確かめたことに
+/// ならないので、同じ実行で両方はできない。どちらで走らせたかは、候補の作り方（全部か、
+/// 断られた宛先だけか）と結果の文面を決めるので、記録に残す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetMode {
+    /// 記録: 通信先を全部許して、触った宛先を全部記録する（`DomainPolicy::record_all`）。
+    /// **この欄が無い古い記録はこれ**（決定64より前のパス2はすべてこの形だった）。
+    #[default]
+    RecordAll,
+    /// 強制: `policy.json`の`net.allow_domains`に一致する宛先だけを許し、ほかは断る。
+    /// 候補は**断られた宛先だけ**から作る（許された宛先は宣言済みなので候補にする意味が無い）。
+    Declared,
+}
+
+impl NetMode {
+    /// 画面とCLIに出す呼び名。
+    pub fn label(self) -> &'static str {
+        match self {
+            NetMode::RecordAll => "記録（通信先を全部許して記録する）",
+            NetMode::Declared => "強制（宣言した通信先だけを許し、ほかは断る）",
+        }
+    }
+
+    /// `net-audit.jsonl`から候補を作るときの取り込み方。
+    pub fn intake(self) -> harness_policy::NetIntake {
+        match self {
+            NetMode::RecordAll => harness_policy::NetIntake::All,
+            NetMode::Declared => harness_policy::NetIntake::DeniedOnly,
+        }
+    }
+}
+
 /// 記録セッション1回分の文脈。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordManifest {
@@ -144,6 +181,13 @@ pub struct RecordManifest {
     /// 拒否された→書込が要る」）。ここも「後から計算し直せない事実」にあたる。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declared_fs: Vec<DeclaredFsRule>,
+    /// [決定64] パス2で通信をどう扱ったか（パス1では`None`）。
+    ///
+    /// **パス2でこの欄が無い古い記録は「記録」**（[`NetMode::RecordAll`]）として読む
+    /// （[`Self::net_mode`]）。パス1に値を書かないのは、パス1は通信を観測しないので
+    /// どちらの値を書いても嘘になるため。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_mode: Option<NetMode>,
 }
 
 /// 記録時点で宣言されていたFSルール1件（[`RecordManifest::declared_fs`]）。
@@ -185,7 +229,13 @@ impl RecordManifest {
             error_kind: None,
             unreachable_exec: None,
             declared_fs: Vec::new(),
+            net_mode: None,
         }
+    }
+
+    /// [決定64] この記録の通信の扱い。欄が無い（古いパス2の）記録は「記録」として読む。
+    pub fn net_mode(&self) -> NetMode {
+        self.net_mode.unwrap_or_default()
     }
 
     /// 記録を**失敗として閉じる**。`status`・`finished_unix_ms`・`error`・`error_kind`を
@@ -482,6 +532,39 @@ mod tests {
             Some("C:/Users/me/.cargo/bin/cargo.exe")
         );
         assert_eq!(read_back.declared_fs, manifest.declared_fs);
+    }
+
+    /// [決定64] パス2の通信の扱いは往復する。**欄の無い古いパス2の記録は「記録」として読む**
+    /// ——決定64より前のパス2はすべて全許可で走っていたので、それ以外に読むと候補の取り込み口が
+    /// 変わり、過去の記録から候補が消える。パス1には値を書かない（通信を観測しないので、
+    /// どちらを書いても嘘になる）。
+    #[test]
+    fn the_net_mode_round_trips_and_old_records_read_as_record_all() {
+        let mut manifest = RecordManifest::new(
+            "abc-3",
+            "cargo build",
+            Path::new("C:/work"),
+            Path::new("C:/work"),
+            1_700_000_000_000,
+        );
+        let pass1_json = serde_json::to_string(&manifest).unwrap();
+        assert!(
+            !pass1_json.contains("net_mode"),
+            "パス1のマニフェストへ通信の扱いを書かない: {pass1_json}"
+        );
+
+        manifest.pass = 2;
+        manifest.net_mode = Some(NetMode::Declared);
+        let json = serde_json::to_string(&manifest).unwrap();
+        assert!(json.contains(r#""net_mode":"declared""#), "{json}");
+        let read_back: RecordManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(read_back.net_mode(), NetMode::Declared);
+
+        let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+        old.as_object_mut().unwrap().remove("net_mode");
+        let old: RecordManifest = serde_json::from_value(old).unwrap();
+        assert_eq!(old.net_mode, None);
+        assert_eq!(old.net_mode(), NetMode::RecordAll);
     }
 
     /// **開始時点で`Running`として書く**ので、異常終了したセッションは`Running`のまま残る。

@@ -7,7 +7,7 @@
 //!        │                                                  │
 //!        │                        付与できた穴を台帳へ／付与できなかった穴を表示
 //!        │                                                  │
-//!        │                     Proxy（record_all）＋Fake DNS（record_all）を起こす
+//!        │    Proxy＋Fake DNSを起こす（記録: record_all／強制: 宣言したallow_domainsだけ）
 //!        │                                                  │
 //!        │                            netfilterd（WFP default-deny＋loopback許可）
 //!        │                                                  │
@@ -34,6 +34,17 @@
 //! パス1が観測（fail-open、D-43）なのに対し、パス2は**強制の上に成り立つ観測**である。
 //! 強制が無い状態の観測を同じ顔で出すと、ユーザーは「このドメインだけ使う」と読んでしまう。
 //!
+//! # 通信の扱いは2通り（決定64、[`NetMode`]）
+//!
+//! | モード | 中継プロキシと名前解決が許す宛先 | 候補にする行 |
+//! |---|---|---|
+//! | 記録（既定） | IPリテラル以外の全部（`DomainPolicy::record_all`） | 触った宛先の全部 |
+//! | 強制 | `policy.json`の`net.allow_domains`に一致する宛先だけ | 断られた宛先だけ |
+//!
+//! どちらのモードでもWFPのdefault-denyは同じで、子が直接外へ出る経路は無い。違うのは
+//! **中継プロキシと名前解決がどの宛先を通すか**だけである。記録は宣言をまだ持たない段階で
+//! 使う宛先を1回で集めるため、強制は宣言を書き終えた後で宣言の外が無いかを確かめるためにある。
+//!
 //! # tokioランタイムは背景ドライバとしてだけ使う（B-31）
 //!
 //! ProxyとFake DNSはasyncだが、この関数自体は同期でありパス1と同じ形をしている。ランタイムは
@@ -56,6 +67,7 @@ pub use crate::child_run::AbortReason;
 use crate::net_aggregate::NetAggregate;
 
 use crate::policy_file::PolicyDomain;
+pub use crate::session_dir::NetMode;
 use crate::session_dir::{now_unix_ms, RecordManifest, RecordSessionDir, RecordStatus};
 use crate::session_lock::{LockOutcome, RecordingLock};
 use crate::shell_output::ShellLine;
@@ -90,12 +102,13 @@ pub fn wfp_enforced_line(reused: bool) -> String {
 
 /// パス2で**実際に拒否されたFSアクセス**の欄（CLIとTUIで共有する）。
 ///
-/// # ネットワークとの非対称を必ず書く
+/// # 通信をどう扱ったかを必ず書く（決定64）
 ///
-/// パス2は`DomainPolicy::record_all()`（ネットワーク全許可）で走る。つまりこの実行は
-/// **FSは宣言どおりに強制されているが、ネットワークは全許可**という中間状態にある。
-/// これを書かないと「テスト画面ができた」と誤読される——実際にはまだ、宣言由来の
-/// ネットワークポリシー注入は無い（`plans/POLICY-EDITOR-TOMOYO-DIG.md`の決定27）。
+/// FSはどちらのモードでも宣言どおりに強制されるが、通信の扱いはモードで違う
+/// （[`NetMode`]）。記録で走らせた実行は**FSは強制・通信は全許可**という中間状態にあり、
+/// これを書かないと「宣言どおりに動くことを確かめた」と誤読される。強制で走らせた実行は
+/// 通信も宣言どおりだが、その宣言が効くのは**この試験実行の中だけ**である——`harness.exe`
+/// 本体はまだ`policy.json`の`net.allow_domains`で通信を許さない（決定6の移設が残っている）。
 ///
 /// `collector_started`が偽なら**観測していない**。「拒否が0件だった」と区別できないと、
 /// fail-openは単なる隠蔽になる（D-43）。
@@ -103,6 +116,7 @@ pub fn render_fs_denials(
     aggregate: &crate::aggregate::Aggregate,
     collector_started: bool,
     etw_available: bool,
+    net_mode: NetMode,
 ) -> String {
     let mut out = String::from("\n観測されたFS拒否（このドメインの宣言で強制した結果）:\n");
     if !collector_started {
@@ -110,16 +124,12 @@ pub fn render_fs_denials(
             "  （観測していません——収集器を起動できませんでした。\n\
              「拒否が0件だった」ではありません）\n",
         );
-        return out;
-    }
-    if !etw_available {
+    } else if !etw_available {
         out.push_str(
             "  （観測していません——ETWセッションを張れませんでした。\n\
              理由はfs-audit.jsonlの制御レコードに残っています）\n",
         );
-        return out;
-    }
-    if aggregate.denied == 0 {
+    } else if aggregate.denied == 0 {
         out.push_str("  （拒否は1件も観測されませんでした）\n");
     } else {
         out.push_str(&format!(
@@ -128,11 +138,82 @@ pub fn render_fs_denials(
             aggregate.denied
         ));
     }
-    out.push_str(
-        "\n注意: **この実行でネットワークは全許可です**（接続先を記録するため）。\n\
-         ここに出ているのはFSの拒否だけで、ネットワークの強制はまだ試していません。\n",
-    );
+    // **FSを観測できなかった回にも出す。** 通信の扱いは収集器の成否と無関係に効いている事実で、
+    // 決定64より前はFSの観測が無い回にこの一文ごと抜けていた。
+    out.push_str(net_mode_note(net_mode));
     out
+}
+
+/// [`render_fs_denials`]の末尾に付ける、通信の扱いの注記（[`NetMode`]ごとに1つ）。
+///
+/// **`match`にワイルドカードを書かない**——モードを足した人のビルドがここで落ちる。
+pub fn net_mode_note(mode: NetMode) -> &'static str {
+    match mode {
+        NetMode::RecordAll => {
+            "\n注意: **この実行で通信は全許可です**（接続先を記録するため）。\n\
+             ここに出ているのはFSの拒否だけで、通信の強制は試していません。\n\
+             宣言した通信先だけで動くかは、強制モードで走らせると確かめられます。\n"
+        }
+        NetMode::Declared => {
+            "\n注意: **この実行で通信は宣言どおりに強制しました**（policy.jsonのnet.allow_domains\n\
+             に一致する宛先だけを中継プロキシと名前解決が通し、ほかは断りました）。\n\
+             断られた宛先は通信の候補一覧に出ます。ただしこの宣言が効くのはこの試験実行の中だけで、\n\
+             harness.exe本体はまだpolicy.jsonのnet.allow_domainsで通信を許しません\n\
+             （本体で効くのは.harness/settings.jsonのnet.allow_domainsです）。\n"
+        }
+    }
+}
+
+/// パス2の中継プロキシと名前解決（Fake DNS）へ渡す、通信の扱い（決定64）。
+///
+/// 2つへは**同じ値**を渡す——食い違うと、名前は引けたのに繋がらない（またはその逆の）状態に
+/// なる（`harness_tools::fake_dns::spawn_fake_dns_with_policy`のdoc）。だから1回だけ作る。
+#[derive(Debug, Clone)]
+pub struct NetPolicyPlan {
+    /// 設定型（`NetProxyConfig`・`FakeDnsConfig`）の`allow_domains`へ入れる値。
+    /// 記録では空のまま（判定は[`DomainPolicy::record_all`]が持つ）。
+    pub allow_domains: Vec<String>,
+    pub policy: DomainPolicy,
+}
+
+/// モードと、そのドメインの`net.allow_domains`から[`NetPolicyPlan`]を作る。
+///
+/// 強制では、宣言の値を`harness.exe`本体が`settings.json`の`net.allow_domains`に掛けているのと
+/// 同じ正規化（[`harness_core::normalize_domain_pattern`]、`validate_and_merge_net_allow_domains`）
+/// へ通す。**正規化できない値が1つでもあれば走らせない。** [`DomainPolicy::new`]はそういう値を
+/// 黙って捨てるので、そのまま渡すと宣言の一部が無言で消えたまま「宣言どおりに走った」と
+/// 表示される（B-10）。
+pub fn net_policy_plan(mode: NetMode, declared: &[String]) -> Result<NetPolicyPlan, String> {
+    match mode {
+        NetMode::RecordAll => Ok(NetPolicyPlan {
+            allow_domains: Vec::new(),
+            policy: DomainPolicy::record_all(),
+        }),
+        NetMode::Declared => {
+            let mut allow_domains: Vec<String> = Vec::new();
+            for value in declared {
+                let normalized = harness_core::normalize_domain_pattern(value)
+                    .map_err(|e| format!("net.allow_domains の `{value}`: {e}"))?;
+                if !allow_domains.contains(&normalized) {
+                    allow_domains.push(normalized);
+                }
+            }
+            Ok(NetPolicyPlan {
+                policy: DomainPolicy::new(allow_domains.clone()),
+                allow_domains,
+            })
+        }
+    }
+}
+
+/// 中継プロキシを起こしたときの1行（CLIとTUIで共有する。表示側で書き写さない、B-05）。
+pub fn proxy_started_line(addr: std::net::SocketAddr, mode: NetMode, allowed: usize) -> String {
+    match mode {
+        NetMode::RecordAll => format!("Local Proxy: {addr}（記録: 通信先を全部許して記録する）"),
+        NetMode::Declared => format!(
+            "Local Proxy: {addr}（強制: 宣言した通信先 {allowed}件だけを許し、ほかは断る）"
+        ),
+    }
 }
 
 /// 対象コマンド終了後、Proxy/Fake DNSの監査ログが書き切られるのを待つ猶予。
@@ -165,6 +246,8 @@ pub struct RecordNetRequest<'a> {
     pub collector: &'a crate::record::SharedCollector,
     /// このpolicy editor processが共有するSpawn Daemon。最初のパス2でだけ遅延起動する。
     pub spawn_daemon: &'a SharedSpawnDaemon,
+    /// [決定64] 通信をどう扱うか（記録＝全部許して記録／強制＝宣言どおり）。
+    pub net_mode: NetMode,
 }
 
 /// パス2の進行。呼び出し側（CLI・TUI）が表示に使う。
@@ -208,7 +291,13 @@ pub enum NetRecordEvent {
     /// 届かないと分かっていても**止めない**（判定は`which`の解決に依存し外れ得る）。
     /// 警告は`warnings`にも積まれるので、実行後のマニフェストからも辿れる。
     ExecReachability(Box<crate::exec_reach::ExecReach>),
-    ProxyStarted(std::net::SocketAddr),
+    /// 中継プロキシが起きた。`allowed`は強制で許す通信先の件数（記録では0）。
+    /// 表示の文言は[`proxy_started_line`]が持つ。
+    ProxyStarted {
+        addr: std::net::SocketAddr,
+        mode: NetMode,
+        allowed: usize,
+    },
     FakeDnsStarted(std::net::SocketAddr),
     /// WFPのdefault-denyが立った（loopbackの穴はProxy/Fake DNSのポートだけ）。
     ///
@@ -276,6 +365,8 @@ pub struct RecordNetOutcome {
     pub collector_started: bool,
     /// ETWセッションが実際に張れたか。同上。
     pub etw_available: bool,
+    /// [決定64] 通信をどう扱って走らせたか（結果の注記と候補の作り方がこれで決まる）。
+    pub net_mode: NetMode,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -308,6 +399,11 @@ pub enum RecordNetError {
     Runtime(String),
     #[error("Tier2aでコマンドを起動できませんでした: {0}")]
     Spawn(String),
+    #[error(
+        "強制モードで走らせられません——宣言した通信先を解釈できませんでした（{0}）。\
+         policy.jsonの値を直すか、記録モードで走らせてください"
+    )]
+    InvalidNetDeclaration(String),
 }
 
 impl RecordNetError {
@@ -329,6 +425,7 @@ impl RecordNetError {
             RecordNetError::NoProxy(_) => "no_proxy",
             RecordNetError::Runtime(_) => "runtime",
             RecordNetError::Spawn(_) => "spawn",
+            RecordNetError::InvalidNetDeclaration(_) => "invalid_net_declaration",
         }
     }
 }
@@ -340,6 +437,9 @@ pub fn record_net(
     request: &RecordNetRequest<'_>,
     on_event: &mut dyn FnMut(NetRecordEvent),
 ) -> Result<RecordNetOutcome, RecordNetError> {
+    // **排他も記録の置き場も取る前に**組み立てる。宣言を解釈できなければ、マシンに何も残さずに断る。
+    let net_plan = net_policy_plan(request.net_mode, &request.domain.net.allow_domains)
+        .map_err(RecordNetError::InvalidNetDeclaration)?;
     let (lock, lock_outcome) = RecordingLock::try_acquire().map_err(RecordNetError::Lock)?;
     if !lock_outcome.can_proceed() {
         return Err(RecordNetError::AlreadyRecording(
@@ -371,6 +471,7 @@ pub fn record_net(
     );
     manifest.pass = 2;
     manifest.domain = Some(request.domain.name.clone());
+    manifest.net_mode = Some(request.net_mode);
     // **この記録を走らせた時点の宣言**を残す（`RecordManifest::declared_fs`のdoc）。
     // 後から`policy.json`を読み直す形にすると、承認して1周した後に古い記録を開いたときに
     // 当時は成立していなかった診断が出る。
@@ -392,6 +493,19 @@ pub fn record_net(
     }
 
     let mut warnings: Vec<String> = Vec::new();
+    // 強制で通信先を1件も宣言していなければ、名前解決も接続も全部断られる。止めはしない
+    // （「このコマンドは通信しない」を確かめる使い方は正当）が、黙って走らせない（B-10）。
+    if request.net_mode == NetMode::Declared && net_plan.allow_domains.is_empty() {
+        warn(
+            format!(
+                "強制モードですが、ドメイン `{}` は通信先を1件も宣言していません。\
+                 この実行では名前解決と接続がすべて断られます（断られた宛先は候補に出ます）。",
+                request.domain.name
+            ),
+            &mut warnings,
+            on_event,
+        );
+    }
     // **失敗しても残さなければならない事実**は`warnings`と同じ形で外へ出す（下記doc）。
     let mut facts = Pass2Facts::default();
     // 撤収は**どの経路を通っても必ず行う**。ここから先で早期returnするたびに
@@ -400,6 +514,7 @@ pub fn record_net(
 
     let result = run_pass2(
         request,
+        &net_plan,
         &dir,
         &mut warnings,
         &mut facts,
@@ -443,6 +558,7 @@ pub fn record_net(
                 audit_log_path: dir.audit_log_path(),
                 collector_started: facts.collector_started,
                 etw_available: facts.etw_available,
+                net_mode: request.net_mode,
                 // **撤収まで済ませてから読み直す。** `teardown`の`StopCollect`で収集器が
                 // 最後の1バッチを書くので、実行中に積んだ集計だけでは取りこぼす。
                 // 観測の正本はJSONLだけ、という既存の方針（`aggregate::from_session`）に合わせる。
@@ -1073,6 +1189,7 @@ struct Pass2Facts {
 
 fn run_pass2<'a>(
     request: &RecordNetRequest<'a>,
+    net_plan: &NetPolicyPlan,
     dir: &RecordSessionDir,
     warnings: &mut Vec<String>,
     facts: &mut Pass2Facts,
@@ -1335,7 +1452,7 @@ fn run_pass2<'a>(
     facts.unreachable_exec = reach.unreachable_exec_value();
     on_event(NetRecordEvent::ExecReachability(Box::new(reach)));
 
-    // --- Proxy / Fake DNS（どちらもrecord_all）-----------------------------------
+    // --- Proxy / Fake DNS（どちらも同じ`net_plan`。記録ならrecord_all、強制なら宣言だけ）---
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(2)
@@ -1344,7 +1461,7 @@ fn run_pass2<'a>(
 
     let net_audit_path = dir.net_audit_log_path();
     let proxy_config = NetProxyConfig {
-        allow_domains: Vec::new(),
+        allow_domains: net_plan.allow_domains.clone(),
         domain_policy_enabled: true,
         // 下でnetfilterdを立てるまでは未確定。この値はProxy自身の判定には使われない。
         enforced_by_wfp: false,
@@ -1356,7 +1473,7 @@ fn run_pass2<'a>(
     let proxy = runtime
         .block_on(harness_tools::net_proxy::spawn_local_proxy_with_policy(
             &proxy_config,
-            DomainPolicy::record_all(),
+            net_plan.policy.clone(),
         ))
         .map_err(|e| RecordNetError::NoProxy(e.to_string()))?
         .ok_or_else(|| {
@@ -1364,17 +1481,21 @@ fn run_pass2<'a>(
         })?;
     let proxy_addr = proxy.addr;
     state.proxy = Some(proxy);
-    on_event(NetRecordEvent::ProxyStarted(proxy_addr));
+    on_event(NetRecordEvent::ProxyStarted {
+        addr: proxy_addr,
+        mode: request.net_mode,
+        allowed: net_plan.allow_domains.len(),
+    });
 
     // **Proxyと同じポリシー**を渡す（食い違うと、名前は引けたのに繋がらない／その逆になる）。
     let fake_dns = runtime.block_on(harness_tools::fake_dns::spawn_fake_dns_with_policy(
         &harness_tools::fake_dns::FakeDnsConfig {
-            allow_domains: Vec::new(),
+            allow_domains: net_plan.allow_domains.clone(),
             policy_required: true,
             audit_log_path: Some(net_audit_path.clone()),
             preferred_port: Some(53),
         },
-        DomainPolicy::record_all(),
+        net_plan.policy.clone(),
     ));
     let fake_dns_addr = match fake_dns {
         Ok(agent) => {
@@ -1601,7 +1722,7 @@ fn run_pass2<'a>(
     on_event(NetRecordEvent::ChildStarted);
 
     // --- 出力と監査を同時に吸う ---------------------------------------------------
-    let mut aggregate = NetAggregate::new();
+    let mut aggregate = NetAggregate::for_mode(request.net_mode);
     let mut tail = crate::audit_tail::AuditTail::new(net_audit_path.clone());
     // 候補にしないパスの規則は**このセッションのworkspace**から作る（BUG-103）。
     // `from_session`（撤収後に読み直す方）と同じ規則になる——マニフェストの
@@ -2028,9 +2149,9 @@ mod fs_denial_panel_tests {
                 Some(std::path::Path::new("C:/no-such-temp")),
             ));
 
-        let not_started = render_fs_denials(&empty, false, false);
-        let no_etw = render_fs_denials(&empty, true, false);
-        let observed_nothing = render_fs_denials(&empty, true, true);
+        let not_started = render_fs_denials(&empty, false, false, NetMode::RecordAll);
+        let no_etw = render_fs_denials(&empty, true, false, NetMode::RecordAll);
+        let observed_nothing = render_fs_denials(&empty, true, true, NetMode::RecordAll);
 
         assert!(not_started.contains("観測していません"), "{not_started}");
         assert!(
@@ -2048,22 +2169,55 @@ mod fs_denial_panel_tests {
         );
     }
 
-    /// **ネットワークが全許可であることを必ず併記する。**
+    /// **通信をどう扱ったかを必ず併記する（決定64）。2つのモードを対で固定する（B-35）。**
     ///
-    /// 書かないと「テスト画面ができた」と読まれる——この実行はFSだけを宣言どおりに強制した
-    /// 中間状態であり、ネットワークの強制はまだ試していない（決定27の範囲）。
+    /// 記録で走らせた実行はFSだけを宣言どおりに強制した中間状態で、書かないと「宣言どおりに
+    /// 確かめた」と読まれる。強制で走らせた実行は、それが**この試験実行の中だけ**であること
+    /// （`harness.exe`本体はまだ`policy.json`の通信の宣言を使わない）を書かないと、
+    /// 「本体でもこの宣言で動く」と読まれる。
     #[test]
-    fn the_network_is_all_allowed_and_the_panel_says_so() {
+    fn the_panel_says_how_the_network_was_handled_in_each_mode() {
         let empty =
             crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(
                 std::path::Path::new("C:/no-such-workspace"),
                 Some(std::path::Path::new("C:/no-such-temp")),
             ));
 
-        let text = render_fs_denials(&empty, true, true);
+        let record_all = render_fs_denials(&empty, true, true, NetMode::RecordAll);
+        let declared = render_fs_denials(&empty, true, true, NetMode::Declared);
 
-        assert!(text.contains("ネットワークは全許可"), "{text}");
-        assert!(text.contains("FSの拒否だけ"), "{text}");
+        assert!(record_all.contains("通信は全許可"), "{record_all}");
+        assert!(record_all.contains("FSの拒否だけ"), "{record_all}");
+        assert!(declared.contains("宣言どおりに強制"), "{declared}");
+        assert!(
+            declared.contains("harness.exe本体はまだ"),
+            "強制が試験実行の中だけであることを書く: {declared}"
+        );
+        assert!(
+            !declared.contains("全許可"),
+            "強制した実行を全許可と書かない: {declared}"
+        );
+    }
+
+    /// **FSを観測できなかった回にも、通信の扱いは出す。**
+    ///
+    /// 決定64より前は、収集器が起きなかった分岐が早く抜けていたので、この一文ごと消えていた。
+    /// 通信の扱いは収集器の成否と無関係に効いている事実である。
+    #[test]
+    fn the_network_note_survives_when_fs_was_not_observed() {
+        let empty =
+            crate::aggregate::Aggregate::new(crate::exclusion::ExclusionRules::with_temp_root(
+                std::path::Path::new("C:/no-such-workspace"),
+                Some(std::path::Path::new("C:/no-such-temp")),
+            ));
+
+        for (collector_started, etw_available) in [(false, false), (true, false)] {
+            for mode in [NetMode::RecordAll, NetMode::Declared] {
+                let text = render_fs_denials(&empty, collector_started, etw_available, mode);
+                assert!(text.contains("観測していません"), "{text}");
+                assert!(text.contains(net_mode_note(mode)), "{mode:?}: {text}");
+            }
+        }
     }
 
     /// 観測できたときは件数を出す（数を出さない報告は行動を決められない、B-32）。
@@ -2082,8 +2236,12 @@ mod fs_denial_panel_tests {
             1,
         ));
 
-        let text = render_fs_denials(&aggregate, true, true);
+        let text = render_fs_denials(&aggregate, true, true, NetMode::RecordAll);
 
         assert!(text.contains("1件の拒否を観測"), "{text}");
     }
 }
+
+#[cfg(test)]
+#[path = "record_net_mode_tests.rs"]
+mod record_net_mode_tests;

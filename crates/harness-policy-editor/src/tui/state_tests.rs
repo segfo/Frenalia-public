@@ -486,10 +486,64 @@ fn pass2_starts_once_the_domain_exists_in_the_policy_file() {
         Some(Action::StartPass2(request)) => {
             assert_eq!(request.domain.name, "cargo");
             assert_eq!(request.command, "cargo build");
+            assert_eq!(request.net_mode, NetMode::RecordAll, "既定は記録");
         }
         _ => panic!("承認済みのドメインならパス2は始まる"),
     }
     assert!(app.is_running());
+}
+
+/// [決定64] 「パス」欄で選んだ通信の扱いが、そのまま記録の要求に載る（画面だけ変わって
+/// 実行は全許可のまま、にしない）。
+#[test]
+fn pass2_carries_the_chosen_net_mode_into_the_request() {
+    let ws = workspace();
+    let mut policy = crate::policy_file::PolicyFile::default();
+    let mut domain = crate::policy_file::PolicyDomain::new("cargo");
+    domain.net.allow_domains.push("crates.io".to_string());
+    policy.domains.push(domain);
+    crate::policy_file::save(ws.path(), &policy).expect("policy.json");
+
+    let mut app = app_with(&ws);
+    app.pass = Pass::Two;
+    app.net_mode = NetMode::Declared;
+    app.record_focus = RecordField::Command;
+    type_text(&mut app, "cargo fetch");
+    app.record_focus = RecordField::Domain;
+    type_text(&mut app, "cargo");
+
+    match app.on_key(key(KeyCode::Enter)) {
+        Some(Action::StartPass2(request)) => {
+            assert_eq!(request.net_mode, NetMode::Declared);
+        }
+        _ => panic!("承認済みのドメインならパス2は始まる"),
+    }
+}
+
+/// [決定64] 「パス」欄は パス1 → パス2（記録）→ パス2（強制）→ パス1 と巡回する。
+/// `→`とSpaceは進み、`←`は戻る（新しいキーを足さずに3つを選ぶ）。
+#[test]
+fn the_pass_field_cycles_through_record_and_enforce() {
+    let ws = workspace();
+    let mut app = app_with(&ws);
+    app.record_focus = RecordField::Pass;
+    assert_eq!((app.pass, app.net_mode), (Pass::One, NetMode::RecordAll));
+
+    app.on_key(key(KeyCode::Right));
+    assert_eq!((app.pass, app.net_mode), (Pass::Two, NetMode::RecordAll));
+    app.on_key(key(KeyCode::Char(' ')));
+    assert_eq!((app.pass, app.net_mode), (Pass::Two, NetMode::Declared));
+    app.on_key(key(KeyCode::Right));
+    assert_eq!(
+        (app.pass, app.net_mode),
+        (Pass::One, NetMode::RecordAll),
+        "パス1へ戻ると強制の選択は持ち越さない"
+    );
+
+    app.on_key(key(KeyCode::Left));
+    assert_eq!((app.pass, app.net_mode), (Pass::Two, NetMode::Declared));
+    app.on_key(key(KeyCode::Left));
+    assert_eq!((app.pass, app.net_mode), (Pass::Two, NetMode::RecordAll));
 }
 
 /// 画面はいつでも切り替えられる（順序を強制しない、決定13）。実行中でも編集画面を見られる。

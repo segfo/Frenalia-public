@@ -25,6 +25,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use crate::approve::{self, ApproveRequest, PathClass};
 use crate::policy_file;
+use crate::session_dir::NetMode;
 use crate::tui::proposal_tree::ProposalTree;
 use crate::tui::state::{
     edit_text, Action, App, Confirm, EditField, Modal, Pass, RecordField, Screen, SessionData,
@@ -74,7 +75,11 @@ impl App {
         // idは衝突しない（`generalize`はFS候補へ`fs-N`、ドメイン候補へ`net-N`を振る）。
         // 収集器が動いていない古い記録では`from_log`が空を返すので、従来どおりの表示になる。
         let view = if manifest.pass == 2 {
-            let net = crate::net_aggregate::from_log(&entry.dir.net_audit_log_path());
+            // 候補の取り込み口は**その記録を走らせたモード**で決まる（決定64）。欄が無い古い記録は記録モード。
+            let net = crate::net_aggregate::from_log(
+                &entry.dir.net_audit_log_path(),
+                manifest.net_mode(),
+            );
             let fs = crate::aggregate::from_session(&entry.dir, &manifest);
 
             // **FS欄は収集器が起きなかったときこそ出す。** 「観測していません（収集器を
@@ -88,6 +93,7 @@ impl App {
                 &fs,
                 manifest.collector_started,
                 manifest.etw_available,
+                manifest.net_mode(),
             ));
             notes.push('\n');
             // **注記も収集器の生死で隠さない。** FS候補は観測だけから作られるものではなく、
@@ -1051,27 +1057,32 @@ impl App {
         let written = policy_file::path(&self.workspace_root)
             .display()
             .to_string();
-        if pass_of_record == 2 {
-            // パス2の候補（許可ドメイン）を承認した。次は宣言だけを許す**ポリシー強制モード**での
-            // 検証だが、その実行系（テスト画面）はまだ無い。**あるように見せない。**
-            self.status = format!(
-                "書きました: {written}{unapproved_note}。宣言したドメインだけを許して検証する\
-                 「テスト」画面はまだ実装していません"
-            );
-            return;
-        }
-
-        // ガイド: FSの穴を承認したら、次はパス2（ここで初めてACEが付く）。
+        // ガイド: 次の1回を記録画面に用意する（Enterで開始。「パス」欄で変えられる）。
+        //  - パス1の候補を承認した → パス2（記録）。ここで初めてACEが付き、通信先を集める。
+        //  - パス2の候補を承認した → パス2（強制）。宣言した通信先だけで動くか、宣言の外で
+        //    断られる宛先が無いかを確かめる（決定64）。
+        let next_mode = if pass_of_record == 2 {
+            NetMode::Declared
+        } else {
+            NetMode::RecordAll
+        };
         self.pass = Pass::Two;
+        self.net_mode = next_mode;
         self.run_domain.set_text(domain.clone());
         self.command.set_text(command);
         self.cwd.set_text(cwd.display().to_string());
         self.screen = Screen::Record;
         self.record_focus = RecordField::Command;
-        self.status = format!(
-            "書きました: {written}{unapproved_note}。次はパス2（ドメイン {domain}）——\
-             **ここで初めてACEが付きます**。Enterで開始"
-        );
+        self.status = match next_mode {
+            NetMode::RecordAll => format!(
+                "書きました: {written}{unapproved_note}。次はパス2（ドメイン {domain}）——\
+                 **ここで初めてACEが付きます**。Enterで開始"
+            ),
+            NetMode::Declared => format!(
+                "書きました: {written}{unapproved_note}。次はパス2の強制（ドメイン {domain}）——\
+                 宣言した通信先だけを許して走らせ、断られる宛先が無いかを確かめます。Enterで開始"
+            ),
+        };
     }
 }
 
