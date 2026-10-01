@@ -35,8 +35,22 @@ pub(super) struct SandboxPrepared {
     pub(super) net_proxy: NetProxyConfig,
     pub(super) net_app: harness_core::NetAppPolicy,
     pub(super) run_shell_path_extra: Vec<String>,
+    /// 付与処理へ渡した一覧（手書き＋入口ドメインの宣言＋付与する範囲の遷移先ドメインの宣言）。
+    /// 付与台帳へ記録するときに、各パスの宣言の範囲（D-63）を引くのに使う。
     pub(super) fs_passthrough: Vec<harness_sandbox::FsPassthrough>,
-    pub(super) settings_fs_paths: std::collections::HashSet<String>,
+    /// 自動撤収（D-27）で「このワークスペースがファイルで宣言している」と数える付与ルート
+    /// ——`settings.json`の`fs.*`と、`policy.json`の全ドメインの**このマシンで承認済み**の宣言（#30）。
+    pub(super) file_declared_fs_paths: std::collections::HashSet<String>,
+    /// [#30] 起動時に1回だけ読んだ`policy.json`。読めなかったら`None`——Tier2aならここまで来ない
+    /// （起動を止める）。**読み直さない**（判定と表示と付与の入力を1つにする、`B-13`）。
+    pub(super) policy: Option<harness_policy::policy_file::PolicyFile>,
+    /// [残課題#65] `policy.json`の外で書込を許した場所。**手書きの一覧だけから作る**
+    /// （`transition_tool::writable_outside_policy`のdoc）。
+    pub(super) writable_outside_policy: Vec<String>,
+    /// [#30] 遷移先ドメインごとの、このセッションで付いた許可（ドメインの用意が読む）。
+    pub(super) domain_fs_grants: super::policy_fs::DomainFsGrants,
+    /// [#30] モデルへ見せる遷移の一覧の権限欄に載せてよい`(値, 級)`（このマシンで承認済みのもの）。
+    pub(super) approved_fs_values: std::collections::BTreeSet<(String, &'static str)>,
     /// M15.7: セッション中のOS監査収集を有効にするか（`--policy-learn`→`settings.policy.learn`→false）。
     /// **`ToolCtx`には載せない**——収集器は受動的で`run_shell`の挙動を変えないため。
     pub(super) policy_learn: bool,
@@ -385,34 +399,135 @@ pub(super) fn stage_prepare_sandbox(
         );
     }
 
-    // fs passthrough ACEのライフサイクル自動整合（D-27）。`.harness/settings.json`から
-    // 消えたエントリのうち、どのワークスペースからも参照されなくなったものだけACEを撤収する
-    // （複数ワークスペースが同じパスを共有宣言している場合は、他が参照している限り残す）。
-    // Tier2aが実際に選択されるかどうかとは独立に、起動のたびに毎回行う（設定変更の反映は
-    // Tierの降格有無と無関係のため）。`select_tier`（preflight）より前に行う。
+    // [残課題#65] **`policy.json`の外で書込を許した場所は、手書きの一覧だけから作る**
+    // ——下で入口ドメインの宣言を合流させる**前**に作ること。宣言は宣言として遷移の検査の視野に
+    // 既にあり、合流させた後で作ると遷移先ドメインの書込宣言まで「入口から書ける」と数え、
+    // 正当な辺を拒否する（`transition_tool::writable_outside_policy`のdoc）。
+    let writable_outside_policy = super::transition_tool::writable_outside_policy(&fs_passthrough);
+
+    // [#30] **`policy.json`とこのマシンでの承認（D-112）を、ここで1回だけ読む。**
+    //
+    // **Tierに関係なく、自動撤収（下のD-27）より前に読む。** 自動撤収は毎回の起動で走るので、
+    // Tier2aのときだけ読むと、`--sandbox tier1`で起動した回に`policy.json`の宣言が
+    // 「もう宣言されていない」と数えられ、取り消し→次のTier2aで付け直し（UAC）を繰り返す。
+    // `--sandbox`を書かない既定の起動もTier2aを要求する（D-72・D-75）。
+    //
+    // **読めないとき**: Tier2aを要求していれば起動しない（P-05。宣言を持たないDaemonを起こすと、
+    // 宣言してある遷移まで拒否され、原因が読み取り失敗であることが画面から分からない＝`B-10`）。
+    // それ以外のTierでは、空として扱わず**この回の自動撤収を飛ばす**——空として扱うと、
+    // `policy.json`が宣言していた許可を全部取り消してしまう。
+    let tier2a_requested = cfg!(windows)
+        && matches!(
+            sandbox_choice,
+            SandboxChoice::OsDefault | SandboxChoice::Tier2a | SandboxChoice::Tier2aCow
+        );
+    let policy = match harness_policy::policy_file::load_for_session(
+        &workspace_root,
+        &writable_outside_policy,
+    ) {
+        Ok(policy) => Some(policy),
+        Err(error) if tier2a_requested => {
+            eprintln!("error: could not read the transition policy: {error}");
+            // **宣言の外から来た「書ける場所」で拒否されたときは、それを言う**（`B-10`）。
+            // 言わないと、`policy.json`のどこにも書込が無いのに拒否された理由が辿れない。
+            if matches!(
+                error,
+                harness_policy::policy_file::PolicyFileError::RejectedTransitions { .. }
+            ) && !writable_outside_policy.is_empty()
+            {
+                eprintln!(
+                    "note: places opened for writing by settings.json `fs.read_write` or \
+                     `--fs-allow <path>:rw` count as writable by the caller, so a fixed \
+                     transition must not point into them: {}",
+                    writable_outside_policy.join(", ")
+                );
+            }
+            return Err(ExitCode::FAILURE);
+        }
+        Err(error) => {
+            eprintln!(
+                "warning: could not read .harness/policy.json ({error}); its file declarations \
+                 are not used this session, and the automatic revoke of no-longer-declared ACEs \
+                 is skipped so that nothing it declares is taken away by mistake"
+            );
+            None
+        }
+    };
+    let approvals =
+        harness_sandbox::tier2a::policy_approval::PolicyApprovalStore::in_config_dir().load();
+    let approval_key =
+        harness_sandbox::tier2a::policy_approval::approval_workspace_key(&workspace_root);
+    let approved = |d: harness_sandbox::tier2a::policy_approval::DeclarationRef<'_>| {
+        approvals.is_approved_for_key(&approval_key, d)
+    };
+    let policy_plan = match &policy {
+        Some(policy) => super::policy_fs::plan(
+            policy,
+            &harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(&workspace_root),
+            &approved,
+            cli.enforce_transitions,
+        ),
+        None => Default::default(),
+    };
+    let approved_fs_values = policy
+        .as_ref()
+        .map(|policy| super::policy_fs::approved_fs_values(policy, &approved))
+        .unwrap_or_default();
+    // **付けない宣言を黙って落とさない**（B-10）。黙ると「承認したのに読めない」の原因が出ない。
+    for skipped in &policy_plan.entry_skipped {
+        eprintln!(
+            "warning: .harness/policy.json declares {} ({}) for the domain {:?}, but no \
+             permission is granted for it: {}",
+            skipped.value,
+            skipped.access.settings_key(),
+            harness_policy::policy_file::ENTRY_DOMAIN,
+            skipped.reason.describe()
+        );
+    }
+    // 入口ドメインの宣言は、手書きの一覧と同じく入口の子のトークンへ載る（同じルートは1本に畳む）。
+    super::policy_fs::merge_into(&mut fs_passthrough, &policy_plan.entry);
+    let mut file_declared_fs_paths = settings_fs_paths;
+    file_declared_fs_paths.extend(policy_plan.declared_roots.iter().cloned());
+
+    // fs passthrough ACEのライフサイクル自動整合（D-27）。ファイル（`.harness/settings.json`と、
+    // [#30] `policy.json`の承認済みの宣言）から消えたエントリのうち、どのワークスペースからも
+    // 参照されなくなったものだけACEを撤収する（複数ワークスペースが同じパスを共有宣言している場合は、
+    // 他が参照している限り残す）。Tier2aが実際に選択されるかどうかとは独立に、起動のたびに毎回行う
+    // （設定変更の反映はTierの降格有無と無関係のため）。`select_tier`（preflight）より前に行う。
     #[cfg(windows)]
-    crate::fs_grants::reconcile_fs_ledger_for_workspace(&workspace_root, &settings_fs_paths);
+    if policy.is_some() {
+        crate::fs_grants::reconcile_fs_ledger_for_workspace(&workspace_root, &file_declared_fs_paths);
+    }
 
     // D7: --require-sandboxとの矛盾チェック。write-containmentは範囲外書込を禁じるため:rwのみ
     // 拒否（:roは書込に無関係で許可）。confidentialは範囲外を読めない保証のため:ro/:rwいずれも
     // 拒否する（外部読取穴がconfidentialの機密性保証と正面から矛盾するため、
     // `--net-allow-app`×confidentialと同じfail-fast思想）。
-    let fs_has_write = fs_passthrough.iter().any(|fp| fp.access.is_read_write());
+    //
+    // [#30] **`policy.json`の宣言から付けるものも数える**（入口ドメインの分は上で合流済み、
+    // 遷移先ドメインの分はここで足す）。数えないと、手書きの宣言だけ拒否して`policy.json`の穴は通す。
+    let all_fs: Vec<&harness_sandbox::FsPassthrough> = fs_passthrough
+        .iter()
+        .chain(policy_plan.domains.iter().flat_map(|(_, list)| list.iter()))
+        .collect();
+    let fs_has_write = all_fs.iter().any(|fp| fp.access.is_read_write());
     match require_sandbox {
         RequireSandbox::WriteContainment if fs_has_write => {
             eprintln!(
-                "error: --fs-allow with :rw conflicts with --require-sandbox (write-containment \
-                 forbids writes outside the workspace; use read-only --fs-allow entries instead, \
-                 or drop --require-sandbox)"
+                "error: write access outside the workspace (--fs-allow :rw, settings.json \
+                 fs.read_write, or a policy.json read_write declaration) conflicts with \
+                 --require-sandbox (write-containment forbids writes outside the workspace; use \
+                 read-only declarations instead, or drop --require-sandbox)"
             );
             return Err(ExitCode::FAILURE);
         }
-        RequireSandbox::Confidential if !fs_passthrough.is_empty() => {
+        RequireSandbox::Confidential if !all_fs.is_empty() => {
             eprintln!(
-                "error: --fs-allow conflicts with --require-sandbox=confidential (confidential \
-                 mode denies reading outside the workspace unconditionally; even read-only \
-                 --fs-allow breaks this guarantee; refusing to start rather than silently \
-                 weakening it)"
+                "error: access outside the workspace (--fs-allow, settings.json fs.*, or a \
+                 policy.json file declaration) conflicts with --require-sandbox=confidential \
+                 (confidential mode denies reading outside the workspace unconditionally; even a \
+                 read-only declaration breaks this guarantee; refusing to start rather than \
+                 silently weakening it)"
             );
             return Err(ExitCode::FAILURE);
         }
@@ -461,6 +576,25 @@ pub(super) fn stage_prepare_sandbox(
     #[cfg(not(windows))]
     let wfp_chain_pipe: Option<String> = None;
 
+    // [#30] **付与処理へは入口の一覧と遷移先ドメインの一覧をまとめて1回で渡す**（昇格は今どおり
+    // 最大1回）。同じパスに別の級が並ぶことがあるが、付与処理は（パス, 級）で照合し、CoWの降格後の
+    // 重複を除く（`preflight`の`dedupe_resolved`）。どの子のトークンへ何を積むかは下で振り分ける。
+    let fs_passthrough: Vec<harness_sandbox::FsPassthrough> = fs_passthrough
+        .into_iter()
+        .chain(
+            policy_plan
+                .domains
+                .iter()
+                .flat_map(|(_, list)| list.iter().cloned()),
+        )
+        .collect();
+    let entry_requested_len = fs_passthrough.len()
+        - policy_plan
+            .domains
+            .iter()
+            .map(|(_, list)| list.len())
+            .sum::<usize>();
+
     let shell_tier = match select_tier(
         require_sandbox,
         &workspace_root,
@@ -480,6 +614,32 @@ pub(super) fn stage_prepare_sandbox(
             return Err(ExitCode::FAILURE);
         }
     };
+
+    // [#30] **付与の結果を一覧ごとに振り分ける。** 入口の子のトークン（`granted_passthrough`）には
+    // 入口の一覧の分だけを、遷移先ドメインの子には自分の一覧の分だけを渡す。宛先SIDは宣言ごとなので、
+    // ここで振り分けを誤らなければ、ドメインの宣言にACEを書いても入口は広がらない。
+    // 書込の印は**一覧ごとに自分の要求で組み直す**（`policy_fs::granted_for`のdoc）。
+    let mut shell_tier = shell_tier;
+    let domain_fs_grants = super::policy_fs::domain_fs_grants(
+        &policy_plan,
+        &shell_tier.granted_passthrough,
+        &write_mode,
+    );
+    let entry_requested = &fs_passthrough[..entry_requested_len];
+    let (entry_granted, _not_granted) = super::policy_fs::granted_for(
+        entry_requested,
+        &shell_tier.granted_passthrough,
+        &write_mode,
+    );
+    shell_tier.granted_passthrough = entry_granted;
+    // 付けられなかった宣言のうち、モデルへ見せるのは入口の分だけ（遷移先ドメインの分は付与処理の
+    // 警告とドメインの用意の断り文が持つ）。
+    shell_tier.denied_passthrough.retain(|(path, _, _)| {
+        let key = harness_sandbox::tier2a::workspace_capability::declaration_key(path);
+        entry_requested.iter().any(|fp| {
+            harness_sandbox::tier2a::workspace_capability::declaration_key(&fp.path) == key
+        })
+    });
 
     sweep_empty_cow_diff_areas();
     sweep_stale_aces_on_cow_diff_areas();
@@ -509,7 +669,11 @@ pub(super) fn stage_prepare_sandbox(
         net_app,
         run_shell_path_extra,
         fs_passthrough,
-        settings_fs_paths,
+        file_declared_fs_paths,
+        policy,
+        writable_outside_policy,
+        domain_fs_grants,
+        approved_fs_values,
         policy_learn,
         wfp_prelude,
         write_mode,

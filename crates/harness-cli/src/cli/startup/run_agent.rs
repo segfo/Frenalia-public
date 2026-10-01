@@ -36,7 +36,11 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         net_app,
         run_shell_path_extra,
         fs_passthrough,
-        settings_fs_paths,
+        file_declared_fs_paths,
+        policy,
+        writable_outside_policy,
+        domain_fs_grants,
+        approved_fs_values,
         policy_learn: policy_learn_enabled,
         wfp_prelude,
         write_mode,
@@ -60,95 +64,74 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         // （段階E）が無い今はDaemonの答えが常に「未実装なので断る」になり、
         // サンドボックスの中で外部プログラムが1つも起動できなくなる。
         // 常時適用へ切り替えるのは段階Eが着地してからで、そのときはこの引数ごと消す。
-        // [段階6b] **遷移の宣言はharnessが読んでDaemonへ渡す**
-        // （`plans/DESIGN-MAC-PROTOCOL.md` §12.1）。**この経路が`policy.json`を読むのは
-        // ここが初めてである**——使うのは`process`（遷移の宣言）だけで、`fs`/`net`は
-        // 従来どおりharness本体の設定経路に関与しない（`policy_file`のモジュールdoc）。
+        // [段階6b・#30] **遷移の宣言はharnessが読んでDaemonへ渡す**
+        // （`plans/DESIGN-MAC-PROTOCOL.md` §12.1）。`policy.json`を読むのは`stage_prepare_sandbox`の
+        // 1回だけで、ここはその値を使う——ファイル宣言から許可を付ける付与処理（#30）より前に読む必要が
+        // あるためで、読み直すと付与に使った宣言とDaemonへ渡す宣言が別物になり得る（`B-13`）。
         //
-        // **読めなければTier2aセッションを始めない。** 宣言を持たないDaemonを起こすと、
-        // 宣言してある遷移まで拒否される。倒れる向きは同じ「拒否」でも、
-        // 原因が読み取り失敗であることは画面から分からない（`B-10`）。
+        // **読めなければTier2aセッションを始めない**——その判断は`stage_prepare_sandbox`が既にしており、
+        // Tier2aでここへ来たなら読めている。`None`はその不変条件の破れなので、起動しない側へ倒す。
         //
         // [残課題 サンドボックス周辺 #65] **`policy.json`の外で書込を許した場所も検査へ渡す。**
-        // 固定した遷移の先がそこにあれば、ワークスペース内のコードが書き換えて遷移先の権限で
-        // 走らせられる。**一覧はここで1回だけ作り、harnessの検査・モデルへ見せる一覧・
-        // Daemonの検査の3つへ同じ値を渡す**——別々に作ると、どれか1つだけ入力が違う状態が
+        // 一覧は`stage_prepare_sandbox`で1回だけ作り、harnessの検査・モデルへ見せる一覧・
+        // Daemonの検査の3つへ同じ値を渡す——別々に作ると、どれか1つだけ入力が違う状態が
         // 黙って成立する（`B-13`）。
-        let writable_outside_policy =
-            super::transition_tool::writable_outside_policy(&fs_passthrough);
-        let transition_policy = match harness_policy::policy_file::load_for_session(
-            &workspace_root,
-            &writable_outside_policy,
-        ) {
-            Ok(policy) => {
-                // [段階6e] **モデルへ見せる一覧は、Daemonへ渡すのと同じ宣言から作る**
-                // （§19.3.8）。ここで読み直すと判定に使うグラフとずれ、「起こせる」と
-                // 答えたものをDaemonが拒否する形になる（正本を2つ持たない、`B-13`）。
-                transition_facts = Some(std::sync::Arc::new(
-                    super::transition_tool::facts_from_policy(
-                        &policy,
-                        &workspace_root.to_string_lossy(),
-                        &writable_outside_policy,
-                    ),
-                ));
-                // [#55] **遷移先ドメインの実体をここで用意する**（`plans/DESIGN-MAC-BROKER.md` §22.9）。
-                //
-                // 判定器は「Dへ移してよい」までしか答えない。Dで実際に起こすには
-                // Dのpackage SIDとcapabilityの組が要り、それは`policy.json`には書かれていない。
-                // **Daemonを起こす前に作って、宣言と同じ電文で渡す**——表を持たないDaemonが
-                // 要求を捌く瞬間を作らないためである（`Hello`に載せた理由そのもの）。
-                //
-                // **新しい許可は1本も付けない。** 既に許可済みの宣言の宛先SIDを引くだけで、
-                // 引けないドメインは用意しない（`domain_provision`のモジュールdoc）。
-                let canonical_workspace = workspace_root
-                    .canonicalize()
-                    .unwrap_or_else(|_| workspace_root.clone());
-                let provisioned =
-                    harness_sandbox::tier2a::win_appcontainer::domain_provision::provision_target_domains(
-                        &policy,
-                        &canonical_workspace,
-                        // **`preflight`が付与したのと同じ語彙**でなければ別の宛先SIDを導出し、
-                        // 用意したドメインからワークスペースが一切見えなくなる。
-                        write_mode.capability_mode(),
-                    );
-                // **用意できなかったものを黙って落とさない**（`B-10`）。落とすと、
-                // 宣言したのに断られる理由が画面のどこにも出ない。
-                for (domain, reason) in &provisioned.skipped {
-                    eprintln!(
-                        "warning: transitions into the domain {domain:?} will be refused: {reason}"
-                    );
-                }
-                harness_sandbox::tier2a::spawnd::TransitionPolicy {
-                    policy,
-                    workspace_root: workspace_root.to_string_lossy().into_owned(),
-                    writable_outside_policy,
-                    domains: provisioned.domains,
-                }
+        let Some(policy) = policy else {
+            eprintln!(
+                "error: the transition policy (.harness/policy.json) was not read before the \
+                 Tier2a session started; refusing to start a Spawn Daemon without it"
+            );
+            let outcome = harness_sandbox::tier2a::session_profile::end_session(
+                &harness_sandbox::tier2a::win_appcontainer::revoke_session_grant,
+            );
+            if let Some(summary) = outcome.summary() {
+                eprintln!("note: {summary}");
             }
-            Err(error) => {
-                eprintln!("error: could not read the transition policy: {error}");
-                // **宣言の外から来た「書ける場所」で拒否されたときは、それを言う**（`B-10`）。
-                // 言わないと、`policy.json`のどこにも書込が無いのに拒否された理由が辿れない。
-                if matches!(
-                    error,
-                    harness_policy::policy_file::PolicyFileError::RejectedTransitions { .. }
-                ) && !writable_outside_policy.is_empty()
-                {
-                    eprintln!(
-                        "note: places opened for writing by settings.json `fs.read_write` or \
-                         `--fs-allow <path>:rw` count as writable by the caller, so a fixed \
-                         transition must not point into them: {}",
-                        writable_outside_policy.join(", ")
-                    );
-                }
-                let outcome = harness_sandbox::tier2a::session_profile::end_session(
-                    &harness_sandbox::tier2a::win_appcontainer::revoke_session_grant,
-                );
-                if let Some(summary) = outcome.summary() {
-                    eprintln!("note: {summary}");
-                }
-                return ExitCode::FAILURE;
-            }
+            return ExitCode::FAILURE;
+        };
+        // [段階6e] **モデルへ見せる一覧は、Daemonへ渡すのと同じ宣言から作る**
+        // （§19.3.8）。ここで読み直すと判定に使うグラフとずれ、「起こせる」と
+        // 答えたものをDaemonが拒否する形になる（正本を2つ持たない、`B-13`）。
+        // [#30] 権限欄にはこのマシンで承認済みの宣言だけを載せる（付いていない許可を伝えない）。
+        transition_facts = Some(std::sync::Arc::new(
+            super::transition_tool::facts_from_policy(
+                &policy,
+                &workspace_root.to_string_lossy(),
+                &writable_outside_policy,
+                &approved_fs_values,
+            ),
+        ));
+        // [#55] **遷移先ドメインの実体をここで用意する**（`plans/DESIGN-MAC-BROKER.md` §22.9）。
+        //
+        // 判定器は「Dへ移してよい」までしか答えない。Dで実際に起こすには
+        // Dのpackage SIDとcapabilityの組が要り、それは`policy.json`には書かれていない。
+        // **Daemonを起こす前に作って、宣言と同じ電文で渡す**——表を持たないDaemonが
+        // 要求を捌く瞬間を作らないためである（`Hello`に載せた理由そのもの）。
+        //
+        // [#30] **宣言の宛先は、このセッションの付与処理が付けたものを渡す**（台帳を引き直さない、
+        // BUG-185）。付与は`stage_prepare_sandbox`が入口の宣言と一緒に1回で済ませている。
+        let canonical_workspace = workspace_root
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_root.clone());
+        let provisioned =
+            harness_sandbox::tier2a::win_appcontainer::domain_provision::provision_target_domains(
+                &policy,
+                &canonical_workspace,
+                // **`preflight`が付与したのと同じ語彙**でなければ別の宛先SIDを導出し、
+                // 用意したドメインからワークスペースが一切見えなくなる。
+                write_mode.capability_mode(),
+                &domain_fs_grants,
+            );
+        // **用意できなかったものを黙って落とさない**（`B-10`）。落とすと、
+        // 宣言したのに断られる理由が画面のどこにも出ない。
+        for (domain, reason) in &provisioned.skipped {
+            eprintln!("warning: transitions into the domain {domain:?} will be refused: {reason}");
+        }
+        let transition_policy = harness_sandbox::tier2a::spawnd::TransitionPolicy {
+            policy,
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            writable_outside_policy,
+            domains: provisioned.domains,
         };
         // **この値が段階6eの露出条件の3つ目である。** `Unrestricted`である限り、
         // 子は要求受付パイプへ頼まずに自分で生成できるので、モデルへ
@@ -480,27 +463,71 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         // 1件ずつ呼ぶとエントリ数の2乗でI/Oが増える。実測でこの台帳は66KBあり、宣言が数百件
         // ある構成では数百MBのI/Oになる。**人へ見せる行は1件ずつのまま**——まとめるのは
         // 台帳の書込だけで、どの穴が開いたかの説明は落とさない。
-        let records: Vec<crate::fs_grants::FsPassthroughGrantRecord> = shell_tier
-            .granted_passthrough
+        //
+        // [#30] 記録するのは入口の子の分と、遷移先ドメインの子の分。**同じパスは記録の前に1行へ畳む**
+        // ——付与台帳はパスごとに1行で、後から書いた行が`forced`/`writable`/`scope`を上書きする
+        // （`upsert_grant`）。ドメインの分（`forced=false`）が後に来ると、撤収が`SeRestorePrivilege`を
+        // 使わなくなる（BUG-119の逆行）。`forced`・`writable`はOR、範囲は再帰が勝つ。
+        // 比べる綴りは宛先SIDの鍵と同じ畳み方（`declaration_key`）。
+        use harness_sandbox::tier2a::workspace_capability::declaration_key;
+        let mut by_path: Vec<harness_core::GrantedPassthrough> = Vec::new();
+        for granted in shell_tier.granted_passthrough.iter().chain(
+            domain_fs_grants
+                .values()
+                .filter_map(|result| result.as_ref().ok())
+                .flatten(),
+        ) {
+            let key = declaration_key(&granted.path);
+            match by_path
+                .iter_mut()
+                .find(|seen| declaration_key(&seen.path) == key)
+            {
+                Some(seen) => {
+                    seen.writable |= granted.writable;
+                    seen.used_restore_privilege |= granted.used_restore_privilege;
+                }
+                None => by_path.push(granted.clone()),
+            }
+        }
+        let records: Vec<crate::fs_grants::FsPassthroughGrantRecord> = by_path
             .iter()
             .map(|granted| {
-                let path = &granted.path;
-                // [D-63] 宣言側から引くのは**範囲だけ**である。
+                let key = declaration_key(&granted.path);
+                // [D-63] 宣言側から引くのは**範囲だけ**である（同じパスの宣言が複数あれば再帰が勝つ）。
                 // [BUG-119] `forced`は宣言側から引かない——`--force-system-acl`は
                 // セッション全域のスイッチで、**そのパスで特権を使ったかという事実ではない**。
                 // 組み立ては`FsPassthroughGrantRecord::from_granted`が唯一の定義を持つ。
-                let declared = fs_passthrough.iter().find(|fp| &fp.path == path);
-                let path_str = path.to_string_lossy().into_owned();
+                let declared = fs_passthrough
+                    .iter()
+                    .filter(|fp| declaration_key(&fp.path) == key)
+                    .max_by_key(|fp| fp.scope.is_recursive());
+                let path_str = granted.path.to_string_lossy();
+                // [#30] 「ファイルで宣言された」（＝自動撤収の対象）かは、台帳と同じ比べ方で決める。
+                // 文字列の完全一致では`C:\x`と`C:/x`が別物になり、毎起動で印が外れて撤収される。
+                let file_declared = file_declared_fs_paths
+                    .iter()
+                    .any(|declared| harness_grant_ledger::same_ledger_path(declared, &path_str));
                 crate::fs_grants::FsPassthroughGrantRecord::from_granted(
                     granted,
                     declared,
-                    settings_fs_paths
-                        .contains(&path_str)
-                        .then(|| workspace_root.to_string_lossy().into_owned()),
+                    file_declared.then(|| workspace_root.to_string_lossy().into_owned()),
                 )
             })
             .collect();
         crate::fs_grants::record_fs_passthrough_grants(&records);
+        // [#30] 遷移先ドメインの分は**ドメインごとに1行**で知らせる（入口の分は下で1件ずつ出す）。
+        for (domain, result) in &domain_fs_grants {
+            if let Ok(granted) = result {
+                if !granted.is_empty() {
+                    eprintln!(
+                        "note: granted {} file declaration(s) of the domain {domain:?} from \
+                         .harness/policy.json; only children transitioned into that domain hold \
+                         them",
+                        granted.len()
+                    );
+                }
+            }
+        }
 
         for granted in &shell_tier.granted_passthrough {
             let path = &granted.path;
@@ -525,10 +552,12 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 // 剥がすと、同じワークスペースの並行セッションが互いの許可を落とす）。
                 // 消える道は2本しかないので、両方名指しする——片方だけ書くと、
                 // `.harness/settings.json`で宣言した人は「消し方が`fs revoke`しか無い」と読む。
+                // [#30] `policy.json`の宣言も同じ道で消える（承認を外したときも含む）。
                 eprintln!(
                     "note: fs-allow granted: {} [{}] (this ACE persists after harness exits by \
                      design; it goes away when the declaration disappears from \
-                     .harness/settings.json and harness starts again, or when you run \
+                     .harness/settings.json or .harness/policy.json (or loses its approval on \
+                     this machine) and harness starts again, or when you run \
                      `harness fs revoke {}`)",
                     path.display(),
                     if writable { "rw" } else { "ro" },

@@ -332,6 +332,25 @@ impl PolicyFile {
         self.domains.iter().find(|d| d.name == name)
     }
 
+    /// 宣言から、**入口ドメイン以外の遷移先**を重複なく、宣言順で拾う。
+    ///
+    /// 入口ドメインを除くのは、そこが呼び出し元自身だからである（自己ループは表を引かない）。
+    /// **遷移先ドメインを用意する側（`domain_provision`）と、そのドメインの宣言へ許可を付ける側
+    /// （`harness.exe`の起動）が同じ関数を通る**——別々に数えると、許可を付けたのに用意しない
+    /// （あるいはその逆の）ドメインが黙って生まれる（B-05）。
+    pub fn transition_target_domains(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for domain in &self.domains {
+            for edge in &domain.process.transitions {
+                if edge.to == ENTRY_DOMAIN || names.iter().any(|n| n == &edge.to) {
+                    continue;
+                }
+                names.push(edge.to.clone());
+            }
+        }
+        names
+    }
+
     /// 受理した提案をドメインへ**和集合で**取り込む。
     ///
     /// 既にある値は増やさない（冪等）。値の削除はここでは行わない——このファイルは追記のみで、

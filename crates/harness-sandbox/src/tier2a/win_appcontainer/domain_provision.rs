@@ -14,17 +14,24 @@
 //! 費用は測ってある（`plans/mac-spike/RESULTS.md` §S72）——1ドメインあたり17〜19msで線形、
 //! 実測された現実的な数（11本）で211ms。
 //!
-//! # **新しい許可は1本も付けない**（骨格の定義）
+//! # 許可はここでは付けない。**このセッションで付いた結果を受け取って積む**
 //!
-//! ここは`lookup`しかしない。**発行も付与もしない**——`preflight`が既に許可した宣言の
-//! 宛先SIDを引くだけである。引けなければ**そのドメインは用意しない**（fail-closed）。
+//! ここは発行も付与もしない。遷移先ドメインの宣言への許可は、`harness.exe`の起動が
+//! `policy.json`のファイル宣言を読んで**付与処理（`preflight`）へ入口の宣言と一緒に渡し**、
+//! 付いた結果をドメインごとに振り分けて渡してくる（#30、`harness-cli`の`startup::policy_fs`）。
+//! ACLを書く経路は`preflight`の1つのままである（書く経路が増えるほど、片方だけが台帳へ記録する／
+//! 片方だけが撤収できる、という形の事故が起きる。BUG-017の孤立ACEと同型）。
 //!
-//! そうしている理由は2つある。
+//! **1件でも付かなかった宣言があるドメインは用意しない**（fail-closed）。付いた分だけで用意すると、
+//! エディタで確かめたより狭い権限で黙って動く。
 //!
-//! 1. **ACLを書く経路を増やさない。** 書く経路が増えるほど、片方だけが台帳へ記録する／
-//!    片方だけが撤収できる、という形の事故が起きる（BUG-017の孤立ACEと同型）
-//! 2. **`harness.exe`が`policy.json`の`fs`を使い始めるのは別の決定である**
-//!    （残課題#30）。骨格でそこへ踏み込むと、2つの変更の切り分けができなくなる
+//! # 台帳から引き直さない（BUG-185）
+//!
+//! 2026-09-20の骨格は「新しい許可を1本も付けない」範囲だったので、既に許可済みの宣言の宛先を
+//! capability台帳から種類ごとに引いていた。台帳の行にはセッションも書込モードも無いので、
+//! 付与処理が和に畳んだ種類・CoWで読取へ下げた種類では引けずに断り、**過去の直接書込の回に発行した
+//! `read_write`の行をCoWの回にも拾っていた**（遷移先の子が本物へ書ける宛先を持つ）。
+//! 付与の結果を受け取る形にしたので、宛先は付与処理が今回書いたものだけになる。
 //!
 //! # 採らなかった逃げ方
 //!
@@ -34,7 +41,7 @@
 
 use std::path::Path;
 
-use harness_policy::policy_file::{PolicyFile, ENTRY_DOMAIN};
+use harness_policy::policy_file::PolicyFile;
 
 use super::AppContainerError;
 use crate::tier2a::spawnd::{DomainIdentitySpec, DomainSpec};
@@ -51,30 +58,45 @@ pub struct Provisioned {
     pub skipped: Vec<(String, String)>,
 }
 
-/// 宣言から、**入口ドメイン以外の遷移先**を重複なく拾う。
+/// 遷移先ドメインの宣言に、このセッションで付いた許可の宛先SID（文字列）。
 ///
-/// 入口ドメインを除くのは、そこが呼び出し元自身だからである（自己ループは表を引かない）。
-fn target_domain_names(policy: &PolicyFile) -> Vec<String> {
-    let mut names: Vec<String> = Vec::new();
-    for domain in &policy.domains {
-        for edge in &domain.process.transitions {
-            if edge.to == ENTRY_DOMAIN || names.iter().any(|n| n == &edge.to) {
-                continue;
+/// - `Some(Ok(list))`: 付いた。宛先SIDを重複なく返す（CoWでは別の宣言が同じ宛先になり得る）
+/// - `Some(Err(reason))`: 付けなかった・付かなかった。そのドメインは用意しない
+/// - `None`: このセッションでは宣言を見ていない。**宣言が1件も無いドメインだけ**用意できる
+pub(crate) fn declaration_sids(
+    name: &str,
+    domain: &harness_policy::policy_file::PolicyDomain,
+    grants: Option<&Result<Vec<harness_core::GrantedPassthrough>, String>>,
+) -> Result<Vec<String>, String> {
+    match grants {
+        Some(Ok(list)) => {
+            let mut sids: Vec<String> = Vec::new();
+            for granted in list {
+                if !sids.contains(&granted.subject_sid) {
+                    sids.push(granted.subject_sid.clone());
+                }
             }
-            names.push(edge.to.clone());
+            Ok(sids)
         }
+        Some(Err(reason)) => Err(format!("`{name}`: {reason}")),
+        None if domain.fs.is_empty() => Ok(Vec::new()),
+        None => Err(format!(
+            "`{name}` declares {} file access(es), but no permission was granted for them in this \
+             session",
+            domain.fs.entries().len()
+        )),
     }
-    names
 }
 
-/// ドメイン`name`のcapability SIDの組を、**既に許可済みの宣言から引く**。
+/// ドメイン`name`のcapability SIDの組を、**共通の土台と、このセッションで付いた宣言の宛先**から組む。
 ///
-/// **発行しない。** 1件でも引けなければ`Err`——そのドメインは用意しない。
+/// **発行しない。** 宣言の分が1件でも付いていなければ`Err`——そのドメインは用意しない。
 fn capability_sids_for(
     policy: &PolicyFile,
     canonical_workspace: &Path,
     workspace_mode: &str,
     name: &str,
+    grants: Option<&Result<Vec<harness_core::GrantedPassthrough>, String>>,
 ) -> Result<Vec<String>, String> {
     let Some(domain) = policy.domain(name) else {
         return Err(format!(
@@ -138,38 +160,8 @@ fn capability_sids_for(
         );
     }
 
-    for (declared, access) in domain.fs.entries() {
-        // 宣言値から**ACEが載るオブジェクト**を出す（`C:/x/**`なら`C:/x`）。
-        // 変換の定義は1つだけである（D-63）。
-        let object = harness_policy::normalize::literal_prefix(declared);
-        // 設定の語彙から**許可を書く側の語彙**へ移す。`settings_key()`が同じ綴りを返すからと
-        // いってそちらを使わない——同じ文字列を2つの型が別々に持つと、片方に級が増えた日に
-        // 静かにずれる（`B-05`）。級は宛先SIDの鍵そのものなので、ずれると
-        // 「ACEは正しいのに子から一切読めない」形になる。
-        let access = crate::shell_tier::FsAccess::from_settings(access);
-        let Some(capability_name) =
-            crate::tier2a::workspace_capability::lookup_declaration_capability_name(
-                canonical_workspace,
-                Path::new(object),
-                access.label(),
-            )
-        else {
-            return Err(format!(
-                "`{name}`が宣言している `{declared}`（{}）が、このセッションでは許可されていない\
-                 ——骨格では新しい許可を付けないので用意しない。\
-                 同じパスを`--fs-allow`か設定でも宣言すると用意できる",
-                access.label()
-            ));
-        };
-        sids.push(
-            crate::win_common::sid_to_string(
-                super::capability_sid_from_name(&capability_name)
-                    .map_err(|e| format!("capability SIDを導出できない（{capability_name}）: {e}"))?
-                    .as_psid(),
-            )
-            .map_err(|e| format!("sid_to_string(capability): {e}"))?,
-        );
-    }
+    // [#30] 宣言の分は**このセッションの付与処理が付けた宛先**だけを積む（台帳を引き直さない、BUG-185）。
+    sids.extend(declaration_sids(name, domain, grants)?);
     Ok(sids)
 }
 
@@ -187,13 +179,25 @@ pub fn provision_target_domains(
     // workspaceのアクセスモード（`"rwx"`/`"ro"`）。**`preflight`が付与したのと同じ語彙**で
     // なければ別のcapability SIDを導出し、ワークスペースが一切見えない子ができる。
     workspace_mode: &str,
+    // [#30] 遷移先ドメインごとの、このセッションで付いた許可（`harness.exe`の起動が付与処理の結果から
+    // 振り分けたもの）。ここに無いドメインは、宣言を1件も持たないときだけ用意できる。
+    domain_grants: &std::collections::BTreeMap<
+        String,
+        Result<Vec<harness_core::GrantedPassthrough>, String>,
+    >,
 ) -> Provisioned {
     let mut domains = Vec::new();
     let mut skipped = Vec::new();
 
-    for name in target_domain_names(policy) {
+    for name in policy.transition_target_domains() {
         let capability_sids =
-            match capability_sids_for(policy, canonical_workspace, workspace_mode, &name) {
+            match capability_sids_for(
+                policy,
+                canonical_workspace,
+                workspace_mode,
+                &name,
+                domain_grants.get(&name),
+            ) {
                 Ok(sids) => sids,
                 Err(reason) => {
                     skipped.push((name, reason));

@@ -10922,10 +10922,10 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
     // から読めない」を区別できない。**同じ台本のまま、宣言を1つ足すだけで反転する**なら、
     // 読めなかった理由は「その鍵を持っていなかったこと」だと言い切れる。
     //
-    // 骨格は**既に許可済みの宣言しか引かない**ので、`--fs-allow`で開けたのと同じパスを
-    // 遷移先ドメイン自身の宣言に書けば引けるはずである
-    // （`domain_provision::capability_sids_for`）。**この経路が端から端まで通るのは初めて**で、
-    // 単体テストは「引けなければ用意しない」側しか測っていない。
+    // [#30] `harness.exe`は`policy.json`のファイル宣言（このマシンで承認済みのもの、D-112）へ
+    // 起動時に許可を付け、遷移先ドメインの子には**そのドメインの宣言の分だけ**を渡す
+    // （`startup::policy_fs`）。だから同じパスを遷移先ドメイン自身の宣言に書いて承認すれば、
+    // 遷移先の子はそれを持って読めるはずである。
     {
         let mut file = harness_policy::policy_file::PolicyFile::default();
         add_edge(
@@ -10941,13 +10941,8 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
         // `--fs-allow`で入口側へ渡した鍵は**そこに現れない**ので、遷移先にだけ書くと
         // 片側だけが広いように読める。
         //
-        // 入口側の宣言は**この回の挙動を1ビットも変えない**——harness本体はまだ
-        // `policy.json`の`fs`を使わないので（残課題#30）、入口の鍵は`--fs-allow`由来のままである。
-        //
-        // **級は`read_exec`である。** `--fs-allow <path>`（`:rw`無し）が台帳へ登録する級は
-        // `FsAccess::ReadExec`で、`read`ではない（`startup/sandbox.rs`の分岐）。
-        // `fs.read`で宣言すると鍵の3軸（ワークスペース・パス・級）の級が合わず、
-        // **許可済みなのに引けない**——2026-09-20に実際にそれで用意できなかった。
+        // 入口側の宣言は**この回の入口の権限を変えない**——`--fs-allow`と同じパス・同じ級
+        // （`read_exec`。`--fs-allow <path>`の級）なので、宛先SIDも同じ1つに畳まれる。
         let declared = format!(r"{}\**", outside.display());
         for name in [harness_policy::policy_file::ENTRY_DOMAIN, "d0"] {
             file.domains
@@ -10960,6 +10955,43 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
         }
         harness_policy::policy_file::save(&ws, &file)
             .unwrap_or_else(|e| panic!("反転の対照の宣言を書けなかった: {e}"));
+        // [D-112] **この試験が書いた宣言は、このマシンで承認しないと許可が付かない**（リポジトリに
+        // 同梱された宣言と区別できないため）。承認は本物の台帳へ書くので、終わったら**製品の取り消し**
+        // で消す（`Drop`。試験が実マシンの共有状態を残さない）。
+        let approvals = harness_sandbox::tier2a::policy_approval::PolicyApprovalStore::in_config_dir();
+        let approved_declarations: Vec<harness_sandbox::tier2a::policy_approval::DeclarationRef<'_>> =
+            [harness_policy::policy_file::ENTRY_DOMAIN, "d0"]
+                .into_iter()
+                .map(|domain| harness_sandbox::tier2a::policy_approval::DeclarationRef {
+                    domain,
+                    value: &declared,
+                    access: harness_config::FsAccess::ReadExec,
+                })
+                .collect();
+        let not_recorded = approvals.approve(&ws, &approved_declarations);
+        assert!(
+            not_recorded.is_empty(),
+            "反転の対照: 宣言の承認を台帳へ記録できなかった: {not_recorded:?}"
+        );
+        struct RevokeApprovals<'a> {
+            store: &'a harness_sandbox::tier2a::policy_approval::PolicyApprovalStore,
+            ws: &'a Path,
+            declarations: &'a [harness_sandbox::tier2a::policy_approval::DeclarationRef<'a>],
+        }
+        impl Drop for RevokeApprovals<'_> {
+            fn drop(&mut self) {
+                let left = self.store.revoke(self.ws, self.declarations);
+                // **後始末の失敗は捨てない**（B-10）。残ると、同じ値が後で同梱されたとき承認済みとして通る。
+                if !left.is_empty() {
+                    eprintln!("[narrowing] 承認の後始末に失敗した（台帳に残っている）: {left:?}");
+                }
+            }
+        }
+        let _revoke_approvals = RevokeApprovals {
+            store: &approvals,
+            ws: &ws,
+            declarations: &approved_declarations,
+        };
 
         let flipped = run_arm_collecting_denials(
             &ws,
@@ -10978,7 +11010,8 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
         if flipped.harness_stderr.contains("will be refused") {
             failures.push(format!(
                 "反転の対照: 遷移先ドメインを**用意できなかった**ので、反転するかを測れていない。\
-                 宣言したパスが許可済みとして引けていない（鍵の綴りか級が合っていない）。\
+                 遷移先の宣言に許可が付いていない（承認が台帳と一致していない・付与に失敗した・\
+                 遷移の強制が無効、のどれか。理由は起動時の警告にある）。\
                  起動時の警告:\n{}",
                 flipped.harness_stderr
             ));
