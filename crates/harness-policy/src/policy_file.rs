@@ -127,6 +127,14 @@ pub enum PolicyFileError {
     },
     #[error("policy.json の遷移の宣言を受け付けられません（{path}）: {reason}")]
     RejectedTransitions { path: PathBuf, reason: String },
+    /// 書こうとした内容が、遷移の編集時検査に落ちる（書くと`harness.exe`もエディタも読めなくなる）。
+    #[error(
+        "policy.json を書いていません（{path}）——書くと遷移の宣言が検査に通らなくなり、\
+         harness.exe もエディタもこのファイルを読めなくなります（たとえば、遷移先のドメインへ\
+         許可を足した・遷移元から許可を外した結果、その遷移が広げる向きになったとき）。\
+         先に該当する遷移の宣言を取り消してください: {reason}"
+    )]
+    WouldRejectTransitions { path: PathBuf, reason: String },
 }
 
 /// ドメイン1件のFSルール。キーは`crate::SettingsKey`と1:1で対応させる
@@ -586,13 +594,8 @@ pub fn load_for_session(
     // **編集時検査をここへ置く理由**: 検査を書いても呼ぶ人が居なければ、手で書いた危険な辺が
     // 素通りする（`B-01`: 対の片方だけ実装しない）。この関数は`policy.json`を読む唯一の関数
     // （[`load`]もここへ委譲する）なので、ここを通せば読む側の全経路が通る。
-    // 宣言画面は書く前に**同じ検査関数**（`transition::check_all`）を呼ぶ。
-    let workspace = workspace_root.to_string_lossy();
-    let input = file.transition_graph_input(Some(workspace.as_ref()), writable_outside_policy);
-    let rejected = match transition::check_all(&input) {
-        Ok(rejections) => rejections.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
-        Err(e) => vec![e.to_string()],
-    };
+    // 書く側は[`save`]が**同じ検査**を掛ける（読めないファイルを書かない）。
+    let rejected = transition_rejections(&file, workspace_root, writable_outside_policy);
     if !rejected.is_empty() {
         return Err(PolicyFileError::RejectedTransitions {
             path,
@@ -602,13 +605,47 @@ pub fn load_for_session(
     Ok(file)
 }
 
+/// 遷移の編集時検査に落ちた理由（落ちなければ空）。**[`load_for_session`]と[`save`]が同じものを通る。**
+fn transition_rejections(
+    file: &PolicyFile,
+    workspace_root: &Path,
+    writable_outside_policy: &[String],
+) -> Vec<String> {
+    let workspace = workspace_root.to_string_lossy();
+    let input = file.transition_graph_input(Some(workspace.as_ref()), writable_outside_policy);
+    match transition::check_all(&input) {
+        Ok(rejections) => rejections.iter().map(|r| r.to_string()).collect(),
+        Err(e) => vec![e.to_string()],
+    }
+}
+
 /// 書き出す（上書き）。親ディレクトリ（`.harness`）が無ければ作る。
 ///
 /// **スキーマ版は内容から決めて書く**（[`PolicyFile::required_schema_version`]）。
 /// 渡された`file`が持っている`schema_version`は読み込んだ時点の値なので、そのまま書き戻すと
 /// **遷移を足したのに版が上がらない**——古いバイナリが黙って無視して読む形が残る。
+///
+/// # [load]が受け付けないファイルは書かない（2026-10-01、BUG-188）
+///
+/// 書く前に、[`load`]と同じ遷移の編集時検査を掛け、落ちたら**何も書かずに**
+/// [`PolicyFileError::WouldRejectTransitions`]を返す。かつては検査せずに書いていたので、
+/// ファイル宣言の承認・取り消しが**遷移の宣言を検査に通らなくする**ファイルを書けた——
+/// 遷移先ドメインへ許可を足すと、そこへの遷移が「広げる遷移」に変わり、書いた直後から
+/// `harness.exe`もエディタもそのファイルを読めなくなる（手でJSONを直すしか戻す手段が無い）。
+/// 版の検査を書く側と読む側で対にしたのと同じ理由である（`B-01`）。
+///
+/// **`policy.json`の外で書込を許した場所は空で検査する**（[`load`]と同じ）——書く側はそれを知らない。
+/// したがって固定した遷移は、ここを通っても`harness.exe`の起動時に初めて落ちることがある
+/// （[`load_for_session`]のdoc。残課題 サンドボックス周辺 #65）。
 pub fn save(workspace_root: &Path, file: &PolicyFile) -> Result<(), PolicyFileError> {
     let path = path(workspace_root);
+    let rejected = transition_rejections(file, workspace_root, &[]);
+    if !rejected.is_empty() {
+        return Err(PolicyFileError::WouldRejectTransitions {
+            path,
+            reason: rejected.join("; "),
+        });
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| PolicyFileError::Write {
             path: path.clone(),

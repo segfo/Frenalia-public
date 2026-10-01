@@ -710,8 +710,10 @@ pub struct RunnableProgramFact {
     pub rights_net: Vec<String>,
     /// **いま実際に起こせるか。**
     ///
-    /// `false`は「宣言は正しいが、harnessがまだ実装していない」を意味する
-    /// （遷移先が別ドメインの辺。`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2の暫定）。
+    /// `false`は「宣言は正しいが、遷移先のドメインがこのセッションでは用意されていない」を意味する
+    /// （harnessが起動時にSpawn Daemonへ渡した表に無い。判定は`harness_policy::transition_listing`）。
+    /// 2026-10-01までは「別ドメイン行きは全部`false`」だった（`plans/DESIGN-MAC-ENFORCEMENT.md`
+    /// §10.1.2の撤去一覧5点目）。
     /// **この欄を落とすと、一覧に出ているのに撃つと拒否されるものが混ざる。**
     pub runnable_now: bool,
 }

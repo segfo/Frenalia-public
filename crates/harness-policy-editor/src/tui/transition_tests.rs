@@ -43,7 +43,7 @@ fn declared_rows(ws: &Path) -> Vec<transition_listing::Row> {
     let file = policy_file::load(ws).expect("policy.jsonが読めない");
     let text = ws.to_string_lossy().into_owned();
     let input = file.transition_graph_input(Some(&text), &[]);
-    transition_listing::rows(&input, ENTRY_DOMAIN).expect("一覧が作れない")
+    transition_listing::rows(&input, ENTRY_DOMAIN, &Default::default()).expect("一覧が作れない")
 }
 
 /// **今日測った台本がそのまま一覧になる。**
@@ -643,4 +643,130 @@ fn a_dismissal_in_the_observed_tab_also_covers_the_same_program_in_the_denied_ta
         app.pending.counts(PendingTab::TransitionsDenied).dismissed,
         1
     );
+}
+
+// --- 遷移先ドメインの欄（2026-10-01） -------------------------------------------
+
+/// 遷移先の欄の中身を消してから`name`を打ち、一覧へ戻る（`Tab`→入力→`Enter`）。
+fn type_destination(app: &mut App, name: &str) {
+    press(app, KeyCode::Tab);
+    assert!(app.pending.destination.focused, "Tabで遷移先の欄へ入れない");
+    for _ in 0..64 {
+        press(app, KeyCode::Backspace);
+    }
+    for ch in name.chars() {
+        press(app, KeyCode::Char(ch));
+    }
+    press(app, KeyCode::Enter);
+    assert!(!app.pending.destination.focused, "Enterで一覧へ戻れない");
+}
+
+fn app_with_one_observed(ws: &Path) -> App {
+    write_observed(ws, &[("C:/curl.exe", "curl https://example.com")]);
+    let mut app = app_at(ws);
+    app.pending.tab = Tab(PendingTab::TransitionsObserved);
+    app.reload_transitions();
+    app
+}
+
+/// **既定は呼び出し元と同じドメイン**（自己ループ）。欄に触らずに確定すると、今までどおりの辺が書かれる。
+#[test]
+fn without_touching_the_destination_the_edge_stays_in_the_callers_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_one_observed(tmp.path());
+    assert_eq!(app.pending.destination.name(), ENTRY_DOMAIN);
+
+    press(&mut app, KeyCode::Char(' '));
+    app.commit_transition();
+
+    assert_eq!(declared_rows(tmp.path())[0].to_domain, ENTRY_DOMAIN);
+}
+
+/// **欄で選んだ遷移先へ辺が向く。** 確認ダイアログは遷移先と、宣言の無いドメインを作ることを先に言う。
+#[test]
+fn the_destination_typed_into_the_field_is_where_the_edge_points() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_one_observed(tmp.path());
+
+    press(&mut app, KeyCode::Char(' '));
+    type_destination(&mut app, "iso");
+    press(&mut app, KeyCode::Char('a'));
+    let dialog = app.modal.as_ref().expect("確認ダイアログが出ていない").lines.join("\n");
+    assert!(dialog.contains("遷移先ドメイン: iso"), "{dialog}");
+    assert!(dialog.contains("宣言の無いドメインとして作ります"), "{dialog}");
+
+    app.commit_transition();
+    let rows = declared_rows(tmp.path());
+    assert_eq!(rows[0].to_domain, "iso", "欄の値ではない遷移先が書かれた");
+    assert!(policy_file::load(tmp.path()).unwrap().domain("iso").is_some());
+}
+
+/// 欄の中では**1文字キーを操作に取らない**（`a`が確定・`x`が却下になると名前が打てない）。
+#[test]
+fn keys_typed_into_the_destination_field_do_not_trigger_actions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_one_observed(tmp.path());
+
+    press(&mut app, KeyCode::Tab);
+    for ch in ['a', 'x', 'f', ' ', 'u'] {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    assert!(app.modal.is_none(), "欄の中のaで確認ダイアログが出た");
+    assert!(app.pending.dismiss.is_empty() && app.pending.approve.is_empty());
+    assert_eq!(app.pending.filter, PendingFilter::Pending, "欄の中のfで表示が変わった");
+    assert!(app.pending.destination.input.text().ends_with("axf u"));
+}
+
+/// **禁止側**: 遷移先が空のまま承認を確定しようとしたら、理由を言って何も出さない（`B-32`）。
+#[test]
+fn an_empty_destination_stops_the_commit_with_a_reason() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_one_observed(tmp.path());
+
+    press(&mut app, KeyCode::Char(' '));
+    type_destination(&mut app, "");
+    press(&mut app, KeyCode::Char('a'));
+
+    assert!(app.modal.is_none(), "空の遷移先で確認ダイアログが出た");
+    assert!(app.status.contains("遷移先"), "理由を言っていない: {}", app.status);
+}
+
+/// **用意されない遷移先は、断らずに⚠付きで書く**（`Startable`と同じ姿勢——書けるが通らないことを
+/// 見えるところへ出し、判断はユーザーに残す）。ここでは通信を宣言している遷移先を使う
+/// （呼び出し元も同じ通信を宣言しているので、遷移そのものは「狭める」で検査を通る）。
+#[test]
+fn a_destination_that_will_not_be_provisioned_is_warned_about_but_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut file = policy_file::PolicyFile::default();
+    for name in [ENTRY_DOMAIN, "net"] {
+        let mut domain = policy_file::PolicyDomain::new(name);
+        domain.net.allow_domains.push("example.com".to_string());
+        file.domains.push(domain);
+    }
+    policy_file::save(tmp.path(), &file).unwrap();
+    let mut app = app_with_one_observed(tmp.path());
+
+    press(&mut app, KeyCode::Char(' '));
+    type_destination(&mut app, "net");
+    assert!(app.destination_needs_attention(), "欄が用意されない遷移先を目立たせていない");
+    press(&mut app, KeyCode::Char('a'));
+    let dialog = app.modal.as_ref().expect("確認ダイアログが出ていない").lines.join("\n");
+    assert!(dialog.contains('⚠') && dialog.contains("通信"), "{dialog}");
+
+    app.commit_transition();
+    let row = &declared_rows(tmp.path())[0];
+    assert_eq!(row.to_domain, "net", "警告だけのはずが書かれていない");
+    // 一覧の「いま起こせるか」も見込みの表に従う（宣言済みの行の表示）。
+    let shown = app
+        .pending
+        .observed
+        .iter()
+        .find_map(|c| match &c.declared {
+            crate::transition_candidates::Declared::ByThisEdge { runnable_now, .. } => {
+                Some(*runnable_now)
+            }
+            _ => None,
+        })
+        .expect("宣言済みの行が無い");
+    assert!(!shown, "用意されない遷移先への辺が「起こせる」と出ている");
 }

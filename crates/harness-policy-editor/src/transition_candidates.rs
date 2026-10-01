@@ -244,14 +244,19 @@ impl DeclaredEdges {
     /// `workspace_root`は、宣言の検査が「呼び出し元が書ける場所」を知るために要る（§19.1）。
     /// **`policy.json`の外で書込を許した場所は渡さない**——エディタはそれを持たない
     /// （`--fs-allow`も`settings.json`も読まない。`policy_file::load`のdoc）。
+    ///
+    /// `provisioned`は**用意される見込みの遷移先**（[`crate::transition_destination::provisioned_names`]）。
+    /// 「いま起こせるか」の欄（[`Row::runnable_now`]）がこれで決まる。`harness.exe`は実際に用意できた
+    /// 表を渡すが、エディタは別プロセスなので見込みを渡す。
     pub fn build(
         file: &PolicyFile,
         workspace_root: &str,
         from_domain: &str,
+        provisioned: &std::collections::BTreeSet<String>,
     ) -> Result<Self, GraphError> {
         let input = file.transition_graph_input(Some(workspace_root), &[]);
         let graph = TransitionGraph::build(&input)?;
-        let rows = transition_listing::rows(&input, from_domain)?;
+        let rows = transition_listing::rows(&input, from_domain, provisioned)?;
         let edges = file
             .domain(from_domain)
             .map(|d| d.process.transitions.clone())
@@ -333,8 +338,8 @@ impl DeclaredEdges {
             return Declared::ByThisEdge {
                 argv: argv_choice,
                 to_domain: edge.to.clone(),
-                // **`runnable_now`をここで計算しない。** 暫定の規則（別ドメインへは遷移できない）
-                // の正本は`transition_listing`で、写すと§22.9が着地した日に片方だけ古くなる。
+                // **`runnable_now`をここで計算しない。** 規則（自己ループか、用意された遷移先か）
+                // の正本は`transition_listing`で、写すとモデルへ見せる値と画面の値が別々に古くなる。
                 runnable_now: self.rows.get(index).is_some_and(|row| row.runnable_now),
             };
         }

@@ -16,12 +16,14 @@
 //! **ユーザーがやることは同じ**である——選んで、許す。画面を分けると同じ操作を2箇所に
 //! 実装することになる（決定62、`docs/CODE-STRUCTURE-RULES.md`§5.1）。
 //!
-//! # 遷移元ドメインは固定である
+//! # 遷移元ドメインは固定である。遷移先は欄で選ぶ
 //!
-//! [`ENTRY_DOMAIN`]（`workspace-shell`）を使う。**記録画面のドメイン欄とは混ぜない**
+//! 遷移元は[`ENTRY_DOMAIN`]（`workspace-shell`）を使う。**記録画面のドメイン欄とは混ぜない**
 //! ——あちらは「パス2で記録中のドメイン名」で由来が違い、入口ドメインが固定なのは
 //! `run_shell`経路だけである（`policy_file::ENTRY_DOMAIN`のdoc）。混ぜると、
 //! **Daemonが一度も見ないドメインへ遷移を書く**ことになる。
+//!
+//! 遷移先は`Tab`で入る欄で選ぶ（2026-10-01。既定は遷移元と同じ。[`super::transition_destination`]）。
 //!
 //! # 木にしない（`F2`のFS/ネットのタブとの違い）
 //!
@@ -196,6 +198,10 @@ pub struct PendingState {
     pub dismiss: BTreeSet<CandidateKey>,
     /// 却下の取り消しの予約（保留中へ戻す）。
     pub undismiss: BTreeSet<CandidateKey>,
+    /// 承認する辺の遷移先（欄。既定は遷移元と同じ）。
+    pub destination: super::transition_destination::DestinationField,
+    /// `policy.json`の各ドメインを`harness.exe`が用意する見込み（読み直すたびに作り直す）。
+    pub outlooks: std::collections::BTreeMap<String, crate::transition_destination::Outlook>,
 }
 
 /// [`PendingState::tab`]の既定を`FsNet`にするための薄い包み。
@@ -318,12 +324,18 @@ impl App {
                 self.pending.observed.clear();
                 self.pending.denied.clear();
                 self.pending.declared_rows.clear();
+                self.pending.outlooks.clear();
                 self.pending.notes = vec![format!("policy.jsonを読めませんでした: {e}")];
                 return;
             }
         };
+        // 遷移先ごとの用意の見込み（`harness.exe`と同じ付与の関数・同じ承認台帳。ここで1回だけ読む）。
+        let grants = crate::transition_destination::grants_on_this_machine(&workspace_root);
+        self.pending.outlooks =
+            crate::transition_destination::outlooks(&file, ENTRY_DOMAIN, &grants);
+        let provisioned = crate::transition_destination::provisioned_names(&self.pending.outlooks);
         let workspace = workspace_root.to_string_lossy().into_owned();
-        let declared = match DeclaredEdges::build(&file, &workspace, ENTRY_DOMAIN) {
+        let declared = match DeclaredEdges::build(&file, &workspace, ENTRY_DOMAIN, &provisioned) {
             Ok(declared) => declared,
             Err(e) => {
                 self.pending.observed.clear();
@@ -412,8 +424,14 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+        // 遷移先の欄に居る間は、文字キーを名前の入力に回す（FS/ネットタブのドメイン欄と同じ）。
+        if self.pending.destination.focused {
+            self.on_destination_key(key);
+            return None;
+        }
         let rows = self.pending.visible().len();
         match key.code {
+            KeyCode::Tab | KeyCode::BackTab => self.focus_destination(),
             KeyCode::Esc => self.screen = Screen::Record,
             KeyCode::Up => checkbox_tree::move_row(self.pending.row_mut(), rows, -1),
             KeyCode::Down => checkbox_tree::move_row(self.pending.row_mut(), rows, 1),
@@ -674,7 +692,11 @@ impl App {
         let mut lines = Vec::new();
         let mut count = 0usize;
         if has_policy {
-            let Some(policy_lines) = self.transition_plan_lines(&approve, &remove, &mut count)
+            let Some(to_domain) = self.destination_for_commit(!approve.is_empty()) else {
+                return;
+            };
+            let Some(policy_lines) =
+                self.transition_plan_lines(&approve, &remove, &to_domain, &mut count)
             else {
                 return;
             };
@@ -706,11 +728,13 @@ impl App {
         &mut self,
         approve: &[EdgeRef],
         remove: &[EdgeRef],
+        to_domain: &str,
         count: &mut usize,
     ) -> Option<Vec<String>> {
         let request = TransitionRequest {
             workspace_root: &self.workspace_root,
             from_domain: ENTRY_DOMAIN,
+            to_domain,
             approve,
             remove,
             record_session: None,
@@ -732,8 +756,11 @@ impl App {
         let mut lines = vec![
             format!("{}:", policy_file::path(&self.workspace_root).display()),
             format!("遷移元ドメイン: {ENTRY_DOMAIN}"),
-            String::new(),
         ];
+        if !plan.added.is_empty() {
+            lines.push(format!("遷移先ドメイン: {}", plan.to_domain));
+        }
+        lines.push(String::new());
         if !plan.added.is_empty() {
             lines.push(format!("許す遷移 {}件:", plan.added.len()));
             for edge in &plan.added {
@@ -772,12 +799,9 @@ impl App {
         // 文言の持ち主は`transition_approve`（表示側で書き写さない、`B-05`）。
         lines.extend(transition_approve::ACE_NOTICE.lines().map(str::to_string));
         if !plan.added.is_empty() {
+            // 遷移先を`harness.exe`が用意する見込み（用意されないなら⚠で。書くかはユーザーが決める）。
             lines.push(String::new());
-            lines.extend(
-                transition_approve::SELF_LOOP_NOTICE
-                    .lines()
-                    .map(str::to_string),
-            );
+            lines.extend(self.destination_notice_lines(&plan));
         }
         Some(lines)
     }
@@ -810,9 +834,13 @@ impl App {
 
         let mut done: Vec<String> = Vec::new();
         if has_policy {
+            let Some(to_domain) = self.destination_for_commit(!approve.is_empty()) else {
+                return;
+            };
             let request = TransitionRequest {
                 workspace_root: &self.workspace_root,
                 from_domain: ENTRY_DOMAIN,
+                to_domain: &to_domain,
                 approve: &approve,
                 remove: &remove,
                 record_session: None,
@@ -827,8 +855,9 @@ impl App {
             };
             match transition_approve::commit(&self.workspace_root, &plan) {
                 Ok(true) => done.push(format!(
-                    "遷移の宣言を更新しました（許可 {}件 / 取り消し {}件。ACLは変わりません）",
+                    "遷移の宣言を更新しました（許可 {}件 → {} / 取り消し {}件。ACLはいま変わりません）",
                     plan.added.len(),
+                    plan.to_domain,
                     plan.removed.len()
                 )),
                 Ok(false) => done.push(

@@ -10,9 +10,17 @@
 //! # ここが「判定・整形・並べ替え」の唯一の実装である
 //!
 //! 同じ一覧を**2つの読み手**が使う——モデル（`can_run_program`ツール）と、
-//! ポリシーエディタの遷移画面（段階⑦。まだ無い）。**2つ作ると、モデルに見えるものと
+//! ポリシーエディタの遷移画面（段階⑦）。**2つ作ると、モデルに見えるものと
 //! ユーザーに見えるものがずれる**（§19.3.8）。だから純粋なこのクレートに置き、
 //! 表示の都合（ページング・文面）だけを呼び出し側に持たせる。
+//!
+//! # 「いま起こせるか」は呼び出し側が渡す表で決まる（2026-10-01）
+//!
+//! 別のドメインへ移す辺は、**そのドメインの実体（package SIDとcapabilityの組）が用意されている
+//! ときだけ**起こせる（Spawn Daemonは表に無い遷移先を`TargetDomainNotProvisioned`で断る）。
+//! 用意したかどうかはこのクレートからは分からないので、**呼び出し側が表を渡す**。
+//! `harness.exe`は実際に用意できたもの（`domain_provision`の結果）を、ポリシーエディタは
+//! 「用意される見込み」を渡す——後者は別プロセスなので実行時の失敗までは知らない。
 //!
 //! # LLMを1本も呼ばない
 //!
@@ -22,6 +30,8 @@
 //!
 //! **同義語の辞書も持たない。** `svn`≈`git`という知識は消費者であるモデルが既に持っており、
 //! 欠けているのは「いま何が使えるか」という事実だけだからである。
+
+use std::collections::BTreeSet;
 
 use crate::transition::{ArgvMatcher, ExeMatcher, GraphError, GraphInput};
 
@@ -47,9 +57,10 @@ pub struct Row {
     pub rights: Rights,
     /// **いま実際に起こせるか。**
     ///
-    /// `false`は「宣言は正しいが、harness側がまだ実装していない」を意味する
-    /// （`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2の暫定。遷移先が別ドメインの辺は
-    /// そのドメインの実体を作る機構が無いので起こせない）。
+    /// 遷移先が呼び出し元と同じドメインなら常に`true`（Daemonは表を引かずに呼び出し元の実体で
+    /// 起こす）。別のドメインなら、[`rows`]へ渡された「用意できた遷移先」に入っているときだけ`true`。
+    /// `false`は「宣言は正しいが、遷移先のドメインがこのセッションでは用意されていない」を意味する
+    /// （通信を宣言している・宣言に許可が付いていない等。理由は用意した側が持つ）。
     ///
     /// **この欄を落とすとモデルへ嘘を言うことになる**——一覧に出ているのに撃つと拒否される。
     pub runnable_now: bool,
@@ -82,7 +93,15 @@ impl Rights {
 ///
 /// 宣言されていないドメイン名を渡したときは**空を返す**。これは「辺が0本」と同じ扱いで、
 /// 区別が要る呼び出し側は[`GraphInput::domains`]を自分で見ること。
-pub fn rows(input: &GraphInput<'_>, from_domain: &str) -> Result<Vec<Row>, GraphError> {
+///
+/// `provisioned`は**実体が用意されている遷移先ドメインの名前**（`policy.json`の`domains[].name`）。
+/// 既定値を持たせない——空を渡すと「別ドメイン行きは全部起こせない」になり、渡し忘れが
+/// 安全側へ黙って倒れる。何を渡すかは呼び出し側ごとに選ぶ（モジュールdoc）。
+pub fn rows(
+    input: &GraphInput<'_>,
+    from_domain: &str,
+    provisioned: &BTreeSet<String>,
+) -> Result<Vec<Row>, GraphError> {
     let Some(view) = input.domains.iter().find(|d| d.name == from_domain) else {
         return Ok(Vec::new());
     };
@@ -104,19 +123,10 @@ pub fn rows(input: &GraphInput<'_>, from_domain: &str) -> Result<Vec<Row>, Graph
             argv_is_pattern,
             to_domain: edge.to.clone(),
             rights: crate::transition::rights_summary(input, &edge.to)?,
-            // **暫定**（§10.1.2の撤去一覧5点目）。
-            //
-            // # 2026-09-20以降、この値は**安全な向きに外れている**
-            //
-            // §22.9の骨格が着地し、**用意された別ドメインの辺は実際に起こせる**ように
-            // なった。ここはそれを知らないので`false`を返す——つまり
-            // 「起こせるのに起こせないと言う」側に外れる。
-            //
-            // **嘘で許可するのではなく、使える物を勧めないだけ**なので、直すまでの間も
-            // 危険側には倒れない。正しく直すには「このセッションが何を用意したか」を
-            // 入力として受け取る必要があり、**呼び出し側の1つ（ポリシーエディタ）は
-            // 別プロセスでそれを知らない**ので、渡し方ごと決める回が要る。
-            runnable_now: edge.to == from_domain,
+            // Spawn Daemonの引き方と同じ2段（`spawnd::server::serve_spawn_request`）——
+            // 自己ループは表を引かずに起こし、別ドメインは用意された表に在るときだけ起こす。
+            // かつては「同じドメインか」だけを見ていた（§10.1.2の撤去一覧5点目。2026-10-01に外した）。
+            runnable_now: edge.to == from_domain || provisioned.contains(&edge.to),
         });
     }
     Ok(rows)

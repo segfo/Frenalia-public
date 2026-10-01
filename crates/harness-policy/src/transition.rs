@@ -551,6 +551,29 @@ pub fn check_all(input: &GraphInput<'_>) -> Result<Vec<Rejection>, GraphError> {
     Ok(GraphFacts::new(input)?.check_all())
 }
 
+/// `from`の`edge_index`番目の辺の向き（§19.1・§19.3.4）。**検査に落ちる宣言でも答える**
+/// （[`TransitionGraph::build`]を通さない）。辺が無ければ`None`。
+///
+/// 検査に落ちた理由を**人へ説明し直す**ために使う——ポリシーエディタは作業ディレクトリを宣言しない
+/// ので、「広げる遷移は固定が要る」と言われても直しようが無く、別の言い方が要る。
+/// **向きの規則はここで書かない。** [`GraphFacts::direction`]ただ1つを呼ぶ（`B-13`）。
+pub fn edge_direction(
+    input: &GraphInput<'_>,
+    from: &str,
+    edge_index: usize,
+) -> Result<Option<Direction>, GraphError> {
+    let facts = GraphFacts::new(input)?;
+    let Some(edge) = input
+        .domains
+        .iter()
+        .find(|d| d.name == from)
+        .and_then(|view| view.process.transitions.get(edge_index))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(facts.direction(from, edge_index, &edge.to)))
+}
+
 /// 固定辺で**固定したファイル**（起こす実行ファイルと、`argv[0]`以降の絶対パスらしいトークン）を、
 /// 書かれた綴りのまま返す。
 ///

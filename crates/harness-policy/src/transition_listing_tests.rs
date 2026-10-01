@@ -107,7 +107,7 @@ fn rows_carry_the_declared_spelling_in_declaration_order() {
         ],
     );
 
-    let rows = rows(&declared.input(), "shell").expect("list");
+    let rows = rows(&declared.input(), "shell", &none()).expect("list");
 
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].exe, r"C:\Program Files\Git\bin\git.exe");
@@ -125,19 +125,16 @@ fn rows_carry_the_declared_spelling_in_declaration_order() {
 #[test]
 fn an_undeclared_domain_has_no_rows() {
     let declared = Declared::default().domain("shell", vec![]);
-    assert!(rows(&declared.input(), "nowhere").expect("list").is_empty());
+    assert!(rows(&declared.input(), "nowhere", &none()).expect("list").is_empty());
 }
 
-/// **【暫定】遷移先が別ドメインの辺には「いまは起こせない」印が付く**
-/// （`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2の撤去一覧5点目）。
-///
-/// 印を落とすと、一覧に出ているのに撃つと拒否される——**モデルへ嘘を言う**ことになる。
-/// **撤去一覧の5点目を消したらこのテストごと消す**（暫定が残っていることを固定するためだけに在る）。
-/// 以前は「§22.9が着地したら」と書いていたが、§22.9の骨格は2026-09-20に着地し、5点目は
-/// 安全な向きに外れる暫定として**意図して残されている**（同設計書の撤去一覧）。
-#[test]
-fn an_edge_to_another_domain_is_marked_as_not_runnable_yet() {
-    let declared = Declared::default()
+/// 用意する表を何も渡さない（別ドメイン行きは1本も起こせない）。
+fn none() -> std::collections::BTreeSet<String> {
+    std::collections::BTreeSet::new()
+}
+
+fn shell_with_a_self_loop_and_an_edge_to_tools() -> Declared {
+    Declared::default()
         .domain(
             "shell",
             vec![
@@ -145,14 +142,42 @@ fn an_edge_to_another_domain_is_marked_as_not_runnable_yet() {
                 edge(lit(r"C:\node.exe"), any(), "tools"),
             ],
         )
-        .domain("tools", vec![]);
+        .domain("tools", vec![])
+}
 
-    let rows = rows(&declared.input(), "shell").expect("list");
+/// **禁止側**: 遷移先のドメインが用意されていなければ、別ドメイン行きの辺は「いまは起こせない」。
+///
+/// 印を落とすと、一覧に出ているのに撃つと拒否される——**モデルへ嘘を言う**ことになる
+/// （Spawn Daemonは表に無い遷移先を`TargetDomainNotProvisioned`で断る）。
+/// 自己ループは表を引かないので、表が空でも起こせる。
+#[test]
+fn an_edge_to_a_domain_that_was_not_provisioned_is_not_runnable() {
+    let declared = shell_with_a_self_loop_and_an_edge_to_tools();
 
-    assert!(rows[0].runnable_now, "同じドメイン行きは起こせる");
+    let rows = rows(&declared.input(), "shell", &none()).expect("list");
+
+    assert!(rows[0].runnable_now, "同じドメイン行きは表に関係なく起こせる");
     assert!(
         !rows[1].runnable_now,
-        "別ドメイン行きが「起こせる」と出ている。一覧に出したものが撃つと拒否される"
+        "用意されていない別ドメイン行きが「起こせる」と出ている。一覧に出したものが撃つと拒否される"
+    );
+}
+
+/// **許可側（対）**: 用意できた遷移先への辺は「起こせる」と出る（§10.1.2の撤去一覧5点目を外した）。
+///
+/// 対にしないと、「別ドメインは常に起こせない」と答える古い実装でも禁止側は緑のままで、
+/// **使える遷移をモデルに勧めない**状態が誰にも気付かれずに残る（`B-35`）。
+#[test]
+fn an_edge_to_a_provisioned_domain_is_runnable() {
+    let declared = shell_with_a_self_loop_and_an_edge_to_tools();
+    let provisioned: std::collections::BTreeSet<String> = ["tools".to_string()].into();
+
+    let rows = rows(&declared.input(), "shell", &provisioned).expect("list");
+
+    assert!(rows[0].runnable_now);
+    assert!(
+        rows[1].runnable_now,
+        "用意できた遷移先への辺を「いまは起こせない」と言っている"
     );
 }
 
@@ -183,7 +208,7 @@ fn rights_are_counted_over_the_reachable_closure_not_just_the_direct_declaration
             vec![],
         );
 
-    let rows = rows(&declared.input(), "shell").expect("list");
+    let rows = rows(&declared.input(), "shell", &none()).expect("list");
 
     assert_eq!(rows.len(), 1);
     let rights = &rows[0].rights;
@@ -204,7 +229,7 @@ fn a_target_that_declares_nothing_has_an_empty_summary() {
         .domain("shell", vec![edge(lit(r"C:\git.exe"), any(), "bare")])
         .domain("bare", vec![]);
 
-    let rows = rows(&declared.input(), "shell").expect("list");
+    let rows = rows(&declared.input(), "shell", &none()).expect("list");
     assert!(rows[0].rights.is_empty());
 }
 

@@ -22,6 +22,17 @@
 //! 承認だけ作ると、**間違えて承認した辺を手でJSONを編集しないと消せない**（`B-01`:
 //! 対の片方だけ実装しない）。FS側が`approve`と`unapprove`を対で持っているのと同じ形を、
 //! 遷移では1モジュールの中に置く——指す対象（[`EdgeRef`]）が同じだからである。
+//!
+//! # 遷移先は呼び出し側が選ぶ（2026-10-01）
+//!
+//! かつては遷移先を必ず呼び出し元と同じドメインに倒していた（`provisional_destination`。
+//! `harness.exe`が別ドメインを用意できるかをエディタが知る手段が無かったため）。#30（D-112）で
+//! 用意できるかが`policy.json`と承認台帳から決まるようになったので外し、[`TransitionRequest::to_domain`]で
+//! 受ける。**書く前に断るのは2つだけ**——入れ物の名前にできない名前
+//! （[`crate::transition_destination::profile_name_problem`]）と、編集時検査に落ちる宣言。
+//! 「宣言の上では用意されない」遷移先（通信を宣言している・許可が付かない宣言がある）は**断らずに書く**
+//! ——警告は画面が[`crate::transition_destination::Outlook`]で出す（`Startable`と同じ姿勢。
+//! 書けるが通らないことを見えるところへ出し、判断はユーザーに残す）。
 
 use std::path::Path;
 
@@ -29,26 +40,18 @@ use harness_change_ledger::path_rules::fold_for_pattern_comparison;
 use harness_policy::policy_file::{self, PolicyDomain, PolicyFile, PolicyFileError};
 use harness_policy::transition::{self, AnyMarker, ArgvMatcher, ExeMatcher, TransitionEdge};
 
-/// 取り消しがACLに何をするのかの説明。**この文言の持ち主はここだけ**（CLIもTUIもこれを出す）。
+/// 承認・取り消しがACLに何をするのかの説明。**この文言の持ち主はここだけ**（CLIもTUIもこれを出す）。
 ///
-/// FS宣言の承認と見た目が同じなので、**何も起きないことを言わないと**「ACLが変わった」と
+/// FS宣言の承認と見た目が同じなので、**いま何も起きないことを言わないと**「ACLが変わった」と
 /// 読まれる（決定18: ACEを付ける経路は`preflight`ただ1つ）。
+///
+/// **2行目は2026-10-01に足した。** 別ドメインへの遷移を書けるようになり、遷移先になったドメインの
+/// 承認済みファイル宣言には、`harness.exe`が遷移の強制を有効にした起動で許可を付ける（D-112の
+/// 「付与する範囲」——遷移先になっていることが条件の1つ）。「変わるのは起こしてよいかだけ」と
+/// 言い切ると、その帰結が見えない。
 pub const ACE_NOTICE: &str = concat!(
-    "注: 遷移の宣言はファイルやネットワークの許可とは別物で、実マシンのACLは変わりません。\n",
-    "    変わるのは「このプログラムを起こしてよいか」だけです。"
-);
-
-/// 自己ループにしか宣言できないことの説明。**暫定**（下記[`provisional_destination`]）。
-///
-/// # いつ消えるか
-///
-/// §22.9（ドメインごとのプロファイル発行器）が着地した日。
-/// この定数を消すと、参照している画面がコンパイルできなくなる。
-pub const SELF_LOOP_NOTICE: &str = concat!(
-    "注: いまは「同じドメインの中で起こす」宣言しか書けません（暫定）。\n",
-    "    代償が3つあります——(1) 以降の深さを区別できなくなる (2) 同じドメインのプロセスは\n",
-    "    互いにコードを注入できる (3) 連鎖の深さに上限が無くなる（止められるのは取り消しと\n",
-    "    時間切れだけ）。別ドメインへ分ける宣言は、その実体を作る機構が入ってから書けます。"
+    "注: 遷移の宣言を書いても、いま実マシンのACLは変わりません（変わるのは「起こしてよいか」）。\n",
+    "    別ドメイン行きは、遷移を強制する起動でそのドメインの承認済み宣言へ許可が付く理由になります。"
 );
 
 /// 辺1本の指し方。**承認と取り消しで同じ型を使う。**
@@ -103,30 +106,7 @@ impl ArgvChoice {
     }
 }
 
-/// **【暫定】この辺の遷移先。いまは必ず呼び出し元と同じドメイン（自己ループ）である。**
-///
-/// # なぜ選べないのか
-///
-/// 別のドメインで起こすには、そのドメインの`(package SID, capability SIDの組)`が要る。
-/// 今日プロファイルを作る機構はセッション単位とMCPサーバ単位の2つだけで、
-/// **ドメインを鍵にした発行器が無い**（`plans/DESIGN-MAC-BROKER.md` §22.9）。
-/// だから別ドメイン宛の辺は宣言できても**Daemonが`TargetDomainNotProvisioned`で断る**
-/// ——「書けるのに一度も通らない辺」を作らせないために、ここで自己ループへ倒す。
-///
-/// # いつ・どうやって消すのか
-///
-/// §22.9が着地した日に**この関数ごと**消す。
-/// `plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2の「まとめて消す」一覧の**6つ目**に載せてある。
-///
-/// **消す作業は小さい。** 辺を組む[`edge_for`]は遷移先を**引数で**受けるので、
-/// この関数を消して呼び出し元（1箇所）が選んだ値を渡すだけになる。
-/// あわせて[`SELF_LOOP_NOTICE`]と、それを固定している試験
-/// `only_self_loop_edges_are_written_today`を消すこと。
-fn provisional_destination(from_domain: &str) -> String {
-    from_domain.to_string()
-}
-
-/// 辺を1本組み立てる。**遷移先は引数で受ける**（暫定を埋め込まない。上記）。
+/// 辺を1本組み立てる。**遷移先は引数で受ける**（[`TransitionRequest::to_domain`]）。
 fn edge_for(edge: &EdgeRef, to_domain: &str) -> TransitionEdge {
     TransitionEdge {
         exe: ExeMatcher::Literal(edge.exe.clone()),
@@ -146,6 +126,12 @@ pub struct TransitionRequest<'a> {
     pub workspace_root: &'a Path,
     /// 遷移元ドメイン。**画面が1つ持つ**（辺の3つ組のうち1つ目）。
     pub from_domain: &'a str,
+    /// 足す辺の遷移先ドメイン（1回の確定で1つ）。`from_domain`と同じなら自己ループ。
+    ///
+    /// **既定値を持たせない**——呼び出し側が選んだ値を必ず渡す（かつての暫定は、ここを
+    /// 遷移元で埋めていた）。`policy.json`に無い名前なら、宣言の無いドメインとして作る。
+    /// 取り消し（`remove`）には効かない（消す辺は`(exe, argv)`で指す）。
+    pub to_domain: &'a str,
     /// 足す辺。
     pub approve: &'a [EdgeRef],
     /// 消す辺。**`policy.json`に書かれている綴りで指すこと。**
@@ -160,6 +146,21 @@ pub enum TransitionApproveError {
     NothingSelected,
     #[error("この宣言では書けません（何も書いていません）:\n{0}")]
     Rejected(String),
+    /// 遷移先の名前が、`harness.exe`の入れ物（AppContainerプロファイル）の名前にできない。
+    #[error("遷移先ドメイン「{to_domain}」には書けません（何も書いていません）: {reason}")]
+    DestinationName { to_domain: String, reason: String },
+    /// 足そうとした辺が「広げる遷移」で、固定（引数と作業ディレクトリ）が無いので検査に落ちた。
+    ///
+    /// **検査の理由をそのまま出すだけでは足りない**——検査は「argvをリテラルにしcwdを宣言せよ」と
+    /// 言うが、このエディタは作業ディレクトリを宣言しない（[`edge_for`]）ので、その直し方は取れない。
+    #[error(
+        "遷移先「{to_domain}」は、呼び出し元より広い権限に届く（または狭いと証明できない）ので、\
+         引数と作業ディレクトリを固定した遷移としてしか宣言できません。このエディタは作業ディレクトリを\
+         宣言しないので書けません（何も書いていません）。\n\
+         遷移先と、そこから辿れるドメインのファイル・通信の宣言を呼び出し元の宣言の範囲に収めるか、\
+         宣言を持たないドメインを遷移先にしてください。\n検査の理由:\n{detail}"
+    )]
+    WidensWithoutFixing { to_domain: String, detail: String },
     #[error(transparent)]
     PolicyFile(#[from] PolicyFileError),
 }
@@ -181,8 +182,13 @@ pub struct TransitionPlan {
     pub removed: Vec<EdgeRef>,
     /// 消そうとしたが`policy.json`に無かった。
     pub not_found: Vec<EdgeRef>,
-    /// 足す辺の遷移先。**【暫定】いまは遷移元と同じ**（[`provisional_destination`]）。
+    /// 足す辺の遷移先（[`TransitionRequest::to_domain`]そのもの）。
     pub to_domain: String,
+    /// 遷移先が`policy.json`に無かったので、**宣言の無いドメインとして作る**。
+    ///
+    /// 確認ダイアログが言うためにある——黙って作ると、宣言画面（F3）に見覚えの無い空のドメインが
+    /// 現れる（`B-09`: 足したものを足したと言う）。
+    pub created_to_domain: bool,
 }
 
 impl TransitionPlan {
@@ -203,12 +209,20 @@ pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApp
     if req.approve.is_empty() && req.remove.is_empty() {
         return Err(TransitionApproveError::NothingSelected);
     }
+    let to_domain = req.to_domain.to_string();
+    // **入れ物の名前にできない遷移先は書く前に断る**（決定63「自動生成名の検証を『あれば良い』に
+    // 落とさない」と同じ理由。編集時検査は通るのに、`harness.exe`が起動時に用意できない）。
+    // 自己ループは入れ物を作らないので見ない。取り消しだけの確定も見ない（遷移先を使わない）。
+    if !req.approve.is_empty() && to_domain != req.from_domain {
+        if let Some(reason) = crate::transition_destination::profile_name_problem(&to_domain) {
+            return Err(TransitionApproveError::DestinationName { to_domain, reason });
+        }
+    }
     let mut file = policy_file::load(req.workspace_root)?;
     if file.domain(req.from_domain).is_none() {
         file.domains.push(PolicyDomain::new(req.from_domain));
         file.domains.sort_by(|a, b| a.name.cmp(&b.name));
     }
-    let to_domain = provisional_destination(req.from_domain);
 
     let mut plan = TransitionPlan {
         file: PolicyFile::default(),
@@ -217,7 +231,10 @@ pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApp
         removed: Vec::new(),
         not_found: Vec::new(),
         to_domain: to_domain.clone(),
+        created_to_domain: false,
     };
+    // 足した辺の添字（検査に落ちたとき、どれが「広げる遷移」かを向きの判定器に聞くため）。
+    let mut added_indices: Vec<usize> = Vec::new();
 
     {
         let entry = file
@@ -252,6 +269,7 @@ pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApp
                 continue;
             }
             entry.process.transitions.push(edge_for(target, &to_domain));
+            added_indices.push(entry.process.transitions.len() - 1);
             plan.added.push(target.clone());
         }
 
@@ -270,12 +288,24 @@ pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApp
         }
     }
 
+    // **遷移先が無ければ、宣言の無いドメインとして作る。** 編集時検査は「宣言されていない
+    // ドメインへの遷移」を断る（打ち間違いが空の＝常に狭い権限で黙って通るのを止めるため）ので、
+    // 作らないと書けない。作るのは**足す辺があるときだけ**（取り消しだけ・既にある辺だけの確定で
+    // 見覚えの無いドメインを増やさない）。
+    if !plan.added.is_empty() && file.domain(&to_domain).is_none() {
+        file.domains.push(PolicyDomain::new(to_domain.as_str()));
+        file.domains.sort_by(|a, b| a.name.cmp(&b.name));
+        plan.created_to_domain = true;
+    }
+
     // **書く前に検査する。** ここで落ちれば`policy.json`は元のままである。
     //
     // **`policy.json`の外で書込を許した場所は空で渡す**——エディタはそれを知らない
     // （`--fs-allow`はharnessの起動ごとの指定で、書く時点では原理的に分からない）。
     // したがって固定した遷移は、ここを通っても`harness.exe`の起動時に初めて拒否されることがある
     // （残課題 サンドボックス周辺 #65。`policy_file::load_for_session`のdoc）。
+    // **このエディタが書く辺は固定した遷移にならない**（`cwd`を宣言しない。[`edge_for`]）ので、
+    // 足した辺がそれで落ちることは無い（試験`an_edge_this_editor_writes_survives_the_writable_places_harness_adds`）。
     let workspace = req.workspace_root.to_string_lossy();
     let input = file.transition_graph_input(Some(workspace.as_ref()), &[]);
     let rejected = match transition::check_all(&input) {
@@ -283,7 +313,19 @@ pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApp
         Err(e) => vec![e.to_string()],
     };
     if !rejected.is_empty() {
-        return Err(TransitionApproveError::Rejected(rejected.join("\n")));
+        let detail = rejected.join("\n");
+        // 足した辺が「広げる遷移」だったなら、このエディタで取れる直し方を言い直す（変種のdoc）。
+        let widens = added_indices.iter().any(|index| {
+            matches!(
+                transition::edge_direction(&input, req.from_domain, *index),
+                Ok(Some(transition::Direction::WiderOrUnknown))
+            )
+        });
+        return Err(if widens {
+            TransitionApproveError::WidensWithoutFixing { to_domain, detail }
+        } else {
+            TransitionApproveError::Rejected(detail)
+        });
     }
 
     plan.file = file;
