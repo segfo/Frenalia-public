@@ -1275,6 +1275,7 @@ dependencies = [
  "harness-sandbox",
  "harness-term",
  "harness-tools",
+ "harness-user-config",
  "ratatui",
  "serde",
  "serde_json",

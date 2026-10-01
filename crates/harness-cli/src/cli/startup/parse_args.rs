@@ -86,16 +86,33 @@ pub(super) fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
     // 補助プロセス自身が同じ関数で読んで行う（`harness_sandbox::process_hardening`）
     // ——補助プロセスを起こす経路は`harness.exe`だけでなくポリシーエディタにもあるので、
     // 起こす側から値を運ぶ形にすると、運ぶ処理を書いた経路でしか設定が効かない（`B-06`）。
-    if let Err(e) = harness_user_config::load() {
-        eprintln!("error: {e}");
-        eprintln!(
-            "note: fix the file, or delete it to start again from the defaults \
-             (it is written back automatically when missing)"
-        );
-        return Err(ExitCode::FAILURE);
-    }
+    let user_config = match harness_user_config::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("error: {e}");
+            eprintln!(
+                "note: fix the file, or delete it to start again from the defaults \
+                 (it is written back automatically when missing)"
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    };
 
     let mut cli = Cli::parse();
+
+    // [残課題#68] **設定ファイルの値を、コマンドラインのフラグが上書きする。**
+    //
+    // 優先順位は「既定値 → `cli-defaults.toml` → このフラグ」で、打たなければ設定ファイルの値、
+    // 設定ファイルにも無ければ既定（掛ける）。解決した結果をプロセスへ1つ置き、
+    // 補助プロセスを起こすときに起動引数として渡す（`process_hardening`のdoc）。
+    //
+    // **ここで解決するのは、起こす箇所が3つあるからである**——値を引数で引き回すと、
+    // 途中の関数すべてに欄が1つ増え、増やし忘れた経路だけが既定で動く（`B-06`）。
+    #[cfg(windows)]
+    harness_sandbox::process_hardening::set_link_mitigation(
+        cli.refuse_untrusted_links
+            .unwrap_or(user_config.security.refuse_untrusted_links),
+    );
 
     let workspace_root = match cli.cwd.clone() {
         Some(dir) => dir,

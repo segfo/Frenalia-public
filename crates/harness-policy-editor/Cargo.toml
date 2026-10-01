@@ -26,6 +26,7 @@ harness-grant-ledger = { version = "0.1.0", path = "../harness-grant-ledger" }
 # 「宣言済み」と言っているのに撃つと断られる（段階⑦、`transition_candidates`）。
 harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 harness-sandbox = { version = "0.1.0", path = "../harness-sandbox" }
+harness-user-config = { version = "0.1.0", path = "../harness-user-config" }
 # 記録モードのTier1起動は`run_shell`とまったく同じブートストラップを通す（4経路目、B-05）。
 harness-tools = { version = "0.1.0", path = "../harness-tools" }
 clap = { version = "4.6.1", features = ["derive"] }

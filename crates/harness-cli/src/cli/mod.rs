@@ -856,8 +856,25 @@ pub(crate) struct Cli {
     /// ままである（「打たなかった」と「打って偽にした」を区別する必要がある）。
     /// かつては値が必須で、**docが案内していた裸の形が必ずclapエラーになっていた**
     /// （`plans/DESIGN-CLI-OPTIONS.md` §4.9 対象3）。
-    #[arg(long = "policy-learn", num_args = 0..=1, default_missing_value = "true")]
-    policy_learn: Option<bool>,
+    #[arg(long = "policy-learn", num_args = 0..=1, default_missing_value = "true")]
+    policy_learn: Option<bool>,
+
+    /// 管理者権限で動く補助プロセス（netfilterd・policy-learnd・vmsandboxd）が、
+    /// 管理者でないユーザーが作ったリンク（ジャンクション・シンボリックリンク）を辿らないようにするか。
+    ///
+    /// **省略時は`cli-defaults.toml`の`security.refuse_untrusted_links`→既定(true)の順に
+    /// フォールバックする。** 設定ファイルが恒久的な既定値を持ち、このフラグが**その起動だけ**
+    /// 上書きする（`plans/DESIGN-CLI-OPTIONS.md` §3.2）。
+    ///
+    /// **裸で打てる**（`--refuse-untrusted-links`＝有効化）。`--refuse-untrusted-links=false`と
+    /// 書けば、設定で有効になっていてもこの実行だけ無効にできる——だから真偽フラグではなく
+    /// `Option<bool>`である（「打たなかった」と「打って偽にした」を区別する必要がある）。
+    ///
+    /// 切ると、リンクを辿る経路の守りが1枚減る（書き込む前にパスを実体へ解決して確かめる処理は残る）。
+    /// 何を守り何を守らないかは`harness_sandbox::process_hardening`のモジュールdocが持つ。
+    /// **切った起動は診断ログ（`privhelper.log`）に残る。**
+    #[arg(long = "refuse-untrusted-links", num_args = 0..=1, default_missing_value = "true")]
+    refuse_untrusted_links: Option<bool>,
 
     /// Streamable HTTPのMCPサーバとして接続してよい宛先を足す（繰り返し指定可、M15.6、D-41/D-49）。
     ///

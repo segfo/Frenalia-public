@@ -361,7 +361,14 @@ unsafe fn launch_daemon_elevated(
 
     let verb_w = wide("runas");
     let file_w = wide(&daemon_path.to_string_lossy());
-    let params_w = wide(pipe_name);
+    // [残課題#68] 補助プロセスへ「掛けるか」を**起動引数で**渡す。
+    // 起こす側（`harness.exe`・ポリシーエディタ）が設定ファイルとコマンドラインのフラグを
+    // 解決した結果が入る（`process_hardening::set_link_mitigation`）。
+    // 渡さなければ掛ける側に倒れる（同関数のdoc）。
+    let params_w = wide(&format!(
+        "{pipe_name}{}",
+        crate::process_hardening::link_mitigation_arg_suffix()
+    ));
 
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,

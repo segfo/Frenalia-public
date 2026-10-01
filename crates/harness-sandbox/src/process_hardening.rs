@@ -89,35 +89,69 @@ pub fn refuse_untrusted_links() -> Result<(), String> {
     Err("windows only".to_string())
 }
 
-/// この緩和策を掛けるかどうかを、ユーザー単位の設定から読む。
+/// 補助プロセスの起動引数で「この緩和策を掛けない」と伝える綴り。
 ///
-/// # なぜ起こす側から渡さず、このプロセスが自分で読むのか
+/// # なぜ起動引数なのか
 ///
-/// **補助プロセスを起こす経路が1つではないからである。** `harness.exe`だけでなく
-/// `harness-policy-editor.exe`も同じ補助プロセス（netfilterd・policy-learnd）を起こす。
-/// 起こす側が値を運ぶ形にすると、**運ぶ処理を書いた経路でしか設定が効かない**
-/// ——実際、`harness.exe`側にだけ配線した版を実機で撃ったところ、ポリシーエディタ経由の起動では
-/// 設定が無視されていた（`B-06`: 同じ状態を作り得る経路を全部数える）。
+/// **設定ファイルの値を、コマンドラインのフラグが上書きできるようにするため**である。
+/// 補助プロセスが設定ファイルを自分で読む形だと、`harness.exe`がフラグで上書きした結果は
+/// そのプロセスへ届かない——フラグで切ったつもりが補助プロセスには効かない、という食い違いが残る。
 ///
-/// **読む規則は`harness_user_config::load`ただ1つ**なので、読む場所が複数でも正本は1つである。
-/// `harness.exe`も起動時に同じ関数を呼ぶが、あちらの目的は**壊れていたら早く止める**ことで、
-/// 掛けるかどうかの判断はここで行う。
+/// **起こす側が最終的な値を渡し、補助プロセスは設定ファイルを読まない。** これで
+/// 「読む場所は`harness.exe`とポリシーエディタだけ、効かせる値は渡されたもの1つ」になる。
 ///
-/// # 読めないときは掛ける
+/// # 渡さなかったときは掛ける
 ///
-/// 設定ファイルを読めない（置き場を決められない・壊れている）ときは**掛ける側へ倒す**。
-/// 倒れる向きが「守る」側になるのが要点で、設定を読めなかったことを理由に守りを外さない。
-/// **ただし黙らない**——読めなかったことを診断ログへ1行書く。
-fn user_wants_the_mitigation() -> (bool, Option<String>) {
-    match harness_user_config::load() {
-        Ok(config) => (config.security.refuse_untrusted_links, None),
-        Err(e) => (
-            true,
-            Some(format!(
-                "could not read the user configuration ({e}); keeping the mitigation on"
-            )),
-        ),
+/// この綴りが引数に無ければ掛ける。**既定を緩い側に倒すと、渡し忘れた経路だけが黙って守りを失う**
+/// ——実際、環境変数で運ぶ版ではポリシーエディタ経由の起動に届いておらず、実機で初めて分かった
+/// （`B-06`: 同じ状態を作り得る経路を全部数える）。倒れる向きを「守る」側にしておけば、
+/// 配線漏れは「切ったのに切れない」として現れ、守りが消える側には倒れない。
+pub const NO_LINK_MITIGATION_ARG: &str = "--no-refuse-untrusted-links";
+
+/// 起こす側のプロセスが、起動時に1度だけ決める「補助プロセスへ掛けるか」。
+///
+/// # なぜプロセスに1つ持つのか
+///
+/// 補助プロセスを起こす箇所は3つ（netfilterd・policy-learnd・vmsandboxd）あり、
+/// どれも`harness.exe`やポリシーエディタの奥から呼ばれる。**値を引数で引き回すと、
+/// 途中の関数すべてに欄が1つ増える**——そして増やし忘れた経路だけが既定で動く。
+/// 起動時に1度決まって以後変わらない値なので、プロセスに1つ持たせて取りに行く形にする。
+///
+/// **設定されていなければ掛ける。** 倒れる向きを「守る」側にしておけば、
+/// 呼び忘れは「切ったのに切れない」として現れ、守りが消える側には倒れない。
+static LINK_MITIGATION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 起こす側が、設定ファイルとコマンドラインのフラグを解決した結果を置く。
+///
+/// **起動時に1度だけ呼ぶ。** 2度目以降は無視される（`OnceLock`）——
+/// 途中で変わる値ではないし、変えられると「どの時点の値で起こしたか」が追えなくなる。
+pub fn set_link_mitigation(refuse_untrusted_links: bool) {
+    let _ = LINK_MITIGATION.set(refuse_untrusted_links);
+}
+
+/// 補助プロセスの起動引数の末尾へ足す綴り。
+///
+/// 掛けるなら空、掛けないなら[`NO_LINK_MITIGATION_ARG`]（前に空白を1つ付ける）。
+/// **3つの起こす箇所が同じ関数を通る**ので、綴りが片方だけずれることがない（`B-05`）。
+pub fn link_mitigation_arg_suffix() -> &'static str {
+    if *LINK_MITIGATION.get().unwrap_or(&true) {
+        ""
+    } else {
+        concat!(" ", "--no-refuse-untrusted-links")
     }
+}
+
+/// 自分の起動引数に「掛けない」の綴りがあるか。
+///
+/// **純粋な判定にしてあるのは、切る側と掛ける側を対で測れるようにするため**である
+/// （Win32を1行も呼ばないので、普通の`cargo test`で回る）。
+pub fn args_disable_link_mitigation<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .any(|a| a.as_ref() == NO_LINK_MITIGATION_ARG)
 }
 
 /// [`refuse_untrusted_links`]を呼び、結果を標準エラーへ1行書く。
@@ -125,24 +159,21 @@ fn user_wants_the_mitigation() -> (bool, Option<String>) {
 /// 管理者権限で動く3つの補助プロセスが**同じ1行**を出すための共通の入口である
 /// （各`main`で文面を書くと、いつか片方だけ古くなる。`B-05`）。
 ///
-/// # ユーザーが切っているときは掛けない
+/// # 切るかどうかは起こす側が決める
 ///
-/// 判断の材料は`cli-defaults.toml`の`security.refuse_untrusted_links`で、
-/// **このプロセス自身が読む**（[`user_wants_the_mitigation`]）。
+/// 判断の材料は`cli-defaults.toml`の`security.refuse_untrusted_links`と、それを上書きする
+/// コマンドラインのフラグで、**どちらも起こす側（`harness.exe`・ポリシーエディタ）が解決し、
+/// 結果だけが起動引数で届く**（[`NO_LINK_MITIGATION_ARG`]）。このプロセスは設定ファイルを読まない。
+///
 /// **切った起動では診断ログへ1行残す**——守りが1枚減ったことが、後から障害を追う人に
 /// 見えないまま流れないようにする。
 pub fn harden_elevated_helper(process_name: &str) {
-    let (wanted, warning) = user_wants_the_mitigation();
-    if let Some(warning) = warning {
-        let message = format!("[{process_name}] warning: {warning}");
-        eprintln!("{message}");
-        log_to_privhelper_diagnostics(&message);
-    }
-    if !wanted {
+    if args_disable_link_mitigation(std::env::args()) {
         let message = format!(
-            "[{process_name}] mitigation disabled by the user configuration \
-             (security.refuse_untrusted_links = false in cli-defaults.toml): this process may \
-             follow links created by non-administrators; the path checks before each write still apply"
+            "[{process_name}] mitigation disabled by the caller \
+             (security.refuse_untrusted_links = false, or the matching command-line flag): \
+             this process may follow links created by non-administrators; \
+             the path checks before each write still apply"
         );
         eprintln!("{message}");
         // **切ったことは必ず残す。** このプロセスの標準エラーはどこにも繋がらないので、
@@ -234,6 +265,47 @@ mod toggle_tests {
     ///
     /// 設定ファイルの読み取り（壊れていたら拒否する・誤字を無視しない等）は
     /// `harness-user-config`の単体テストが固定している。
+    /// **禁止側**: 「掛けない」の綴りが引数にあれば切ると読む。
+    #[test]
+    fn the_disable_argument_is_recognised() {
+        assert!(super::args_disable_link_mitigation([
+            "harness-netfilterd.exe",
+            "a-pipe-name",
+            super::NO_LINK_MITIGATION_ARG,
+        ]));
+    }
+
+    /// **許可側（対）**: 綴りが無ければ掛ける。似た綴りにも反応しない。
+    ///
+    /// これが無いと「常に切る」実装でも上のテストが緑になる（`B-35`）。
+    #[test]
+    fn anything_else_keeps_the_mitigation_on() {
+        assert!(!super::args_disable_link_mitigation([
+            "harness-netfilterd.exe",
+            "a-pipe-name",
+        ]));
+        assert!(!super::args_disable_link_mitigation([
+            "harness-vmsandboxd.exe",
+            "--owner-sid",
+            "S-1-5-21-0",
+            "--refuse-untrusted-links",
+        ]));
+    }
+
+    /// 起こす側が足す綴りと、受ける側が探す綴りが**同じ**である。
+    ///
+    /// 別々に書くと、片方だけ直したときに「切ったのに切れない」が無言で成立する（`B-05`）。
+    #[test]
+    fn the_suffix_the_launcher_appends_is_what_the_helper_looks_for() {
+        // 既定（まだ`set_link_mitigation`を呼んでいない）は掛ける側なので空。
+        assert_eq!(super::link_mitigation_arg_suffix(), "");
+        // 切る側の綴りは、受ける側が探すものと一致する。
+        assert_eq!(
+            concat!(" ", "--no-refuse-untrusted-links").trim(),
+            super::NO_LINK_MITIGATION_ARG
+        );
+    }
+
     #[test]
     fn the_default_configuration_keeps_the_mitigation_on() {
         assert!(

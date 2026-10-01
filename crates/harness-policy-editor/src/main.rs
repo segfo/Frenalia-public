@@ -189,6 +189,20 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // [残課題#68] **このプロセスも補助プロセス（netfilterd・policy-learnd）を起こす。**
+    // 起こす箇所は`harness-sandbox`側で共通だが、**掛けるかどうかを解決するのは起こす側の
+    // プロセス**なので、ここでも置く必要がある——`harness.exe`にだけ書いた版を実機で撃つと、
+    // こちら経由の起動では設定が効いていなかった（`B-06`: 同じ状態を作り得る経路を全部数える）。
+    //
+    // **エディタはコマンドラインのフラグを持たない**ので、設定ファイルの値をそのまま使う。
+    // 読めなければ掛ける側に倒れる（`harness_user_config::load`が失敗したときの既定）。
+    #[cfg(windows)]
+    harness_sandbox::process_hardening::set_link_mitigation(
+        harness_user_config::load()
+            .map(|c| c.security.refuse_untrusted_links)
+            .unwrap_or(true),
+    );
+
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Record {
