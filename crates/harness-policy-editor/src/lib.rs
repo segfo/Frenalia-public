@@ -108,6 +108,9 @@ pub mod net_aggregate;
 /// **ここに再公開を残すのは、既存の呼び出し25箇所の綴りを変えないためだけ**であって、
 /// 2つ目の実装ではない（`docs/CODE-STRUCTURE-RULES.md`規則5.0）。
 pub use harness_policy::policy_file;
+/// `policy.json`のファイル宣言1件の種類と`**`を付け替える（宣言画面の`c`・`R`）。
+/// 承認の状態は引き継ぎ、承認と同じ幅の検査を通す。**ACEは触らない**（取り消しと同じ）。
+pub mod reassign;
 pub mod session_dir;
 pub mod session_lock;
 pub mod shell_output;

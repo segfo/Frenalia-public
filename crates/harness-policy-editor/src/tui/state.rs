@@ -788,6 +788,8 @@ pub struct App {
     /// [D-112] 宣言画面の「このマシンでの承認」の状態（未承認の宣言と、承認の予約）。
     /// 中身は`tui::declared`が持つ（このファイルへ状態を広げない、上の`pending`と同じ理由）。
     pub declared_approval: crate::tui::declared::DeclaredApprovalState,
+    /// 宣言画面の付け替え（`c`・`R`）の予約。中身は`tui::declared`の子が持つ（上と同じ理由）。
+    pub declared_reassign: crate::tui::declared::declared_reassign::DeclaredReassignState,
     /// `Esc`を最後に押した時刻。**2回連続で押されたか**を判定するためだけに持つ
     /// （[`is_double_esc`]）。`Esc`以外のキーが来たら捨てる。
     pub last_esc: Option<std::time::Instant>,
@@ -880,6 +882,7 @@ impl App {
             declared_row: 0,
             unapproved: BTreeSet::new(),
             declared_approval: Default::default(),
+            declared_reassign: Default::default(),
             last_esc: None,
             declared_domain: None,
         };

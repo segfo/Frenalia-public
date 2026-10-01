@@ -32,6 +32,12 @@
 //! D-42が禁じているのは「読まずに権限を**与える**」ことである。こちらは権限を**減らす**向きなので
 //! 同じ制約は掛からない——減らす側を面倒にすると、「とりあえず全部消してやり直す」という
 //! 安全な回復手段が失われる。
+//!
+//! # 付け替え（`c`・`R`）
+//!
+//! 宣言1件の種類と`**`を変える予約（[`declared_reassign`]）。確定は[`crate::reassign`]を通り、
+//! 承認の状態を引き継ぎ、承認と同じ検査を掛ける。確定の順は「承認 → 付け替え → 取り消し」
+//! （権限を減らす側が後）。
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
@@ -68,10 +74,13 @@ impl App {
         self.declared = unapprove::all_targets(&file);
         self.rebuild_declared_tree();
 
-        // 存在しない宣言への予約を落とす。
+        // 存在しない宣言への予約を落とす（取り消しも付け替えも同じ規則で）。
         let alive: std::collections::BTreeSet<UnapproveTarget> =
             self.declared.iter().cloned().collect();
         self.unapproved.retain(|target| alive.contains(target));
+        self.declared_reassign
+            .reserved
+            .retain(|from, _| alive.contains(from));
 
         // [D-112] このマシンで未承認の宣言を数え直す。予約は**まだ未承認のもの**だけ残す
         // （別の経路で承認済みになった宣言を、もう一度承認する予約として持ち歩かない）。
@@ -152,6 +161,9 @@ impl App {
             KeyCode::Char(' ') => self.toggle_declared_subtree(),
             KeyCode::Char('A') => self.reserve_all_declared(),
             KeyCode::Char('y') => self.toggle_declared_approval_subtree(),
+            // 付け替え。キーは候補画面の`c`・`R`と同じ（`reassign`のモジュールdoc）。
+            KeyCode::Char('c') => self.cycle_declared_access(),
+            KeyCode::Char('R') => self.toggle_declared_recursive(),
             KeyCode::Char('r') => {
                 self.reload_declared();
                 self.status = "policy.jsonを読み直しました".to_string();
@@ -284,20 +296,43 @@ impl App {
         self.status = format!("全{count}件を取り消します（aで確定 / Spaceで個別に戻せます）");
     }
 
-    /// 承認と取り消しの確認ダイアログを出す（**まだ書かない**）。
+    /// 承認・付け替え・取り消しの確認ダイアログを出す（**まだ書かない**）。
     fn request_declared_changes(&mut self) {
-        if self.unapproved.is_empty() && self.declared_approval.reserved.is_empty() {
-            self.status = "取り消す宣言をスペースで、このマシンで承認する宣言をyで選んでください\
-                           （Aで全件取り消し、Spaceとyは配下まとめて）"
+        if self.unapproved.is_empty()
+            && self.declared_approval.reserved.is_empty()
+            && self.declared_reassign.reserved.is_empty()
+        {
+            self.status = "取り消す宣言をスペースで、このマシンで承認する宣言をyで、\
+                           付け替える宣言をcかRで選んでください\
+                           （Aで全件取り消し、Spaceとyは配下まとめて、cとRは1行ずつ）"
                 .to_string();
             return;
         }
         // [D-112] 承認の分。断った宣言は**確認の画面に理由ごと出す**（黙って落とさない、B-10）。
-        let approval_lines = match self.declared_approval_plan() {
-            Ok(plan) => declared_approval_lines(&plan),
+        let approval_plan = match self.declared_approval_plan() {
+            Ok(plan) => plan,
             Err(e) => {
                 self.modal = Some(Modal {
                     title: "承認できません（何も書いていません）".to_string(),
+                    lines: e.to_string().lines().map(str::to_string).collect(),
+                    confirm: Confirm::ReadOnly,
+                });
+                return;
+            }
+        };
+        let approval_lines = declared_approval_lines(&approval_plan);
+        // 付け替えの分。**同じ確定で先に承認する宣言を渡す**——承認は付け替えより先に書くので、
+        // 渡さないと「承認してから付け替える」宣言を「未承認のまま」と見せてしまう（`reassign::plan`）。
+        let reassign_lines = match crate::reassign::plan(
+            &self.workspace_root,
+            &self.declared_reassign.effective(&self.unapproved),
+            self.require_sandbox,
+            &approval_plan.approve,
+        ) {
+            Ok(plan) => declared_reassign::reassign_lines(&plan),
+            Err(e) => {
+                self.modal = Some(Modal {
+                    title: "付け替えられません（何も書いていません）".to_string(),
                     lines: e.to_string().lines().map(str::to_string).collect(),
                     confirm: Confirm::ReadOnly,
                 });
@@ -325,6 +360,7 @@ impl App {
             String::new(),
         ];
         lines.extend(approval_lines);
+        lines.extend(reassign_lines);
         if !plan.removed.is_empty() {
             lines.push(format!("取り消す宣言 {}件:", plan.removed.len()));
         }
@@ -375,8 +411,12 @@ impl App {
         crate::approve_declared::plan(&self.workspace_root, &targets, self.require_sandbox)
     }
 
-    /// 確認後に実際に書く——**承認を先に、取り消しを後に**書く。同じ宣言を両方で予約していたら
-    /// 取り消しが勝つ（`unapprove::commit`が承認も消す）。権限を減らす側が後に来る順序にしてある。
+    /// 確認後に実際に書く——**承認 → 付け替え → 取り消し**の順に書く。同じ宣言を承認と取り消しの
+    /// 両方で予約していたら取り消しが勝つ（`unapprove::commit`が承認も消す）。付け替えと取り消しの
+    /// 両方なら付け替えは書かない（`DeclaredReassignState::effective`）。権限を減らす側が後に来る。
+    ///
+    /// 付け替えを承認の**後**に置くのは、「このマシンで承認してから付け替える」予約（`y`と`c`を同じ行に）
+    /// で承認が付け替えた後の値へ引き継がれるようにするため（`reassign`のモジュールdoc）。
     pub(crate) fn commit_declared_changes(&mut self) {
         let mut notes = Vec::new();
         if !self.declared_approval.reserved.is_empty() {
@@ -397,6 +437,36 @@ impl App {
                 }
                 // **書けなかったことを黙らない。** 取り消しは続けて試みる（独立した操作である）。
                 Err(e) => notes.push(format!("承認は失敗しました: {e}")),
+            }
+        }
+        let reassignments = self.declared_reassign.effective(&self.unapproved);
+        if !reassignments.is_empty() {
+            // **`plan`は作り直す**（取り消しと同じ理由）。承認は上で台帳へ書いたので、先に承認した宣言を
+            // 渡す必要は無い——台帳そのものを読む（書けなかった承認を「書けた」と見なさない）。
+            match crate::reassign::plan(
+                &self.workspace_root,
+                &reassignments,
+                self.require_sandbox,
+                &[],
+            )
+            .and_then(|plan| {
+                let refused = plan.refused.len() + plan.not_found.len();
+                crate::reassign::commit(&self.workspace_root, &plan).map(|count| (count, refused))
+            }) {
+                Ok((count, refused)) => {
+                    self.declared_reassign.reserved.clear();
+                    if count > 0 {
+                        notes.push(format!(
+                            "{count}件の宣言を付け替えました（ACLは次のパス2開始時に変わります）"
+                        ));
+                    }
+                    if refused > 0 {
+                        notes.push(format!(
+                            "{refused}件は付け替えませんでした（確認の画面の理由を参照）"
+                        ));
+                    }
+                }
+                Err(e) => notes.push(format!("付け替えは失敗しました: {e}")),
             }
         }
         if !self.unapproved.is_empty() {
@@ -481,6 +551,11 @@ fn declared_approval_lines(plan: &crate::approve_declared::DeclaredApprovalPlan)
     }
     lines
 }
+
+/// 付け替え（`c`・`R`）の予約と確認の画面の行。この画面の状態遷移の一部なので、このモジュールの
+/// 子に置く（選択中の行を引く関数を共有するため）。
+#[path = "declared_reassign.rs"]
+pub(crate) mod declared_reassign;
 
 #[cfg(test)]
 #[path = "declared_tests.rs"]
