@@ -126,6 +126,9 @@ pub mod transition_approve;
 /// `harness_sandbox`のwindows専用モジュールが持つため。
 #[cfg(windows)]
 pub mod transition_candidates;
+/// [段階⑦] 遷移先ドメインを`harness.exe`が用意する見込みと、遷移先の名前の検査。
+/// **見込みであって判定ではない**——実際に起こせるかは`harness.exe`が起動時に決める。
+pub mod transition_destination;
 /// 承認済み宣言の取り消し（[`approve`]の対）。`policy.json`から宣言を消す。**ACEは触らない**
 /// ——撤収は付与と同じライフサイクル点（パス2の開始時と、プロセス終了時）が担当する。
 pub mod unapprove;

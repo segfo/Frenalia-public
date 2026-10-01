@@ -92,22 +92,41 @@ async fn a_query_with_no_match_points_back_to_the_listing() {
     assert!(out.contains("引数なし"), "次の一手を書いていない: {out}");
 }
 
-/// **【暫定】起こせない辺には、その旨がはっきり出る**
-/// （`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2の撤去一覧5点目）。
+/// **起こせない辺には、その旨と遷移先のドメインがはっきり出る。**
 ///
 /// 出さないと、一覧に出ているのに撃つと拒否される——**モデルから見て最も分かりにくい形**になる。
-/// **撤去一覧の5点目を消したらこのテストごと消す**（暫定が残っていることを固定するためだけに在る）。
-/// 以前は「§22.9が着地したら」と書いていたが、§22.9の骨格は2026-09-20に着地し、5点目は
-/// 安全な向きに外れる暫定として**意図して残されている**（同設計書の撤去一覧）。
+/// 2026-10-01から「起こせない」は「遷移先のドメインがこのセッションで用意されていない」を意味する
+/// （§10.1.2の撤去一覧5点目を外した）。**「機構がまだ無い」と言わない**——用意できた遷移は起こせるので、
+/// その言い方は嘘になる。
 #[tokio::test]
 async fn a_program_that_cannot_be_started_yet_says_so() {
-    let ctx = ctx_with(vec![program(r"C:\bin\node.exe", false)]);
-    let out = call(&ctx, serde_json::json!({})).await;
+    let mut p = program(r"C:\bin\node.exe", false);
+    p.to_domain = "iso".to_string();
+    let out = call(&ctx_with(vec![p]), serde_json::json!({})).await;
 
     assert!(
         out.contains("いまは起こせません"),
         "起こせない辺が起こせるものとして並んでいる: {out}"
     );
+    assert!(
+        out.contains("`iso`"),
+        "どの遷移先が用意されていないのかを言っていない: {out}"
+    );
+    assert!(
+        !out.contains("機構"),
+        "「機構がまだ無い」は2026-10-01から嘘である: {out}"
+    );
+}
+
+/// **対の側**: 起こせる辺には「起こせません」が付かない（印が常に付く実装を落とす。`B-35`）。
+#[tokio::test]
+async fn a_program_that_can_be_started_carries_no_refusal_note() {
+    let out = call(
+        &ctx_with(vec![program(r"C:\bin\git.exe", true)]),
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(!out.contains("いまは起こせません"), "{out}");
 }
 
 /// 権限の要約は**中身を出す**（件数ではない）。

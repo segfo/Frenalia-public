@@ -34,7 +34,15 @@ fn policy(edges: Vec<TransitionEdge>) -> PolicyFile {
 }
 
 fn declared(file: &PolicyFile) -> DeclaredEdges {
-    DeclaredEdges::build(file, WS, ENTRY_DOMAIN).expect("宣言が組めない")
+    declared_with(file, &Default::default())
+}
+
+/// 用意される見込みの遷移先を渡して組む。
+fn declared_with(
+    file: &PolicyFile,
+    provisioned: &std::collections::BTreeSet<String>,
+) -> DeclaredEdges {
+    DeclaredEdges::build(file, WS, ENTRY_DOMAIN, provisioned).expect("宣言が組めない")
 }
 
 fn observed(exe: &str, argv: &str) -> ObservedRecord {
@@ -106,30 +114,49 @@ fn a_program_declared_with_this_exact_spelling_becomes_removable() {
     }
 }
 
-/// **遷移先が別ドメインの辺は「いまは起こせない」として出る。**
-///
-/// 暫定（`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2）の可視化であり、
-/// **判定の正本は`transition_listing`**である。ここで計算し直していないことを固定する
-/// ——§22.9が着地したら`transition_listing`側が`true`を返すようになり、
-/// この期待は**そのとき赤くなって**気付ける。
-#[test]
-fn an_edge_into_another_domain_is_shown_as_not_runnable_today() {
+/// 別ドメインへの辺を1本持つ宣言。
+fn policy_with_an_edge_into_git_domain() -> PolicyFile {
     let mut file = policy(vec![edge(
         ExeMatcher::Literal("C:/git.exe".to_string()),
         ArgvMatcher::Any(AnyMarker),
         "git-domain",
     )]);
     file.domains.push(PolicyDomain::new("git-domain"));
-    let candidates = from_observations(&[observed("C:/git.exe", "git status")], &declared(&file));
+    file
+}
 
-    match &candidates[0].declared {
-        Declared::ByThisEdge { runnable_now, .. } => assert!(
-            !runnable_now,
-            "別ドメインへの遷移が「いま起こせる」と表示されている\
-             （§22.9が着地したならこの期待ごと直すこと）"
-        ),
+fn runnable_now_of(candidate: &Candidate) -> bool {
+    match &candidate.declared {
+        Declared::ByThisEdge { runnable_now, .. } => *runnable_now,
         other => panic!("この綴りの辺として認識されていない: {other:?}"),
     }
+}
+
+/// **禁止側**: 用意される見込みの無い遷移先への辺は「いまは起こせない」として出る。
+///
+/// **判定の正本は`transition_listing`**である——ここでは渡した表がそのまま効くことだけを見る
+/// （計算し直していないことの固定）。
+#[test]
+fn an_edge_into_a_domain_that_will_not_be_provisioned_is_shown_as_not_runnable() {
+    let file = policy_with_an_edge_into_git_domain();
+    let candidates = from_observations(&[observed("C:/git.exe", "git status")], &declared(&file));
+    assert!(
+        !runnable_now_of(&candidates[0]),
+        "用意されない遷移先への遷移が「いま起こせる」と表示されている"
+    );
+}
+
+/// **許可側（対）**: 用意される見込みの遷移先への辺は「起こせる」として出る
+/// （2026-10-01に§10.1.2の撤去一覧5点目を外した）。
+#[test]
+fn an_edge_into_a_domain_that_will_be_provisioned_is_shown_as_runnable() {
+    let file = policy_with_an_edge_into_git_domain();
+    let provisioned: std::collections::BTreeSet<String> = ["git-domain".to_string()].into();
+    let candidates = from_observations(
+        &[observed("C:/git.exe", "git status")],
+        &declared_with(&file, &provisioned),
+    );
+    assert!(runnable_now_of(&candidates[0]));
 }
 
 /// パターンが覆っているだけの候補は、**この行からは外せない**。

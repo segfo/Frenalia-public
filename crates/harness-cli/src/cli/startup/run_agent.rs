@@ -89,18 +89,6 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
             }
             return ExitCode::FAILURE;
         };
-        // [段階6e] **モデルへ見せる一覧は、Daemonへ渡すのと同じ宣言から作る**
-        // （§19.3.8）。ここで読み直すと判定に使うグラフとずれ、「起こせる」と
-        // 答えたものをDaemonが拒否する形になる（正本を2つ持たない、`B-13`）。
-        // [#30] 権限欄にはこのマシンで承認済みの宣言だけを載せる（付いていない許可を伝えない）。
-        transition_facts = Some(std::sync::Arc::new(
-            super::transition_tool::facts_from_policy(
-                &policy,
-                &workspace_root.to_string_lossy(),
-                &writable_outside_policy,
-                &approved_fs_values,
-            ),
-        ));
         // [#55] **遷移先ドメインの実体をここで用意する**（`plans/DESIGN-MAC-BROKER.md` §22.9）。
         //
         // 判定器は「Dへ移してよい」までしか答えない。Dで実際に起こすには
@@ -127,6 +115,26 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         for (domain, reason) in &provisioned.skipped {
             eprintln!("warning: transitions into the domain {domain:?} will be refused: {reason}");
         }
+        // [段階6e] **モデルへ見せる一覧は、Daemonへ渡すのと同じ宣言と同じ表から作る**
+        // （§19.3.8）。ここで読み直すと判定に使うグラフとずれ、「起こせる」と
+        // 答えたものをDaemonが拒否する形になる（正本を2つ持たない、`B-13`）。
+        // [#30] 権限欄にはこのマシンで承認済みの宣言だけを載せる（付いていない許可を伝えない）。
+        // [2026-10-01] 「いま起こせるか」は**用意できた表**（Daemonへ渡す`provisioned.domains`）で決める
+        // ——そのため一覧は用意の**後**に作る（§10.1.2の撤去一覧5点目を外した）。
+        let provisioned_domains: std::collections::BTreeSet<String> = provisioned
+            .domains
+            .iter()
+            .map(|domain| domain.policy_domain.clone())
+            .collect();
+        transition_facts = Some(std::sync::Arc::new(
+            super::transition_tool::facts_from_policy(
+                &policy,
+                &workspace_root.to_string_lossy(),
+                &writable_outside_policy,
+                &approved_fs_values,
+                &provisioned_domains,
+            ),
+        ));
         let transition_policy = harness_sandbox::tier2a::spawnd::TransitionPolicy {
             policy,
             workspace_root: workspace_root.to_string_lossy().into_owned(),

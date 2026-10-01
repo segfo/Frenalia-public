@@ -518,3 +518,70 @@ fn an_empty_command_yields_an_empty_default_domain_name() {
     assert_eq!(default_domain_name(""), "");
     assert_eq!(default_domain_name("   "), "");
 }
+
+// ---------------------------------------------------------------------------
+// [2026-10-01] `save`は`load`が受け付けないファイルを書かない
+// ---------------------------------------------------------------------------
+
+/// 入口から空のドメイン`iso`へ移る辺を1本持つ宣言（遷移先は何も持たないので「狭める」）。
+fn entry_with_an_edge_to_an_empty_domain() -> PolicyFile {
+    serde_json::from_str(&format!(
+        r#"{{
+          "schema_version": {POLICY_SCHEMA_VERSION},
+          "domains": [
+            {{
+              "name": "shell",
+              "process": {{ "transitions": [
+                {{ "exe": {{ "literal": "C:/tools/gen.exe" }}, "argv": {{ "any": true }}, "to": "iso" }}
+              ] }}
+            }},
+            {{ "name": "iso" }}
+          ]
+        }}"#
+    ))
+    .expect("parse")
+}
+
+/// **許可側**: 遷移先が何も持たない辺（狭める遷移）は書けて、読み戻せる。
+#[test]
+fn save_writes_a_policy_whose_transitions_pass_the_checks() {
+    let ws = workspace();
+    save(ws.path(), &entry_with_an_edge_to_an_empty_domain()).expect("a narrowing edge saves");
+    load(ws.path()).expect("and loads back");
+}
+
+/// **禁止側（対）**: 遷移先へ許可を足して辺が「広げる遷移」に変わったら、**何も書かない**。
+///
+/// かつては検査せずに書いていたので、ファイル宣言の承認がこの形を作れた——書いた直後から
+/// `harness.exe`もエディタも`policy.json`を読めなくなり、手でJSONを直すしか戻す手段が無かった。
+/// 元のファイルが残っていること（上書きしていないこと）まで見る。
+#[test]
+fn save_refuses_a_policy_that_load_would_reject_and_leaves_the_file_alone() {
+    let ws = workspace();
+    save(ws.path(), &entry_with_an_edge_to_an_empty_domain()).expect("setup");
+    let before = std::fs::read_to_string(path(ws.path())).unwrap();
+
+    let mut widened = load(ws.path()).expect("setup loads");
+    widened
+        .domains
+        .iter_mut()
+        .find(|d| d.name == "iso")
+        .unwrap()
+        .fs
+        .read
+        .push("C:/secrets/**".to_string());
+
+    match save(ws.path(), &widened).expect_err("a widening edge without fixing must not be saved") {
+        PolicyFileError::WouldRejectTransitions { reason, .. } => assert!(
+            reason.contains("widens"),
+            "the reason should be the checker's own words: {reason}"
+        ),
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(path(ws.path())).unwrap(),
+        before,
+        "the refused save overwrote policy.json"
+    );
+    load(ws.path()).expect("the file on disk must still load");
+}

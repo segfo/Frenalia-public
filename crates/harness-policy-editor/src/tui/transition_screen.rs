@@ -21,12 +21,55 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedbac
     // 下の枠を**8行**にしてある（枠線2＋中身6）。中身はACEの注記2行・予約の案内1行・
     // 選択中のフルパス2行で、読めなかった事実が出た回はそのぶん押し出される
     // ——押し出される順序は[`draw_notes`]のdocが持つ。
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(8)]).split(area);
-    let offset = draw_list(frame, chunks[0], app);
-    draw_notes(frame, chunks[1], app);
+    // 上の3行は遷移先ドメインの欄（2026-10-01。承認待ちのFS/ネットタブのドメイン欄と同じ高さ）。
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(3),
+        Constraint::Length(8),
+    ])
+    .split(area);
+    draw_destination(frame, chunks[0], app);
+    let offset = draw_list(frame, chunks[1], app);
+    draw_notes(frame, chunks[2], app);
     crate::tui::DrawFeedback {
         candidate_list_offset: Some(offset),
         ..Default::default()
+    }
+}
+
+/// 遷移先ドメインの欄。**名前の横に、`harness.exe`が用意する見込みを出す**——書いた後で
+/// 「起こせない」と知るのでは遅い（用意されない遷移先は、書けても断られ続ける）。
+fn draw_destination(frame: &mut Frame, area: Rect, app: &App) {
+    let destination = &app.pending.destination;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(if destination.focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        })
+        .title(" 遷移先ドメイン（Tab で編集。確定すると、許す遷移はすべてここへ向く） ");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let warn = app.destination_needs_attention();
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                destination.input.text().to_string(),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!("   {}", app.destination_label()),
+                Style::default().fg(if warn { Color::Yellow } else { Color::DarkGray }),
+            ),
+        ])),
+        inner,
+    );
+    if destination.focused {
+        frame.set_cursor_position(ratatui::layout::Position::new(
+            inner.x + destination.input.cursor_col(),
+            inner.y,
+        ));
     }
 }
 
@@ -166,10 +209,11 @@ fn declared_mark_and_tail<'a>(app: &App, candidate: &Candidate) -> (Mark, Vec<Sp
     match &candidate.declared {
         Declared::No | Declared::UnknownSourceDomain => {
             if app.pending.is_reserved(candidate) {
+                // **どこへ移るかを行に出す**——遷移先は欄で選ぶので、行だけ見ても分かるようにする。
                 (
                     Mark::All,
                     vec![Span::styled(
-                        "  ← 許します".to_string(),
+                        format!("  ← 許します → {}", app.pending.destination.name()),
                         Style::default().fg(Color::Green),
                     )],
                 )
@@ -196,9 +240,16 @@ fn declared_mark_and_tail<'a>(app: &App, candidate: &Candidate) -> (Mark, Vec<Sp
                 Style::default().fg(Color::Green),
             )];
             if !*runnable_now {
-                // **一覧に出ているのに撃つと断られる、を黙らせない**（§10.1.2の暫定）。
+                // **一覧に出ているのに撃つと断られる、を黙らせない。** 理由は見込みの表が持つ
+                // （2026-10-01から「別ドメインだから」ではなく「遷移先が用意されないから」）。
+                let reason = app
+                    .pending
+                    .outlooks
+                    .get(to_domain.as_str())
+                    .map(|o| o.short_label())
+                    .unwrap_or_else(|| "用意されない見込み".to_string());
                 tail.push(Span::styled(
-                    "  ［いまは起こせない］".to_string(),
+                    format!("  ［起こせない: {reason}］"),
                     Style::default().fg(Color::Yellow),
                 ));
             }
@@ -362,9 +413,11 @@ fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
     let mut text = format!("{}\n", crate::transition_approve::ACE_NOTICE);
 
     let pending = &app.pending;
-    if pending.reserved_count() == 0 {
+    if pending.destination.focused {
+        text.push_str("遷移先ドメインを入力中です（Enter か Tab で一覧へ戻る）。\n");
+    } else if pending.reserved_count() == 0 {
         text.push_str(
-            "Spaceで選ぶ／xで却下／uで引数の広さ／fで表示の切替／rで読み直し／aで確定。\n",
+            "Spaceで選ぶ／Tabで遷移先／xで却下／uで引数の広さ／fで表示の切替／rで読み直し／aで確定。\n",
         );
     } else {
         // **強調の記号を文字として書かない。** 端末では`**`はそのまま星印として出る

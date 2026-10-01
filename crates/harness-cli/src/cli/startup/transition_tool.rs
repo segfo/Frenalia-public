@@ -45,18 +45,24 @@ pub(super) fn should_expose(
 /// [#30] **権限欄（`rights_fs`）には、このマシンで承認済みの宣言だけを載せる**（`approved_fs_values`、
 /// `startup::policy_fs::approved_fs_values`が作る）。未承認の宣言には許可が付かないので、載せると
 /// 付いていない許可をモデルへ伝えることになる。辺と判定の入力は変えない（Daemonと同じグラフのまま）。
+///
+/// **`provisioned_domains`はDaemonへ渡すのと同じ表から作ること**（`domain_provision`が実際に用意できた
+/// 遷移先の`policy_domain`）。「いま起こせるか」はその表に在るかで決まる——別に数えると、
+/// モデルには「起こせる」と答えたのにDaemonが`TargetDomainNotProvisioned`で断る形になる（`B-13`）。
+/// かつては表を受け取らず「別ドメイン行きは全部起こせない」と答えていた（§10.1.2の撤去一覧5点目）。
 pub(super) fn facts_from_policy(
     policy: &harness_policy::policy_file::PolicyFile,
     workspace_root: &str,
     writable_outside_policy: &[String],
     approved_fs_values: &std::collections::BTreeSet<(String, &'static str)>,
+    provisioned_domains: &std::collections::BTreeSet<String>,
 ) -> TransitionFacts {
     let input = policy.transition_graph_input(Some(workspace_root), writable_outside_policy);
     let from_domain = harness_policy::policy_file::ENTRY_DOMAIN;
     // 宣言が壊れているならDaemonも起動していない（`TransitionGraph::build`が落ちる）ので、
     // ここで失敗したときは**空の一覧**にする。**空は「起こせるものが無い」**であり、
     // 「機構が効いていない」ではない——後者は`Option`が`None`であることで表す。
-    let programs = harness_policy::transition_listing::rows(&input, from_domain)
+    let programs = harness_policy::transition_listing::rows(&input, from_domain, provisioned_domains)
         .unwrap_or_default()
         .into_iter()
         .map(|row| RunnableProgramFact {
@@ -178,7 +184,7 @@ mod tests {
         let policy: harness_policy::policy_file::PolicyFile =
             serde_json::from_value(json).expect("parse");
 
-        let facts = facts_from_policy(&policy, "C:/ws", &[], &Default::default());
+        let facts = facts_from_policy(&policy, "C:/ws", &[], &Default::default(), &Default::default());
 
         assert_eq!(facts.from_domain, harness_policy::policy_file::ENTRY_DOMAIN);
         assert_eq!(facts.programs.len(), 1);
@@ -193,8 +199,57 @@ mod tests {
     #[test]
     fn a_policy_without_transitions_yields_an_empty_list_not_a_missing_one() {
         let policy = harness_policy::policy_file::PolicyFile::default();
-        let facts = facts_from_policy(&policy, "C:/ws", &[], &Default::default());
+        let facts = facts_from_policy(&policy, "C:/ws", &[], &Default::default(), &Default::default());
         assert!(facts.programs.is_empty());
+    }
+
+    fn entry_with_an_edge_to(target: &str) -> harness_policy::policy_file::PolicyFile {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "domains": [
+                {
+                    "name": harness_policy::policy_file::ENTRY_DOMAIN,
+                    "process": { "transitions": [
+                        { "exe": { "literal": "C:/bin/curl.exe" }, "argv": { "any": true },
+                          "to": target }
+                    ]}
+                },
+                { "name": target }
+            ]
+        }))
+        .expect("parse")
+    }
+
+    /// **許可側**: Daemonへ渡す表に在る遷移先への辺は、モデルへ「起こせる」と見せる
+    /// （§10.1.2の撤去一覧5点目を外した。2026-10-01）。
+    #[test]
+    fn an_edge_to_a_provisioned_domain_is_shown_as_runnable() {
+        let provisioned: std::collections::BTreeSet<String> = ["iso".to_string()].into();
+        let facts = facts_from_policy(
+            &entry_with_an_edge_to("iso"),
+            "C:/ws",
+            &[],
+            &Default::default(),
+            &provisioned,
+        );
+        assert!(
+            facts.programs[0].runnable_now,
+            "Daemonが起こせる遷移を、モデルには「起こせない」と言っている"
+        );
+    }
+
+    /// **禁止側（対）**: 表に無い遷移先（このセッションで用意できなかった）への辺は「いまは起こせない」。
+    /// 「起こせる」と言うと、撃った瞬間に`TargetDomainNotProvisioned`で断られる。
+    #[test]
+    fn an_edge_to_a_domain_missing_from_the_daemons_table_is_not_runnable() {
+        let facts = facts_from_policy(
+            &entry_with_an_edge_to("iso"),
+            "C:/ws",
+            &[],
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(!facts.programs[0].runnable_now);
     }
 
     /// [#30] **権限欄には、このマシンで承認済みの宣言だけを載せる**（未承認には許可が付かない）。
@@ -217,7 +272,7 @@ mod tests {
         let approved: std::collections::BTreeSet<(String, &'static str)> =
             [("C:/approved/**".to_string(), "read")].into_iter().collect();
 
-        let facts = facts_from_policy(&policy, "C:/ws", &[], &approved);
+        let facts = facts_from_policy(&policy, "C:/ws", &[], &approved, &Default::default());
 
         assert_eq!(facts.programs.len(), 1, "the edge itself does not depend on approval");
         let rights: Vec<&str> = facts.programs[0]

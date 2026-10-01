@@ -27,14 +27,33 @@ fn request<'a>(
     approve: &'a [EdgeRef],
     remove: &'a [EdgeRef],
 ) -> TransitionRequest<'a> {
+    request_to(ws, ENTRY_DOMAIN, approve, remove)
+}
+
+/// 遷移先を選んだ要求（[`request`]は既定の自己ループ）。
+fn request_to<'a>(
+    ws: &'a Path,
+    to_domain: &'a str,
+    approve: &'a [EdgeRef],
+    remove: &'a [EdgeRef],
+) -> TransitionRequest<'a> {
     TransitionRequest {
         workspace_root: ws,
         from_domain: ENTRY_DOMAIN,
+        to_domain,
         approve,
         remove,
         record_session: Some("session-1"),
         now_unix_ms: 1_700_000_000_000,
     }
+}
+
+/// 一覧を作る（別ドメインの用意は「何も用意されていない」で渡す——ここで見るのは辺の形だけ）。
+fn listed(ws: &Path) -> Vec<transition_listing::Row> {
+    let file = policy_file::load(ws).expect("書いたものが読めない");
+    let ws_text = ws.to_string_lossy().into_owned();
+    let input = file.transition_graph_input(Some(&ws_text), &[]);
+    transition_listing::rows(&input, ENTRY_DOMAIN, &Default::default()).expect("一覧が作れない")
 }
 
 /// 承認して書き、**読み直して同じ辺が出る**ところまで見る。
@@ -46,10 +65,7 @@ fn approve_and_reload(ws: &Path, edges: &[EdgeRef]) -> Vec<transition_listing::R
         commit(ws, &plan).expect("書けない"),
         "書く必要が無いと判定された"
     );
-    let file = policy_file::load(ws).expect("書いたものが読めない");
-    let ws_text = ws.to_string_lossy().into_owned();
-    let input = file.transition_graph_input(Some(&ws_text), &[]);
-    transition_listing::rows(&input, ENTRY_DOMAIN).expect("一覧が作れない")
+    listed(ws)
 }
 
 // --- 承認 -------------------------------------------------------------------
@@ -70,34 +86,233 @@ fn an_approved_edge_shows_up_in_the_same_listing_the_model_sees() {
     assert_eq!(rows[0].to_domain, ENTRY_DOMAIN);
 }
 
-/// **暫定を固定する**（`plans/DESIGN-MAC-ENFORCEMENT.md` §10.1.2の撤去一覧6つ目）。
-///
-/// いま書ける辺は**自己ループだけ**である。別ドメインで起こすにはそのドメインの
-/// プロファイルが要るが、ドメインを鍵にした発行器がまだ無い（§22.9）。
-///
-/// # このテストが赤くなったら
-///
-/// §22.9（ドメインごとのプロファイル発行器）が着地したということである。**そのときは
-/// `provisional_destination`とこのテストと`SELF_LOOP_NOTICE`を消し、遷移先を選べるように
-/// すること**（辺を組む`edge_for`は遷移先を引数で受けているので、渡す値を変えるだけでよい）。
-/// あわせて§10.1.2の撤去一覧から6つ目を消す。
+/// 遷移先に呼び出し元と同じドメインを渡せば自己ループが書け、**表に関係なく起こせる**。
 #[test]
-fn only_self_loop_edges_are_written_today() {
+fn a_self_loop_is_written_when_the_destination_is_the_callers_own_domain() {
     let tmp = tempfile::tempdir().unwrap();
     let plan = plan(&request(tmp.path(), &[any("C:/git.exe")], &[])).expect("承認できない");
-
-    assert_eq!(
-        plan.to_domain, ENTRY_DOMAIN,
-        "遷移元と違うドメインへの辺を書いている。\
-         §22.9が着地したのなら、provisional_destination・SELF_LOOP_NOTICE・\
-         このテスト・§10.1.2の撤去一覧6つ目をまとめて消すこと"
-    );
+    assert_eq!(plan.to_domain, ENTRY_DOMAIN);
+    assert!(!plan.created_to_domain, "呼び出し元は遷移先として作り直さない");
 
     let rows = approve_and_reload(tmp.path(), &[any("C:/git.exe")]);
     assert!(
         rows[0].runnable_now,
         "自己ループなのに「いまは起こせない」になっている"
     );
+}
+
+/// [2026-10-01] **別のドメインへの遷移が書ける**（§10.1.2の撤去一覧6つ目を外した）。
+///
+/// `policy.json`に無い遷移先は**宣言の無いドメインとして作り**、作ったことを返す
+/// （編集時検査は宣言されていないドメインへの遷移を断るので、作らないと書けない）。
+/// 宣言の無い遷移先は呼び出し元より狭いので、作業ディレクトリを固定しない辺でも検査を通る。
+#[test]
+fn an_edge_to_another_domain_is_written_and_a_missing_destination_is_created_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = plan(&request_to(tmp.path(), "iso", &[any("C:/curl.exe")], &[])).expect("承認できない");
+    assert_eq!(plan.to_domain, "iso");
+    assert!(plan.created_to_domain, "作ったのに作ったと言っていない（B-09）");
+    assert!(commit(tmp.path(), &plan).expect("書けない"));
+
+    let rows = listed(tmp.path());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].to_domain, "iso", "選んだ遷移先ではなく別の値が書かれた");
+    let file = policy_file::load(tmp.path()).unwrap();
+    let iso = file.domain("iso").expect("遷移先のドメインが作られていない");
+    assert!(iso.fs.entries().is_empty() && iso.net.allow_domains.is_empty());
+
+    // 2本目は既にある遷移先へ書くので、作り直さない。
+    let again =
+        super::plan(&request_to(tmp.path(), "iso", &[any("C:/wget.exe")], &[])).expect("2本目が落ちた");
+    assert!(!again.created_to_domain);
+}
+
+/// 取り消しだけ・既にある辺だけの確定では、**遷移先のドメインを作らない**（見覚えの無い空のドメインを増やさない）。
+#[test]
+fn a_destination_is_not_created_when_no_edge_is_added() {
+    let tmp = tempfile::tempdir().unwrap();
+    approve_and_reload(tmp.path(), &[any("C:/git.exe")]);
+
+    let plan = plan(&request_to(tmp.path(), "never", &[any("C:/git.exe")], &[])).expect("plan");
+    assert!(plan.added.is_empty());
+    assert!(!plan.created_to_domain);
+    assert!(plan.file.domain("never").is_none());
+}
+
+/// 遷移先にファイル宣言を1つ持たせて書く（手で書いたのと同じ形。`save`は検査を通るものしか書かない）。
+fn declare_domain_with_read(ws: &Path, name: &str, value: &str) {
+    let mut file = policy_file::load(ws).unwrap();
+    let mut domain = PolicyDomain::new(name);
+    domain.fs.read.push(value.to_string());
+    file.domains.push(domain);
+    policy_file::save(ws, &file).expect("setup");
+}
+
+/// **禁止側**: 遷移先が呼び出し元より広い権限に届く遷移は、**このエディタの言葉で**断る。
+///
+/// 検査は「argvをリテラルにしcwdを宣言せよ」と言うが、このエディタは作業ディレクトリを宣言しない
+/// ので、その直し方は取れない。そのまま見せると、ユーザーは取れない手を探すことになる。
+#[test]
+fn a_widening_destination_is_refused_with_a_fix_this_editor_can_take() {
+    let tmp = tempfile::tempdir().unwrap();
+    declare_domain_with_read(tmp.path(), "wide", "C:/secrets/**");
+    let before = std::fs::read_to_string(policy_file::path(tmp.path())).unwrap();
+
+    match plan(&request_to(tmp.path(), "wide", &[any("C:/curl.exe")], &[])) {
+        Err(TransitionApproveError::WidensWithoutFixing { to_domain, detail }) => {
+            assert_eq!(to_domain, "wide");
+            assert!(detail.contains("widens"), "検査の理由が落ちている: {detail}");
+        }
+        other => panic!("広げる遷移が別の形で返った: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(policy_file::path(tmp.path())).unwrap(),
+        before,
+        "planが書いた"
+    );
+}
+
+/// **許可側（対）**: 遷移先の宣言が呼び出し元の宣言の範囲に収まる（狭める）なら書ける。
+/// 「別ドメインは全部断る」実装でも禁止側は緑になるので、対にする（`B-35`）。
+#[test]
+fn a_narrowing_destination_with_declarations_can_be_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    declare_domain_with_read(tmp.path(), ENTRY_DOMAIN, "C:/secrets/**");
+    declare_domain_with_read(tmp.path(), "narrow", "C:/secrets/a.txt");
+
+    let plan = plan(&request_to(tmp.path(), "narrow", &[any("C:/curl.exe")], &[]))
+        .expect("狭める遷移が断られた");
+    assert!(commit(tmp.path(), &plan).expect("書けない"));
+    assert_eq!(listed(tmp.path())[0].to_domain, "narrow");
+}
+
+/// **禁止側**: 入れ物（AppContainerプロファイル）の名前にできない遷移先は、**書く前に**断る。
+///
+/// 編集時検査は50文字・`.`可で通すが、`harness.exe`はセッションの印を足した名前で入れ物を作るので、
+/// 長い名前は起動時に用意できない。`.`は持ち主の判定が読み違える（`profile_name_problem`のdoc）。
+#[test]
+fn a_destination_that_cannot_become_a_profile_name_is_refused_before_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let too_long = "x".repeat(40);
+    for bad in ["a.b", too_long.as_str(), "bad name", ""] {
+        match plan(&request_to(tmp.path(), bad, &[any("C:/curl.exe")], &[])) {
+            Err(TransitionApproveError::DestinationName { to_domain, .. }) => {
+                assert_eq!(to_domain, bad)
+            }
+            other => panic!("{bad:?} が断られなかった: {other:?}"),
+        }
+    }
+    assert!(
+        !policy_file::path(tmp.path()).exists(),
+        "断ったのにpolicy.jsonを書いた"
+    );
+}
+
+/// 取り消しだけの確定は遷移先を使わないので、**遷移先の欄に何が入っていても通る**
+/// （打ちかけの名前が、無関係な取り消しを止めない）。
+#[test]
+fn removing_alone_does_not_look_at_the_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    approve_and_reload(tmp.path(), &[any("C:/git.exe")]);
+
+    let plan = plan(&request_to(tmp.path(), "a.b", &[], &[any("C:/git.exe")]))
+        .expect("取り消しが遷移先の名前で止まった");
+    assert_eq!(plan.removed.len(), 1);
+}
+
+/// **引き継ぎ資料Aの注意を確かめる**: このエディタが書く別ドメイン行きの辺は、`harness.exe`が
+/// 「呼び出し元から書ける場所」を足しても（`settings.json`の`fs.read_write`・`--fs-allow :rw`）
+/// 起動時に落ちない——作業ディレクトリを宣言しないので固定した遷移にならず、その検査の対象外だからである。
+///
+/// **歯の確認（対）**: 同じ場所の下を指す**固定した**辺（手で書いたもの）は、同じ入力で落ちる。
+/// これが落ちなければ、上の「落ちない」は何も測っていない。
+#[test]
+fn an_edge_this_editor_writes_survives_the_writable_places_harness_adds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = plan(&request_to(
+        tmp.path(),
+        "iso",
+        &[literal("C:/tools/gen.exe", "\"C:/tools/gen.exe\" --check")],
+        &[],
+    ))
+    .expect("承認できない");
+    assert!(commit(tmp.path(), &plan).expect("書けない"));
+    let writable_outside = ["C:/tools".to_string()];
+
+    policy_file::load_for_session(tmp.path(), &writable_outside)
+        .expect("このエディタが書いた辺がharness.exeの起動時の検査で落ちた");
+
+    // 対: 同じ実行ファイルを、作業ディレクトリまで固定した辺（手で書いたもの）で足す。
+    let mut file = policy_file::load(tmp.path()).unwrap();
+    let ws = tmp.path().to_string_lossy().into_owned();
+    let entry = file
+        .domains
+        .iter_mut()
+        .find(|d| d.name == ENTRY_DOMAIN)
+        .unwrap();
+    entry.process.transitions.push(TransitionEdge {
+        exe: ExeMatcher::Literal("C:/tools/gen.exe".to_string()),
+        argv: ArgvMatcher::Literal("\"C:/tools/gen.exe\" --fixed".to_string()),
+        cwd: Some(ws),
+        to: ENTRY_DOMAIN.to_string(),
+        env: None,
+    });
+    policy_file::save(tmp.path(), &file).expect("エディタの検査（書ける場所を知らない）は通る");
+    assert!(
+        policy_file::load_for_session(tmp.path(), &writable_outside).is_err(),
+        "固定した辺も落ちない——この試験は書ける場所の検査を測れていない"
+    );
+}
+
+/// [2026-10-01] **ファイル宣言の承認が、遷移の宣言を壊す`policy.json`を書かない。**
+///
+/// 遷移先へ許可を足すと、そこへの遷移が「広げる遷移」に変わる。かつては`policy_file::save`が検査せずに
+/// 書いたので、承認した直後から`harness.exe`もエディタも`policy.json`を読めなくなった——別ドメインへの
+/// 遷移を書けるようにした回に、この画面の操作だけで踏める形になった。
+#[test]
+fn approving_a_file_declaration_into_the_destination_cannot_break_the_transitions() {
+    use harness_policy::{generalize::SettingsKey, RuleProposal};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let plan = plan(&request_to(tmp.path(), "iso", &[any("C:/curl.exe")], &[])).expect("setup");
+    commit(tmp.path(), &plan).expect("setup");
+
+    let proposals = vec![RuleProposal {
+        id: "fs-1".to_string(),
+        key: SettingsKey::FsRead,
+        value: "C:/Users/x/.cargo/**".to_string(),
+        evidence: Vec::new(),
+        warnings: Vec::new(),
+    }];
+    let accept = vec!["fs-1".to_string()];
+    let approve_into = |domain: &'static str| crate::approve::ApproveRequest {
+        workspace_root: tmp.path(),
+        proposals: &proposals,
+        accept_ids: &accept,
+        require_sandbox: harness_core::RequireSandbox::None,
+        domain,
+        command: None,
+        cwd: None,
+        record_session: None,
+        now_unix_ms: 1,
+    };
+
+    // 禁止側: 遷移先にだけ足す → 書かない。
+    let widening = crate::approve::plan(&approve_into("iso")).expect("plan");
+    match crate::approve::commit(tmp.path(), &widening) {
+        Err(crate::approve::ApproveError::PolicyFile(
+            policy_file::PolicyFileError::WouldRejectTransitions { .. },
+        )) => {}
+        other => panic!("遷移を壊す承認が書かれた: {other:?}"),
+    }
+    let file = policy_file::load(tmp.path()).expect("policy.jsonが読めなくなった");
+    assert!(file.domain("iso").unwrap().fs.read.is_empty());
+
+    // 許可側（対）: 呼び出し元にも同じ宣言があれば狭める遷移のままなので、書ける。
+    let into_entry = crate::approve::plan(&approve_into(ENTRY_DOMAIN)).expect("plan");
+    crate::approve::commit(tmp.path(), &into_entry).expect("呼び出し元への承認が書けない");
+    let narrowing = crate::approve::plan(&approve_into("iso")).expect("plan");
+    crate::approve::commit(tmp.path(), &narrowing).expect("狭める遷移のままの承認が書けない");
 }
 
 /// 引数を絞る承認もできる（観測された引数のときだけ通る辺）。
@@ -156,7 +371,7 @@ fn an_approved_edge_can_be_removed_again() {
     let file = policy_file::load(tmp.path()).expect("読めない");
     let ws_text = tmp.path().to_string_lossy().into_owned();
     let input = file.transition_graph_input(Some(&ws_text), &[]);
-    let rows = transition_listing::rows(&input, ENTRY_DOMAIN).expect("一覧");
+    let rows = transition_listing::rows(&input, ENTRY_DOMAIN, &Default::default()).expect("一覧");
     assert!(rows.is_empty(), "取り消したのに辺が残っている");
     // **ドメインは残す**（`crate::unapprove`と同じ理由——宣言を全部外した状態で
     // 本当に断られるかを確かめられるようにするため）。
@@ -208,7 +423,7 @@ fn one_commit_can_replace_an_edge_with_a_narrower_one() {
     let file = policy_file::load(tmp.path()).expect("読めない");
     let ws_text = tmp.path().to_string_lossy().into_owned();
     let input = file.transition_graph_input(Some(&ws_text), &[]);
-    let rows = transition_listing::rows(&input, ENTRY_DOMAIN).expect("一覧");
+    let rows = transition_listing::rows(&input, ENTRY_DOMAIN, &Default::default()).expect("一覧");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].argv, "git status");
 }
