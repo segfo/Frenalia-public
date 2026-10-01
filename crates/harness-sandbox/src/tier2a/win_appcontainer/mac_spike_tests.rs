@@ -1591,3 +1591,381 @@ fn access_check_with_an_appcontainer_token_matches_what_the_child_can_open() {
         "the read-only file must not be writable"
     );
 }
+
+// ---------------------------------------------------------------------------
+// RedirectionGuard: 誰が作ったリンクを辿らなくなるか（残課題#68）
+// ---------------------------------------------------------------------------
+
+/// ハーネス自身がサンドボックスの外で行う操作（差分層の変更を本物へ戻す処理・アクセス制御リストへの書込）は、
+/// サンドボックスより強い権限で動きながら、サンドボックス内のコードが書ける場所のパスを辿る。
+/// そこへジャンクションを置かれると、本来触るはずのない場所を強い権限で書き換える恐れがある（残課題#68）。
+///
+/// Windows 11のプロセス単位の緩和策RedirectionGuard（`PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY`）は
+/// 「管理者でないユーザーが作ったリパースポイントを辿らない」ことを有効にする。**誰が作ったリンクに効くのか・
+/// 互換性を壊さないか**を測る。
+///
+/// # 対照を必ず混ぜる
+///
+/// 緩和策を掛けない腕（`none`）で**全部開けること**を同じ回で確かめる。これが無いと、
+/// 全部断られたのを「緩和策が効いた」と読んでしまう（仕込みの不備と区別できない）。
+/// 普通のファイル（リンクを1つも挟まない）も毎回測る——これが断られたら緩和策ではなく計器の問題である。
+///
+/// # 開発者モードで2回撃つ
+///
+/// 開発者モードは**管理者でないユーザーがシンボリックリンクを作れるか**を決める。この試験は
+/// 設定を変えない（ユーザーが切り替える）。実行時の値を報告に載せるので、どちらの回の数字かは後から分かる。
+#[test]
+#[ignore = "spawns a real AppContainer child and creates junctions; run NON-elevated with --test-threads=1"]
+fn redirection_guard_refuses_links_made_by_unprivileged_actors() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let _cleanup =
+        super::test_support::scopeguard(|| forget_workspace_capability(workspace.path()));
+    let sid = session_sid();
+    preflight(workspace.path(), &[], None, &WorkspaceWriteMode::DirectRw).expect("preflight");
+    grant_job::wait_until_done().expect("background grant job");
+    let traverse = traverse_capability_sid().expect("traverse capability");
+    let workspace_cap = workspace_capability_for(workspace.path());
+    let mut caps = vec![traverse.as_psid()];
+    if let Some(cap) = &workspace_cap {
+        caps.push(cap.as_psid());
+    }
+    let probe = probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
+
+    // **開発者モードの値を報告へ載せる**（どちらの回の数字かを取り違えないため）。
+    let dev_mode = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock",
+            "/v",
+            "AllowDevelopmentWithoutDevLicense",
+        ])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("0x1"))
+        .unwrap_or(false);
+    eprintln!("[redirection-guard] developer mode ON? {dev_mode}");
+
+    // --- 的を用意する ---
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    let real = outside.path().join("real");
+    std::fs::create_dir(&real).expect("real dir");
+    let target_file = real.join("f.txt");
+    std::fs::write(&target_file, b"x").expect("target file");
+    let hard = outside.path().join("hard.txt");
+    std::fs::hard_link(&target_file, &hard).expect("hard link");
+
+    // (a) **このテストのプロセス**（管理者でない今のユーザー）が作ったジャンクション。
+    let user_junction = outside.path().join("user-junction");
+    let out = run_probe_locally(
+        &probe_str,
+        &[
+            "--make-junction",
+            &format!("{}|{}", user_junction.display(), real.display()),
+        ],
+    );
+    assert_eq!(
+        last_json_line(&out).and_then(|v| v["make_junction"][0]["created"].as_bool()),
+        Some(true),
+        "このユーザーがジャンクションを作れないと、(a)の腕が測れない: {out}"
+    );
+
+    // (d) 同じプロセスがシンボリックリンクを作れるか。**作れないことも測定結果**である。
+    let user_symlink_file = outside.path().join("user-symlink-f.txt");
+    let user_symlink_dir = outside.path().join("user-symlink-d");
+    let out = run_probe_locally(
+        &probe_str,
+        &[
+            "--make-symlink",
+            &format!("file|{}|{}", user_symlink_file.display(), target_file.display()),
+            "--make-symlink",
+            &format!("dir|{}|{}", user_symlink_dir.display(), real.display()),
+        ],
+    );
+    let symlink_report = last_json_line(&out).unwrap_or_else(|| panic!("no JSON: {out}"));
+    let user_symlink_file_made = symlink_report["make_symlink"][0]["created"]
+        .as_bool()
+        .unwrap_or(false);
+    let user_symlink_dir_made = symlink_report["make_symlink"][1]["created"]
+        .as_bool()
+        .unwrap_or(false);
+    eprintln!(
+        "[redirection-guard] user symlink: file={user_symlink_file_made} dir={user_symlink_dir_made} \
+         (dev mode ON? {dev_mode}) report={symlink_report}"
+    );
+
+    // (b)(e) **AppContainerの子**（サンドボックス役）に、ワークスペースの中でリンクを作らせる。
+    let sandbox_junction = workspace.path().join("sandbox-junction");
+    let sandbox_symlink = workspace.path().join("sandbox-symlink-d");
+    let junction_arg = format!("{}|{}", sandbox_junction.display(), real.display());
+    let mut sandbox_child = SpikeSpawn {
+        exe: &probe_str,
+        args: &["--make-junction", &junction_arg],
+        cwd: workspace.path(),
+        container_sid: sid.as_psid(),
+        capabilities: &caps,
+        child_process_restricted: false,
+        stdout_override: None,
+        extra_inherit: &[],
+        process_sddl: None,
+        thread_sddl: None,
+        token_default_dacl_sddl: None,
+        no_appcontainer: false,
+        console: SpikeConsole::NoWindow,
+    }
+    .spawn()
+    .expect("spawn the sandbox child that makes a junction");
+    let (sandbox_out, sandbox_err, sandbox_code) = sandbox_child.wait_and_read();
+    eprintln!(
+        "[redirection-guard] sandbox junction: exit={sandbox_code} stderr={sandbox_err}\n{sandbox_out}"
+    );
+    let sandbox_junction_made = last_json_line(&sandbox_out)
+        .and_then(|v| v["make_junction"][0]["created"].as_bool())
+        .unwrap_or(false);
+
+    // **交絡を潰す**: 上の腕は対象がワークスペースの**外**（子が読めない場所）なので、
+    // 断られたのが「リパースポイントを作れない」のか「対象へ到達できない」のか区別できない。
+    // 対象をワークスペースの**中**にした腕を同じ回で撃つ。
+    let inside_target = workspace.path().join("inside-target");
+    std::fs::create_dir(&inside_target).expect("target dir inside the workspace");
+    std::fs::write(inside_target.join("f.txt"), b"x").expect("file inside the workspace");
+    let sandbox_junction_inside = workspace.path().join("sandbox-junction-inside");
+    let junction_inside_arg = format!(
+        "{}|{}",
+        sandbox_junction_inside.display(),
+        inside_target.display()
+    );
+    let mut sandbox_inside_child = SpikeSpawn {
+        exe: &probe_str,
+        args: &["--make-junction", &junction_inside_arg],
+        cwd: workspace.path(),
+        container_sid: sid.as_psid(),
+        capabilities: &caps,
+        child_process_restricted: false,
+        stdout_override: None,
+        extra_inherit: &[],
+        process_sddl: None,
+        thread_sddl: None,
+        token_default_dacl_sddl: None,
+        no_appcontainer: false,
+        console: SpikeConsole::NoWindow,
+    }
+    .spawn()
+    .expect("spawn the sandbox child that makes a junction inside the workspace");
+    let (inside_out, _inside_err, _inside_code) = sandbox_inside_child.wait_and_read();
+    eprintln!("[redirection-guard] sandbox junction (target inside the workspace):\n{inside_out}");
+    let sandbox_junction_inside_made = last_json_line(&inside_out)
+        .and_then(|v| v["make_junction"][0]["created"].as_bool())
+        .unwrap_or(false);
+
+    // サンドボックスの中から**ハードリンク**を作れるか（`plans/DESIGN-MAC-POC.md` §20項目12）。
+    // 2本測る——(1) ワークスペースの中から中へ、(2) ワークスペースの中から**外のファイル**へ。
+    // (2)が通ると、許可されていないファイルへ許可された場所から別名を張れることになる。
+    let sandbox_hard_inside = workspace.path().join("sandbox-hard-inside.txt");
+    let sandbox_hard_outside = workspace.path().join("sandbox-hard-outside.txt");
+    let hard_inside_arg = format!(
+        "{}|{}",
+        sandbox_hard_inside.display(),
+        inside_target.join("f.txt").display()
+    );
+    let hard_outside_arg = format!("{}|{}", sandbox_hard_outside.display(), target_file.display());
+    let mut sandbox_hard_child = SpikeSpawn {
+        exe: &probe_str,
+        args: &[
+            "--make-hardlink",
+            &hard_inside_arg,
+            "--make-hardlink",
+            &hard_outside_arg,
+        ],
+        cwd: workspace.path(),
+        container_sid: sid.as_psid(),
+        capabilities: &caps,
+        child_process_restricted: false,
+        stdout_override: None,
+        extra_inherit: &[],
+        process_sddl: None,
+        thread_sddl: None,
+        token_default_dacl_sddl: None,
+        no_appcontainer: false,
+        console: SpikeConsole::NoWindow,
+    }
+    .spawn()
+    .expect("spawn the sandbox child that makes hard links");
+    let (hard_out, _hard_err, _hard_code) = sandbox_hard_child.wait_and_read();
+    eprintln!("[redirection-guard] sandbox hard links:\n{hard_out}");
+
+    // シンボリックリンクも**対象の場所で2本**撃つ（ジャンクションと同じ交絡を潰す）。
+    let sandbox_symlink_inside = workspace.path().join("sandbox-symlink-inside");
+    let symlink_outside_arg = format!("dir|{}|{}", sandbox_symlink.display(), real.display());
+    let symlink_inside_arg = format!(
+        "dir|{}|{}",
+        sandbox_symlink_inside.display(),
+        inside_target.display()
+    );
+    let mut sandbox_sym_child = SpikeSpawn {
+        exe: &probe_str,
+        args: &[
+            "--make-symlink",
+            &symlink_outside_arg,
+            "--make-symlink",
+            &symlink_inside_arg,
+        ],
+        cwd: workspace.path(),
+        container_sid: sid.as_psid(),
+        capabilities: &caps,
+        child_process_restricted: false,
+        stdout_override: None,
+        extra_inherit: &[],
+        process_sddl: None,
+        thread_sddl: None,
+        token_default_dacl_sddl: None,
+        no_appcontainer: false,
+        console: SpikeConsole::NoWindow,
+    }
+    .spawn()
+    .expect("spawn the sandbox child that makes symlinks");
+    let (sym_out, _sym_err, _sym_code) = sandbox_sym_child.wait_and_read();
+    eprintln!("[redirection-guard] sandbox symlinks (dev mode ON? {dev_mode}):\n{sym_out}");
+    let sandbox_symlink_made = last_json_line(&sym_out)
+        .and_then(|v| v["make_symlink"][0]["created"].as_bool())
+        .unwrap_or(false);
+    let sandbox_symlink_inside_made = last_json_line(&sym_out)
+        .and_then(|v| v["make_symlink"][1]["created"].as_bool())
+        .unwrap_or(false);
+
+    // --- 測る対象を並べる（作れなかったものは外す） ---
+    let install_junction = PathBuf::from(r"C:\Documents and Settings\segfo");
+    let mut targets: Vec<(&str, PathBuf, bool)> = vec![
+        // (ラベル, 開くパス, 緩和策が断ることを期待するか)
+        ("plain-file", target_file.clone(), false),
+        ("hard-link", hard.clone(), false),
+        ("user-junction", user_junction.join("f.txt"), true),
+    ];
+    if install_junction.exists() {
+        // インストール時からあるジャンクション（管理者が作った）。**断られないことを期待する**
+        // ——ここが断られるなら、この緩和策は普通の運用を壊す。
+        targets.push(("install-junction", install_junction, false));
+    }
+    if sandbox_junction_made {
+        targets.push(("sandbox-junction", sandbox_junction.join("f.txt"), true));
+    }
+    if sandbox_junction_inside_made {
+        targets.push((
+            "sandbox-junction-inside",
+            sandbox_junction_inside.join("f.txt"),
+            true,
+        ));
+    }
+    if user_symlink_file_made {
+        targets.push(("user-symlink-file", user_symlink_file, true));
+    }
+    if user_symlink_dir_made {
+        targets.push(("user-symlink-dir", user_symlink_dir.join("f.txt"), true));
+    }
+    if sandbox_symlink_made {
+        targets.push(("sandbox-symlink-dir", sandbox_symlink.join("f.txt"), true));
+    }
+    if sandbox_symlink_inside_made {
+        targets.push((
+            "sandbox-symlink-inside",
+            sandbox_symlink_inside.join("f.txt"),
+            true,
+        ));
+    }
+
+    let mut specs: Vec<String> = Vec::new();
+    for (label, path, _) in &targets {
+        specs.push("--redirection-open".to_string());
+        specs.push(format!("{label}:{}", path.display()));
+    }
+
+    // --- 3つの設定で撃つ（対照を同じ回に混ぜる） ---
+    let mut results: Vec<(&str, serde_json::Value)> = Vec::new();
+    for mode in ["none", "enforce", "audit"] {
+        let mut args: Vec<&str> = vec!["--redirection-trust", mode];
+        args.extend(specs.iter().map(String::as_str));
+        let out = run_probe_locally(&probe_str, &args);
+        let report = last_json_line(&out)
+            .unwrap_or_else(|| panic!("no JSON for mode {mode}: {out}"))["redirection_trust"]
+            .clone();
+        eprintln!("[redirection-guard] mode={mode} report={report}");
+        // **掛かったことを別の口で確かめる**（掛けたつもりで測らない）。
+        let expected_flags = match mode {
+            "none" => 0,
+            "enforce" => 1,
+            _ => 2,
+        };
+        assert_eq!(
+            report["readback_flags"].as_u64(),
+            Some(expected_flags),
+            "緩和策が実際に掛かっていない（この回の数字は使えない）: mode={mode} {report}"
+        );
+        results.push((mode, report));
+    }
+
+    let opened = |report: &serde_json::Value, label: &str| -> Option<(bool, u64)> {
+        report["opens"].as_array()?.iter().find_map(|o| {
+            if o["label"].as_str() != Some(label) {
+                return None;
+            }
+            Some((o["opened"].as_bool()?, o["last_error"].as_u64()?))
+        })
+    };
+
+    // **対照**: 緩和策なしでは全部開ける。1つでも開けないなら仕込みが壊れている。
+    let none = &results[0].1;
+    for (label, path, _) in &targets {
+        assert_eq!(
+            opened(none, label).map(|(ok, _)| ok),
+            Some(true),
+            "緩和策なしで開けないものがある（仕込みの不備。この回の数字は使えない）: \
+             {label} path={} report={none}",
+            path.display()
+        );
+    }
+
+    // **強制**: 期待する向きまで確かめる。断る側と断らない側を同じ表で読む。
+    let enforce = &results[1].1;
+    for (label, path, should_refuse) in &targets {
+        let (ok, err) = opened(enforce, label)
+            .unwrap_or_else(|| panic!("{label}の結果が無い: {enforce}"));
+        if *should_refuse {
+            assert!(
+                !ok && err == 448,
+                "**管理者でない主体が作ったリンクを、緩和策が辿っている。** \
+                 ハーネス側の操作をこの緩和策で守る案（残課題#68）が成立しない: \
+                 {label} path={} last_error={err} report={enforce}",
+                path.display()
+            );
+        } else {
+            assert!(
+                ok,
+                "**緩和策が、守る相手ではないものまで断った。** 掛けると普通の運用が壊れる: \
+                 {label} path={} last_error={err} report={enforce}",
+                path.display()
+            );
+        }
+    }
+
+    // **監査だけ**: 断らない（記録するだけ）。強制と同じ結果なら、2つのモードを区別していない。
+    let audit = &results[2].1;
+    for (label, path, _) in &targets {
+        assert_eq!(
+            opened(audit, label).map(|(ok, _)| ok),
+            Some(true),
+            "監査だけのモードで断られた（強制と区別できていない）: {label} path={} report={audit}",
+            path.display()
+        );
+    }
+}
+
+/// プローブを**AppContainerに入れずに**（このテストと同じトークンで）起こし、標準出力を返す。
+///
+/// ハーネス自身がサンドボックスの外で動く側を演じる腕で使う。
+fn run_probe_locally(probe: &str, args: &[&str]) -> String {
+    let out = std::process::Command::new(probe)
+        .args(args)
+        .output()
+        .expect("run the probe");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}

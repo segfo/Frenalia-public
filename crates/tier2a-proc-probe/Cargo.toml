@@ -45,4 +45,7 @@ windows = { version = "0.58", features = [
     # 戻りアドレス列の採取に要る。`EXCEPTION_POINTERS`は`Win32_System_Kernel`側に居る。
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
+    # [残課題#68] RedirectionGuard（PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY）の実測に要る。
+    "Win32_System_SystemServices",
+    "Win32_System_Ioctl",
 ] }

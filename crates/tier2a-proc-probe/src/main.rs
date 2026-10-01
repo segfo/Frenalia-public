@@ -30,6 +30,9 @@ mod fault_log;
 mod load_library;
 /// 指定した権利を要求して開くだけのモード（`AccessCheck`の答えと実際を突き合わせる計器）。
 mod open_rights;
+/// [残課題#68] RedirectionGuardを自分に掛けてからリンク越しのパスを開くモードと、
+/// 管理者でないユーザーがシンボリックリンクを作れるかを測るモード。
+mod redirection_trust;
 mod spawn_via;
 #[cfg(windows)]
 mod try_runas;
@@ -93,6 +96,11 @@ struct Args {
     /// （`load_library`モジュールdoc参照）。
     load_library: Option<String>,
     open_rights: Vec<String>,
+    redirection_trust: Option<String>,
+    redirection_open: Vec<String>,
+    make_symlink: Vec<String>,
+    make_junction: Vec<String>,
+    make_hardlink: Vec<String>,
     /// MAC設計§20項目1: プロセス生成の全経路を試し、どれが拒否されるかを報告する
     /// （`spawn_matrix`モジュールdoc参照）。値はマーカーファイルを書くディレクトリ。
     spawn_matrix: Option<String>,
@@ -187,6 +195,11 @@ fn parse_args() -> Args {
     let mut spawn_via = None;
     let mut load_library = None;
     let mut open_rights: Vec<String> = Vec::new();
+    let mut redirection_trust = None;
+    let mut redirection_open: Vec<String> = Vec::new();
+    let mut make_symlink: Vec<String> = Vec::new();
+    let mut make_junction: Vec<String> = Vec::new();
+    let mut make_hardlink: Vec<String> = Vec::new();
     let mut spawn_matrix = None;
     // 空＝全部（既定）。指定すればその経路だけを撃つ。
     let mut spawn_matrix_methods: Vec<String> = Vec::new();
@@ -253,6 +266,11 @@ fn parse_args() -> Args {
             "--spawn-via-winexec" => spawn_via = Some(("winexec".to_string(), next())),
             "--load-library" => load_library = Some(next()),
             "--open-rights" => open_rights.push(next()),
+            "--redirection-trust" => redirection_trust = Some(next()),
+            "--redirection-open" => redirection_open.push(next()),
+            "--make-symlink" => make_symlink.push(next()),
+            "--make-junction" => make_junction.push(next()),
+            "--make-hardlink" => make_hardlink.push(next()),
             // --- MACスパイク用（`plans/mac-spike/RESULTS.md`） ---
             "--spawn-matrix" => spawn_matrix = Some(next()),
             "--spawn-matrix-methods" => {
@@ -387,6 +405,11 @@ fn parse_args() -> Args {
         spawn_via,
         load_library,
         open_rights,
+        redirection_trust,
+        redirection_open,
+        make_symlink,
+        make_junction,
+        make_hardlink,
         spawn_matrix,
         spawn_matrix_methods,
         reach,
@@ -739,6 +762,42 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::to_string(&report).expect("try_runas report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if !args.make_hardlink.is_empty() {
+        let report = redirection_trust::make_hardlink(&args.make_hardlink);
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("make_hardlink report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if !args.make_junction.is_empty() {
+        let report = redirection_trust::make_junction(&args.make_junction);
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("make_junction report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if !args.make_symlink.is_empty() {
+        let report = redirection_trust::make_symlink(&args.make_symlink);
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("make_symlink report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if let Some(mode) = &args.redirection_trust {
+        let report = redirection_trust::run(mode, &args.redirection_open);
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("redirection_trust report must serialize")
         );
         return ExitCode::SUCCESS;
     }
