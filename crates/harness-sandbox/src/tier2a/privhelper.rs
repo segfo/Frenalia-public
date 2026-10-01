@@ -405,6 +405,16 @@ pub enum PrivilegedResponse {
         /// **追加は必ず末尾へ**。`#[serde(default)]`なので、この項目を持たない旧応答も読める。
         #[serde(default)]
         netfilterd_chain: Option<Result<(), String>>,
+        /// [#30] `fs_allow_granted`の各行が**どの級の宣言の結果か**（`FsAccess::label`。並びは同じ）。
+        ///
+        /// 同じパスへ別の級の宣言が並ぶ（`policy.json`のドメインが違う）と、パスだけでは要求と
+        /// 結果を突き合わせられない。`#[serde(default)]`なので、この項目を持たない旧応答も読める
+        /// ——空なら呼び出し側はパスだけで突き合わせる（同じパスに2つの級が無い限り同じ結果）。
+        #[serde(default)]
+        fs_allow_granted_access: Vec<String>,
+        /// [#30] `fs_allow_failures`の各行の級（並びは同じ）。
+        #[serde(default)]
+        fs_allow_failures_access: Vec<String>,
     },
 }
 
@@ -1049,6 +1059,8 @@ mod tests {
             fs_allow_granted: vec![PathBuf::from(r"C:\ProgramData\Tool")],
             fs_allow_failures: vec![(PathBuf::from(r"C:\Windows\System32"), "denied".to_string())],
             netfilterd_chain: Some(Err("refusing to chain-launch the WFP daemon".to_string())),
+            fs_allow_granted_access: vec!["read_exec".to_string()],
+            fs_allow_failures_access: vec!["read".to_string()],
         };
         let bytes = serde_json::to_vec(&response).unwrap();
         let decoded: PrivilegedResponse = serde_json::from_slice(&bytes).unwrap();
@@ -1059,7 +1071,12 @@ mod tests {
                 fs_allow_granted,
                 fs_allow_failures,
                 netfilterd_chain,
+                fs_allow_granted_access,
+                fs_allow_failures_access,
             } => {
+                // [#30] 級の列も往復する（パスだけでは同じパスの別の級を区別できない）。
+                assert_eq!(fs_allow_granted_access, vec!["read_exec".to_string()]);
+                assert_eq!(fs_allow_failures_access, vec!["read".to_string()]);
                 // **連鎖起動の結末が往復すること**（BUG-093）。これが落ちると、親は
                 // 「起こせなかった」を知れずに30秒待ってからfail-closedへ倒れる。
                 assert_eq!(
@@ -1073,6 +1090,27 @@ mod tests {
                 );
                 assert_eq!(fs_allow_granted.len(), 1);
                 assert_eq!(fs_allow_failures.len(), 1);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// [#30] **級の列を持たない旧応答も読める**（`#[serde(default)]`）。読めなければ、ヘルパーを
+    /// 入れ替えていない環境で付与の結果が全部「解析失敗」になる。空の列は呼び出し側が
+    /// 「パスだけで照合する」の合図として読む。
+    #[test]
+    fn a_workspace_access_result_without_access_columns_still_parses() {
+        let old = r#"{"WorkspaceAccessResult":{"traverse_granted":[],"traverse_error":null,"fs_allow_granted":["C:/x"],"fs_allow_failures":[]}}"#;
+        match serde_json::from_str::<PrivilegedResponse>(old).expect("an older response parses") {
+            PrivilegedResponse::WorkspaceAccessResult {
+                fs_allow_granted,
+                fs_allow_granted_access,
+                fs_allow_failures_access,
+                ..
+            } => {
+                assert_eq!(fs_allow_granted.len(), 1);
+                assert!(fs_allow_granted_access.is_empty());
+                assert!(fs_allow_failures_access.is_empty());
             }
             other => panic!("unexpected variant: {other:?}"),
         }

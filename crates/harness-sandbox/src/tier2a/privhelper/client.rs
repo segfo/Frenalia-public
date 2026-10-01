@@ -71,12 +71,17 @@ pub type FsAllowRevokeOutcome = (Vec<PathBuf>, Vec<PathBuf>, Vec<(PathBuf, Strin
 ///
 /// 最後の要素は`None`＝依頼していない／`Some(Ok(()))`＝起きた／`Some(Err(reason))`＝
 /// 起こせなかった。**呼び出し側はこれを見てシナリオA/Bを決める**（BUG-093）。
+///
+/// [#30] 最後の2つは、fs-allow付与一覧・失敗一覧の各行の級（`FsAccess::label`、並びは同じ）。
+/// 旧ヘルパーの応答では空——呼び出し側はパスだけで突き合わせる。
 pub type WorkspaceAccessOutcome = (
     Vec<PathBuf>,
     Option<String>,
     Vec<PathBuf>,
     Vec<(PathBuf, String)>,
     Option<Result<(), String>>,
+    Vec<String>,
+    Vec<String>,
 );
 
 /// `GrantWorkspaceAccess`専用の委譲関数。**非管理者からのTier2a起動が特権を要するときは、
@@ -110,19 +115,23 @@ pub fn run_privileged_workspace_access(
             fs_allow_granted,
             fs_allow_failures,
             netfilterd_chain,
+            fs_allow_granted_access,
+            fs_allow_failures_access,
         } => Ok((
             traverse_granted,
             traverse_error,
             fs_allow_granted,
             fs_allow_failures,
             netfilterd_chain,
+            fs_allow_granted_access,
+            fs_allow_failures_access,
         )),
         // 以下2つは旧ヘルパー（この応答variantを知らない版）との互換経路。連鎖起動の結末を
         // 名乗れないので`None`＝「依頼していない」と同じ扱いにする。**呼び出し側はシナリオB
         // （自前の`runas`）へ落ちる**——起きたと誤解して待つより、UACが1回増える方が良い（P-03）。
-        PrivilegedResponse::Ok => Ok((Vec::new(), None, Vec::new(), Vec::new(), None)),
+        PrivilegedResponse::Ok => Ok((Vec::new(), None, Vec::new(), Vec::new(), None, Vec::new(), Vec::new())),
         PrivilegedResponse::GrantChain { granted, error } => {
-            Ok((granted, error, Vec::new(), Vec::new(), None))
+            Ok((granted, error, Vec::new(), Vec::new(), None, Vec::new(), Vec::new()))
         }
         PrivilegedResponse::RevokeFsAllowResult { .. } => Err(PrivHelperError::Ipc(
             "unexpected RevokeFsAllowResult response for a GrantWorkspaceAccess request"

@@ -240,6 +240,27 @@ const _: () = {
     }
 };
 
+/// 要求された級から、**実際にACEを書く級**を決める（D-30）。
+///
+/// `--sandbox tier2a-cow`では書込を含む要求を読取（実行権を含む和なら読取＋実行）へ下げる——
+/// 書込はRedirector DLLが差分層へ向けるので、本物へ書ける許可は渡さない（理由の全文は
+/// `win_appcontainer::preflight`の降格の箇所）。直接書込モードでは要求のまま。
+///
+/// **この規則を持つのはこの関数だけである。** 付与処理（`preflight`）と、付与の結果を宣言の一覧
+/// ごとに振り分ける側（`harness.exe`の起動）が同じ関数を通る——別々に書くと、振り分ける側が
+/// 別の級で結果を探して見つけられず、「付いているのに子へ渡らない」になる（B-05）。
+pub fn effective_access(requested: FsAccess, write_mode: &WorkspaceWriteMode) -> FsAccess {
+    let downgrade = matches!(write_mode, WorkspaceWriteMode::Cow { .. }) && requested.is_read_write();
+    if !downgrade {
+        return requested;
+    }
+    if requested.is_exec() {
+        FsAccess::ReadExec
+    } else {
+        FsAccess::Read
+    }
+}
+
 /// Tier2a向けfs passthrough記述子（D-13、`plans/DESIGN-SANDBOX-APPPOLICY.md` §5.1）。
 /// package SIDへ追加ルート（`workspace_root`外）の許可ACEを付与する対象を表す。
 /// Windows以外では値を運ぶだけで`best_effort_tier`のLinux/other分岐からは無視される

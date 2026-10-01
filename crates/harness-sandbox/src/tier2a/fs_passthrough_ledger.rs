@@ -436,6 +436,7 @@ mod grant_record_tests {
             writable: false,
             subject_sid: "S-1-15-3-1111".to_string(),
             used_restore_privilege: used_privilege,
+            granted_access: "read_exec".to_string(),
         }
     }
 

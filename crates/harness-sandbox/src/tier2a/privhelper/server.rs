@@ -11,6 +11,7 @@
 //! 呼び出し元の認可は、パイプのDACLを呼び出しユーザー専有にすること
 //! （`crate::win_pipe_ipc::user_only_security_attributes`）で成立させる。
 
+use crate::shell_tier::FsAccess;
 use super::*;
 
 /// ヘルパー側のファイルログ（`%APPDATA%\harness\config\privhelper.log`、台帳と同じ`config_dir`）。
@@ -238,7 +239,10 @@ unsafe fn launch_netfilterd_chained(pipe_name: &str) -> Result<(), PrivHelperErr
 /// `(受け取った秘密, **この関数がこれから書き込む当のパス**, access級)`で、パスを
 /// 呼び出し元の申告ではなく`entry.path`——実際の書込先——から取るのが要点である
 /// （申告されたパスから導出して別のパスへ書くと、束縛が名目だけになる）。
-fn grant_fs_allow_entries(entries: Vec<FsAllowGrant>) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
+#[allow(clippy::type_complexity)]
+fn grant_fs_allow_entries(
+    entries: Vec<FsAllowGrant>,
+) -> (Vec<(PathBuf, FsAccess)>, Vec<(PathBuf, FsAccess, String)>) {
     let mut granted = Vec::new();
     let mut failures = Vec::new();
     for entry in entries {
@@ -251,9 +255,7 @@ fn grant_fs_allow_entries(entries: Vec<FsAllowGrant>) -> (Vec<PathBuf>, Vec<(Pat
                  the capability-SID migration)",
                 entry.path.display()
             ));
-            failures.push((
-                entry.path,
-                "no capability secret on the wire (caller predates the capability-SID migration)"
+            failures.push((entry.path, entry.access, "no capability secret on the wire (caller predates the capability-SID migration)"
                     .to_string(),
             ));
             continue;
@@ -273,9 +275,7 @@ fn grant_fs_allow_entries(entries: Vec<FsAllowGrant>) -> (Vec<PathBuf>, Vec<(Pat
                     "  entry {} : FAILED to derive the declaration capability: {e}",
                     entry.path.display()
                 ));
-                failures.push((
-                    entry.path,
-                    format!("could not derive the capability SID: {e}"),
+                failures.push((entry.path, entry.access, format!("could not derive the capability SID: {e}"),
                 ));
                 continue;
             }
@@ -289,7 +289,7 @@ fn grant_fs_allow_entries(entries: Vec<FsAllowGrant>) -> (Vec<PathBuf>, Vec<(Pat
                     "  entry {} : forced grant REFUSED by deny-gate: {reason}",
                     entry.path.display()
                 ));
-                failures.push((entry.path, reason));
+                failures.push((entry.path, entry.access, reason));
                 continue;
             }
         }
@@ -317,7 +317,7 @@ fn grant_fs_allow_entries(entries: Vec<FsAllowGrant>) -> (Vec<PathBuf>, Vec<(Pat
                     if entry.forced { ",forced" } else { "" },
                     started.elapsed().as_millis()
                 ));
-                granted.push(entry.path);
+                granted.push((entry.path, entry.access));
             }
             Err(e) => {
                 log::line(&format!(
@@ -331,7 +331,7 @@ fn grant_fs_allow_entries(entries: Vec<FsAllowGrant>) -> (Vec<PathBuf>, Vec<(Pat
                     if entry.forced { ",forced" } else { "" },
                     started.elapsed().as_millis()
                 ));
-                failures.push((entry.path, e.to_string()));
+                failures.push((entry.path, entry.access, e.to_string()));
             }
         }
     }
@@ -518,7 +518,15 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
             // [§22.3.1] **fs-allowの宛先SIDはもうセッションプロファイル名から導出しない。**
             // 宣言ごとのcapability SIDへ移したので、名前を受け取って検証する段はここには無く、
             // 導出はエントリごとに`grant_fs_allow_entries`の中で行う（同関数のdoc）。
-            let (fs_allow_granted, fs_allow_failures) = grant_fs_allow_entries(fs_allow_entries);
+            let (granted_rows, failure_rows) = grant_fs_allow_entries(fs_allow_entries);
+            // [#30] 級は別の列で返す（旧応答の形を変えないため。`WorkspaceAccessResult`のdoc）。
+            let fs_allow_granted_access: Vec<String> =
+                granted_rows.iter().map(|(_, a)| a.label().to_string()).collect();
+            let fs_allow_failures_access: Vec<String> =
+                failure_rows.iter().map(|(_, a, _)| a.label().to_string()).collect();
+            let fs_allow_granted: Vec<PathBuf> = granted_rows.into_iter().map(|(p, _)| p).collect();
+            let fs_allow_failures: Vec<(PathBuf, String)> =
+                failure_rows.into_iter().map(|(p, _, r)| (p, r)).collect();
             log::line(&format!(
                 "dispatch: GrantWorkspaceAccess done, {} traverse node(s) granted (error={:?}), \
                  {} fs-allow granted, {} fs-allow failed",
@@ -535,6 +543,8 @@ fn dispatch(req: PrivilegedRequest) -> PrivilegedResponse {
                 // 連鎖起動は`dispatch`の外（`serve`）で行う。結末は
                 // `with_netfilterd_chain_result`が応答を送る直前に埋める。
                 netfilterd_chain: None,
+                fs_allow_granted_access,
+                fs_allow_failures_access,
             }
         }
         PrivilegedRequest::RevokeFsAllow { entries } => {

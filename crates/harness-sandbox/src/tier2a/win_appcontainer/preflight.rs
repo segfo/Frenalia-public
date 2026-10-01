@@ -47,7 +47,65 @@ pub struct PreflightOutcome {
 }
 
 /// `preflight`のfs-allow昇格結果（`granted`パス一覧、`(path, reason)`失敗一覧）。
-type FsAllowElevationOutcome = (Vec<std::path::PathBuf>, Vec<(std::path::PathBuf, String)>);
+/// 昇格した付与の結果（付与できた行・失敗した行）。各行の級は**分かれば**`Some`
+/// （[#30] 旧ヘルパーの応答には級が無い）。照合は[`elevation_row_matches`]が持つ。
+type FsAllowElevationOutcome = (
+    Vec<(std::path::PathBuf, Option<String>)>,
+    Vec<(std::path::PathBuf, Option<String>, String)>,
+);
+
+/// [#30] 昇格の結果1行が、この要求（**パス＋級**）のものか。
+///
+/// 同じパスへ別の級の宣言が並ぶ（`policy.json`のドメインが違う）と、パスだけで照合すると
+/// 片方の成否をもう片方へ写してしまう。級を返さない旧ヘルパーの応答（`None`）だけはパスで決める
+/// ——その場合でも、同じパスに2つの級が並ばない限り結果は変わらない。
+fn elevation_row_matches(
+    path: &Path,
+    access: &Option<String>,
+    grant: &crate::tier2a::privhelper::FsAllowGrant,
+) -> bool {
+    path == grant.path && access.as_deref().is_none_or(|a| a == grant.access.label())
+}
+
+/// [#30] 級の列を、パスの列へ並びで添える。**長さが合わなければ級を捨てる**（`None`＝パスだけで照合）
+/// ——ずれた並びで組を作ると、別の行の級を名乗ってしまう。
+fn zip_access<T>(rows: Vec<T>, access: Vec<String>) -> Vec<(T, Option<String>)> {
+    if rows.len() == access.len() {
+        rows.into_iter().zip(access.into_iter().map(Some)).collect()
+    } else {
+        rows.into_iter().map(|row| (row, None)).collect()
+    }
+}
+
+/// [#30] **降格後の（パス, 級）で重複を除く。**
+///
+/// 付与処理へは`harness.exe`が入口とドメインの宣言をまとめて渡すので、同じパスに複数の級が来る。
+/// 級が違えば宛先SIDも違うのでそのまま並べてよいが、CoWでは`read_write`と`read`がどちらも`read`へ
+/// 下がり、**同じ宛先SIDの行が2つ**になる。残すと同じSIDを子のトークンへ2回積むことになる
+/// （`spawnd/child_plan.rs`は重複を`ERROR_INVALID_PARAMETER`の原因として挙げている）。
+///
+/// 合成の規則: 範囲は再帰が勝つ（狭い方を採ると明示的に広げた宣言が黙って効かなくなる）、
+/// `forced`と「書込を要求したか」はOR。**ここで畳むのは付与処理への入力だけ**で、子へ何を渡すかは
+/// 呼び出し側が宣言の一覧ごとに自分の要求で組み直す（書込の要求を他の一覧へ写さないため）。
+fn dedupe_resolved(resolved: Vec<(FsPassthrough, bool)>) -> Vec<(FsPassthrough, bool)> {
+    let mut out: Vec<(FsPassthrough, bool)> = Vec::with_capacity(resolved.len());
+    for (fp, requested_rw) in resolved {
+        match out
+            .iter_mut()
+            .find(|(seen, _)| seen.path == fp.path && seen.access == fp.access)
+        {
+            Some((seen, seen_rw)) => {
+                if fp.scope.is_recursive() {
+                    seen.scope = fp.scope;
+                }
+                seen.forced |= fp.forced;
+                *seen_rw |= requested_rw;
+            }
+            None => out.push((fp, requested_rw)),
+        }
+    }
+    out
+}
 
 /// [§22.3] 昇格ヘルパーへ回す宣言1件と、**その宣言の宛先SID**を1つの値で持つ。
 ///
@@ -67,6 +125,12 @@ type FsAllowElevationOutcome = (Vec<std::path::PathBuf>, Vec<(std::path::PathBuf
 struct PendingElevation {
     /// 昇格ヘルパーへ送る電文そのもの。
     grant: crate::tier2a::privhelper::FsAllowGrant,
+    /// **ユーザーが要求した**アクセスが書込を含むか（`GrantedPassthrough::writable`へ写す値）。
+    ///
+    /// [#30] `grant.access`はCoWで降格した後の級なので、そこから`is_read_write`を読むと
+    /// 昇格した行だけ「書込なし」になり、CoWの書込誘導の対象から黙って外れていた
+    /// （本体内で付けた行は要求の値を使っていた）。
+    requested_rw: bool,
     /// この宣言の宛先SID。子のトークンへ積むのも、台帳へ記録するのもこれ。
     subject: crate::win_common::OwnedSid,
     /// [`Self::subject`]の文字列表現。`sid_to_string`は失敗し得るので、
@@ -886,7 +950,7 @@ pub fn preflight_with_privhelper_launcher(
     // **秘密はまだ持たない**——付与のループを抜けてから1回の台帳読み直しでまとめて引き、
     // そこで[`PendingElevation`]を組む（1件ずつ引くと、システム保護されたパスが多いドメインで
     // 台帳の全文往復が件数ぶん戻ってくる）。
-    let mut pending_elevation: Vec<(FsPassthrough, crate::win_common::OwnedSid, String)> =
+    let mut pending_elevation: Vec<(FsPassthrough, crate::win_common::OwnedSid, String, bool)> =
         Vec::new();
     let mut netfilterd_chain_attempted = false;
     // 到達性プローブ（D8）の対象。**ここでは測らず、全ての付与が終わってから1プロセスで
@@ -978,17 +1042,8 @@ pub fn preflight_with_privhelper_launcher(
         // 「書込をRedirector DLLのフックへ強制的に通す」ためであって、ユーザーが明示的に
         // `fs.read_exec`で要求した実行権を取り上げる理由は無い（上の「頼まれてもいない実行権限まで
         // 付与する理由は無い」の裏返し——頼まれた実行権を消す理由も無い）。
-        let downgrade_to_ro = matches!(write_mode, WorkspaceWriteMode::Cow { .. })
-            && requested.access.is_read_write();
-        let effective_access = if downgrade_to_ro {
-            if requested.access.is_exec() {
-                FsAccess::ReadExec
-            } else {
-                FsAccess::Read
-            }
-        } else {
-            requested.access
-        };
+        // 規則は`shell_tier::effective_access`が1つだけ持つ（付与の結果を振り分ける側と共有する）。
+        let effective_access = crate::shell_tier::effective_access(requested.access, write_mode);
         resolved.push((
             FsPassthrough {
                 path: requested.path.clone(),
@@ -1001,6 +1056,8 @@ pub fn preflight_with_privhelper_launcher(
             requested.access.is_read_write(),
         ));
     }
+
+    let resolved = dedupe_resolved(resolved);
 
     // [§22.3 / 残課題#37] **この宣言たちの宛先SID**を、1回の台帳更新でまとめて確保する。
     // 以前はセッションのpackage SID（＝サンドボックス全体で共有されるSID）だったので、
@@ -1128,6 +1185,7 @@ pub fn preflight_with_privhelper_launcher(
             path: fp.path.clone(),
             writable,
             subject_sid: entry_cap_text.clone(),
+            granted_access: fp.access.label().to_string(),
             // [BUG-119] **この経路では`SeRestorePrivilege`を1度も使っていない。**
             // `already_sufficient`（Win32を1回も呼ばない）と、普通に`grant_ace_scoped`で
             // 書けたパスの両方がここを通る。`--force-system-acl`を打っていても、
@@ -1205,7 +1263,7 @@ pub fn preflight_with_privhelper_launcher(
                     }
                 };
                 // [残課題#37] 秘密はここでは引かない（このループを抜けてから1回でまとめて引く）。
-                pending_elevation.push((fp.clone(), subject, entry_cap_text.clone()));
+                pending_elevation.push((fp.clone(), subject, entry_cap_text.clone(), requested_rw));
             }
         }
     }
@@ -1217,15 +1275,18 @@ pub fn preflight_with_privhelper_launcher(
     if !pending_elevation.is_empty() {
         let secret_requests: Vec<(&Path, &str)> = pending_elevation
             .iter()
-            .map(|(fp, _, _)| (fp.path.as_path(), fp.access.label()))
+            .map(|(fp, _, _, _)| (fp.path.as_path(), fp.access.label()))
             .collect();
         let issued = crate::tier2a::workspace_capability::ensure_declaration_capabilities(
             &canonical_workspace_root,
             &secret_requests,
         );
-        for ((fp, subject, subject_sid), capability) in pending_elevation.into_iter().zip(issued) {
+        for ((fp, subject, subject_sid, requested_rw), capability) in
+            pending_elevation.into_iter().zip(issued)
+        {
             match capability {
                 Ok(capability) => needs_elevation.push(PendingElevation {
+                    requested_rw,
                     grant: crate::tier2a::privhelper::FsAllowGrant {
                         path: fp.path.clone(),
                         access: fp.access,
@@ -1291,7 +1352,11 @@ pub fn preflight_with_privhelper_launcher(
                     // （dispatch側と同じ防壁。本体が既に管理者の経路でも同一の不変条件を保つ）。
                     if grant.forced {
                         if let Some(reason) = is_force_grant_forbidden(&grant.path) {
-                            failures.push((grant.path.clone(), reason));
+                            failures.push((
+                                grant.path.clone(),
+                                Some(grant.access.label().to_string()),
+                                reason,
+                            ));
                             continue;
                         }
                     }
@@ -1314,9 +1379,10 @@ pub fn preflight_with_privhelper_launcher(
                     } else {
                         do_grant()
                     };
+                    let access = Some(grant.access.label().to_string());
                     match result {
-                        Ok(()) => granted.push(grant.path.clone()),
-                        Err(e) => failures.push((grant.path.clone(), e.to_string())),
+                        Ok(()) => granted.push((grant.path.clone(), access)),
+                        Err(e) => failures.push((grant.path.clone(), access, e.to_string())),
                     }
                 }
                 Ok((granted, failures))
@@ -1354,6 +1420,8 @@ pub fn preflight_with_privhelper_launcher(
                         granted,
                         failures,
                         netfilterd_chain,
+                        granted_access,
+                        failures_access,
                     )) => {
                         // **「依頼した」ではなく「実際に起きた」を返す**（BUG-093）。
                         // 以前はここで`wfp_chain_pipe.is_some()`を立てていたため、privhelperの
@@ -1380,7 +1448,11 @@ pub fn preflight_with_privhelper_launcher(
                             )));
                             }
                         }
-                        Ok((granted, failures))
+                        let failures = zip_access(failures, failures_access)
+                            .into_iter()
+                            .map(|((path, reason), access)| (path, access, reason))
+                            .collect();
+                        Ok((zip_access(granted, granted_access), failures))
                     }
                     Err(e) => {
                         // traverseが不足していて、それがprivhelper経由でも解消できなかった場合は
@@ -1414,15 +1486,19 @@ pub fn preflight_with_privhelper_launcher(
                 for entry in &needs_elevation {
                     let grant = &entry.grant;
                     let path = &grant.path;
-                    if granted.iter().any(|p| p == path) {
+                    if granted
+                        .iter()
+                        .any(|(p, access)| elevation_row_matches(p, access, grant))
+                    {
                         // [§22.3] 昇格側が書いたACEの宛先SIDも、子のトークンと台帳へ運ぶ
                         // ——ここが抜けると、**穴は開いているのに子がその宛先SIDを持っていない**
                         // （＝到達不能）か、**撤収経路の無い孤立ACE**のどちらかになる。
                         fs_allow_caps.push(entry.subject.clone());
                         granted_passthrough.push(harness_core::GrantedPassthrough {
                             path: path.clone(),
-                            writable: grant.access.is_read_write(),
+                            writable: entry.requested_rw,
                             subject_sid: entry.subject_sid.clone(),
+                            granted_access: grant.access.label().to_string(),
                             // [BUG-119] 昇格経路で`SeRestorePrivilege`を有効化するのは
                             // **`forced`なエントリだけ**（本体が管理者の直接付与も、
                             // privhelperへ委譲した場合も同じ条件）。ここへ来ている時点で
@@ -1435,12 +1511,20 @@ pub fn preflight_with_privhelper_launcher(
                         // 漏れる」形を踏んでいるので、経路ごとに数え方を変えない）。
                         progress.record_granted();
                         fs_allow_opened_paths.push(path.clone());
-                        if let Some(fp) = passthrough.iter().find(|fp| &fp.path == path) {
+                        // 到達確認の対象は**降格後の一覧**から（パス＋級で）引く——要求時の
+                        // 一覧から引くと、CoWで降格する前の級で到達を測ってしまう。
+                        if let Some((fp, _)) = resolved
+                            .iter()
+                            .find(|(fp, _)| fp.path == *path && fp.access == grant.access)
+                        {
                             probe_targets.push(fp.clone());
                         }
                         continue;
                     }
-                    let Some((_, reason)) = failures.iter().find(|(p, _)| p == path) else {
+                    let Some((_, _, reason)) = failures
+                        .iter()
+                        .find(|(p, access, _)| elevation_row_matches(p, access, grant))
+                    else {
                         // 送ったのに`granted`にも`failures`にも居ない。**黙って落とさない**
                         // （B-09/B-10: 「対象が無かった」と「見失った」は別の事実）。
                         warnings.push(format!(
@@ -1459,8 +1543,9 @@ pub fn preflight_with_privhelper_launcher(
                     if matches!(sid_ace_mask(path, entry.subject.as_psid()), Ok(Some(_))) {
                         granted_passthrough.push(harness_core::GrantedPassthrough {
                             path: path.clone(),
-                            writable: grant.access.is_read_write(),
+                            writable: entry.requested_rw,
                             subject_sid: entry.subject_sid.clone(),
+                            granted_access: grant.access.label().to_string(),
                             // [BUG-119] **部分適用は「どう書かれたか」が分からない。**
                             // 実DACLにACEが在ることしか確かめていないので、
                             // `forced`なら`true`へ倒す——「使ったのに記録しない」は
@@ -1502,8 +1587,9 @@ pub fn preflight_with_privhelper_launcher(
                     ) {
                         granted_passthrough.push(harness_core::GrantedPassthrough {
                             path: grant.path.clone(),
-                            writable: grant.access.is_read_write(),
+                            writable: entry.requested_rw,
                             subject_sid: entry.subject_sid.clone(),
+                            granted_access: grant.access.label().to_string(),
                             // [BUG-119] 上と同じ理由で`forced`なら`true`へ倒す。
                             used_restore_privilege: grant.forced,
                         });
@@ -1945,3 +2031,7 @@ mod traverse_target_tests {
         assert_eq!(targets, vec![std::path::PathBuf::from(r"C:\work")]);
     }
 }
+
+#[cfg(test)]
+#[path = "preflight_merge_tests.rs"]
+mod preflight_merge_tests;

@@ -427,6 +427,12 @@ pub struct GrantedPassthrough {
     /// 「使ったのに`false`」は撤収不能を意味する（D-19 不変条件5が禁じた向き）ので、
     /// 判断に迷ったら`true`へ倒すこと。
     pub used_restore_privilege: bool,
+    /// このACEを**実際に書いた**級（`harness_sandbox::FsAccess::label`。CoWでは降格後の級）。
+    /// 宛先SID（[`Self::subject_sid`]）は`(ワークスペース, パス, この級)`から導出されている。
+    ///
+    /// [#30] **同じパスへ別の級の宣言が並ぶ**（`policy.json`のドメインが違う）とき、付与の結果を
+    /// 宣言の一覧ごとに振り分ける鍵になる。[`Self::writable`]（要求した側の値）とは別物である。
+    pub granted_access: String,
 }
 
 /// `harness-sandbox::shell_tier::select_tier`の結果。`ToolCtx`が運ぶ「値」であり、
