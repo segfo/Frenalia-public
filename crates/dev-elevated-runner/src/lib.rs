@@ -745,6 +745,9 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     // 起こすため管理者権限と外部への到達性が要る（`crates/harness-policy-editor/tests/
     // record_net_e2e.rs`）。**2本目は対のテスト**で、生ソケットがWFPに落とされることを
     // 確かめる——落とされないなら1本目の「到達できた」は強制の証明にならない。
+    //
+    // **`harness_grants::`（#71の4点目）は外す**——付与側が残した状態を撤収側が片付ける順序を持つ対で、
+    // `e2e-mock`付きの`harness.exe`も要る（下の`e2e-policy-editor-keeps-harness-grants`の注記）。
     (
         "e2e-policy-editor-pass2",
         &[
@@ -757,6 +760,47 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--ignored",
             "--test-threads=1",
             "--nocapture",
+            "--skip",
+            "harness_grants::",
+        ],
+    ),
+    // [#71の4点目・BUG-184] パス2（`record-net`）を`harness.exe`と同じワークスペースで回しても、
+    // `harness.exe`が付けた許可（`--fs-allow`と承認済みの`policy.json`の宣言）が残ることを測る
+    // （`crates/harness-policy-editor/tests/record_net_e2e/harness_grants.rs`）。
+    // **付与側と撤収側を別のキーにしてある**（`CLAUDE.md`「開発コマンド」節）。付与側（`keep_`）は
+    // `harness.exe`を動かしたままパス2を回して3つの置き場のACEと承認を**残して**終わり、撤収側（`revoke_`）は
+    // 動いていない状態のパス2で「どこからも外れた宣言」だけが消えることを確かめ、製品の取り消しで片付ける。
+    // **必ず付与側→撤収側の順に撃つ。** 撃つ前に`cargo build --workspace`→
+    // `cargo build -p harness-cli --features e2e-mock`の順でビルドしておくこと（`e2e-mock`付きの
+    // `harness.exe`が要る。無ければ試験が手順付きで落ちる）。
+    (
+        "e2e-policy-editor-keeps-harness-grants",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "record_net_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "harness_grants::keep_",
+        ],
+    ),
+    (
+        "e2e-policy-editor-revokes-stale-grants",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "record_net_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "harness_grants::revoke_",
         ],
     ),
     // 上の`e2e-policy-editor-pass2`のうち**FS側の1本だけ**を撃つ。承認したFS宣言が実DACLへ

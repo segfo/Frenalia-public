@@ -16,7 +16,8 @@
 //! | [`revoke_an_entry_declaration_whose_approval_was_removed`]・[`revoke_a_target_domain_declaration_whose_approval_was_removed`] | 承認を外して起動し直すと、自動撤収（D-27）でACEが消える | 撤収後: ACE 0本・台帳の行も宛先の索引も消える・読めない | 撤収前: 付与のキーが残したACEが在ることを前提として確かめる |
 //!
 //! **4点目（ポリシーエディタの試験実行を同じワークスペースで回しても`harness.exe`の許可が残る）は
-//! ここに無い**——エディタ側の試験（`crates/harness-policy-editor/tests/`）の担当である。
+//! ここに無い**——エディタ側の試験（`crates/harness-policy-editor/tests/record_net_e2e/harness_grants.rs`、
+//! キーは`e2e-policy-editor-keeps-harness-grants`→`e2e-policy-editor-revokes-stale-grants`）の担当である。
 //!
 //! # 付与と撤収を別のキーにしてある（撃つ順序が要る）
 //!
