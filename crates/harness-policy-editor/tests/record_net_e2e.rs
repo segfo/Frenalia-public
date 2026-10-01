@@ -365,6 +365,9 @@ fn enforcing_pass2_allows_only_the_declared_domain_and_proposes_the_refused_one(
 
     // 許可側: 宣言した宛先は許可リストに一致して通った（record_allで通ったのではない）。
     let audit = net_audit_of_latest_session(workspace_root);
+    // 監査の生の行も残す。ホスト名を持たないWFPのdropが何件・どの宛先かは、合否と別に
+    // 読み返したくなる（一時ワークスペースは試験の終わりに消える）。
+    eprintln!("--- net-audit.jsonl ---\n{audit}");
     let events: Vec<serde_json::Value> = audit
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
