@@ -9280,12 +9280,15 @@ fn run_arm_collecting_denials_in(
                 if matches!(d.reason, DenyReason::SpawnFailed) {
                     spawn_failures += 1;
                 }
-                // **3つへ畳んだ側を持つ**（`DenyReason`の写しではない）。読む側が要る区別は
+                // **畳んだ側を持つ**（`DenyReason`の写しではない）。読む側が要る区別は
                 // 「宣言を足せば通るのか」だけで、そこは`remedy`が唯一の定義を持つ（`B-05`）。
                 let label = match remedy(&d.reason) {
                     Remedy::FixTheDeclaration => "宣言を足せば通る",
                     Remedy::BlockedUntilHarnessImplementsIt => "harness未実装。宣言しても通らない",
                     Remedy::NotAboutPolicy => "宣言と無関係。宣言しても通らない",
+                    Remedy::FixTheEnvironment => {
+                        "固定したファイルを呼び出し元が書き換えられる。宣言しても通らない"
+                    }
                 };
                 denied_detail.push((d.exe.clone(), format!("{label}（{:?}）", d.reason)));
             }

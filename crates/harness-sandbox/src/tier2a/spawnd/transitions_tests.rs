@@ -68,10 +68,12 @@ fn the_remedy_table_separates_declaration_problems_from_harness_limits() {
     );
 
     // 宣言とも実装とも関係ないもの。
+    // （`SpawnFailed`は2026-10-01まで抜けていた。この一覧は型が守らないので手で足す。）
     for reason in [
         DenyReason::NotRegistered,
         DenyReason::PidReused,
         DenyReason::MalformedRequest,
+        DenyReason::SpawnFailed,
     ] {
         assert_eq!(
             remedy(&reason),
@@ -79,6 +81,14 @@ fn the_remedy_table_separates_declaration_problems_from_harness_limits() {
             "宣言候補として画面に出してはいけない: {reason:?}"
         );
     }
+
+    // 固定辺は宣言済みだが、固定したファイルを呼び出し元が書き換えられる。直すのは環境の側。
+    // `FixTheDeclaration`にすると、突き合わせた読む側が「解決済み」と判定して画面から消す。
+    assert_eq!(
+        remedy(&DenyReason::FixedInputWritable),
+        Remedy::FixTheEnvironment,
+        "固定辺の前提が崩れた拒否は、宣言では直らない"
+    );
 }
 
 // --- 行の形（決定2の欄も含む） ---------------------------------------------

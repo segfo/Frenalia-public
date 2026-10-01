@@ -47,6 +47,7 @@ pub(super) fn note(records: &[PendingRecord]) -> Option<String> {
     let mut fixable: BTreeSet<String> = BTreeSet::new();
     let mut blocked: BTreeSet<String> = BTreeSet::new();
     let mut unrelated: BTreeSet<String> = BTreeSet::new();
+    let mut environment: BTreeSet<String> = BTreeSet::new();
     let mut dropped = 0u64;
 
     for record in records {
@@ -63,6 +64,7 @@ pub(super) fn note(records: &[PendingRecord]) -> Option<String> {
             Remedy::FixTheDeclaration => &mut fixable,
             Remedy::BlockedUntilHarnessImplementsIt => &mut blocked,
             Remedy::NotAboutPolicy => &mut unrelated,
+            Remedy::FixTheEnvironment => &mut environment,
         };
         bucket.insert(file_name_of(&denial.exe));
     }
@@ -80,6 +82,16 @@ pub(super) fn note(records: &[PendingRecord]) -> Option<String> {
             "[transition: denied starting {}; harness does not support this transition target \
              yet, so declaring it will not help]",
             named(&blocked)
+        ));
+    }
+    if !environment.is_empty() {
+        // 宣言は通っている。**宣言を直せとも、ツールを引けとも言わない**——どちらも効かない。
+        // 直せるのはユーザーだけなので、モデルにはそう伝える。
+        lines.push(format!(
+            "[transition: denied starting {}; the declared transition fixes a program or argument \
+             file that this sandbox can modify, so it is refused — ask the user to move that file \
+             somewhere this sandbox cannot write, or to remove the write permission]",
+            named(&environment)
         ));
     }
     if !unrelated.is_empty() {
@@ -197,9 +209,25 @@ mod tests {
         assert!(!text.contains(CAN_RUN_PROGRAM_TOOL), "{text}");
     }
 
-    /// 3分類が混ざったら**3行とも出す**。1つに畳むと、直せるものと直せないものが混ざる。
+    /// 固定辺の前提が崩れて断られたものは、**宣言でもツールでもなく、ユーザーに頼め**と言う。
+    ///
+    /// 宣言は通っているので「宣言を直せ」は効かず、`can_run_program`は「起こせる」と答える
+    /// ——どちらを促しても、モデルは同じ要求を繰り返すだけになる。
     #[test]
-    fn the_three_kinds_are_reported_separately() {
+    fn a_fixed_input_the_sandbox_can_modify_asks_the_user_instead_of_a_declaration() {
+        let text =
+            note(&[denial("C:/tools/gen.exe", DenyReason::FixedInputWritable)]).expect("a note");
+        assert!(text.contains("gen.exe"), "{text}");
+        assert!(text.contains("ask the user"), "{text}");
+        assert!(
+            !text.contains("declare the transition") && !text.contains(CAN_RUN_PROGRAM_TOOL),
+            "宣言では直らないのに宣言やツールを促している: {text}"
+        );
+    }
+
+    /// 分類が混ざったら**分類ごとに1行ずつ出す**。1つに畳むと、直せるものと直せないものが混ざる。
+    #[test]
+    fn each_kind_is_reported_separately() {
         let text = note(&[
             fixable("C:/bin/a.exe"),
             denial("C:/bin/b.exe", DenyReason::NotRegistered),
@@ -209,9 +237,10 @@ mod tests {
                     to: "d".to_string(),
                 },
             ),
+            denial("C:/bin/e.exe", DenyReason::FixedInputWritable),
         ])
         .expect("a note");
-        assert_eq!(text.lines().count(), 3, "{text}");
+        assert_eq!(text.lines().count(), 4, "{text}");
     }
 
     /// **名前は上限で打ち切る。** 打ち切らないと、断られた種類の数だけ1行が伸びる

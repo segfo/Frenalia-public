@@ -487,6 +487,10 @@ fn an_any_argv_edge_passes_the_environment_through_and_a_literal_one_fixes_it() 
         passed.inherit_handles,
         "an any-argv narrowing edge keeps the caller's stdio"
     );
+    assert!(
+        !passed.fixed,
+        "an any-argv edge fixes nothing, so the daemon has no fixed file to check"
+    );
 
     let Resolution::Allowed(fixed) = graph.resolve(SpawnAttempt {
         from_domain: "shell",
@@ -503,6 +507,29 @@ fn an_any_argv_edge_passes_the_environment_through_and_a_literal_one_fixes_it() 
     assert!(
         !fixed.inherit_handles,
         "a fully fixed edge must not inherit the caller's handles (stdin can carry code)"
+    );
+    assert!(
+        fixed.fixed,
+        "a fully fixed edge must tell the daemon to check its fixed files before spawning"
+    );
+}
+
+/// 固定したファイルの候補は、**書かれた綴りのまま**（大小も区切りも変えずに）返る
+/// ——Daemonはこの値でファイルを実際に開く。相対トークンとスイッチは候補にしない（対）。
+#[test]
+fn fixed_file_paths_are_the_image_and_absolute_arguments_as_written() {
+    let paths = fixed_file_paths(
+        r"C:\Tools\Gen.exe",
+        r#""C:\Tools\Gen.exe" --in C:\Data\In.txt /c rel.txt --out "D:\Out Dir\x.bin""#,
+    );
+    assert_eq!(
+        paths,
+        vec![
+            r"C:\Tools\Gen.exe".to_string(),
+            r"C:\Data\In.txt".to_string(),
+            r"D:\Out Dir\x.bin".to_string(),
+        ],
+        "the image first, then only the absolute path-like arguments, spelled as written"
     );
 }
 

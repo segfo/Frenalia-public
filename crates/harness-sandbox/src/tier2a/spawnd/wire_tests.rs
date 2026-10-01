@@ -274,6 +274,10 @@ fn every_deny_reason_has_a_distinct_wire_value() {
         DenyReason::TargetDomainNotProvisioned {
             to: "other-domain".to_string(),
         },
+        // **この一覧は型が守らない**（手で並べている）。2026-10-01まで`SpawnFailed`が
+        // 抜けていたので、固定辺の拒否を足した回に一緒に入れた。変種を足したらここにも足すこと。
+        DenyReason::SpawnFailed,
+        DenyReason::FixedInputWritable,
     ];
     let mut seen: Vec<String> = reasons
         .iter()

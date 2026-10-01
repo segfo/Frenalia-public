@@ -517,6 +517,24 @@ pub(super) struct SuspendedSpikeChild {
 unsafe impl Send for SuspendedSpikeChild {}
 
 impl SuspendedSpikeChild {
+    /// 止まっている子のプロセスハンドル（所有権は移さない）。
+    ///
+    /// **動かす前に子のトークンを取り出す**ために要る——固定辺の検査の計器
+    /// （`spawnd::fixed_inputs`）が、子が何かをする前の時点で判定できることを測る。
+    pub(super) fn process(&self) -> HANDLE {
+        self.child
+            .as_ref()
+            .expect("the child has not been resumed yet")
+            .process
+    }
+
+    pub(super) fn pid(&self) -> u32 {
+        self.child
+            .as_ref()
+            .expect("the child has not been resumed yet")
+            .pid
+    }
+
     /// 主スレッドを動かし始める。スレッドハンドルは`Drop`が閉じる。
     pub(super) fn resume(mut self) -> SpikeChild {
         let child = self
@@ -1351,5 +1369,225 @@ fn s2b_a_custom_process_dacl_can_close_the_same_package_open_process_hole() {
         Some(true),
         "起動後に生えたスレッドが開けなくなった。RESULTS.md §S2bの結論\
          （lpThreadAttributesは最初の1本にしか効かない）を測り直すこと。report={report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 固定辺の検査の計器（`spawnd::fixed_inputs`）は、AppContainerのトークンで正しく答えるか
+// ---------------------------------------------------------------------------
+
+/// Spawn Daemonは固定辺の起動直前に、**呼び出し元のトークン**で`AccessCheck`を掛けて
+/// 「固定したファイルを書き換えられるか」を判定する（`plans/DESIGN-MAC.md` §19.1）。
+/// このリポジトリには**AppContainerのトークンで`AccessCheck`を測った記録が無かった**
+/// （Tier3の`vmsandboxd`は非AppContainerのトークンでしか使っていない）。AppContainerの子は
+/// 低い整合性レベルで動き、Tier2aは整合性ラベルを付けないので、答えが実際と食い違い得る。
+///
+/// **同じ子について2つを突き合わせる**: (1) 止まっている子のトークンで計器が返す権利、
+/// (2) 動かした後に、その子が同じ権利を要求して実際に開けたか（開くだけで何も書かない）。
+/// 1件でも食い違えば、この計器を判定に使ってはいけない（B-29）。
+#[test]
+#[ignore = "spawns a real AppContainer child; run NON-elevated with --test-threads=1"]
+fn access_check_with_an_appcontainer_token_matches_what_the_child_can_open() {
+    use crate::tier2a::spawnd::fixed_inputs::{granted_access, CallerToken};
+
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let _cleanup =
+        super::test_support::scopeguard(|| forget_workspace_capability(workspace.path()));
+    let sid = session_sid();
+    preflight(workspace.path(), &[], None, &WorkspaceWriteMode::DirectRw).expect("preflight");
+    grant_job::wait_until_done().expect("background grant job");
+    let traverse = traverse_capability_sid().expect("traverse capability");
+    let workspace_cap = workspace_capability_for(workspace.path());
+    let mut caps = vec![traverse.as_psid()];
+    if let Some(cap) = &workspace_cap {
+        caps.push(cap.as_psid());
+    }
+
+    // 書込を許したディレクトリと、読取＋実行だけを許したディレクトリ（宛先はこの子のpackage SID）。
+    // ファイルは付与の**後**に作るので、ディレクトリのACEを継承する。
+    let writable = tempfile::tempdir().expect("writable dir");
+    grant_ace_inheritable_access(writable.path(), sid.as_psid(), FsAccess::ReadWriteExec)
+        .expect("grant read/write/exec");
+    let writable_file = writable.path().join("fixed.txt");
+    std::fs::write(&writable_file, b"x").expect("writable file");
+    let readonly = tempfile::tempdir().expect("read-only dir");
+    grant_ace_inheritable_access(readonly.path(), sid.as_psid(), FsAccess::ReadExec)
+        .expect("grant read/exec");
+    let readonly_file = readonly.path().join("fixed.txt");
+    std::fs::write(&readonly_file, b"x").expect("read-only file");
+    let workspace_file = workspace.path().join("fixed.txt");
+    std::fs::write(&workspace_file, b"x").expect("workspace file");
+    // **整合性ラベルが「低」のファイル**。AppContainerの子が自分で作ったファイルにはこのラベルが付くので、
+    // ラベルの無いファイルだけで一致しても、ラベル付きの側で食い違わないとは言えない。
+    let low_label = |path: &Path| {
+        std::fs::write(path, b"x").expect("low-label file");
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/setintegritylevel", "Low"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run icacls");
+        assert!(status.success(), "icacls /setintegritylevel Low {}", path.display());
+    };
+    let writable_low_file = writable.path().join("low.txt");
+    low_label(&writable_low_file);
+    let readonly_low_file = readonly.path().join("low.txt");
+    low_label(&readonly_low_file);
+
+    let system_root =
+        PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()));
+    // (パス, ディレクトリか)。システムの側は**書き換えられないはずの対照**である。
+    let objects: Vec<(PathBuf, bool)> = vec![
+        (writable_file.clone(), false),
+        (writable.path().to_path_buf(), true),
+        (readonly_file.clone(), false),
+        (readonly.path().to_path_buf(), true),
+        (workspace_file.clone(), false),
+        (workspace.path().to_path_buf(), true),
+        (writable_low_file.clone(), false),
+        (readonly_low_file.clone(), false),
+        (system_root.join("System32").join("cmd.exe"), false),
+        (system_root.join("System32"), true),
+        (system_root.clone(), true),
+        (PathBuf::from(r"C:\"), true),
+    ];
+    const FILE_RIGHTS: &[&str] = &[
+        "write_data",
+        "append_data",
+        "write_attributes",
+        "delete",
+        "write_dac",
+        "write_owner",
+    ];
+    const DIRECTORY_RIGHTS: &[&str] = &[
+        "write_data",
+        "append_data",
+        "delete_child",
+        "write_attributes",
+        "delete",
+        "write_dac",
+        "write_owner",
+    ];
+    // プローブへ渡す綴り。**`\`で終わる引数は渡さない**——`SpikeSpawn`は引数を`"…"`で囲むので、
+    // `C:\`の末尾の`\"`がエスケープとして読まれ、次の引数と連結される（1回目の実測で起きた）。
+    // Win32は`C:\.`を`C:\`へ正規化して開くので、同じオブジェクトを指す。
+    let arg_path = |path: &Path| -> String {
+        let text = path.display().to_string();
+        if text.ends_with('\\') {
+            format!("{text}.")
+        } else {
+            text
+        }
+    };
+    let mut args: Vec<String> = Vec::new();
+    for (path, is_dir) in &objects {
+        let rights = if *is_dir { DIRECTORY_RIGHTS } else { FILE_RIGHTS };
+        for right in rights {
+            args.push("--open-rights".to_string());
+            args.push(format!("{right}:{}", arg_path(path)));
+        }
+    }
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let probe = probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
+
+    let suspended = SpikeSpawn {
+        exe: &probe_str,
+        args: &arg_refs,
+        cwd: workspace.path(),
+        container_sid: sid.as_psid(),
+        capabilities: &caps,
+        child_process_restricted: false,
+        stdout_override: None,
+        extra_inherit: &[],
+        process_sddl: None,
+        thread_sddl: None,
+        token_default_dacl_sddl: None,
+        no_appcontainer: false,
+        console: SpikeConsole::NoWindow,
+    }
+    .spawn_suspended()
+    .expect("spawn the suspended probe");
+
+    // (1) 子が何もしていないうちに、子のトークンで計器に答えさせる。
+    let token = CallerToken::from_process(suspended.process(), suspended.pid())
+        .expect("duplicate the child's token");
+    let predicted: Vec<(String, u32)> = objects
+        .iter()
+        .map(|(path, _)| {
+            let granted = granted_access(path, &token, true)
+                .unwrap_or_else(|e| panic!("granted_access({}): {e}", path.display()));
+            // 照合の鍵はプローブへ渡した綴りにそろえる（報告はその綴りで返ってくる）。
+            (arg_path(path), granted)
+        })
+        .collect();
+    drop(token);
+
+    // (2) 同じ子を動かし、同じ権利を要求して実際に開かせる。
+    let mut child = suspended.resume();
+    let (stdout, stderr, code) = child.wait_and_read();
+    let report = last_json_line(&stdout)
+        .unwrap_or_else(|| panic!("the probe produced no JSON: exit={code} stderr={stderr}\n{stdout}"));
+    let attempts = report["open_rights"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no open_rights array: {report}"));
+    assert_eq!(attempts.len(), args.len() / 2, "every requested open must be reported: {report}");
+
+    let mut mismatches = Vec::new();
+    for attempt in attempts {
+        let path = attempt["path"].as_str().expect("path");
+        let right = attempt["right"].as_str().expect("right");
+        let mask = attempt["mask"].as_u64().expect("mask") as u32;
+        let last_error = attempt["last_error"].as_u64().expect("last_error");
+        // 32＝共有違反は、アクセス判定を**通った後**に共有の判定で断られたもの。
+        let actual = last_error == 0 || last_error == 32;
+        let granted = predicted
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, g)| *g)
+            .unwrap_or_else(|| panic!("no prediction for {path}"));
+        let said = granted & mask != 0;
+        eprintln!(
+            "[fixed-inputs] {path} {right}: AccessCheck={said} opened={actual} \
+             (last_error={last_error}, granted=0x{granted:08x})"
+        );
+        if said != actual {
+            mismatches.push(format!(
+                "{path} {right}: AccessCheck={said} opened={actual} (last_error={last_error}, granted=0x{granted:08x})"
+            ));
+        }
+    }
+
+    // 計器が常に同じ答えを返していないこと（対。書込を許したファイルは書ける、読取だけのものは書けない）。
+    let writable_granted = predicted
+        .iter()
+        .find(|(p, _)| *p == writable_file.display().to_string())
+        .map(|(_, g)| *g)
+        .expect("writable file prediction");
+    let readonly_granted = predicted
+        .iter()
+        .find(|(p, _)| *p == readonly_file.display().to_string())
+        .map(|(_, g)| *g)
+        .expect("read-only file prediction");
+    eprintln!(
+        "[fixed-inputs] writable file granted=0x{writable_granted:08x} read-only file granted=0x{readonly_granted:08x}"
+    );
+    assert!(
+        mismatches.is_empty(),
+        "AccessCheck with the AppContainer child's token disagreed with what the child could \
+         actually open ({} of {}). Do not use it as the spawn-time check until this is explained:\n{}",
+        mismatches.len(),
+        attempts.len(),
+        mismatches.join("\n")
+    );
+    assert_ne!(
+        writable_granted & 0x2,
+        0,
+        "the writable file must be writable (otherwise the pair measures nothing)"
+    );
+    assert_eq!(
+        readonly_granted & 0x2,
+        0,
+        "the read-only file must not be writable"
     );
 }

@@ -1052,7 +1052,11 @@ fn a_same_domain_child_is_still_fully_reachable_through_the_handle_the_caller_ge
 /// （「固定値が指す先を呼び出し元が書き換えられるなら、引数を固定しても無意味」）。
 /// だからこの辺の引数には**ワークスペースの中のパスを1つも書かない**——
 /// 走ったことは`exit`の終了コードで確かめる。
-fn policy_with_fixed_edge(exe: &str, command_line: &str, cwd: &std::path::Path) -> PolicyFile {
+pub(super) fn policy_with_fixed_edge(
+    exe: &str,
+    command_line: &str,
+    cwd: &std::path::Path,
+) -> PolicyFile {
     let mut file = PolicyFile::default();
     let mut entry = PolicyDomain::new(E2E_POLICY_DOMAIN);
     entry.process = serde_json::from_value(serde_json::json!({

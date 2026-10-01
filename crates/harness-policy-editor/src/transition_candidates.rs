@@ -392,6 +392,10 @@ pub fn from_observations(records: &[ObservedRecord], declared: &DeclaredEdges) -
 ///
 /// **`BlockedUntilHarnessImplementsIt`は候補として残す。** 宣言は足りているが
 /// harness側が未実装なもので、**ユーザーが直せない**という事実そのものを画面に出す必要がある。
+///
+/// **`FixTheEnvironment`も候補にしない**（固定したファイルを呼び出し元が書き換えられるので
+/// 固定辺を断ったもの）。直す場所は宣言ではない。**除いた件数はこの画面に出ない**——
+/// `NotAboutPolicy`と同じ扱いで、出すなら画面の側に件数の欄を足す必要がある。
 pub fn from_denials(records: &[PendingRecord], declared: &DeclaredEdges) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = records
         .iter()
@@ -401,8 +405,16 @@ pub fn from_denials(records: &[PendingRecord], declared: &DeclaredEdges) -> Vec<
                 PendingRecord::DeniedByKernel(denial) => (true, denial),
                 PendingRecord::Overflowed { .. } => return None,
             };
-            if remedy(&denial.reason) == Remedy::NotAboutPolicy {
-                return None;
+            // **`_ =>`を書かない。** 分類が増えた日に、ここで「候補にするか」を必ず選ばされる
+            // （以前は`== NotAboutPolicy`の比較で、新しい分類が黙って候補側へ混ざる形だった）。
+            match remedy(&denial.reason) {
+                Remedy::FixTheDeclaration | Remedy::BlockedUntilHarnessImplementsIt => {}
+                Remedy::NotAboutPolicy => return None,
+                // 固定辺の前提（固定したファイルを呼び出し元が書き換えられないこと）が崩れて断られた。
+                // 辺は宣言済みなので、候補にしても「承認しても直りません」の行が並ぶだけで、
+                // 直し方（置き場所か書込許可を変える）は伝わらない。直す案内はモデルへの注記と
+                // Daemonの標準エラーが持つ。
+                Remedy::FixTheEnvironment => return None,
             }
             Some(Candidate {
                 declared: declared.classify(&denial.exe, &denial.argv),

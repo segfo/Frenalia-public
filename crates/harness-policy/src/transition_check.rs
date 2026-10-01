@@ -179,7 +179,10 @@ impl GraphFacts<'_> {
     ///   （`settings.json`の`fs.read_write`・`--fs-allow <path>:rw`）を渡し、ポリシーエディタは
     ///   ワークスペースだけを渡す（エディタは宣言の外で書込を許す経路を持たない）
     /// - パスの比較は綴りの畳み込み（区切りと大小）だけで、`..`・8.3形式の短い名前・
-    ///   シンボリックリンクとジャンクションは解決しない
+    ///   シンボリックリンクとジャンクション・ハードリンクは解決しない。**別名はSpawn Daemonが
+    ///   起こす直前に、呼び出し元のトークンで実体のアクセス制御リストを見て補う**
+    ///   （`harness_sandbox`の`spawnd::fixed_inputs`、[`Allowed::fixed`]）
+    /// - 作業ディレクトリそのものと相対パスの引数は候補にしていない（[`fixed_file_paths`]のdoc）
     /// - 保証するのは「呼び出し元から書けない場所にある」ことだけで、
     ///   **そのファイルを別の経路で書ける主体が居ないこと**は検査していない
     fn caller_writable_fixed_paths(
@@ -191,13 +194,21 @@ impl GraphFacts<'_> {
             // 固定していない辺には、そもそも守るべき固定値が無い。
             return Vec::new();
         }
-        let mut candidates: Vec<String> = Vec::new();
-        if let ExeMatcher::Literal(exe) = &edge.exe {
-            candidates.push(fold_for_pattern_comparison(exe));
+        // 固定辺ならargvはリテラルである（`is_fully_fixed`）。
+        let argv = match &edge.argv {
+            ArgvMatcher::Literal(argv) => argv.as_str(),
+            ArgvMatcher::Pattern(_) | ArgvMatcher::Any(_) => "",
+        };
+        // 候補の集め方は起こす直前の検査と共有する（[`fixed_file_paths`]）。ここは綴りで比べるので畳む。
+        let candidates: Vec<String> = match &edge.exe {
+            ExeMatcher::Literal(exe) => fixed_file_paths(exe, argv),
+            // パターンのexeは、実際にどの綴りで起きるかが宣言からは分からないので引数だけを見る
+            // （起こす直前の検査は、要求された実際の実行ファイルを見る）。
+            ExeMatcher::Pattern(_) => absolute_path_tokens(argv),
         }
-        if let ArgvMatcher::Literal(argv) = &edge.argv {
-            candidates.extend(absolute_path_tokens(argv));
-        }
+        .iter()
+        .map(|path| fold_for_pattern_comparison(path))
+        .collect();
 
         let writable = self.caller_writable_roots(view.name);
         candidates
@@ -402,12 +413,34 @@ fn first_relative_path_token(command_line: &str) -> Option<String> {
         })
 }
 
-/// argvの中の、絶対パスらしいトークン（畳み込み済み）。
+/// argvの中の、絶対パスらしいトークン（**書かれた綴りのまま**）。
+///
+/// 畳み込まずに返すのは、Daemonがこの値でファイルを実際に開くからである
+/// （[`fixed_file_paths`]）。綴りで比べる側は、受け取ってから畳む。
 fn absolute_path_tokens(command_line: &str) -> Vec<String> {
     split_command_line(command_line)
         .into_iter()
         .skip(1)
-        .map(|token| fold_for_pattern_comparison(&token))
-        .filter(|token| looks_like_path(token) && is_absolute_path(token))
+        .filter(|token| {
+            looks_like_path(token) && is_absolute_path(&fold_for_pattern_comparison(token))
+        })
+        .collect()
+}
+
+/// 固定辺で**固定したファイル**——起こす実行ファイルと、argv[0]以降の絶対パスらしいトークン
+/// ——を、書かれた綴りのまま返す。
+///
+/// 読み込み時の検査（[`GraphFacts::caller_writable_fixed_paths`]）と、Daemonが起こす直前に
+/// 呼び出し元のトークンでOSに聞く検査（`harness_sandbox`の`spawnd::fixed_inputs`）が
+/// **同じ候補**を見るための、唯一の集め方である（片方だけ候補が増えると、2層の検査が
+/// 別のファイルを見ることになる）。
+///
+/// # 見ていないもの（P-11）
+///
+/// **相対パスの引数と、作業ディレクトリそのもの**は候補にしない。相対トークンの見分けは
+/// 当て推量で（`/c`のようなスイッチもパスに見える）、候補にすると正当な辺まで断る。
+pub(super) fn fixed_file_paths(image: &str, command_line: &str) -> Vec<String> {
+    std::iter::once(image.to_string())
+        .chain(absolute_path_tokens(command_line))
         .collect()
 }

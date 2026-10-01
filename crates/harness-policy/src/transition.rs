@@ -297,6 +297,18 @@ pub struct Allowed<'a> {
     /// 完全分解（`..`を書かない）で、欄が増えるとあちらがコンパイルできなくなる。
     pub inherit_handles: bool,
     pub direction: Direction,
+    /// **固定辺か**（argvがリテラルで、cwdが宣言されている。`is_fully_fixed`）。
+    ///
+    /// 真なら、Daemonは起こす直前に「固定したファイルを呼び出し元が書き換えられないか」を
+    /// 呼び出し元のトークンでOSに聞く（`plans/DESIGN-MAC.md` §19.1）。読み込み時の検査は
+    /// 綴りで比べるので別名（8.3形式の短い名前・リンク・ハードリンク）に弱く、それを実体の側で補う。
+    ///
+    /// # なぜ`inherit_handles`から読み取らせないのか
+    ///
+    /// 今は「`inherit_handles == false` ⇔ 固定辺」が成り立つが、それは編集時検査が
+    /// 「広げる辺は固定必須」を課している**結果**であって、型が保証していない。
+    /// 読み手が裏の事情に頼ると、検査の規則が変わった日に黙って外れる。
+    pub fixed: bool,
 }
 
 /// 拒否の理由。**「拒否された」だけでは、宣言が無いのか曖昧なのかが区別できない。**
@@ -396,6 +408,7 @@ struct CompiledEdge {
     env: EnvPolicy,
     direction: Direction,
     inherit_handles: bool,
+    fixed: bool,
 }
 
 #[derive(Debug)]
@@ -449,6 +462,7 @@ impl TransitionGraph {
                     env: env_policy(edge),
                     direction,
                     inherit_handles: !fixed && direction != Direction::WiderOrUnknown,
+                    fixed,
                 });
             }
             domains.insert(view.name.to_string(), CompiledDomain { edges });
@@ -515,6 +529,7 @@ impl TransitionGraph {
             env: &chosen.env,
             inherit_handles: chosen.inherit_handles,
             direction: chosen.direction,
+            fixed: chosen.fixed,
         })
     }
 
@@ -534,6 +549,17 @@ impl TransitionGraph {
 /// 2つの規則が分かれることがない（`bug-pattern-rules` B-05）。
 pub fn check_all(input: &GraphInput<'_>) -> Result<Vec<Rejection>, GraphError> {
     Ok(GraphFacts::new(input)?.check_all())
+}
+
+/// 固定辺で**固定したファイル**（起こす実行ファイルと、`argv[0]`以降の絶対パスらしいトークン）を、
+/// 書かれた綴りのまま返す。
+///
+/// Daemonは固定辺の子を起こす直前に、これらを**実際に`CreateProcessW`へ渡す値**
+/// （要求された実行ファイルとコマンドライン）から取り、呼び出し元のトークンで
+/// 書き換えられないかをOSに聞く（[`Allowed::fixed`]）。読み込み時の検査も同じ関数で
+/// 候補を集めるので、2層の検査が別のファイルを見ることはない。
+pub fn fixed_file_paths(image: &str, command_line: &str) -> Vec<String> {
+    transition_check::fixed_file_paths(image, command_line)
 }
 
 /// [段階6e] `domain`から**到達できる範囲**の権限（§19.3.4の到達閉包）。

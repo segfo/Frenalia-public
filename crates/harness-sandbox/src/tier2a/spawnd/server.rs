@@ -783,6 +783,7 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
         // 向きは判定器の中で使い終わっている（`inherit_handles`の計算に入っている）。
         // ここで再判定しない——同じ規則を2箇所に置くと、片方だけ直る。
         direction: _,
+        fixed,
     } = allowed;
 
     // [#55] **遷移先ドメインの実体を表から引く。**
@@ -839,6 +840,31 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
     } else {
         super::CallerHandles::default()
     };
+
+    // **固定辺なら、固定したファイルを呼び出し元が書き換えられないかをOSに聞く**
+    // （`plans/DESIGN-MAC.md` §19.1）。読み込み時の検査は綴りで比べるので、8.3形式の短い名前・
+    // リンク・ハードリンクを挟むと見逃す。ここは実体のアクセス制御リストを**呼び出し元のトークン**で
+    // 評価するので、どの名前で書かれていても同じ答えになる（`fixed_inputs`のモジュールdoc）。
+    //
+    // 見るのは**実際に`CreateProcessW`へ渡す値**（`request.image`と呼び出し元のコマンドライン）で、
+    // 宣言の綴りではない——判定したのと別のファイルが起きる形を作らない（B-21）。
+    //
+    // **理由はサンドボックスへ返さない**（パスと権利の名前を含むので、`SpawnFailed`と同じ扱い）。
+    // Daemonの標準エラーにだけ出す（B-10）。
+    if fixed {
+        if let Some(reason) = super::fixed_inputs::refusal(
+            HANDLE(caller.process as *mut _),
+            caller.pid,
+            request.image,
+            &command_line,
+        ) {
+            eprintln!(
+                "[spawnd] refused a fixed transition for pid {}: {reason}",
+                caller.pid
+            );
+            return Served::denied(DenyReason::FixedInputWritable, from_domain, command_line);
+        }
+    }
 
     match spawn_nested(
         shared,

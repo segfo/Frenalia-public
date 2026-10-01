@@ -56,6 +56,10 @@ pub mod client;
 /// windows専用。**Daemon側だけが使う**——harness本体はコンソールを借りない。
 #[cfg(windows)]
 pub mod console_holder;
+/// 固定辺の起動直前に、固定したファイルを呼び出し元が書き換えられないかを
+/// 呼び出し元のトークンでOSに聞く（`plans/DESIGN-MAC.md` §19.1）。
+#[cfg(windows)]
+pub(crate) mod fixed_inputs;
 #[cfg(windows)]
 pub mod server;
 #[cfg(windows)]
@@ -948,6 +952,20 @@ pub enum DenyReason {
     /// **待ち行列を読んでも理由は出てこない。** 2026-09-19の測定（`plans/mac-spike/RESULTS.md`
     /// §S67）はここを取り違えて、待ち行列に理由が在るつもりで1往復を失った。
     SpawnFailed,
+    /// **固定辺は許可だったが、固定したファイルを呼び出し元が書き換えられる**
+    /// （`plans/DESIGN-MAC.md` §19.1）。起こす直前に、呼び出し元のトークンで実体の
+    /// アクセス制御リストを評価して分かった（[`fixed_inputs`]）。判定できなかったときもこれで断る。
+    ///
+    /// # 宣言を直しても通らない
+    ///
+    /// 辺そのものは宣言どおりである。直し方は、固定したプログラムを呼び出し元が書けない場所へ
+    /// 移すか、その場所への書込許可を外すことで、**`policy.json`の側ではない**
+    /// （[`transitions::Remedy::FixTheEnvironment`]）。
+    ///
+    /// **どのパスのどの権利かはこの値に載せない**——[`DenyReason::SpawnFailed`]と同じく、
+    /// この型は電文と待ち行列の両方が使うので、載せるとサンドボックスの中へパスが漏れる。
+    /// 中身はDaemonの標準エラーにだけ出る。
+    FixedInputWritable,
 }
 
 impl DenyReason {
@@ -962,6 +980,9 @@ impl DenyReason {
             }
             DenyReason::MalformedRequest => "malformed request",
             DenyReason::SpawnFailed => "the transition was allowed but the process could not be started",
+            DenyReason::FixedInputWritable => {
+                "the transition fixes a file that the caller can modify (or that could not be verified)"
+            }
         }
     }
 }

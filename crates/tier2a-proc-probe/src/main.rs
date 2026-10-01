@@ -28,6 +28,8 @@ use serde_json::{json, Value};
 /// **環境変数を張ったときだけ**動くので、他の的の挙動は変わらない（モジュールdoc参照）。
 mod fault_log;
 mod load_library;
+/// 指定した権利を要求して開くだけのモード（`AccessCheck`の答えと実際を突き合わせる計器）。
+mod open_rights;
 mod spawn_via;
 #[cfg(windows)]
 mod try_runas;
@@ -90,6 +92,7 @@ struct Args {
     /// DLLを`LoadLibraryW`でロードした結果と`GetLastError`だけをJSONで報告する
     /// （`load_library`モジュールdoc参照）。
     load_library: Option<String>,
+    open_rights: Vec<String>,
     /// MAC設計§20項目1: プロセス生成の全経路を試し、どれが拒否されるかを報告する
     /// （`spawn_matrix`モジュールdoc参照）。値はマーカーファイルを書くディレクトリ。
     spawn_matrix: Option<String>,
@@ -183,6 +186,7 @@ fn parse_args() -> Args {
     let mut try_runas = None;
     let mut spawn_via = None;
     let mut load_library = None;
+    let mut open_rights: Vec<String> = Vec::new();
     let mut spawn_matrix = None;
     // 空＝全部（既定）。指定すればその経路だけを撃つ。
     let mut spawn_matrix_methods: Vec<String> = Vec::new();
@@ -248,6 +252,7 @@ fn parse_args() -> Args {
             }
             "--spawn-via-winexec" => spawn_via = Some(("winexec".to_string(), next())),
             "--load-library" => load_library = Some(next()),
+            "--open-rights" => open_rights.push(next()),
             // --- MACスパイク用（`plans/mac-spike/RESULTS.md`） ---
             "--spawn-matrix" => spawn_matrix = Some(next()),
             "--spawn-matrix-methods" => {
@@ -381,6 +386,7 @@ fn parse_args() -> Args {
         try_runas,
         spawn_via,
         load_library,
+        open_rights,
         spawn_matrix,
         spawn_matrix_methods,
         reach,
@@ -733,6 +739,15 @@ fn main() -> ExitCode {
         println!(
             "{}",
             serde_json::to_string(&report).expect("try_runas report must serialize")
+        );
+        return ExitCode::SUCCESS;
+    }
+
+    if !args.open_rights.is_empty() {
+        let report = open_rights::run(&args.open_rights);
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("open_rights report must serialize")
         );
         return ExitCode::SUCCESS;
     }
