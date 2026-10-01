@@ -213,12 +213,23 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
     // `DirectRw`のまま実プローブを行う。
     //
     // つまり印字されるプロンプトは、**CoWの記述だけが実セッションと食い違う**。
-    if !cli.fs_allow.is_empty() || cli.force_system_acl || sandbox_choice.wants_cow() {
+    // [#30] `.harness/policy.json`のファイル宣言も同じ理由で適用しない（付与はUAC連鎖・台帳記録を
+    // 伴う）。**黙ると「policy.jsonに書いた穴がプロンプトに出ない」理由が分からない**ので、
+    // 宣言が在るときも1行出す。
+    let policy_declares_fs = harness_policy::policy_file::load(workspace_root)
+        .map(|policy| policy.domains.iter().any(|d| !d.fs.is_empty()))
+        .unwrap_or(false);
+    if !cli.fs_allow.is_empty()
+        || cli.force_system_acl
+        || sandbox_choice.wants_cow()
+        || policy_declares_fs
+    {
         eprintln!(
             "note: `harness prompt` does not apply fs passthrough (--fs-allow / \
-             --force-system-acl) nor the Copy-on-Write half of `--sandbox tier2a-cow`; the tier \
-             requirement itself is honoured, but the printed prompt describes a directly writable \
-             workspace and no passthrough roots."
+             --force-system-acl / the file declarations in .harness/policy.json) nor the \
+             Copy-on-Write half of `--sandbox tier2a-cow`; the tier requirement itself is \
+             honoured, but the printed prompt describes a directly writable workspace and no \
+             passthrough roots."
         );
     }
 

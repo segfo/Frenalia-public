@@ -41,10 +41,15 @@ pub(super) fn should_expose(
 ///
 /// 一覧と権限の要約の計算は[`harness_policy::transition_listing`]が持つ。
 /// **ここへ写さない**——段階⑦のポリシーエディタの画面も同じものを使う。
+///
+/// [#30] **権限欄（`rights_fs`）には、このマシンで承認済みの宣言だけを載せる**（`approved_fs_values`、
+/// `startup::policy_fs::approved_fs_values`が作る）。未承認の宣言には許可が付かないので、載せると
+/// 付いていない許可をモデルへ伝えることになる。辺と判定の入力は変えない（Daemonと同じグラフのまま）。
 pub(super) fn facts_from_policy(
     policy: &harness_policy::policy_file::PolicyFile,
     workspace_root: &str,
     writable_outside_policy: &[String],
+    approved_fs_values: &std::collections::BTreeSet<(String, &'static str)>,
 ) -> TransitionFacts {
     let input = policy.transition_graph_input(Some(workspace_root), writable_outside_policy);
     let from_domain = harness_policy::policy_file::ENTRY_DOMAIN;
@@ -64,6 +69,7 @@ pub(super) fn facts_from_policy(
                 .rights
                 .fs
                 .into_iter()
+                .filter(|(path, access)| approved_fs_values.contains(&(path.clone(), *access)))
                 .map(|(path, access)| (path, access.to_string()))
                 .collect(),
             rights_net: row.rights.net,
@@ -89,13 +95,12 @@ pub(super) fn facts_from_policy(
 /// CoWでは`:rw`の実ACEが読取へ降格され書込は差分層へ向かうが、既存の検査は
 /// ワークスペースもCoWに関係なく「書ける」と数えているので、それに揃える。
 ///
-/// # `#30`で読み直すこと
+/// # `policy.json`の宣言は入れない（#30）
 ///
-/// いまこの一覧に入るのは`settings.json`と`--fs-allow`由来だけである。
-/// **`policy.json`の`fs`を`harness.exe`が読んでこの一覧の元へ流し込むようになったら
-/// （`docs/INDEX.md`の未実装機能 サンドボックス周辺 #30）、その分はここから除くこと**
-/// ——宣言は宣言として既に検査の視野にあり、ここへ入れると遷移先ドメインの書込宣言まで
-/// 「入口から書ける」と数えられ、正当な辺が拒否される。
+/// この一覧に入るのは`settings.json`と`--fs-allow`由来だけである。`harness.exe`は#30から
+/// `policy.json`の`fs`も付与の一覧へ流し込むが、**この関数は合流させる前の手書きの一覧で呼ぶ**
+/// （`stage_prepare_sandbox`）——宣言は宣言として既に検査の視野にあり、ここへ入れると遷移先ドメインの
+/// 書込宣言まで「入口から書ける」と数えられ、正当な辺が拒否される。
 pub(super) fn writable_outside_policy(
     fs_passthrough: &[harness_sandbox::FsPassthrough],
 ) -> Vec<String> {
@@ -173,7 +178,7 @@ mod tests {
         let policy: harness_policy::policy_file::PolicyFile =
             serde_json::from_value(json).expect("parse");
 
-        let facts = facts_from_policy(&policy, "C:/ws", &[]);
+        let facts = facts_from_policy(&policy, "C:/ws", &[], &Default::default());
 
         assert_eq!(facts.from_domain, harness_policy::policy_file::ENTRY_DOMAIN);
         assert_eq!(facts.programs.len(), 1);
@@ -188,8 +193,39 @@ mod tests {
     #[test]
     fn a_policy_without_transitions_yields_an_empty_list_not_a_missing_one() {
         let policy = harness_policy::policy_file::PolicyFile::default();
-        let facts = facts_from_policy(&policy, "C:/ws", &[]);
+        let facts = facts_from_policy(&policy, "C:/ws", &[], &Default::default());
         assert!(facts.programs.is_empty());
+    }
+
+    /// [#30] **権限欄には、このマシンで承認済みの宣言だけを載せる**（未承認には許可が付かない）。
+    /// 対の側として、承認済みの宣言は載る（`B-35`）。辺そのものは承認に関係なく載る。
+    #[test]
+    fn the_rights_column_shows_only_approved_file_declarations() {
+        let json = serde_json::json!({
+            "schema_version": 2,
+            "domains": [{
+                "name": harness_policy::policy_file::ENTRY_DOMAIN,
+                "fs": { "read": ["C:/approved/**", "C:/shipped/**"] },
+                "process": { "transitions": [
+                    { "exe": { "literal": "C:/bin/git.exe" }, "argv": { "any": true },
+                      "to": harness_policy::policy_file::ENTRY_DOMAIN }
+                ]}
+            }]
+        });
+        let policy: harness_policy::policy_file::PolicyFile =
+            serde_json::from_value(json).expect("parse");
+        let approved: std::collections::BTreeSet<(String, &'static str)> =
+            [("C:/approved/**".to_string(), "read")].into_iter().collect();
+
+        let facts = facts_from_policy(&policy, "C:/ws", &[], &approved);
+
+        assert_eq!(facts.programs.len(), 1, "the edge itself does not depend on approval");
+        let rights: Vec<&str> = facts.programs[0]
+            .rights_fs
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(rights, vec!["C:/approved/**"]);
     }
 
     fn passthrough(path: &str, access: harness_sandbox::FsAccess) -> harness_sandbox::FsPassthrough {

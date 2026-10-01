@@ -254,6 +254,59 @@ impl GrantContext {
     }
 }
 
+impl GrantContext {
+    /// `policy.json`の**全ドメイン**の承認済み宣言の付与ルート（自動撤収の宣言集合に入れる形）。
+    ///
+    /// `harness.exe`の起動（D-27の自動撤収）と、ポリシーエディタの試験実行の開始時の取り消し（BUG-184）が
+    /// 同じ関数を通る——片方だけ別の範囲で数えると、もう片方が「まだ宣言されている穴」を取り消す。
+    /// **付与する範囲（遷移先・強制の有無）に関係なく全ドメインを数える**——付けなかった回に
+    /// 「もう宣言されていない」と数えると、次の回に付け直しになる。
+    pub fn declared_roots(
+        &self,
+        policy: &harness_policy::policy_file::PolicyFile,
+        approved: &dyn Fn(crate::tier2a::policy_approval::DeclarationRef<'_>) -> bool,
+    ) -> Vec<String> {
+        policy
+            .domains
+            .iter()
+            .flat_map(|domain| self.domain_grants(domain, approved).passthrough)
+            .map(|fp| fp.path.to_string_lossy().into_owned())
+            .collect()
+    }
+}
+
+/// 手書きの宣言（`settings.json`の`fs.*`・`--fs-allow`）の値から、**ACEを付けるオブジェクト**を求める
+/// （D-63）。ワークスペース基準で絶対化する——既に絶対パスなら`Path::join`はそれをそのまま採る。
+///
+/// `policy.json`の値（[`GrantContext::grant_root`]）と規則が違うのは、手書きの宣言が相対パスを
+/// ワークスペース基準として受け付けてきたためである（`policy.json`は相対パスを付けない）。
+/// 切る位置は`harness_policy::normalize::literal_prefix`が唯一の定義を持つ（B-05）。
+pub fn manual_grant_root(workspace_root: &Path, declared: &str) -> PathBuf {
+    workspace_root.join(harness_policy::normalize::literal_prefix(declared))
+}
+
+/// `settings.json`の`fs.*`の宣言から、**自動撤収（D-27）の宣言集合**に入れる付与ルートを作る。
+///
+/// `harness.exe`の起動と、ポリシーエディタの試験実行の開始時の取り消し（BUG-184）が同じ関数を通る
+/// ——片方だけ別の規則で数えると、もう片方が「まだ宣言されている穴」を取り消す。
+///
+/// 受け付けない綴り（途中のワイルドカード）は**数えない**——付与しないパスを「宣言している」と数えると、
+/// 他の経路が付けた同名の台帳エントリを撤収から守ってしまう（参照カウントは付与と対でなければ嘘になる）。
+pub fn settings_declared_roots(
+    workspace_root: &Path,
+    entries: &[(String, harness_config::FsAccess)],
+) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|(path, _)| !harness_policy::normalize::has_unsupported_wildcard(path))
+        .map(|(path, _)| {
+            manual_grant_root(workspace_root, path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
 /// harnessのユーザースコープの制御ディレクトリ（`%APPDATA%\harness`）。
 ///
 /// 台帳の置き場は`<config_dir>`だが、守るのは**その親**である——harnessが将来ここへ

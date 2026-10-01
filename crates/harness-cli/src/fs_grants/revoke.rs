@@ -814,21 +814,32 @@ pub(crate) fn fs_revoke_all() -> ExitCode {
 /// この関数である——**新しい差分機構は作らない**（検問7/8）。足りないのは
 /// 「消えた宣言の宛先SIDを実ACLから剥がす」段だけで、それは`revoke_fs_ledger_entries`が持つ。
 ///
-/// **対象は`.harness/settings.json`の宣言だけ**である。`--fs-allow`のCLI宣言を差分の材料に
+/// **対象はファイルの宣言だけ**である——`.harness/settings.json`の`fs.*`と、[#30]
+/// `.harness/policy.json`の全ドメインの**このマシンで承認済み**の宣言（D-112。承認を外した宣言は
+/// 「もう宣言されていない」側に数わる）。`--fs-allow`のCLI宣言を差分の材料に
 /// しないのは、宣言集合が**起動ごとに違い得る**ためで、材料にすると
 /// (a) 同じワークスペースを別の`--fs-allow`で開いた2セッションのうち後発が先発の穴を剥がし、
 /// (b) ドメインごとに`preflight`を回すポリシーエディタのパス2が互いの宣言を剥がす。
 /// どちらも生存判定を足さないと塞げず、それは§22.2.1が明示的に避けた道である。
 /// CLI宣言のACEは従来どおり`harness fs revoke <path>`（名前の付いた扉）で消す。
+///
+/// # [#30] 突き合わせは台帳と同じ比べ方で行う
+///
+/// 台帳の`path`は最初に書かれた綴りを保ち、宣言側は`settings.json`がユーザーの綴りのまま
+/// （`C:\x`）、`policy.json`が正規化した綴り（`C:/x`）で来る。文字列の完全一致で比べると
+/// **同じパスが別物に見え、まだ宣言されている穴を毎起動で撤収して付け直す**（BUG-142と同型）。
+/// だから`same_ledger_path`（台帳の他の照合と同じ関数）で比べる。
 #[cfg(windows)]
 pub fn reconcile_fs_ledger_for_workspace(
     workspace_root: &Path,
-    settings_fs_paths: &std::collections::HashSet<String>,
+    file_declared_fs_paths: &std::collections::HashSet<String>,
 ) {
     let ws = workspace_root.to_string_lossy().into_owned();
     let orphan_candidates: Vec<FsLedgerEntry> = fs_ledger().update(|ledger| {
         for entry in ledger.entries.iter_mut() {
-            let declared_now = settings_fs_paths.contains(&entry.path);
+            let declared_now = file_declared_fs_paths
+                .iter()
+                .any(|declared| harness_grant_ledger::same_ledger_path(declared, &entry.path));
             let was_tagged = entry.settings_workspaces.iter().any(|w| w == &ws);
             if declared_now && !was_tagged {
                 entry.settings_workspaces.push(ws.clone());

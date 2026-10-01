@@ -502,7 +502,9 @@ fn render_shell_tier(shell_tier: &ShellTierSelection) -> Vec<String> {
     out
 }
 
-/// `--fs-allow`/`settings.json`が開けた（あるいは開けなかった）ワークスペース外の穴。
+/// `--fs-allow`/`settings.json`/[#30] `policy.json`の入口ドメイン（このマシンで承認済みの宣言）が
+/// 開けた（あるいは開けなかった）ワークスペース外の穴。**入口の子の分だけ**が来る——遷移先ドメインの
+/// 宣言はそのドメインの子だけが持つので、ここ（モデルのシェルの環境）には載せない。
 ///
 /// # なぜモデルへ伝えるのか
 ///

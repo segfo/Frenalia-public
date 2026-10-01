@@ -1052,7 +1052,12 @@ mod cow_gc_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // **このテスト専用のセッションID。** マーカーはプロセス終了まで解放されない仕様なので、
         // 他のテストと名前が衝突すると、そちらの生存判定を汚す。
-        let session_id = "harness-test-marker-order-probe";
+        //
+        // **プロセスIDを足す**（BUG-186）。マーカーの名前付きmutexは`Local\`（同じログオン
+        // セッションの全プロセスで共有）に作られるので、固定名だと**別のワークツリーで同時に
+        // 走っている同じテスト**が握ったマーカーを見て、上の前提の確認で落ちる。
+        let session_id = format!("harness-test-marker-order-probe-{}", std::process::id());
+        let session_id = session_id.as_str();
         let blocked = dir.path().join(session_id);
         std::fs::write(&blocked, b"a file, not a directory").expect("seed a file in the way");
 

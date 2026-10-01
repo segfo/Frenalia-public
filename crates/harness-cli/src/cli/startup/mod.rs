@@ -13,6 +13,9 @@ mod configure;
 mod dotenv;
 mod mcp;
 mod parse_args;
+/// [#30] `policy.json`のファイル宣言から付ける許可を決め、付いた結果を宣言の一覧ごとに振り分ける。
+/// **windows専用にしない**——決める部分も振り分ける部分も純粋で、単体テストできることが要である。
+mod policy_fs;
 /// `/workspace`（`harness_tui::RunOutcome::Relaunch`）の再起動と、その引数の組み立て。
 mod relaunch;
 mod run_agent;

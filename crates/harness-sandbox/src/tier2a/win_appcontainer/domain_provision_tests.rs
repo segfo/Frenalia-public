@@ -4,7 +4,7 @@
 //! 通信を宣言している・定義が無い）は入れ物を1つも作らないので、通常の`cargo test`で回る。
 
 use super::*;
-use harness_policy::policy_file::{PolicyDomain, PolicyFile};
+use harness_policy::policy_file::{PolicyDomain, PolicyFile, ENTRY_DOMAIN};
 use harness_policy::transition::{AnyMarker, ArgvMatcher, ExeMatcher, TransitionEdge};
 
 /// 入口ドメインから`to`への辺を1本持つ宣言を組む。
@@ -33,7 +33,7 @@ fn policy_with_edge(to: &str, target: Option<PolicyDomain>) -> PolicyFile {
 #[test]
 fn a_policy_with_only_self_loops_has_no_target_domains() {
     let policy = policy_with_edge(ENTRY_DOMAIN, None);
-    assert!(target_domain_names(&policy).is_empty());
+    assert!(policy.transition_target_domains().is_empty());
 }
 
 /// 別ドメインへの辺があれば、その名前が1回だけ出る（同じ先への辺が複数あっても重複しない）。
@@ -54,7 +54,7 @@ fn each_target_domain_is_listed_once() {
         env: None,
     });
 
-    assert_eq!(target_domain_names(&policy), vec!["cargo".to_string()]);
+    assert_eq!(policy.transition_target_domains(), vec!["cargo".to_string()]);
 }
 
 /// **通信を宣言するドメインは用意しない**（理由付きで断る）。
@@ -72,7 +72,7 @@ fn a_domain_that_declares_network_is_not_provisioned() {
     let policy = policy_with_edge("fetcher", Some(target));
     let workspace = tempfile::tempdir().expect("temp workspace");
 
-    let outcome = provision_target_domains(&policy, workspace.path(), "rwx");
+    let outcome = provision_target_domains(&policy, workspace.path(), "rwx", &Default::default());
     assert!(
         outcome.domains.is_empty(),
         "通信を宣言したドメインを用意している"
@@ -93,7 +93,7 @@ fn a_target_domain_without_a_definition_is_not_provisioned() {
     let policy = policy_with_edge("ghost", None);
     let workspace = tempfile::tempdir().expect("temp workspace");
 
-    let outcome = provision_target_domains(&policy, workspace.path(), "rwx");
+    let outcome = provision_target_domains(&policy, workspace.path(), "rwx", &Default::default());
     assert!(outcome.domains.is_empty());
     assert_eq!(outcome.skipped.len(), 1);
     assert!(
@@ -103,13 +103,12 @@ fn a_target_domain_without_a_definition_is_not_provisioned() {
     );
 }
 
-/// **宣言が許可済みでなければ用意しない**（骨格の定義）。
+/// **宣言に許可が付いていなければ用意しない**（[#30] このセッションの付与結果が無い）。
 ///
 /// # 壊れた状態を一文で
 ///
-/// **新しい許可をACLへ書いてしまう。** この回のスコープは「1本も書かない」であり、
-/// 書く経路が増えるほど「片方だけが台帳へ記録する／片方だけが撤収できる」形の
-/// 事故が起きる（BUG-017の孤立ACEと同型）。
+/// **エディタで確かめたより狭い権限で黙って動く**か、台帳に残った過去の宛先を拾って
+/// **広い権限で動く**（BUG-185）。どちらも、付いていない宣言を持つドメインを用意した結果である。
 #[test]
 fn a_domain_whose_declarations_are_not_granted_is_not_provisioned() {
     let mut target = PolicyDomain::new("cargo");
@@ -118,14 +117,14 @@ fn a_domain_whose_declarations_are_not_granted_is_not_provisioned() {
     let policy = policy_with_edge("cargo", Some(target));
     let workspace = tempfile::tempdir().expect("temp workspace");
 
-    let outcome = provision_target_domains(&policy, workspace.path(), "rwx");
+    let outcome = provision_target_domains(&policy, workspace.path(), "rwx", &Default::default());
     assert!(
         outcome.domains.is_empty(),
         "許可されていない宣言を持つドメインを用意している"
     );
     assert_eq!(outcome.skipped.len(), 1);
     assert!(
-        outcome.skipped[0].1.contains("許可されていない"),
+        outcome.skipped[0].1.contains("no permission was granted"),
         "断った理由が読めない: {}",
         outcome.skipped[0].1
     );
@@ -144,7 +143,7 @@ fn a_domain_with_no_declarations_is_provisioned() {
     let policy = policy_with_edge("s55bare", Some(PolicyDomain::new("s55bare")));
     let workspace = tempfile::tempdir().expect("temp workspace");
 
-    let outcome = provision_target_domains(&policy, workspace.path(), "rwx");
+    let outcome = provision_target_domains(&policy, workspace.path(), "rwx", &Default::default());
     let _cleanup = super::super::test_support::scopeguard(|| {
         let _ = crate::tier2a::session_profile::end_session(&super::super::revoke_session_grant);
     });
@@ -185,4 +184,44 @@ fn a_domain_with_no_declarations_is_provisioned() {
         "入れ物が作られていない: {}",
         spec.name
     );
+}
+
+/// [#30] 付いた許可の宛先SIDを**重複なく**返す（CoWでは別の宣言が同じ宛先になり得る）。
+#[test]
+fn declaration_sids_come_from_the_grants_of_this_session() {
+    let mut domain = PolicyDomain::new("cargo");
+    domain.fs.read = vec!["C:/a/**".to_string(), "C:/b/**".to_string()];
+    let granted = |sid: &str| harness_core::GrantedPassthrough {
+        path: std::path::PathBuf::from("C:/a"),
+        writable: false,
+        subject_sid: sid.to_string(),
+        used_restore_privilege: false,
+        granted_access: "read".to_string(),
+    };
+    let grants = Ok(vec![granted("S-1-15-3-1"), granted("S-1-15-3-2"), granted("S-1-15-3-1")]);
+    assert_eq!(
+        declaration_sids("cargo", &domain, Some(&grants)).expect("granted"),
+        vec!["S-1-15-3-1".to_string(), "S-1-15-3-2".to_string()]
+    );
+}
+
+/// [#30] 付けなかった理由はそのまま返る（ドメインの用意が断る理由として人へ見せる）。
+#[test]
+fn a_reason_for_not_granting_is_carried_to_the_skip() {
+    let domain = PolicyDomain::new("cargo");
+    let grants = Err("transitions are not enforced".to_string());
+    let reason = declaration_sids("cargo", &domain, Some(&grants)).expect_err("not granted");
+    assert!(reason.contains("transitions are not enforced"), "{reason}");
+}
+
+/// [#30] 付与の結果が無いとき、**宣言が1件も無いドメインだけ**は土台だけで用意できる（対の側、`B-35`）。
+#[test]
+fn without_grants_only_a_domain_with_no_declarations_is_acceptable() {
+    assert_eq!(
+        declaration_sids("bare", &PolicyDomain::new("bare"), None).expect("no declarations"),
+        Vec::<String>::new()
+    );
+    let mut declared = PolicyDomain::new("cargo");
+    declared.fs.read = vec!["C:/a/**".to_string()];
+    assert!(declaration_sids("cargo", &declared, None).is_err());
 }

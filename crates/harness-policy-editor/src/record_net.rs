@@ -676,9 +676,16 @@ impl Drop for SessionGrants {
 /// （小文字・区切りは`\`）である。一方`wanted`は`policy.json`由来なので区切りが`/`のことが多い。
 /// 大文字小文字だけを無視する比較では**同じルートが別物に見え、まだ要る穴を全部剥がす**。
 /// FS軸の畳み込みは1つでなければならない（`B-20`）ので、ここでも同じ関数を通す。
-fn stale_roots(held: &[PathBuf], wanted: &[FsPassthrough]) -> Vec<PathBuf> {
+///
+/// [BUG-184] `wanted`は**このワークスペースがファイルで宣言している付与ルートの全部**
+/// （[`file_declared_roots`]）であって、記録中のドメインの分だけではない。`held`は台帳の
+/// ワークスペース全体なので、`wanted`も同じ範囲で数えないと、差が他ドメインの宣言の分だけ広がる。
+fn stale_roots(held: &[PathBuf], wanted: &[String]) -> Vec<PathBuf> {
     use harness_sandbox::tier2a::workspace_capability::declaration_key;
-    let wanted_keys: Vec<String> = wanted.iter().map(|fp| declaration_key(&fp.path)).collect();
+    let wanted_keys: Vec<String> = wanted
+        .iter()
+        .map(|root| declaration_key(Path::new(root)))
+        .collect();
     held.iter()
         .filter(|granted| {
             let key = declaration_key(granted);
@@ -686,6 +693,60 @@ fn stale_roots(held: &[PathBuf], wanted: &[FsPassthrough]) -> Vec<PathBuf> {
         })
         .cloned()
         .collect()
+}
+
+/// [BUG-184] 開始時の取り消しで**残す**付与ルート——`policy.json`の**全ドメイン**のこのマシンで
+/// 承認済みの宣言と、`settings.json`の`fs.*`。数え方は`harness.exe`の自動撤収（D-27）と同じ関数
+/// （`GrantContext::declared_roots`・`policy_grants::settings_declared_roots`）を通す。
+///
+/// **読めなければ`None`**（取り消しを飛ばす）。空として扱うと、宣言されている穴まで全部取り消す。
+fn file_declared_roots(
+    workspace_root: &Path,
+    warnings: &mut Vec<String>,
+    on_event: &mut dyn FnMut(NetRecordEvent),
+) -> Option<Vec<String>> {
+    let policy = match crate::policy_file::load(workspace_root) {
+        Ok(policy) => policy,
+        Err(e) => {
+            warn(
+                format!(
+                    "policy.jsonを読めないので、もう宣言されていない許可の取り消しを飛ばしました: {e}"
+                ),
+                warnings,
+                on_event,
+            );
+            return None;
+        }
+    };
+    let settings_entries = harness_config::Settings::load(workspace_root)
+        .fs
+        .unwrap_or_default()
+        .to_fs_passthrough();
+    Some(declared_roots_from(
+        &policy,
+        &settings_entries,
+        workspace_root,
+        &crate::approval_store::approval_store().load(),
+    ))
+}
+
+/// [`file_declared_roots`]の純粋な部分（試験はここを測る）。
+fn declared_roots_from(
+    policy: &crate::PolicyFile,
+    settings_entries: &[(String, harness_config::FsAccess)],
+    workspace_root: &Path,
+    approvals: &harness_sandbox::tier2a::policy_approval::PolicyApprovalLedger,
+) -> Vec<String> {
+    let workspace_key =
+        harness_sandbox::tier2a::policy_approval::approval_workspace_key(workspace_root);
+    let mut roots =
+        harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(workspace_root)
+            .declared_roots(policy, &|d| approvals.is_approved_for_key(&workspace_key, d));
+    roots.extend(harness_sandbox::tier2a::policy_grants::settings_declared_roots(
+        workspace_root,
+        settings_entries,
+    ));
+    roots
 }
 
 /// 宣言が縮んだぶんのACEを剥がす（パス2開始時のreconcile、D-27と同型）。
@@ -702,8 +763,23 @@ fn stale_roots(held: &[PathBuf], wanted: &[FsPassthrough]) -> Vec<PathBuf> {
 /// 差分が空なら追加コストは0である。`teardown`が実行1回ごとの撤収を**しない**理由
 /// （同一プロセスの2回目で付け直す無駄を避ける）はここでも守られる——剥がすのは
 /// 「今回の宣言に含まれないもの」だけなので、次の実行で付け直す対象にはならない。
+///
+/// # [BUG-184] 残す集合はワークスペースのファイル宣言の全部、走っているワークスペースは触らない
+///
+/// 以前は残す集合が**記録中の1ドメイン**だけで、他ドメインの宣言と、同じワークスペースで
+/// `harness.exe`が`settings.json`・`--fs-allow`で付けた許可・CoWの差分層の許可まで取り消していた
+/// （取り消しは発行元を名指しする経路なので、生存判定が掛からない）。いまは
+/// - 残す集合を[`file_declared_roots`]（`policy.json`の全ドメインの承認済み宣言＋`settings.json`）にし、
+/// - 発行元のワークスペースが**実行中なら取り消さずに件数を出す**（`workspace_ledger::live_modes`。
+///   `revocable_declaration_issuers`と同じ判定）。
+///
+/// **この限界は残る**: 画面版のエディタは1つのプロセスで試験実行を繰り返し、作業ディレクトリのモードの印を
+/// プロセスが終わるまで持つので、**2回目以降は自分の印で「実行中」と判定して見送る**。見送ったACEの
+/// 宛先SIDはどのトークンにも載らないので効き目は無く、次にエディタか`harness.exe`を起動したときに消える。
+/// `--fs-allow`の許可は残す集合に入らない（エディタは発行元を区別できる台帳を持たない）ので、
+/// 走っていないセッションの分はこの後も取り消される（次の起動で付け直し）。
 fn reconcile_undeclared_roots(
-    wanted: &[FsPassthrough],
+    wanted: &[String],
     workspace_root: &Path,
     warnings: &mut Vec<String>,
     on_event: &mut dyn FnMut(NetRecordEvent),
@@ -724,6 +800,24 @@ fn reconcile_undeclared_roots(
             .collect();
     let stale = stale_roots(&held, wanted);
     if stale.is_empty() {
+        return;
+    }
+    // [BUG-184] **走っているワークスペースからは取り上げない。** 同じワークスペースで`harness.exe`
+    // （やこのエディタの前の試験実行）が動いている間に取り消すと、その子が走行中に許可を失う。
+    // 判定は`revocable_declaration_issuers`と同じ（作業ディレクトリのモードの印が生きているか）。
+    let live = harness_sandbox::tier2a::workspace_ledger::live_modes(&canonical_ws);
+    if !live.is_empty() {
+        warn(
+            format!(
+                "もう宣言されていない許可が{}件ありますが、このワークスペースは使用中なので\
+                 取り消しを見送りました（モード: {}）。その許可の宛先はこの試験実行の子には渡らないので\
+                 効き目はありません。次にエディタか harness.exe を起動したときに取り消されます",
+                stale.len(),
+                live.join(", ")
+            ),
+            warnings,
+            on_event,
+        );
         return;
     }
 
@@ -990,7 +1084,12 @@ fn run_pass2<'a>(
     // このプロセスが既に開けたACEは残っており、同じプロセスで次のパス2を走らせると
     // 「取り消したのにまだ通る」ことになる（付与は`preflight`が宣言から毎回計算するので
     // 付け直しはされないが、剥がす側の経路が無かった）。
-    reconcile_undeclared_roots(&passthrough, request.workspace_root, warnings, on_event);
+    //
+    // [BUG-184] 残す集合は**このワークスペースのファイル宣言の全部**（記録中のドメインだけではない）。
+    // 宣言を読めなければ取り消し自体を飛ばす——空として扱うと全部を取り消す。
+    if let Some(wanted) = file_declared_roots(request.workspace_root, warnings, on_event) {
+        reconcile_undeclared_roots(&wanted, request.workspace_root, warnings, on_event);
+    }
     on_event(NetRecordEvent::ElevationExpected {
         // **出ない見込みのUACを予告しない**——出なかったことが「何か起きなかった」に見える。
         max_prompts: if request.wfp.is_live() {
@@ -1715,18 +1814,55 @@ fn warn(message: String, warnings: &mut Vec<String>, on_event: &mut dyn FnMut(Ne
 #[cfg(test)]
 mod stale_roots_tests {
     use super::*;
-    use harness_sandbox::FsAccess;
 
-    fn wanted(paths: &[&str]) -> Vec<FsPassthrough> {
-        paths
-            .iter()
-            .map(|p| FsPassthrough {
-                path: PathBuf::from(p),
-                access: FsAccess::Read,
-                forced: false,
-                scope: harness_policy::GrantScope::Recursive,
-            })
-            .collect()
+    fn wanted(paths: &[&str]) -> Vec<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// [BUG-184] **残す集合は、記録中のドメインだけでなく全ドメインと`settings.json`の宣言を含む。**
+    /// 記録中のドメインだけで数えると、他ドメインの宣言と`harness.exe`が設定で付けた許可を取り消す。
+    #[test]
+    fn the_kept_set_covers_every_domain_and_the_settings_file() {
+        use harness_sandbox::tier2a::policy_approval::{
+            approval_workspace_key, FsDeclarationApproval, PolicyApprovalLedger,
+            APPROVAL_FORMAT_VERSION,
+        };
+        let ws = tempfile::tempdir().expect("tempdir");
+        let mut cargo = crate::PolicyDomain::new("cargo");
+        cargo.fs.read.push("C:/cargo/**".to_string());
+        let mut npm = crate::PolicyDomain::new("npm");
+        npm.fs.read.push("C:/npm/**".to_string());
+        npm.fs.read.push("C:/shipped/**".to_string());
+        let policy = crate::PolicyFile {
+            domains: vec![cargo, npm],
+            ..Default::default()
+        };
+        let approve = |domain: &str, value: &str| FsDeclarationApproval {
+            workspace: approval_workspace_key(ws.path()),
+            domain: domain.to_string(),
+            access: harness_config::FsAccess::Read,
+            value: value.to_string(),
+            approved_at_unix_secs: 0,
+            format_version: Some(APPROVAL_FORMAT_VERSION),
+        };
+        // `C:/shipped/**`は承認していない（同梱された宣言）。
+        let approvals = PolicyApprovalLedger {
+            approvals: vec![approve("cargo", "C:/cargo/**"), approve("npm", "C:/npm/**")],
+        };
+        let settings = vec![("C:/from-settings/**".to_string(), harness_config::FsAccess::Read)];
+
+        let kept = declared_roots_from(&policy, &settings, ws.path(), &approvals);
+        let held = held(&["C:/cargo", "C:/npm", "C:/from-settings", "C:/shipped", "C:/gone"]);
+        let stale = stale_roots(&held, &kept);
+        assert_eq!(
+            stale,
+            held_of(&["C:/shipped", "C:/gone"]),
+            "only the unapproved and the no-longer-declared roots are stale: kept={kept:?}"
+        );
+    }
+
+    fn held_of(paths: &[&str]) -> Vec<PathBuf> {
+        held(paths)
     }
 
     fn held(paths: &[&str]) -> Vec<PathBuf> {

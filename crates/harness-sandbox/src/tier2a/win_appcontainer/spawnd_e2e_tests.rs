@@ -240,6 +240,9 @@ fn setup_with_transitions_and_domains(
             &canonical,
             // E2Eの土台は`DirectRw`（`setup`が`WorkspaceWriteMode::DirectRw`でpreflightしている）。
             "rwx",
+            // [#30] このE2Eの遷移先ドメインはファイル宣言を持たない（土台だけで用意できる）ので、
+            // 付与の結果は空でよい。宣言を足すなら、製品と同じく付与処理の結果を渡すこと。
+            &Default::default(),
         );
         for (domain, reason) in &provisioned.skipped {
             eprintln!("[spawnd-e2e] domain {domain:?} was not provisioned: {reason}");
