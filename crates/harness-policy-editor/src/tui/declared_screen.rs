@@ -14,7 +14,9 @@ use crate::tui::checkbox_tree::{self, Mark};
 use crate::tui::state::App;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(area);
+    // 説明欄は「操作の案内1行＋未承認の案内（折り返して最大2行）＋取り消しの注記4行」が入る高さ
+    // （枠の2行を足して9）。足りないと注記の末尾が黙って切れる。
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(9)]).split(area);
     let declared_list_offset = draw_tree(frame, chunks[0], app);
     draw_notes(frame, chunks[1], app);
     crate::tui::DrawFeedback {

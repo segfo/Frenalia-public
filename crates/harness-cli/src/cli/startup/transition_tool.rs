@@ -95,13 +95,12 @@ pub(super) fn facts_from_policy(
 /// CoWでは`:rw`の実ACEが読取へ降格され書込は差分層へ向かうが、既存の検査は
 /// ワークスペースもCoWに関係なく「書ける」と数えているので、それに揃える。
 ///
-/// # `#30`で読み直すこと
+/// # `policy.json`の宣言は入れない（#30）
 ///
-/// いまこの一覧に入るのは`settings.json`と`--fs-allow`由来だけである。
-/// **`policy.json`の`fs`を`harness.exe`が読んでこの一覧の元へ流し込むようになったら
-/// （`docs/INDEX.md`の未実装機能 サンドボックス周辺 #30）、その分はここから除くこと**
-/// ——宣言は宣言として既に検査の視野にあり、ここへ入れると遷移先ドメインの書込宣言まで
-/// 「入口から書ける」と数えられ、正当な辺が拒否される。
+/// この一覧に入るのは`settings.json`と`--fs-allow`由来だけである。`harness.exe`は#30から
+/// `policy.json`の`fs`も付与の一覧へ流し込むが、**この関数は合流させる前の手書きの一覧で呼ぶ**
+/// （`stage_prepare_sandbox`）——宣言は宣言として既に検査の視野にあり、ここへ入れると遷移先ドメインの
+/// 書込宣言まで「入口から書ける」と数えられ、正当な辺が拒否される。
 pub(super) fn writable_outside_policy(
     fs_passthrough: &[harness_sandbox::FsPassthrough],
 ) -> Vec<String> {
