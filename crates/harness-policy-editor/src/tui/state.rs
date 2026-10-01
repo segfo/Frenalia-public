@@ -23,7 +23,7 @@ use crate::child_run::AbortReason;
 use crate::policy_file::{self, PolicyDomain};
 use crate::record::{RecordEvent, RecordOutcome};
 use crate::record_net::NetRecordEvent;
-use crate::session_dir::{self, RecordManifest, RecordSessionDir};
+use crate::session_dir::{self, NetMode, RecordManifest, RecordSessionDir};
 use crate::tui::proposal_tree::ProposalTree;
 use crate::tui::text_input::TextInput;
 use crate::tui::worker::{Pass1Request, Pass2Request, RunHandle, WorkerMsg};
@@ -52,10 +52,17 @@ pub enum Pass {
 }
 
 impl Pass {
-    pub fn label(self) -> &'static str {
-        match self {
-            Pass::One => "パス1: 隔離なし（Tier0）でFSアクセスを記録（UAC 1回）",
-            Pass::Two => "パス2: Tier2aで接続ドメインを記録（UAC 最大2回・ACEが実際に付く）",
+    /// 記録画面の「パス」欄に出す名前。パス2は通信の扱い（決定64、[`NetMode`]）ごとに違う
+    /// ——同じ「パス2」でも、記録は接続先を集め、強制は宣言の外を断る。
+    pub fn label(self, net_mode: NetMode) -> &'static str {
+        match (self, net_mode) {
+            (Pass::One, _) => "パス1: 隔離なし（Tier0）でFSアクセスを記録（UAC 1回）",
+            (Pass::Two, NetMode::RecordAll) => {
+                "パス2（記録）: Tier2aで通信先を全部許して記録（UAC 最大2回・ACEが実際に付く）"
+            }
+            (Pass::Two, NetMode::Declared) => {
+                "パス2（強制）: Tier2aで宣言した通信先だけを許して走らせる（UAC 最大2回・ACEが実際に付く）"
+            }
         }
     }
 
@@ -67,6 +74,31 @@ impl Pass {
             Pass::Two => crate::record_net::elevation_notice(2),
         }
     }
+}
+
+/// 「パス」欄の切り替え順（決定64）。`→`・Spaceで進み、`←`で戻る。
+///
+/// パス1 → パス2（記録）→ パス2（強制）→ パス1 の3つを巡回する。**新しいキーを足さない**
+/// ために既存の欄を3つの巡回にした——キー案内を増やすと、ほかの画面のキーとの衝突を
+/// 数え直すことになる。
+pub(crate) fn cycle_pass(pass: Pass, net_mode: NetMode, backward: bool) -> (Pass, NetMode) {
+    const ORDER: [(Pass, NetMode); 3] = [
+        (Pass::One, NetMode::RecordAll),
+        (Pass::Two, NetMode::RecordAll),
+        (Pass::Two, NetMode::Declared),
+    ];
+    // パス1では`net_mode`を使わないので、どちらを持っていても先頭として扱う。
+    let current = match (pass, net_mode) {
+        (Pass::One, _) => 0,
+        (Pass::Two, NetMode::RecordAll) => 1,
+        (Pass::Two, NetMode::Declared) => 2,
+    };
+    let next = if backward {
+        (current + ORDER.len() - 1) % ORDER.len()
+    } else {
+        (current + 1) % ORDER.len()
+    };
+    ORDER[next]
 }
 
 /// 記録の進行段階。**停止操作が効くかどうかがここで決まる。**
@@ -688,6 +720,9 @@ pub struct App {
 
     // 記録画面
     pub pass: Pass,
+    /// [決定64] パス2で通信をどう扱うか。「パス」欄の切り替えで[`Pass`]と一緒に回る
+    /// （パス1 → パス2・記録 → パス2・強制 → パス1）。パス1では使わない。
+    pub net_mode: NetMode,
     pub command: TextInput,
     pub cwd: TextInput,
     pub run_domain: TextInput,
@@ -847,6 +882,7 @@ impl App {
             modal: None,
             modal_scroll: 0,
             pass: Pass::One,
+            net_mode: NetMode::RecordAll,
             command: TextInput::default(),
             run_domain: TextInput::default(),
             record_focus: RecordField::Command,
@@ -1220,9 +1256,11 @@ impl App {
             NetRecordEvent::CollectorStopped { written } => {
                 run.log_line(format!("収集器が畳みました（書込 {written}件）"));
             }
-            NetRecordEvent::ProxyStarted(addr) => {
-                run.log_line(format!("Local Proxy: {addr}（全許可・記録用）"))
-            }
+            NetRecordEvent::ProxyStarted {
+                addr,
+                mode,
+                allowed,
+            } => run.log_line(crate::record_net::proxy_started_line(addr, mode, allowed)),
             NetRecordEvent::FakeDnsStarted(addr) => run.log_line(format!("Fake DNS: {addr}")),
             NetRecordEvent::WfpEnforced { reused } => {
                 run.log_line(crate::record_net::wfp_enforced_line(reused))
@@ -1317,6 +1355,7 @@ impl App {
                     &outcome.fs_aggregate,
                     outcome.collector_started,
                     outcome.etw_available,
+                    outcome.net_mode,
                 )
                 .lines()
                 {
@@ -1801,10 +1840,8 @@ impl App {
         if self.record_focus == RecordField::Pass {
             match key.code {
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
-                    self.pass = match self.pass {
-                        Pass::One => Pass::Two,
-                        Pass::Two => Pass::One,
-                    };
+                    (self.pass, self.net_mode) =
+                        cycle_pass(self.pass, self.net_mode, key.code == KeyCode::Left);
                     if self.pass == Pass::Two && self.run_domain.is_empty() {
                         // 承認済みドメインが1件だけなら埋める（複数あるなら選ばせる）。
                         if let Ok(policy) = policy_file::load(&self.workspace_root) {
@@ -1900,6 +1937,7 @@ impl App {
                     wfp: self.wfp.clone(),
                     collector: self.collector.clone(),
                     spawn_daemon: self.spawn_daemon.clone(),
+                    net_mode: self.net_mode,
                 })))
             }
         }

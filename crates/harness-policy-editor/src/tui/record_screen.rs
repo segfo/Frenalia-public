@@ -134,7 +134,7 @@ fn draw_form(frame: &mut Frame, area: Rect, app: &App) {
     let mut pass_line = vec![
         Span::styled(pad_label("パス"), label_style(pass_focused)),
         Span::styled(
-            app.pass.label().to_string(),
+            app.pass.label(app.net_mode).to_string(),
             Style::default().fg(Color::White),
         ),
     ];

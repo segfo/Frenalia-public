@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::session_dir::{self, RecordManifest, RecordSessionDir, RecordStatus};
+use crate::session_dir::{self, NetMode, RecordManifest, RecordSessionDir, RecordStatus};
 use crate::tui::state::{App, CandidateFilter, Confirm, EditField, Pass, Screen};
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -238,6 +238,8 @@ fn confirming_the_diff_writes_the_policy_file_and_points_at_pass2() {
     let ws = workspace();
     seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
     let mut app = open_edit(&ws);
+    // 前の操作で強制モードを選んでいたことにする。既定値のままだと「記録へ戻す」を検査できない。
+    app.net_mode = NetMode::Declared;
     app.edit_focus = EditField::Proposals;
     app.on_key(key(KeyCode::Char(' ')));
     app.on_key(key(KeyCode::Char('a')));
@@ -256,6 +258,11 @@ fn confirming_the_diff_writes_the_policy_file_and_points_at_pass2() {
     // ガイド: 次はパス2（ここで初めてACEが付く）。画面と入力欄が埋まっている。
     assert_eq!(app.screen, Screen::Record);
     assert_eq!(app.pass, Pass::Two);
+    assert_eq!(
+        app.net_mode,
+        NetMode::RecordAll,
+        "FSを承認した直後は通信先をまだ宣言していないので、記録で集める"
+    );
     assert_eq!(app.run_domain.text(), "cargo");
     assert_eq!(app.command.text(), "cargo build");
     assert!(app.status.contains("パス2"), "{}", app.status);
@@ -967,9 +974,12 @@ fn a_pass2_recording_shows_the_domain_candidates() {
     assert_eq!(app.domain.text(), "cargo", "記録時のドメインを引き継ぐ");
 }
 
-/// パス2の候補を承認したあとは、**テスト画面が無いことをそのまま言う**（次があるように見せない）。
+/// [決定64] パス2の候補を承認したあとは、**同じドメインのパス2を強制モードで**用意する
+/// （宣言した通信先だけで動くかを確かめるのが次の一手）。パス1の候補を承認したときは
+/// 記録モード（`fs_approval_leads_to_pass2`の側）——モードを取り違えると、宣言をまだ持たない
+/// ドメインを全部断る実行へ案内してしまう。
 #[test]
-fn approving_domains_admits_that_the_test_screen_does_not_exist_yet() {
+fn approving_domains_leads_to_the_enforcing_pass2() {
     let ws = workspace();
     seed_pass2(&ws, "s2", "cargo build", "cargo", &["crates.io"]);
     let mut app = open_edit(&ws);
@@ -984,12 +994,12 @@ fn approving_domains_admits_that_the_test_screen_does_not_exist_yet() {
         policy.domain("cargo").expect("ドメイン").net.allow_domains,
         vec!["crates.io".to_string()]
     );
-    assert_eq!(app.screen, Screen::Edit, "行き先が無いので画面は変えない");
-    assert!(
-        app.status.contains("まだ実装していません"),
-        "無い機能を案内しない: {}",
-        app.status
-    );
+    assert_eq!(app.screen, Screen::Record, "次の実行を記録画面に用意する");
+    assert_eq!(app.pass, Pass::Two);
+    assert_eq!(app.net_mode, NetMode::Declared, "強制モードへ案内する");
+    assert_eq!(app.run_domain.text(), "cargo", "記録時のドメインを引き継ぐ");
+    assert_eq!(app.command.text(), "cargo build", "記録時のコマンドを引き継ぐ");
+    assert!(app.status.contains("強制"), "{}", app.status);
 }
 
 /// セッションを移ったら中身も入れ替わる（選択だけ動いて表示が古いまま、にしない）。
@@ -1077,7 +1087,7 @@ fn a_pass2_recording_shows_the_filesystem_denials_it_observed() {
         view.proposals
     );
     assert!(
-        view.notes.contains("ネットワークは全許可"),
+        view.notes.contains("通信は全許可"),
         "the asymmetry has to be stated, or this reads as 'the sandbox allowed everything': {}",
         view.notes
     );

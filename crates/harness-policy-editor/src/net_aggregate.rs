@@ -1,11 +1,16 @@
 //! パス2で観測したネットワークイベントを、人が判断できる形（許可ドメインの候補）へ畳み込む。
 //!
-//! # record-allで走らせるので「拒否」ではなく「触った全部」が入ってくる
+//! # 候補にする行は、走らせたモードで決まる（決定64、[`NetMode`]）
 //!
-//! パス2は[`harness_core::DomainPolicy::record_all`]で走らせるため、`net-audit.jsonl`の行は
-//! ほぼ全部が`allowed: true, reason: "record_all"`になる。`harness_policy::normalize_net_audit`は
+//! **記録**（既定）は[`harness_core::DomainPolicy::record_all`]で走らせるため、`net-audit.jsonl`の
+//! 行はほぼ全部が`allowed: true, reason: "record_all"`になる。`harness_policy::normalize_net_audit`は
 //! 拒否行以外を捨てる（`normalize.rs`）ので、そのまま通すと候補が**0件**になる。
 //! [`harness_policy::NetIntake::All`]で取り込む——FS側の`on_operation_end_any`と同じ形の分岐である。
+//!
+//! **強制**は宣言した通信先だけを許して走らせるので、許された行は宣言済みの宛先である。
+//! 候補にするのは**断られた行だけ**（[`harness_policy::NetIntake::DeniedOnly`]、通常運用の
+//! `harness policy suggest`と同じ取り込み口）。全部を取り込むと、宣言済みの宛先が
+//! 「新しい候補」として並び、何が足りなかったのかが埋もれる。
 //!
 //! # 正本はJSONLであってここではない
 //!
@@ -15,7 +20,9 @@
 
 use std::collections::BTreeMap;
 
-use harness_policy::{DeniedCandidate, NetIntake, RuleProposal};
+use harness_policy::{DeniedCandidate, RuleProposal};
+
+use crate::session_dir::NetMode;
 
 /// パス2の記録1回分の集計。
 #[derive(Debug, Default)]
@@ -23,10 +30,10 @@ pub struct NetAggregate {
     /// 観測した行（そのまま。候補の計算は`harness_policy`へ通し直す）。
     lines: Vec<String>,
     pub events_seen: u64,
-    /// うち許可されたもの（record-allなのでほぼ全部）。
+    /// うち許可されたもの（記録モードではほぼ全部）。
     pub allowed: u64,
-    /// うち拒否されたもの。**record-allでの拒否はIPリテラル宛が主**（`evaluate_host`は
-    /// record-allでもIPリテラルを拒否する）。
+    /// うち拒否されたもの。**記録モードでの拒否はIPリテラル宛が主**（`evaluate_host`は
+    /// record-allでもIPリテラルを拒否する）。強制モードでは宣言の外の宛先がここへ入る。
     pub denied: u64,
     /// ホスト名を持たなかったイベント（IP直打ち・WFPのdrop）。**盲点の指標**。
     pub without_host: u64,
@@ -41,11 +48,26 @@ pub struct NetAggregate {
     /// **黙って捨てもしない。** ここに溜めたものを呼び出し側が警告として見せる
     /// ——昇格側の失敗は`SW_HIDE`のコンソールへ消えるので、これが唯一の伝達路である。
     control_reasons: Vec<String>,
+    /// どのモードで走らせた記録か。候補の取り込み口（[`NetMode::intake`]）と注記を決める。
+    mode: NetMode,
 }
 
 impl NetAggregate {
+    /// 記録モード（既定）の集計。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `mode`で走らせた記録の集計。
+    pub fn for_mode(mode: NetMode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
+
+    pub fn mode(&self) -> NetMode {
+        self.mode
     }
 
     /// 監査イベント1件を取り込む。
@@ -109,7 +131,7 @@ impl NetAggregate {
     pub fn candidates(&self) -> Vec<DeniedCandidate> {
         harness_policy::normalize::normalize_net_audit_with_mode(
             &self.lines.join("\n"),
-            NetIntake::All,
+            self.mode.intake(),
         )
         .candidates
     }
@@ -123,7 +145,7 @@ impl NetAggregate {
     pub fn notes(&self) -> Vec<String> {
         harness_policy::normalize::normalize_net_audit_with_mode(
             &self.lines.join("\n"),
-            NetIntake::All,
+            self.mode.intake(),
         )
         .notes
     }
@@ -131,10 +153,11 @@ impl NetAggregate {
 
 /// 記録済みの`net-audit.jsonl`を読み直して集計する。
 ///
-/// **保存済みの集計値は使わない**（B-13）。何度でも見直せる。
-pub fn from_log(path: &std::path::Path) -> NetAggregate {
+/// **保存済みの集計値は使わない**（B-13）。何度でも見直せる。`mode`はその記録の
+/// マニフェストから渡す（[`crate::session_dir::RecordManifest::net_mode`]）。
+pub fn from_log(path: &std::path::Path, mode: NetMode) -> NetAggregate {
     let mut tail = crate::audit_tail::AuditTail::new(path);
-    let mut aggregate = NetAggregate::new();
+    let mut aggregate = NetAggregate::for_mode(mode);
     let (events, skipped) = tail.poll_json_values();
     for event in &events {
         aggregate.add_event(event);
@@ -149,6 +172,7 @@ pub fn from_log(path: &std::path::Path) -> NetAggregate {
 pub fn render_notes(aggregate: &NetAggregate) -> String {
     let mut out = String::new();
 
+    out.push_str(&format!("通信の扱い: {}\n", aggregate.mode().label()));
     out.push_str(&format!(
         "観測: {}件（許可 {} / 拒否 {}）、異なるホスト {}件\n",
         aggregate.events_seen,
@@ -202,7 +226,10 @@ pub fn render(aggregate: &NetAggregate, limit: usize) -> String {
     let mut out = render_notes(aggregate);
     let proposals = aggregate.proposals();
 
-    out.push_str("\n許可ドメインの候補（観測された値そのまま）:\n");
+    out.push_str(match aggregate.mode() {
+        NetMode::RecordAll => "\n許可ドメインの候補（観測された値そのまま）:\n",
+        NetMode::Declared => "\n許可ドメインの候補（宣言の外で断られた宛先）:\n",
+    });
     if proposals.is_empty() {
         out.push_str("  （候補なし）\n");
     }

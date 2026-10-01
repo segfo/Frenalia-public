@@ -18,6 +18,9 @@
 //! 7. **承認したFS宣言が実DACLへ届き、その宛先SIDがcapability SIDである**（残課題#20の
 //!    移行の不変条件＝package SID宛が0本）。**取り消したあとに何が残るか**も同じ実行で測る
 //!    ——[`an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_runs`]
+//! 8. **強制モード（`--enforce-net`、決定64）は宣言した通信先だけを通し、宣言の外を断る**
+//!    ——同じ実行で許可側と禁止側を両方測り、候補が断られた宛先だけになることを確かめる
+//!    （[`enforcing_pass2_allows_only_the_declared_domain_and_proposes_the_refused_one`]）
 //!
 //! # このテストが触らないもの（正直に書く）
 //!
@@ -40,6 +43,17 @@ fn editor_exe() -> &'static str {
 const TARGET_DOMAIN: &str = "example.com";
 
 fn write_policy(workspace_root: &Path, domain: &str, command: &str) {
+    // **1つも宣言しない。** それでも到達できることがrecord_allの効き目の証明になる。
+    write_policy_declaring(workspace_root, domain, command, &[]);
+}
+
+/// [`write_policy`]の、通信先を宣言する版（強制モードの試験が使う）。
+fn write_policy_declaring(
+    workspace_root: &Path,
+    domain: &str,
+    command: &str,
+    allow_domains: &[&str],
+) {
     let policy = serde_json::json!({
         "schema_version": 1,
         "domains": [{
@@ -48,8 +62,7 @@ fn write_policy(workspace_root: &Path, domain: &str, command: &str) {
             "cwd": workspace_root,
             // 意図的に空（モジュールdocの「触らないもの」参照）。
             "fs": { "read": [], "read_write": [], "read_exec": [] },
-            // **1つも宣言しない。** それでも到達できることがrecord_allの効き目の証明になる。
-            "net": { "allow_domains": [] },
+            "net": { "allow_domains": allow_domains },
             "provenance": { "record_sessions": [], "updated_unix_ms": 0 }
         }]
     });
@@ -63,9 +76,20 @@ fn write_policy(workspace_root: &Path, domain: &str, command: &str) {
 }
 
 fn run_record_net(workspace_root: &Path, domain: &str, command: &str) -> std::process::Output {
+    run_record_net_with(workspace_root, domain, command, &[])
+}
+
+/// [`run_record_net`]に`record-net`のフラグ（`--enforce-net`等）を足して走らせる版。
+fn run_record_net_with(
+    workspace_root: &Path,
+    domain: &str,
+    command: &str,
+    flags: &[&str],
+) -> std::process::Output {
     Command::new(editor_exe())
+        .arg("record-net")
+        .args(flags)
         .args([
-            "record-net",
             "--domain",
             domain,
             "--workspace",
@@ -304,6 +328,100 @@ fn pass2_records_the_domain_a_command_reached_without_declaring_any_allowlist() 
     );
 }
 
+/// 8番（決定64）: **強制モードは宣言した通信先だけを通し、宣言の外を断る。断った宛先だけが候補になる。**
+///
+/// 1本のコマンドで、宣言した宛先（`example.com`）と宣言していない宛先（`example.org`）へ
+/// 1回ずつ繋ぐ。許可側と禁止側を同じ実行に置くので、「何も通さない」でも「全部通す」でも落ちる
+/// （B-35）。断る側は中継プロキシが接続の前に断るので、`example.org`へ実際に届く必要は無い。
+#[test]
+#[ignore = "requires administrator rights (WFP netfilterd) and outbound network access"]
+fn enforcing_pass2_allows_only_the_declared_domain_and_proposes_the_refused_one() {
+    const UNDECLARED: &str = "example.org";
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let workspace_root = workspace.path();
+    let command = format!(
+        "curl.exe -sS -o NUL -w '%{{http_code}}' https://{TARGET_DOMAIN}/; \
+         curl.exe -sS -o NUL -w '%{{http_code}}' https://{UNDECLARED}/"
+    );
+    write_policy_declaring(workspace_root, "e2e-enforce", &command, &[TARGET_DOMAIN]);
+
+    let output = run_record_net_with(workspace_root, "e2e-enforce", &command, &["--enforce-net"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+
+    assert!(
+        output.status.success(),
+        "record-net should succeed even if the command itself fails: {stdout}\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Tier2aへ着地しました"),
+        "the run must land on Tier2a: {stderr}"
+    );
+    assert!(
+        stderr.contains("宣言した通信先 1件だけを許し"),
+        "the proxy must start with the declared allowlist, not record_all: {stderr}"
+    );
+
+    // 許可側: 宣言した宛先は許可リストに一致して通った（record_allで通ったのではない）。
+    let audit = net_audit_of_latest_session(workspace_root);
+    // 監査の生の行も残す。ホスト名を持たないWFPのdropが何件・どの宛先かは、合否と別に
+    // 読み返したくなる（一時ワークスペースは試験の終わりに消える）。
+    eprintln!("--- net-audit.jsonl ---\n{audit}");
+    let events: Vec<serde_json::Value> = audit
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let host_of = |event: &serde_json::Value| {
+        event["host"]
+            .as_str()
+            .or_else(|| event["remote_host"].as_str())
+            .map(str::to_string)
+    };
+    assert!(
+        events.iter().any(|e| host_of(e).as_deref() == Some(TARGET_DOMAIN)
+            && e["allowed"] == true
+            && e["reason"] == "domain_allowed"),
+        "the declared domain must pass as an allowlist hit: {audit}"
+    );
+    assert!(
+        !audit.contains("record_all"),
+        "nothing may pass as record_all in the enforcing mode: {audit}"
+    );
+    // 禁止側: 宣言していない宛先は断られた。
+    assert!(
+        events.iter().any(|e| host_of(e).as_deref() == Some(UNDECLARED)
+            && e["allowed"] == false),
+        "the undeclared domain must be refused: {audit}"
+    );
+
+    // 候補は断られた宛先だけ（宣言済みの宛先を候補へ戻さない）。
+    assert!(
+        stdout.contains(&format!("net.allow_domains = {UNDECLARED}")),
+        "the refused domain must be proposed: {stdout}"
+    );
+    assert!(
+        !stdout.contains(&format!("net.allow_domains = {TARGET_DOMAIN}")),
+        "an already-declared domain must not be proposed again: {stdout}"
+    );
+
+    // マニフェストがモードを残しており、`show`で開き直しても同じ候補になる。
+    let manifest = manifest_of_latest_session(workspace_root);
+    assert_eq!(manifest["net_mode"], "declared", "manifest: {manifest}");
+    assert_eq!(manifest["status"], "finished", "manifest: {manifest}");
+    let shown = run_show(workspace_root);
+    assert!(
+        shown.contains(&format!("net.allow_domains = {UNDECLARED}"))
+            && !shown.contains(&format!("net.allow_domains = {TARGET_DOMAIN}")),
+        "show must read the record back with the mode it was run with: {shown}"
+    );
+
+    assert!(
+        stderr.contains("撤収: AppContainerプロファイルとACE"),
+        "the session profile teardown must run: {stderr}"
+    );
+}
+
 /// 4番（対のテスト、B-35）: **プロキシを経由しない生ソケットはWFPに落とされる。**
 ///
 /// 上のテストが通るのは「何も強制していないから素通しできた」のではなく、
@@ -417,6 +535,7 @@ fn a_second_pass2_in_the_same_process_reuses_the_daemon_and_still_enforces() {
             wfp: &wfp,
             collector: &collector,
             spawn_daemon: &spawn_daemon,
+            net_mode: harness_policy_editor::record_net::NetMode::RecordAll,
         };
         let mut reused: Option<bool> = None;
         let mut stdout = String::new();

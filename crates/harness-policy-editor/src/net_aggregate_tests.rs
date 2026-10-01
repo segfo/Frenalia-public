@@ -114,7 +114,7 @@ fn reading_the_log_back_produces_the_same_candidates() {
     );
     std::fs::write(&path, text).unwrap();
 
-    let aggregate = from_log(&path);
+    let aggregate = from_log(&path, NetMode::RecordAll);
 
     assert_eq!(aggregate.events_seen, 2);
     assert_eq!(aggregate.host_count(), 2);
@@ -209,7 +209,7 @@ fn control_reasons_survive_reading_the_log_back() {
     )
     .unwrap();
 
-    let aggregate = from_log(&path);
+    let aggregate = from_log(&path, NetMode::RecordAll);
 
     assert_eq!(aggregate.events_seen, 0);
     assert_eq!(
@@ -238,5 +238,77 @@ fn the_rendered_notes_surface_what_the_elevated_side_reported() {
     assert!(
         !text.contains("ホスト名を持たないイベント"),
         "制御レコードを通信の盲点として数えてはいけない: {text}"
+    );
+}
+
+/// [決定64] **強制で走らせた記録は、断られた宛先だけを候補にする。** 許された宛先は宣言済みで、
+/// 候補に並べると「何が足りなかったのか」が埋もれる。同じ入力を記録モードで読むと両方が出る
+/// ——取り込み口が実際にモードで切り替わっていることの対（B-35）。
+#[test]
+fn a_declared_run_proposes_only_the_refused_hosts() {
+    let events = [
+        proxy_event("crates.io", true, "domain_allowed"),
+        proxy_event("example.com", false, "domain_denied"),
+    ];
+    let mut declared = NetAggregate::for_mode(NetMode::Declared);
+    let mut record_all = NetAggregate::for_mode(NetMode::RecordAll);
+    for event in &events {
+        declared.add_event(event);
+        record_all.add_event(event);
+    }
+
+    let declared_values: Vec<String> =
+        declared.proposals().into_iter().map(|p| p.value).collect();
+    let mut record_all_values: Vec<String> =
+        record_all.proposals().into_iter().map(|p| p.value).collect();
+    record_all_values.sort();
+
+    assert_eq!(declared_values, vec!["example.com".to_string()]);
+    assert_eq!(
+        record_all_values,
+        vec!["crates.io".to_string(), "example.com".to_string()]
+    );
+    // 件数は取り込み口と無関係に、観測したとおりに数える。
+    assert_eq!((declared.allowed, declared.denied), (1, 1));
+}
+
+/// 記録を開き直す経路（`show`・編集画面）でも、マニフェストのモードで取り込み口が決まる。
+#[test]
+fn reading_the_log_back_uses_the_mode_it_was_run_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("net-audit.jsonl");
+    let text = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&proxy_event("crates.io", true, "domain_allowed")).unwrap(),
+        serde_json::to_string(&proxy_event("example.com", false, "domain_denied")).unwrap()
+    );
+    std::fs::write(&path, text).unwrap();
+
+    assert_eq!(from_log(&path, NetMode::Declared).proposals().len(), 1);
+    assert_eq!(from_log(&path, NetMode::RecordAll).proposals().len(), 2);
+}
+
+/// 注記はどちらのモードで走らせたかを先頭に出し、候補の見出しもモードで変える
+/// （強制の候補を「観測された値そのまま」と書くと、許された宛先まで入っていると読まれる）。
+#[test]
+fn the_rendered_text_names_the_mode() {
+    let declared = NetAggregate::for_mode(NetMode::Declared);
+    let record_all = NetAggregate::new();
+
+    let declared_text = render(&declared, 10);
+    let record_all_text = render(&record_all, 10);
+
+    assert!(
+        declared_text.contains(NetMode::Declared.label()),
+        "{declared_text}"
+    );
+    assert!(declared_text.contains("宣言の外で断られた宛先"), "{declared_text}");
+    assert!(
+        record_all_text.contains(NetMode::RecordAll.label()),
+        "{record_all_text}"
+    );
+    assert!(
+        record_all_text.contains("観測された値そのまま"),
+        "{record_all_text}"
     );
 }
