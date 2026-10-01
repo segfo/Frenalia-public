@@ -98,6 +98,43 @@ pub fn grant_traverse_chain(
     grant_traverse_chain_with_progress(target, sid, |_node, _result, _elapsed| {})
 }
 
+/// [残課題#68] 通行許可を書く**祖先の並び**を、浅い方から深い方の順で作る。
+///
+/// # 標的を実体へ解決してから並べる（2026-10-01、`plans/mac-spike/RESULTS.md` §S82で測った）
+///
+/// 許可を書くのは`SetNamedSecurityInfoW`で、**これはパスを辿る**——途中にジャンクションが
+/// あると、許可はリンク自身ではなく**リンクの先の実体**に書かれる（実測）。綴りのまま並べると、
+/// 次の2つがずれる。
+///
+/// - **台帳に載るパスと、実際に許可が書かれた場所がずれる。** 台帳は撤収の唯一の索引なので、
+///   後からリンクが張り替えられると剥がす先が変わり、**実体に許可が残る**（`B-01`の非対称）
+/// - **リンクの先の祖先に許可が付かない。** 綴りの祖先には付くが実体の祖先には付かないので、
+///   その経路を通過できないまま終わることがある
+///
+/// 解決すれば、許可を書く先・台帳へ載る綴り・通過できる経路の3つが一致する。
+///
+/// **`\\?\`前置は落とす**——台帳の他の記録と綴りを揃えるため（`B-19`。揃えないと同じノードが
+/// 2つの綴りで載る）。**解決できないときは綴りのまま進む**——ここで止めると、リンクを1つも
+/// 含まない普通の経路まで付与できなくなる。
+///
+/// # 予告（[`preview_traverse_chain`]）と本番（[`grant_traverse_chain_with_progress`]）が
+/// **同じ関数を通る**
+///
+/// 別々に並べると、予告が「ここへ付きます」と出した場所と実際に付く場所がずれる（`B-05`）。
+fn traverse_chain_nodes(target: &Path) -> Vec<std::path::PathBuf> {
+    let resolved = std::fs::canonicalize(target)
+        .ok()
+        .map(|p| {
+            std::path::PathBuf::from(harness_change_ledger::path_rules::normalize_root_spelling(
+                &p.to_string_lossy(),
+            ))
+        })
+        .unwrap_or_else(|| target.to_path_buf());
+    let mut chain: Vec<std::path::PathBuf> = resolved.ancestors().map(|p| p.to_path_buf()).collect();
+    chain.reverse();
+    chain
+}
+
 /// `grant_traverse_chain`と同じ処理を行うが、各ノードへの付与試行が完了するたびに
 /// `on_node(node, result, elapsed)`を呼ぶ。特権分離ヘルパー（D-16、`privhelper.rs`）が
 /// ノード別の所要時間をログへ残せるようにするためのフック（BUG-011の遅いプロファイル
@@ -109,8 +146,7 @@ pub fn grant_traverse_chain_with_progress(
     sid: PSID,
     mut on_node: impl FnMut(&Path, &Result<(), AppContainerError>, std::time::Duration),
 ) -> (Vec<std::path::PathBuf>, Result<(), AppContainerError>) {
-    let mut chain: Vec<std::path::PathBuf> = target.ancestors().map(|p| p.to_path_buf()).collect();
-    chain.reverse();
+    let chain = traverse_chain_nodes(target);
 
     let mut granted = Vec::with_capacity(chain.len());
     for node in &chain {
@@ -144,8 +180,7 @@ pub struct TraversePreviewNode {
 
 pub fn preview_traverse_chain(target: &Path, sid: PSID) -> Vec<TraversePreviewNode> {
     const REQUIRED: u32 = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0;
-    let mut chain: Vec<std::path::PathBuf> = target.ancestors().map(|p| p.to_path_buf()).collect();
-    chain.reverse();
+    let chain = traverse_chain_nodes(target);
 
     chain
         .into_iter()
@@ -296,4 +331,109 @@ mod machine_probe_tests {
              sufficient; if not, the measurement above says nothing about the migration"
         );
     }
+
+    /// [残課題#68] **リンク越しの綴りで頼まれても、許可を書く先と台帳へ載る綴りが一致する。**
+    ///
+    /// # 壊れた状態を一文で
+    ///
+    /// 台帳には`…\link\deep`と載るのに、許可は`…\real\deep`に書かれている。
+    /// 後でリンクが張り替えられると、撤収は別の場所を剥がしに行き、**元の実体に許可が残る**。
+    #[test]
+    #[cfg(windows)]
+    fn the_traverse_chain_is_resolved_so_the_ledger_matches_where_the_ace_lands() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("deep")).expect("real dirs");
+        let link = root.path().join("link");
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run mklink");
+        assert!(status.success(), "mklink /J failed; the arm cannot be measured");
+
+        let chain = traverse_chain_nodes(&link.join("deep"));
+
+        // 実体の経路が並ぶ——**リンクの綴りは1つも出ない**。
+        assert!(
+            chain.iter().all(|p| !p.to_string_lossy().contains("link")),
+            "the chain still carries the link spelling, so the ledger would not match where the ACE \
+             lands: {chain:?}"
+        );
+        // 実体の末端と、その親の両方が並ぶ（親が抜けるとその経路を通過できない）。
+        let real_canonical = std::path::PathBuf::from(
+            harness_change_ledger::path_rules::normalize_root_spelling(
+                &std::fs::canonicalize(&real)
+                    .expect("canonicalize the real dir")
+                    .to_string_lossy(),
+            ),
+        );
+        assert!(
+            chain.contains(&real_canonical),
+            "the resolved parent is missing, so the child could not traverse into it: {chain:?}"
+        );
+        assert!(
+            chain.contains(&real_canonical.join("deep")),
+            "the resolved leaf is missing: {chain:?}"
+        );
+        // 浅い方から深い方の順（途中で失敗しても、到達できない深い段だけが残る形にしない）。
+        assert_eq!(
+            chain.last(),
+            Some(&real_canonical.join("deep")),
+            "the chain must end at the deepest node: {chain:?}"
+        );
+    }
+
+    /// **対（許可側）**: リンクを1つも含まない普通の綴りでは、並びは今までどおりである。
+    ///
+    /// これが無いと、「標的が何であれ空の並びを返す」実装でも上の試験が緑になる（`B-35`）。
+    #[test]
+    #[cfg(windows)]
+    fn a_plain_path_without_links_keeps_the_same_traverse_chain() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let deep = root.path().join("a").join("b");
+        std::fs::create_dir_all(&deep).expect("dirs");
+
+        let chain = traverse_chain_nodes(&deep);
+
+        let expected = std::path::PathBuf::from(
+            harness_change_ledger::path_rules::normalize_root_spelling(
+                &std::fs::canonicalize(&deep)
+                    .expect("canonicalize")
+                    .to_string_lossy(),
+            ),
+        );
+        assert_eq!(chain.last(), Some(&expected), "chain={chain:?}");
+        assert!(
+            chain.len() > 2,
+            "the ancestors must still be there: {chain:?}"
+        );
+        // ドライブルートから始まる（浅い方が先）。
+        assert_eq!(
+            chain.first().map(|p| p.to_string_lossy().len()),
+            chain.iter().map(|p| p.to_string_lossy().len()).min(),
+            "the chain must start at the shallowest node: {chain:?}"
+        );
+    }
+
+    /// **解決できない標的（まだ無いパス）でも、並びは空にならない。**
+    ///
+    /// 空を返すと、付与が1件も走らないまま成功に見える（成功に見える失敗、`B-09`）。
+    #[test]
+    #[cfg(windows)]
+    fn a_target_that_cannot_be_resolved_still_yields_its_spelled_chain() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let missing = root.path().join("not-yet").join("deep");
+
+        let chain = traverse_chain_nodes(&missing);
+
+        assert!(
+            chain.contains(&missing),
+            "the spelled target must remain when it cannot be resolved: {chain:?}"
+        );
+        assert!(chain.len() > 2, "chain={chain:?}");
+    }
+
 }

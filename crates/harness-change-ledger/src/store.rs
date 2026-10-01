@@ -617,4 +617,51 @@ mod tests {
             PathBuf::from("diff_layer/_ext/c/Windows/probe.txt")
         );
     }
+    /// [残課題#68] **差分層の走査は、ジャンクション（ディレクトリのリパースポイント）の先へ入らない。**
+    ///
+    /// # なぜ確かめるのか
+    ///
+    /// サンドボックスの子は、既定のモード（`DirectRw`）ではワークスペースの中にジャンクションを
+    /// 作れる（`plans/mac-spike/RESULTS.md` §S81）。この走査はハーネス側で動き、差分層の下を
+    /// 再帰で歩く。**ここが辿ると、差分層の外のファイルが変更一覧に載る**。
+    ///
+    /// 他の再帰（`WorkspaceJail::walk_dir`・ACLの木歩き・遅延付与の走査）は
+    /// `is_symlink()`で明示的に飛ばしているが、**ここにはその行が無い**。
+    /// 飛ばせているのは`std::fs::FileType::is_dir()`がWindowsでリパースポイントに偽を返すからで、
+    /// **言語の実装に依存した暗黙の防御**である。暗黙のままにせず、破れたら赤くなるようにする。
+    #[test]
+    #[cfg(windows)]
+    fn the_diff_layer_scan_does_not_descend_into_a_junction() {
+        let diff_layer = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"TOP-SECRET").unwrap();
+        // 差分層の中にも1つ置く（走査そのものが動いていることの対照）。
+        std::fs::write(diff_layer.path().join("real.txt"), b"x").unwrap();
+
+        let link = diff_layer.path().join("link");
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(outside.path())
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run mklink");
+        assert!(status.success(), "mklink /J failed; the arm cannot be measured");
+
+        let found = scan_diff_layer_content_files(diff_layer.path());
+
+        // **対照**: 差分層の中の普通のファイルは見つかる。見つからないなら走査が壊れている。
+        assert!(
+            found.iter().any(|k| k == "real.txt"),
+            "the scan missed a plain file in the diff layer, so the arm below means nothing: {found:?}"
+        );
+        // **本題**: ジャンクションの先のファイルは1つも載らない。
+        assert!(
+            !found.iter().any(|k| k.contains("secret")),
+            "**the diff layer scan followed a junction and listed a file outside the diff layer.** \
+             A sandboxed child can plant junctions, so this would put arbitrary files into the \
+             change list: {found:?}"
+        );
+    }
+
 }

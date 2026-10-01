@@ -2369,3 +2369,105 @@ fn cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_diff_
          report={report:?})"
     );
 }
+
+/// [残課題#68] **差分層を使うモードで、ワークスペース側のパスを指定してジャンクションを張ると
+/// どちらへ着地するか。**
+///
+/// # なぜこれだけ別に測るのか
+///
+/// 既に在る[`cow_apply_does_not_follow_a_junction_that_the_sandboxed_child_plants_in_diff_layer`]は、
+/// 子に**差分層のパスを直接**指定させている。Redirector DLLは差分層配下を書き換えの対象外に
+/// しているので、あれが測っているのは「差分層の中に張られたジャンクションをapplyが辿らないこと」である。
+///
+/// **ワークスペース側のパスを指定したときどうなるかは測っていなかった**
+/// （`plans/mac-spike/RESULTS.md` §S81の「言えないこと」の1行目）。
+///
+/// # 計器は`tier2a-proc-probe --make-junction`にそろえる
+///
+/// 既定のモード（`DirectRw`）で「子はワークスペースの中を指すジャンクションを**作れる**」と測ったのは
+/// この計器である（§S81）。PowerShellの`New-Item -ItemType Junction`で測ると、失敗したときに
+/// **PowerShellが先に落ちたのか、リパースポイントの設定が拒否されたのか**を区別できない
+/// ——プローブは`CreateFileW`と`FSCTL_SET_REPARSE_POINT`のどちらで落ちたかを`stage`で返す。
+///
+/// # 測るのは2つ
+///
+/// 1. 子はジャンクションを作れるか（作れないならこの穴は差分層モードでは成立しない）
+/// 2. 作れたとして、**本物のワークスペース**と**差分層**のどちらに現れるか
+///
+/// どちらの結果でも記録する——これは受け入れではなく測定である。
+/// ただし**本物のワークスペースに現れたら落とす**: ワークスペースは読取専用で開いてあり、
+/// そこに子がリパースポイントを作れるなら、差分層モードの封じ込めそのものが破れている。
+#[test]
+#[ignore = "spawns a real AppContainer child with the Redirector injected; run through cow-diagnostics"]
+fn cow_junction_at_a_workspace_path_lands_in_the_diff_layer_not_the_workspace() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
+    let secret_root = tempfile::tempdir().expect("secret tempdir");
+    std::fs::write(secret_root.path().join("id_rsa"), "TOP-SECRET-KEY").expect("seed secret");
+
+    let sid = session_sid();
+    let write_mode = WorkspaceWriteMode::Cow {
+        diff_layer_dir: diff_layer.path().to_path_buf(),
+    };
+    preflight_for_test(workspace.path(), &[], None, &write_mode);
+
+    // 標的は2つ——(1) ワークスペース側の綴りで自分が作れる場所、(2) ワークスペースの外の機密。
+    // 交絡を切るために両方撃つ（1つだけだと「標的へ届かない」と「リパースポイントを作れない」を
+    // 区別できない。既存のテストと同じ理由）。
+    let ws_target = workspace.path().join("ws-target");
+    let ws_link = workspace.path().join("ws-link");
+    let ws_link_secret = workspace.path().join("ws-link-secret");
+    let probe = tier2a_proc_probe_x64_exe();
+    let env = crate::secret_env::build_child_env();
+    let child = spawn_in_workspace(
+        probe.to_str().expect("probe path is valid utf-8"),
+        &[
+            "--make-junction",
+            &format!("{}|{}", ws_link.display(), ws_target.display()),
+            "--make-junction",
+            &format!("{}|{}", ws_link_secret.display(), secret_root.path().display()),
+        ],
+        workspace.path(),
+        &env,
+        false,
+        sid.as_psid(),
+        NetworkCapability::Deny,
+        Some(CowInject {
+            workspace_root: workspace.path(),
+            diff_layer_dir: diff_layer.path(),
+            ext_capture_roots: &[],
+        }),
+    )
+    .expect("spawn with cow injection should succeed");
+    let (stdout, stderr, code) = child
+        .write_stdin_read_output_and_wait(None)
+        .expect("child should run to completion");
+
+    // 名前そのものが在るか（リンク切れのリンクも「在る」。辿らない）。
+    let exists_as_name = |p: &std::path::Path| std::fs::symlink_metadata(p).is_ok();
+    let in_workspace = exists_as_name(&ws_link);
+    let in_diff_layer = exists_as_name(&diff_layer.path().join("ws-link"));
+    let secret_in_workspace = exists_as_name(&ws_link_secret);
+    let secret_in_diff_layer = exists_as_name(&diff_layer.path().join("ws-link-secret"));
+
+    println!(
+        "MEASUREMENT: sandboxed child planting a junction at a WORKSPACE path under CoW -> \
+         exit={code}\n  stdout={}\n  stderr={}\n  \
+         link to a workspace path: workspace={in_workspace} diff_layer={in_diff_layer}\n  \
+         link to the outside secret: workspace={secret_in_workspace} diff_layer={secret_in_diff_layer}",
+        stdout.trim(),
+        stderr.trim()
+    );
+
+    // **本物のワークスペースに現れたら落とす。** 差分層モードではワークスペースを読取専用で
+    // 開いているので、そこへ子がリパースポイントを作れるなら封じ込めが破れている。
+    assert!(
+        !in_workspace && !secret_in_workspace,
+        "**サンドボックスの子が、本物のワークスペースにリパースポイントを作った。** \
+         差分層モードではワークスペースを読取専用で開いているので、これが起きるなら封じ込めが破れている: \
+         workspace-path-link={in_workspace} secret-link={secret_in_workspace} \
+         stdout={} stderr={}",
+        stdout.trim(),
+        stderr.trim()
+    );
+}

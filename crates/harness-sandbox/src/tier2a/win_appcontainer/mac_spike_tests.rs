@@ -1969,3 +1969,280 @@ fn run_probe_locally(probe: &str, args: &[&str]) -> String {
         .expect("run the probe");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
+
+/// [残課題#68] **`--fs-allow <path>:rw`で開けた場所から、サンドボックスの子は
+/// 「読めないファイル」へハードリンクを張れるか。**
+///
+/// # なぜこれだけ別に測るのか
+///
+/// RedirectionGuard（管理者でないユーザーが作ったリパースポイントを辿らない緩和策）は
+/// **ハードリンクには効かない**（`plans/mac-spike/RESULTS.md` §S81）。ハードリンクは1つの
+/// ファイル実体に付いた対等な名前なので、パスをどう解決しても見つからないからである。
+///
+/// §S81では「子はワークスペースの外のファイルへハードリンクを作れない（アクセス拒否）」まで測った。
+/// **ただしあれは、リンクを作る場所がワークスペースの中の場合である。** `--fs-allow X:rw`は
+/// ワークスペースの外に書ける場所Xを開けるので、**Xの中に、Xの外のファイルへのリンクを張れるか**は
+/// 別の問いとして残っていた（§S81の「言えないこと」の`--fs-allow`の行）。
+///
+/// # 何が起きると困るのか
+///
+/// 張れると、子が読めないはずのファイルに、子が読める場所から別名が付く。しかも
+/// RedirectionGuardでは止まらない。
+///
+/// # 対照を混ぜる
+///
+/// **Xの中からXの中のファイルへのリンク**も同じ回で張らせる。これが成功しないと、
+/// 外向きが失敗したのを「ハードリンクそのものを作れない」と読んでしまう（§18.5の交絡）。
+#[test]
+#[ignore = "spawns a real AppContainer child and grants an fs-allow ACE; run NON-elevated with --test-threads=1"]
+fn a_sandboxed_child_cannot_hard_link_an_unreadable_file_into_an_fs_allow_directory() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let _cleanup =
+        super::test_support::scopeguard(|| forget_workspace_capability(workspace.path()));
+
+    // `--fs-allow X:rw`で開ける場所X（ワークスペースの外）。
+    let allowed = tempfile::tempdir().expect("fs-allow tempdir");
+    std::fs::write(allowed.path().join("inside.txt"), b"readable").expect("file inside X");
+    // 子が読めないはずのファイル（どこからも許可していない場所）。
+    let secret_root = tempfile::tempdir().expect("secret tempdir");
+    let secret = secret_root.path().join("id_rsa");
+    std::fs::write(&secret, b"TOP-SECRET-KEY").expect("seed secret");
+
+    let passthrough = vec![crate::FsPassthrough {
+        path: allowed.path().to_path_buf(),
+        access: crate::FsAccess::ReadWrite,
+        forced: false,
+        scope: harness_policy::GrantScope::Recursive,
+    }];
+    let sid = session_sid();
+    preflight(
+        workspace.path(),
+        &passthrough,
+        None,
+        &WorkspaceWriteMode::DirectRw,
+    )
+    .expect("preflight with an fs-allow entry");
+    grant_job::wait_until_done().expect("background grant job");
+    let traverse = traverse_capability_sid().expect("traverse capability");
+    let workspace_cap = workspace_capability_for(workspace.path());
+    let mut caps = vec![traverse.as_psid()];
+    if let Some(cap) = &workspace_cap {
+        caps.push(cap.as_psid());
+    }
+    // `--fs-allow`の穴は**宣言ごとのcapability SID**宛に開く。子のトークンへ積まないと、
+    // Xそのものへ到達できず「書けないから張れない」を測ることになる。
+    let canonical_workspace = workspace
+        .path()
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.path().to_path_buf());
+    let declaration_caps: Vec<crate::win_common::OwnedSid> =
+        fs_allow_capability_sids_for_declarations(
+            &canonical_workspace,
+            &[(allowed.path(), crate::FsAccess::ReadWrite)],
+        )
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+    for cap in &declaration_caps {
+        caps.push(cap.as_psid());
+    }
+
+    let probe = probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
+    // (1) Xの中 → Xの中（対照。これが成功しないと外向きの失敗を読めない）
+    // (2) Xの中 → 読めないファイル（本題）
+    let inside_arg = format!(
+        "{}|{}",
+        allowed.path().join("link-inside.txt").display(),
+        allowed.path().join("inside.txt").display()
+    );
+    let secret_arg = format!(
+        "{}|{}",
+        allowed.path().join("link-secret.txt").display(),
+        secret.display()
+    );
+    let mut child = SpikeSpawn {
+        exe: &probe_str,
+        args: &["--make-hardlink", &inside_arg, "--make-hardlink", &secret_arg],
+        cwd: workspace.path(),
+        container_sid: sid.as_psid(),
+        capabilities: &caps,
+        child_process_restricted: false,
+        stdout_override: None,
+        extra_inherit: &[],
+        process_sddl: None,
+        thread_sddl: None,
+        token_default_dacl_sddl: None,
+        no_appcontainer: false,
+        console: SpikeConsole::NoWindow,
+    }
+    .spawn()
+    .expect("spawn the sandbox child that makes hard links");
+    let (stdout, stderr, code) = child.wait_and_read();
+    eprintln!(
+        "MEASUREMENT: hard links from a sandboxed child into an --fs-allow :rw directory -> \
+         exit={code} stderr={stderr}\n{stdout}"
+    );
+    let report = last_json_line(&stdout)
+        .unwrap_or_else(|| panic!("the probe produced no JSON: {stdout}"));
+    let inside_made = report["make_hardlink"][0]["created"].as_bool();
+    let secret_made = report["make_hardlink"][1]["created"].as_bool();
+
+    // 後始末は判定より先に（`--fs-allow`で開けた穴を、assertで落ちても残さない）。
+    for cap in &declaration_caps {
+        let _ = revoke_ace(allowed.path(), cap.as_psid());
+    }
+
+    // **対照**: Xの中からXの中へは張れる。張れないなら、下の判定は意味を持たない。
+    assert_eq!(
+        inside_made,
+        Some(true),
+        "`--fs-allow X:rw`で開けたXの中で、Xの中のファイルへハードリンクを張れない。\
+         これでは外向きの失敗を「権限が無いから」と読めない（交絡）: {report}"
+    );
+    // **本題**: 読めないファイルへは張れない。
+    assert_eq!(
+        secret_made,
+        Some(false),
+        "**サンドボックスの子が、読めないはずのファイルへ、書ける場所から別名を張った。** \
+         ハードリンクはRedirectionGuardでは止まらないので、この経路が成立するなら\
+         残課題#68の受容の前提（サンドボックスは許可されていないファイルへ別名を張れない）が崩れる: \
+         {report}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 残課題#68の未確認2経路（S82の表の「未確認」）
+// ---------------------------------------------------------------------------
+
+/// ジャンクション（ディレクトリのリパースポイント）を作る。**昇格は要らない**。
+#[cfg(test)]
+fn make_junction_for_test(link: &std::path::Path, target: &std::path::Path) {
+    let status = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .expect("run mklink");
+    assert!(
+        status.success(),
+        "mklink /J {} {} failed; the arm cannot be measured",
+        link.display(),
+        target.display()
+    );
+}
+
+/// [残課題#68] **差分層を消す処理は、中に置かれたジャンクションの先まで消さない。**
+///
+/// # なぜ確かめるのか
+///
+/// `remove_overlay_dir`（`session_scope.rs`）は`std::fs::remove_dir_all`をそのまま呼ぶ。
+/// サンドボックスの子は既定のモードで差分層の中へ書けるので、そこへジャンクションを置ける。
+/// **辿って消すなら、子が指した任意のディレクトリの中身が消える**——起動時の回収
+/// （`run_cow_gc`）でも同じ処理が走るので、消える先はユーザーのファイルになり得る。
+///
+/// 辿らないのはRustの`remove_dir_all`がリパースポイントをリンクとして消すからだが、
+/// **言語の実装に依存した暗黙の防御**である。破れたら赤くなるようにする。
+#[test]
+#[cfg(windows)]
+fn removing_the_diff_layer_does_not_delete_through_a_junction_planted_inside_it() {
+    let diff_layer = tempfile::tempdir().expect("diff layer tempdir");
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    let secret = outside.path().join("id_rsa");
+    std::fs::write(&secret, b"TOP-SECRET-KEY").expect("seed secret");
+    // 差分層の中の普通のファイル（走査ではなく削除が動いていることの対照）。
+    std::fs::write(diff_layer.path().join("real.txt"), b"x").expect("plain file");
+
+    make_junction_for_test(&diff_layer.path().join("link"), outside.path());
+
+    crate::session_scope::remove_overlay_dir(diff_layer.path()).expect("remove the diff layer");
+
+    // **対照**: 差分層そのものは消えている。消えていないなら下の判定は意味を持たない。
+    assert!(
+        !diff_layer.path().exists(),
+        "the diff layer itself was not removed, so the arm below means nothing"
+    );
+    // **本題**: ジャンクションの先のファイルは残っている。
+    assert!(
+        secret.exists(),
+        "**removing the diff layer followed a junction and deleted a file outside it.** \
+         A sandboxed child can plant junctions in the diff layer, so this would let it delete \
+         arbitrary directories: {}",
+        secret.display()
+    );
+    assert_eq!(
+        std::fs::read(&secret).expect("read the secret back"),
+        b"TOP-SECRET-KEY",
+        "the file outside the diff layer was modified"
+    );
+}
+
+/// [残課題#68] **祖先への通行許可の付与は、途中のジャンクションの先へ許可を付けるか。**
+///
+/// # なぜ確かめるのか
+///
+/// `grant_traverse_chain_with_progress`（`traverse.rs`）は`target.ancestors()`を歩き、
+/// 各段へ`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`の許可を書く。**`canonicalize`しない**ので、
+/// 途中の段がジャンクションなら、許可はリンクの先のディレクトリへ付く可能性がある
+/// （`SetNamedSecurityInfoW`はパスを辿る）。
+///
+/// 付くなら、サンドボックスが自分で張ったリンクで**許可を付ける先を選べる**ことになる。
+/// 付くのは「通過」と「属性の読取」だけで中身を読む許可ではないが、意図した相手ではない。
+///
+/// # これは測定であって受け入れではない
+///
+/// **どちらの結果でも記録する。** 付くなら残課題として残し、付かないなら根拠として残す。
+#[test]
+#[cfg(windows)]
+fn granting_traverse_through_a_junction_shows_where_the_ace_lands() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).expect("real dir");
+    std::fs::create_dir(real.join("deep")).expect("deep dir");
+    let link = root.path().join("link");
+    make_junction_for_test(&link, &real);
+
+    // 付与の宛先は、このテスト専用に作る入れ物の識別子にする（他の機構の宛先を汚さない）。
+    let sid = traverse_capability_sid().expect("traverse capability");
+
+    // リンク越しの綴りで、その下の段を標的にする。
+    let target = link.join("deep");
+    let (granted, result) = grant_traverse_chain_with_progress(&target, sid.as_psid(), |_, _, _| {});
+    let grant_outcome = format!("{result:?}");
+
+    // リンクそのものと、リンクの先の実体に許可が付いたかを読む。
+    let on_link = sid_ace_mask(&link, sid.as_psid()).ok().flatten();
+    let on_real = sid_ace_mask(&real, sid.as_psid()).ok().flatten();
+
+    // 後始末は判定より先に（assertで落ちても許可を残さない）。
+    for node in &granted {
+        let _ = revoke_ace(node, sid.as_psid());
+    }
+    let _ = revoke_ace(&real, sid.as_psid());
+    let _ = revoke_ace(&link, sid.as_psid());
+
+    println!(
+        "MEASUREMENT: granting traverse through a junction -> result={grant_outcome} \
+         granted_nodes={granted:?}\n  ace on the link itself: {on_link:?}\n  \
+         ace on the junction's real target: {on_real:?}"
+    );
+
+    // **実測（2026-10-01）**: 許可は**リンクの先の実体**に付き、リンク自身には付かなかった
+    // （`FILE_TRAVERSE | FILE_READ_ATTRIBUTES` = 0xa0 = 160）。`SetNamedSecurityInfoW`が
+    // パスを辿るためである。**この事実を固定する**——向きが変わったら（辿らなくなったら）
+    // ここが赤くなり、残課題#68の記述を読み直す合図になる。
+    const TRAVERSE_AND_READ_ATTRIBUTES: u32 = 0xa0;
+    assert_eq!(
+        on_real,
+        Some(TRAVERSE_AND_READ_ATTRIBUTES),
+        "祖先への通行許可の付与がジャンクションを辿らなくなった（または別のマスクが付いた）。\
+         残課題#68の「辿る」という記述と、`plans/mac-spike/RESULTS.md` §S82を読み直すこと: \
+         link={on_link:?} real={on_real:?} result={grant_outcome}"
+    );
+    assert_eq!(
+        on_link, None,
+        "リンク自身にも許可が付いた（実測ではリンクの先だけに付いていた）: \
+         link={on_link:?} real={on_real:?}"
+    );
+}
