@@ -5,7 +5,7 @@
 //! ポリシーエディタ側に別実装を書いたところ、`Wrap`が効いている枠で**折り返し前の
 //! バッファ行**を数えてしまい、長い行（cargoのビルドログ等）があるだけでスクロール量と
 //! 見えているものがずれた。transcript側は最初からこの罠を避けており
-//! （`Paragraph::line_count`で折り返し後の行を数える）、しかも
+//! （`Paragraph::line_count`で折り返し後の行を数える。いまは`crate::wrap::rows`）、しかも
 //! [`BUG-076`]の教訓——**クランプを描画側だけでやると状態が青天井に伸び続ける**——まで
 //! 織り込まれている。同じものを2つ持つ理由が無い（`docs/CODE-STRUCTURE-RULES.md`§5.0）。
 //!
@@ -25,7 +25,7 @@
 
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::Block;
 use ratatui::Frame;
 
 /// ホイール1刻みで動かす行数（端末の既定送り量に合わせる）。
@@ -105,25 +105,19 @@ pub fn render(
     scroll: Scrollback,
 ) -> u16 {
     // 折り返し後の行数で数える。ここをバッファ行にすると、長い行がある枠で
-    // 末尾まで戻り切れなくなる（モジュールdoc）。
-    let text_width = area.width.saturating_sub(2);
-    let total = Paragraph::new(lines.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(text_width)
-        .min(u16::MAX as usize) as u16;
-    let viewport = area.height.saturating_sub(2);
-    let max_offset = total.saturating_sub(viewport);
+    // 末尾まで戻り切れなくなる（モジュールdoc）。数える幅と描く幅は`crate::wrap`が揃える
+    // （行末の全角文字が右の枠線を覆わないよう、どちらも右端の1桁を空ける。BUG-200）。
+    let inner = block.inner(area);
+    let total = u16::try_from(crate::wrap::rows(lines.clone(), inner.width)).unwrap_or(u16::MAX);
+    let max_offset = total.saturating_sub(inner.height);
     // 表示にはクランプ後の値を使う（状態そのものは呼び出し側が`clamp`で直す）。
     let offset = scroll.offset().min(max_offset);
     let top = max_offset.saturating_sub(offset);
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((top, 0)),
-        area,
-    );
+    crate::wrap::Wrapped::new(lines)
+        .block(block)
+        .scroll(top)
+        .render(frame, area);
     max_offset
 }
 
@@ -215,5 +209,38 @@ mod tests {
             title.contains("ホイールで戻る"),
             "戻し方も出す（出さないと止まったと読まれる）: {title}"
         );
+    }
+
+    /// [BUG-200] **行の最後の全角文字が、右の枠線を覆わない。** ratatuiの単語折り返しは、
+    /// 語の最後の全角文字が行の最後の1桁から始まると、その行を1桁長くする。はみ出した後半が
+    /// 右の枠線の桁に掛かると、枠線のセルは端末へ送られない（全角文字の後半として飛ばされる）。
+    /// 会話TUIのtranscriptとポリシーエディタの記録画面の枠がここを通る。
+    #[test]
+    fn a_line_ending_in_a_wide_character_does_not_cover_the_right_border() {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Borders;
+        use ratatui::Terminal;
+
+        for width in [40u16, 41] {
+            let lines = vec![Line::raw(crate::spilling_line(width - 2))];
+            let mut term = Terminal::new(TestBackend::new(width, 6)).expect("test terminal");
+            term.draw(|frame| {
+                render(
+                    frame,
+                    frame.area(),
+                    lines,
+                    Block::default().borders(Borders::ALL),
+                    Scrollback::default(),
+                );
+            })
+            .expect("draw");
+            let buffer = term.backend().buffer();
+            let right: Vec<&str> = (0..6).map(|y| buffer[(width - 1, y)].symbol()).collect();
+            assert_eq!(
+                right,
+                ["┐", "│", "│", "│", "│", "┘"],
+                "幅{width}: 右の枠線が欠けた"
+            );
+        }
     }
 }

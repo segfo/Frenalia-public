@@ -8,7 +8,7 @@
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::tui::state::{
@@ -400,16 +400,13 @@ fn draw_progress(frame: &mut Frame, area: Rect, run: &RunState) -> ScrollLimits 
             .title(format!(" ⚠ 対応が要ります（{}件） ", run.warnings.len()));
         let inner = block.inner(warnings_area);
         let all: Vec<&str> = run.warnings.iter().flat_map(|w| w.lines()).collect();
-        frame.render_widget(
-            Paragraph::new(fit_warning_lines(
-                &all,
-                inner.width,
-                usize::from(inner.height),
-            ))
-            .wrap(Wrap { trim: false })
-            .block(block),
-            warnings_area,
-        );
+        harness_term::wrap::Wrapped::new(fit_warning_lines(
+            &all,
+            inner.width,
+            usize::from(inner.height),
+        ))
+        .block(block)
+        .render(frame, warnings_area);
     }
 
     // 描画と上限の算出は`harness_term::scrollback`が持つ（会話TUIのtranscriptと共有）。

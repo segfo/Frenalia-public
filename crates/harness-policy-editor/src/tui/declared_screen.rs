@@ -7,7 +7,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use ratatui::Frame;
 
 use crate::tui::checkbox_tree::{self, Mark};
@@ -60,15 +60,12 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &App) -> usize {
     if app.declared.is_empty() {
         // **「空」と「読めなかった」を混ぜない。** 読めなかった場合は`reload_declared`が
         // `status`へ理由を出しており、ここは空のときの案内だけを持つ（D-43）。
-        frame.render_widget(
-            Paragraph::new(
-                "承認済みの宣言はありません（policy.jsonが無い、または宣言が空です）。\n\
-                 F1で記録し、F2で候補を承認するとここに並びます。",
-            )
-            .wrap(Wrap { trim: false })
-            .block(block),
-            area,
-        );
+        harness_term::wrap::Wrapped::new(
+            "承認済みの宣言はありません（policy.jsonが無い、または宣言が空です）。\n\
+             F1で記録し、F2で候補を承認するとここに並びます。",
+        )
+        .block(block)
+        .render(frame, area);
         // 一覧を描いていないので表示位置は進まない。
         return app.declared_list_offset;
     }

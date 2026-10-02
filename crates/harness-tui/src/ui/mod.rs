@@ -11,7 +11,7 @@ pub(crate) use approval::render_permission_modal;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
@@ -88,7 +88,7 @@ pub fn render_prep_screen(
     warm_requested: bool,
 ) {
     let rect = centered_rect(60, 30, f.area());
-    f.render_widget(Clear, rect);
+    harness_term::overlay::clear(f, rect);
 
     let (elapsed, label) = match latest {
         Some(ev) => (ev.elapsed, ev.label.as_str()),
@@ -118,10 +118,9 @@ pub fn render_prep_screen(
     let block = Block::default()
         .borders(Borders::ALL)
         .title("sandbox preparing");
-    let paragraph = Paragraph::new(lines)
+    harness_term::wrap::Wrapped::new(lines)
         .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(paragraph, rect);
+        .render(f, rect);
 }
 
 /// `input_cursor`（先頭からの文字数）が何行目（0始まり、`\n`の数）にあるか。
@@ -552,6 +551,7 @@ pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::widgets::Wrap;
 
     fn line_texts(lines: &[Line]) -> Vec<String> {
         lines
@@ -756,5 +756,233 @@ mod scope_label_tests {
         assert!(screen.contains("ws=harness"), "{screen}");
         assert!(screen.contains("overlay=session-a"), "{screen}");
         assert!(screen.contains("=session-b"), "{screen}");
+    }
+}
+
+/// 重ねて描く枠と折り返して描く本文の枠線（ポリシーエディタと同じ欠けがこの画面にもあった）。
+///
+/// - [BUG-198](../../../../docs/bugs/BUG-198.md)の形: 後ろの画面の全角文字が重ねた枠の左隣から始まると、
+///   左の枠線のセルが全角文字の後半として端末へ送られない。
+/// - [BUG-200](../../../../docs/bugs/BUG-200.md)の形: ratatuiの単語折り返しは行末の全角文字で1桁はみ出し、
+///   右の枠線を覆う。
+///
+/// どちらも画面のセルは`TestBackend`が**受け取った差分**から読む（端末と同じ形で欠ける）。
+#[cfg(test)]
+mod border_tests {
+    use super::*;
+    use crate::app::PermissionView;
+    use harness_core::{PermissionSubject, ProgramSubject, RiskClass};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// ratatuiの単語折り返しが`width`桁の場所で1桁はみ出す1行（`harness_term`の試験の同名の関数と同じ作り方）。
+    fn spilling_line(width: u16) -> String {
+        let width = usize::from(width);
+        let head = if width % 2 == 1 { "a" } else { "ab" };
+        let wide = (width - head.len()) / 2;
+        format!("{head} {}", "あ".repeat(wide))
+    }
+
+    fn approval(args: &[String]) -> PermissionView {
+        PermissionView::new(
+            "perm-0".to_string(),
+            "run_program".to_string(),
+            RiskClass::Exec,
+            PermissionSubject::Program(ProgramSubject::plain("git", args.to_vec())),
+            "{}".to_string(),
+            None,
+            "C:/ws".to_string(),
+        )
+    }
+
+    /// 画面全体を1フレーム描き、セルの格子（行ごとに1セル1記号）を返す。
+    fn screen(app: &AppState, width: u16, height: u16) -> Vec<Vec<String>> {
+        let mut term = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        term.draw(|f| {
+            render(f, app);
+        })
+        .expect("draw");
+        let buffer = term.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// 見出しの最初の文字が`first`の枠の矩形（左右の桁と上下の行）。左上の角の直後に見出しが来る。
+    fn drawn_box(grid: &[Vec<String>], first: &str) -> (usize, usize, usize, usize) {
+        for (top, row) in grid.iter().enumerate() {
+            if let Some(left) =
+                (0..row.len().saturating_sub(1)).find(|&x| row[x] == "┌" && row[x + 1] == first)
+            {
+                let right = (left + 1..row.len())
+                    .find(|&x| row[x] == "┐")
+                    .expect("右上の角が無い");
+                let bottom = (top + 1..grid.len())
+                    .find(|&y| grid[y][right] == "┘")
+                    .expect("右下の角が無い");
+                return (left, right, top, bottom);
+            }
+        }
+        panic!("見出しが「{first}…」の枠が無い");
+    }
+
+    /// 枠の右の枠線のうち、角を除いた行で欠けているもの。
+    fn broken_right_border(
+        grid: &[Vec<String>],
+        right: usize,
+        top: usize,
+        bottom: usize,
+    ) -> Vec<String> {
+        (top + 1..bottom)
+            .filter(|&y| grid[y][right] != "│")
+            .map(|y| format!("{y}行目: 「{}」 / {}", grid[y][right], grid[y].concat()))
+            .collect()
+    }
+
+    /// 後ろのtranscriptに、`symbol`だけの行を1桁ずつずらして並べる。
+    fn app_with_transcript(symbol: &str) -> AppState {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        for i in 0..40 {
+            let pad = if i % 2 == 0 { "" } else { " " };
+            app.transcript.push(TranscriptItem::Assistant(format!(
+                "{pad}{}",
+                symbol.repeat(30)
+            )));
+        }
+        app
+    }
+
+    /// [BUG-198の形] **後ろのtranscriptに全角文字が並んでいても、承認ダイアログの左の枠線はどの行でも欠けない。**
+    /// 枠の位置は、半角だけを並べた画面で描いたときのセルから読む（全角の画面では、読むのに使う角が欠け得る）。
+    #[test]
+    fn the_approval_modal_keeps_its_left_border_over_a_wide_transcript() {
+        let mut failures = Vec::new();
+        for width in [120u16, 119, 100] {
+            let mut narrow = app_with_transcript("x");
+            narrow.pending_permission = Some(approval(&["status".to_string()]));
+            let (left, _, top, bottom) = drawn_box(&screen(&narrow, width, 30), "承");
+            let mut wide = app_with_transcript("あ");
+            wide.pending_permission = Some(approval(&["status".to_string()]));
+            let grid = screen(&wide, width, 30);
+            for (y, row) in grid.iter().enumerate().take(bottom + 1).skip(top) {
+                let want = match y {
+                    y if y == top => "┌",
+                    y if y == bottom => "└",
+                    _ => "│",
+                };
+                if row[left] != want {
+                    failures.push(format!(
+                        "{width}桁 {y}行目: 「{}」 / {}",
+                        row[left],
+                        row.concat()
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "承認ダイアログの左の枠線が欠けた:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// [BUG-200の形] **transcriptの行末の全角文字が、右の枠線を覆わない。**
+    #[test]
+    fn the_transcript_keeps_its_right_border_when_a_line_ends_with_a_wide_character() {
+        for width in [120u16, 119] {
+            let mut app = AppState::new("mock".into(), "mock-model".into());
+            app.transcript
+                .push(TranscriptItem::Assistant(spilling_line(width - 2)));
+            let grid = screen(&app, width, 20);
+            let (_, right, top, bottom) = drawn_box(&grid, "t");
+            let broken = broken_right_border(&grid, right, top, bottom);
+            assert!(
+                broken.is_empty(),
+                "{width}桁: transcriptの右の枠線が欠けた:\n{}",
+                broken.join("\n")
+            );
+        }
+    }
+
+    /// [BUG-200の形] **承認ダイアログの本文の行末の全角文字が、右の枠線を覆わない。**
+    /// 引数の行（`  [0] <引数>`）が、枠の中の最後の1桁から始まる全角文字で終わるようにする。
+    #[test]
+    fn the_approval_modal_keeps_its_right_border_when_an_argument_ends_with_a_wide_character() {
+        for width in [120u16, 119] {
+            let mut probe = AppState::new("mock".into(), "mock-model".into());
+            probe.pending_permission = Some(approval(&["status".to_string()]));
+            let (left, right, _, _) = drawn_box(&screen(&probe, width, 30), "承");
+            let inner = right - left - 1;
+            // 「  [0] 」の6桁の後ろに置く語。最後の全角文字が、枠の中の最後の1桁から始まる。
+            let filler = if (inner - 6) % 2 == 0 { "x" } else { "" };
+            let wide = (inner - 5 - filler.len()) / 2;
+            let arg = format!("{filler}{}", "あ".repeat(wide));
+            assert_eq!(
+                6 + filler.len() + 2 * wide,
+                inner + 1,
+                "台本の前提が崩れた（はみ出す形の行になっていない）"
+            );
+            let mut app = AppState::new("mock".into(), "mock-model".into());
+            app.pending_permission = Some(approval(&[arg]));
+            let grid = screen(&app, width, 30);
+            let (_, right, top, bottom) = drawn_box(&grid, "承");
+            let broken = broken_right_border(&grid, right, top, bottom);
+            assert!(
+                broken.is_empty(),
+                "{width}桁: 承認ダイアログの右の枠線が欠けた:\n{}",
+                broken.join("\n")
+            );
+        }
+    }
+
+    /// **重ねる枠の消し方と、折り返して描く本文は、どれも`harness_term`を通る**（ポリシーエディタと共有）。
+    /// `Clear`・`Wrap`・`line_count`を直接使う箇所が1つでもあると、そこだけ欠けが戻るか、数えた行数と
+    /// 描いた行数が食い違う。各ファイルの、末尾の試験モジュールより前だけを数える。
+    #[test]
+    fn every_overlay_and_wrapped_text_goes_through_harness_term() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths = vec![root];
+        let mut offenders = Vec::new();
+        while let Some(path) = paths.pop() {
+            if path.is_dir() {
+                paths.extend(
+                    std::fs::read_dir(&path)
+                        .expect("read_dir")
+                        .map(|entry| entry.expect("entry").path()),
+                );
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read");
+            let lines: Vec<&str> = source.lines().collect();
+            // `#[cfg(test)]`の直後が`mod 名前 {`なら、そこから先は試験モジュール。
+            let end = (0..lines.len())
+                .find(|&i| {
+                    lines[i].trim() == "#[cfg(test)]"
+                        && lines
+                            .get(i + 1)
+                            .is_some_and(|next| next.starts_with("mod ") && next.ends_with('{'))
+                })
+                .unwrap_or(lines.len());
+            let body = lines[..end].join("\n");
+            for needle in ["Wrap {", "line_count(", "render_widget(Clear"] {
+                let count = body.matches(needle).count();
+                if count > 0 {
+                    offenders.push(format!("{}: {needle} ×{count}", path.display()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "harness_term を通さずに重ねる・折り返す箇所がある:\n{}",
+            offenders.join("\n")
+        );
     }
 }

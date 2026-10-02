@@ -86,7 +86,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Frame, Terminal};
 
 use state::{Action, App, Screen};
@@ -382,7 +382,8 @@ fn status_height(status: &Text, area: Rect) -> u16 {
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, status: Text<'static>) {
-    frame.render_widget(Paragraph::new(status).wrap(Wrap { trim: false }), area);
+    // 数える幅（`status_height`の`wrap::rows`）と同じ幅で折り返す（BUG-200）。
+    harness_term::wrap::Wrapped::new(status).render(frame, area);
 }
 
 /// 画面ごとのキー案内。押せるキーだけを出す。**効かない操作を案内しない**（B-32）。
@@ -807,32 +808,12 @@ mod render_tests;
 /// 後ろの画面の上に枠を重ねる場所を空ける。**後ろの画面に重ねて描く枠（確認ダイアログ・ヘルプ）は
 /// どれもここを通る。** `area`の中央に`width`×`height`を取って中を消し、その矩形を返す。
 ///
-/// # 枠線の桁に掛かる全角文字も消す（[BUG-198](../../../../docs/bugs/BUG-198.md)）
-///
-/// ratatuiの画面は全角文字を「前半のセルに記号、後半のセルは空白」で持ち、端末へ差分を送るときは
-/// **全角文字の後半に当たるセルを飛ばす**（`ratatui::buffer::Buffer::diff_iter`のdoc）。`Clear`は
-/// 枠の中しか消さないので、後ろの画面の全角文字が枠の左隣の桁から始まっていると、その後半に当たる
-/// 枠線のセルが飛ばされて端末へ届かず、全角文字がそのまま見えて左の枠線が欠けていた。
-/// だから枠より左にあって枠の中まで届く文字（全角文字の前半）を空白に置き換えてから消す。
-///
-/// 左右に1桁ずつ広く消す直し方は採らない。枠線に届かない半角や全角まで消え、ratatui自身も
-/// 「入り切らない全角文字は描かずに空けておく」を選んでいる（`Buffer::set_stringn`）ので、それに揃える。
-/// 右側は要らない——枠の中から始まって右へはみ出す全角文字は、`Clear`が前半ごと消す。
+/// 消し方は会話TUIと共有する`harness_term::overlay::clear`が持つ——`Clear`は矩形の中しか消さないので、
+/// 後ろの画面の全角文字が枠の左隣から始まると左の枠線が端末へ届かない。その全角文字も消す
+/// （[BUG-198](../../../../docs/bugs/BUG-198.md)。理由と採らなかった直し方は同モジュールのdoc）。
 fn open_overlay(frame: &mut Frame, area: Rect, width: u16, height: u16) -> Rect {
-    use ratatui::buffer::CellWidth;
-
     let overlay = centered(area, width, height);
-    let buffer = frame.buffer_mut();
-    for y in overlay.top()..overlay.bottom() {
-        for x in buffer.area.left()..overlay.left() {
-            let cell = &mut buffer[(x, y)];
-            if x.saturating_add(cell.cell_width()) > overlay.left() {
-                // 色は残す（選択行の背景色などが途中で切れないように）。
-                cell.set_symbol(" ");
-            }
-        }
-    }
-    frame.render_widget(Clear, overlay);
+    harness_term::overlay::clear(frame, overlay);
     overlay
 }
 

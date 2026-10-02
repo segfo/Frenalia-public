@@ -11,7 +11,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use harness_sandbox::textdiff::DiffKind;
@@ -20,7 +20,8 @@ use crate::app::{ReviewDiffLine, ReviewFocus, ReviewPanelState};
 
 pub(super) fn render_review_panel(f: &mut Frame, area: Rect, panel: &ReviewPanelState) {
     let rect = super::centered_rect(90, 80, area);
-    f.render_widget(Clear, rect);
+    // 後ろの画面の全角文字に左の枠線が欠けないよう、共有の部品で消す（`harness_term::overlay`）。
+    harness_term::overlay::clear(f, rect);
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)

@@ -8,7 +8,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
 use crate::app::{ApprovalStage, LineStyle, PermissionView};
@@ -17,7 +17,9 @@ use harness_sandbox::textdiff::DiffKind;
 /// 承認モーダルを描き、**この描画で判明したスクロールの上限**を返す。
 pub fn render_permission_modal(f: &mut Frame, area: Rect, pending: &PermissionView) -> u16 {
     let rect = super::centered_rect(84, 70, area);
-    f.render_widget(Clear, rect);
+    // 後ろのtranscriptの全角文字が枠の左隣から始まっても左の枠線が欠けないよう、共有の部品で消す
+    // （ポリシーエディタと同じ。`harness_term::overlay`）。
+    harness_term::overlay::clear(f, rect);
 
     let mut lines: Vec<Line> = pending.body().into_iter().map(styled).collect();
     // `edit_file`の差分だけは材料（書込先パス）に写らないので、ここで足す。
@@ -54,23 +56,23 @@ pub fn render_permission_modal(f: &mut Frame, area: Rect, pending: &PermissionVi
         .collect();
     // **折り返してから高さを決める。** 日本語は1文字2桁なので、幅の狭い端末では
     // 「[d] このセッション中は拒否」のような選択肢が黙って端で切れる。
-    let hints = Paragraph::new(hints).wrap(Wrap { trim: false });
-    let hint_height = hints
-        .line_count(inner.width.max(1))
+    //
+    // 数える幅と描く幅は`harness_term::wrap`が揃える（行末の全角文字が右の枠線を覆わないよう、
+    // どちらも右端の1桁を空ける。BUG-200）。
+    let hint_height = harness_term::wrap::rows(hints.clone(), inner.width)
         .min(inner.height.saturating_sub(1) as usize) as u16;
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(hint_height)])
         .split(inner);
 
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let total = paragraph.line_count(parts[0].width.max(1)) as u16;
+    let total =
+        u16::try_from(harness_term::wrap::rows(lines.clone(), parts[0].width)).unwrap_or(u16::MAX);
     let max_scroll = total.saturating_sub(parts[0].height);
-    f.render_widget(
-        paragraph.scroll((pending.scroll.min(max_scroll), 0)),
-        parts[0],
-    );
-    f.render_widget(hints, parts[1]);
+    harness_term::wrap::Wrapped::new(lines)
+        .scroll(pending.scroll.min(max_scroll))
+        .render(f, parts[0]);
+    harness_term::wrap::Wrapped::new(hints).render(f, parts[1]);
     max_scroll
 }
 

@@ -7,12 +7,16 @@
 //! 下が**黙って**切れる——確認ダイアログでは権限の注意（「配下へ付いた継承ACEは残って効き続けます」）が
 //! 確定の前に見えなくなった。その数え方が画面ごとに別々に書かれていたので、ここで1つにする。
 //!
-//! # 数え方は描画と同じ折り返し器
+//! # 数え方は描画と同じ折り返し器（`harness_term::wrap`）
 //!
-//! [`rows`]は`Paragraph::line_count`（ratatuiの`WordWrapper`）で数える。描くときも
-//! `Wrap { trim: false }`で同じ折り返し器を通すので、全角・空白での折り返しを含めて**数えた行数と
-//! 描いた行数が一致する**。幅を自分で足し算すると、空白で切る規則の分だけ描画とずれる
-//! （会話TUIの承認ダイアログと`harness_term::scrollback`が先に同じ選択をしている）。
+//! [`rows`]は`Paragraph::line_count`（ratatuiの`WordWrapper`）で数える。描くときも同じ折り返し器を
+//! 通すので、全角・空白での折り返しを含めて**数えた行数と描いた行数が一致する**。幅を自分で足し算すると、
+//! 空白で切る規則の分だけ描画とずれる（会話TUIの承認ダイアログと`harness_term::scrollback`が先に
+//! 同じ選択をしている）。
+//!
+//! 数える幅と描く幅は、会話TUIと共有する`harness_term::wrap`が1か所で決める。どちらも**右端の1桁を空ける**
+//! ——ratatuiの折り返しは行末の全角文字で1桁はみ出し、右の枠線を覆うため（[BUG-200](../../../../docs/bugs/BUG-200.md)）。
+//! このエディタで`Wrap`や`line_count`を直接使わない（`render_tests`が数えている）。
 //!
 //! # 限界
 //!
@@ -25,18 +29,13 @@ use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::symbols;
 use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{Block, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
-/// `text`を`width`桁で折り返したときの表示行数。
-///
-/// **`Wrap { trim: false }`で描く枠には、必ずこれで数える**（モジュールdoc）。
-/// 幅0は1桁として数える（会話TUIの承認ダイアログと同じ扱い。幅0の枠には何も描かれない）。
-pub(super) fn rows<'a>(text: impl Into<Text<'a>>, width: u16) -> usize {
-    Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .line_count(width.max(1))
-}
+/// `text`を`width`桁の場所へ折り返して描いたときの表示行数。**折り返して描く場所は、必ずこれで数える**
+/// （描くのは`harness_term::wrap::Wrapped`。数える幅と描く幅は同じ。モジュールdoc）。
+pub(super) use harness_term::wrap::rows;
+use harness_term::wrap::Wrapped;
 
 /// 枠付きの説明欄の高さ（枠線の2行を含む）。中身を`width`桁の枠で折り返した行数ぶん取る。
 ///
@@ -73,10 +72,7 @@ pub(super) fn draw_box<'a>(
     } else {
         block.title_bottom(overflow_notice(hidden))
     };
-    frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
-        area,
-    );
+    Wrapped::new(text).block(block).render(frame, area);
 }
 
 /// 入り切らなかった行数の案内。**残りがあることが分からないと、読み切ったつもりで判断してしまう**。
@@ -142,9 +138,9 @@ impl Window {
 ///
 /// # スクロールバーは枠線の上に描く
 ///
-/// 内側に描くと本文の右端の1桁を潰すので、折り返しの幅を1桁減らし、[`rows`]で数える幅もそれに
-/// 合わせることになる。枠線の上なら本文の幅は変わらず、数えた行数と描いた行数の一致（モジュールdoc）に
-/// 触らない。線は枠線と同じ記号・同じ色にし、つまみだけを`█`にするので、収まらないときは
+/// 内側に描くと、本文の右端に空けてある1桁（行末の全角文字のはみ出し用。BUG-200）を潰すので、
+/// 折り返しの幅をさらに減らし、[`rows`]で数える幅もそれに合わせることになる。枠線の上なら本文の幅は
+/// 変わらず、数えた行数と描いた行数の一致（モジュールdoc）に触らない。線は枠線と同じ記号・同じ色にし、つまみだけを`█`にするので、収まらないときは
 /// 右の枠線の一部がつまみに変わって見える。上下の矢印は付けない（つまみが端に付いたことで先頭・末尾を
 /// 言うため。矢印を付けると、端に付いても矢印との間に線が残る）。
 ///
@@ -158,13 +154,10 @@ pub(super) fn draw_scrolled<'a>(
     window: Window,
     bar: Style,
 ) {
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .scroll((u16::try_from(window.top).unwrap_or(u16::MAX), 0))
-            .block(block),
-        area,
-    );
+    Wrapped::new(text)
+        .block(block)
+        .scroll(u16::try_from(window.top).unwrap_or(u16::MAX))
+        .render(frame, area);
     if !window.overflows() {
         return;
     }

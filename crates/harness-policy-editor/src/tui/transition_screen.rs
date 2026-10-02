@@ -9,7 +9,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::transition_candidates::{Candidate, Declared, Source};
@@ -107,12 +107,9 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App) -> usize {
 
     let visible = app.pending.visible();
     if visible.is_empty() {
-        frame.render_widget(
-            Paragraph::new(empty_text(tab, app.pending.filter, counts))
-                .wrap(Wrap { trim: false })
-                .block(block),
-            area,
-        );
+        harness_term::wrap::Wrapped::new(empty_text(tab, app.pending.filter, counts))
+            .block(block)
+            .render(frame, area);
         return app.candidate_list_offset;
     }
 

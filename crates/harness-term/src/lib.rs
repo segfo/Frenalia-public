@@ -6,8 +6,12 @@
 //! 2つ目のバイナリ**だからで、コピーにしないのは端末復帰が「壊れても例外が出ない」
 //! 種類のロジックだからである（`docs/CODE-STRUCTURE-RULES.md`規則5）。
 
+/// 後ろの画面の上に枠を重ねる場所を空ける（会話TUIとポリシーエディタの、重ねて描く枠が共有。BUG-198）。
+pub mod overlay;
 /// 末尾追従のスクロール表示（会話TUIのtranscriptとポリシーエディタの記録画面が共有）。
 pub mod scrollback;
+/// 折り返して描く本文の、数える幅と描く幅（会話TUIとポリシーエディタが共有。BUG-200）。
+pub mod wrap;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,4 +104,17 @@ fn install_panic_hook() {
         let _ = leave_screen();
         default_hook(info);
     }));
+}
+
+/// [BUG-200] ratatuiの単語折り返しが`width`桁の場所で1桁はみ出す1行（試験用）。
+///
+/// 「短い語・空白・全角だけの語」で、全角の語の最後の文字がちょうど最後の1桁から始まる形
+/// （ポリシーエディタのヘルプの1行目と同じ形）。折り返しは「いまの文字を足す前の幅」で
+/// あふれを判定するので、この行は折り返されずに`width + 1`桁になる。
+#[cfg(test)]
+pub(crate) fn spilling_line(width: u16) -> String {
+    let width = usize::from(width);
+    let head = if width % 2 == 1 { "a" } else { "ab" };
+    let wide = (width - head.len()) / 2;
+    format!("{head} {}", "あ".repeat(wide))
 }

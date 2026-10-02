@@ -7,7 +7,7 @@
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::tui::state::{App, EditField};
@@ -189,12 +189,9 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
         let mut lines = locked.unwrap_or_default();
         lines.push(Line::raw(""));
         lines.push(Line::raw(text));
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .block(block),
-            area,
-        );
+        harness_term::wrap::Wrapped::new(lines)
+            .block(block)
+            .render(frame, area);
         return app.candidate_list_offset;
     }
 
@@ -382,7 +379,7 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
                 .min(inner.height.saturating_sub(1));
             let rows =
                 Layout::vertical([Constraint::Length(lock_rows), Constraint::Min(1)]).split(inner);
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[0]);
+            harness_term::wrap::Wrapped::new(lines).render(frame, rows[0]);
             frame.render_stateful_widget(list, rows[1], &mut state);
         }
         None => frame.render_stateful_widget(list.block(block), area, &mut state),

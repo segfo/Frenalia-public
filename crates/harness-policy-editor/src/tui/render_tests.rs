@@ -1080,18 +1080,19 @@ fn the_scrollbar_thumb_touches_the_top_at_the_start_and_the_bottom_at_the_end() 
     );
 }
 
-/// [BUG-196] **許可側**: スクロールバーは本文の右端の文字を隠さない。枠の中の幅をちょうど埋める行の
+/// [BUG-196] **許可側**: スクロールバーは本文の右端の文字を隠さない。本文の幅をちょうど埋める行の
 /// 最後の文字が、送れる状態でも見えている（スクロールバーを枠の内側へ描いたのに折り返しの幅を
-/// 減らさない、という壊し方を止める）。
+/// 減らさない、という壊し方を止める）。本文の幅は枠の中から右端の1桁を空けた幅（BUG-200）。
 #[test]
 fn the_scrollbar_does_not_hide_the_last_character_of_a_full_width_line() {
     let ws = workspace();
     let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
-    // 80桁の端末では枠も80桁、中は78桁。各行をちょうど78桁にして、最後の1桁を`Z`にする。
+    // 80桁の端末では枠も80桁、中は78桁、本文は右端の1桁を空けた77桁（BUG-200）。
+    // 各行をちょうど77桁にして、最後の1桁を`Z`にする。
     app.modal = Some(state::Modal {
         title: "承認の確認".to_string(),
         lines: (0..40)
-            .map(|i| format!("{i:02}{}Z", "-".repeat(75)))
+            .map(|i| format!("{i:02}{}Z", "-".repeat(74)))
             .collect(),
         confirm: Confirm::Approval,
     });
@@ -1104,7 +1105,7 @@ fn the_scrollbar_does_not_hide_the_last_character_of_a_full_width_line() {
     assert!(
         inner
             .iter()
-            .all(|row| row.len() == 78 && row.ends_with('Z')),
+            .all(|row| row.len() == 78 && row.ends_with("Z ")),
         "行の最後の文字が見えない（隠れたか、折り返した）:\n{}",
         inner.join("\n")
     );
@@ -1262,15 +1263,17 @@ fn an_overlay_erases_only_the_wide_character_that_reaches_its_border() {
 }
 
 /// [BUG-198] **重ねる枠はどれも`open_overlay`を通る。** 上の2本は[`OVERLAYS`]の組しか描かないので、
-/// 重ねる枠を足したのに`open_overlay`を通さず`Clear`で直接消すと、その枠だけ欠けが戻っても気付けない。
-/// 重ねる枠は`draw`（`tui/mod.rs`）が画面の後に描くので、そのファイルで数える。
+/// 重ねる枠を足したのに`open_overlay`を通さず消すと、その枠だけ欠けが戻っても気付けない。
+/// 重ねる枠は`draw`（`tui/mod.rs`）が画面の後に描くので、そのファイルで数える。消し方そのものは
+/// 会話TUIと共有する`harness_term::overlay::clear`が持ち、`Clear`を直接使う箇所が無いことは
+/// [`every_wrapped_text_and_overlay_goes_through_harness_term`]が数える。
 #[test]
 fn every_overlay_goes_through_open_overlay() {
     let source = include_str!("mod.rs");
     assert_eq!(
-        source.matches("render_widget(Clear").count(),
+        source.matches("harness_term::overlay::clear(").count(),
         1,
-        "`Clear`で直接消している箇所が`open_overlay`の外にある"
+        "重ねる枠を消す箇所が`open_overlay`の外にもある"
     );
     assert_eq!(
         source.matches("open_overlay(frame,").count(),
@@ -1292,6 +1295,151 @@ fn the_reassignment_confirmation_keeps_its_left_border_over_the_declared_screen(
         broken.is_empty(),
         "確認画面の左の枠線が欠けた:\n{}",
         broken.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 折り返して描く枠の右の枠線。[BUG-200]
+//
+// ratatuiの単語折り返しは、あふれるかどうかを「いまの文字を足す前の幅」で判定する。だから語の最後の
+// 全角文字が行の最後の1桁から始まると、その行は1桁長くなり、全角文字の後半が右の枠線の桁に掛かる。
+// 枠線のセルは全角文字の後半として端末へ送られない（BUG-198と同じ仕組み）。
+// ---------------------------------------------------------------------------
+
+/// ratatuiの単語折り返しが`width`桁の場所で1桁はみ出す1行。「短い語・空白・全角だけの語」で、
+/// 全角の語の最後の文字がちょうど最後の1桁から始まる（ヘルプの1行目と同じ形。
+/// `harness_term`の試験の同名の関数と同じ作り方）。
+fn spilling_line(width: u16) -> String {
+    let width = usize::from(width);
+    let head = if width % 2 == 1 { "a" } else { "ab" };
+    let wide = (width - head.len()) / 2;
+    format!("{head} {}", "あ".repeat(wide))
+}
+
+/// 枠の行ごとに、右の枠線の記号（上から`┐`・`│`…・`┘`）が欠けていないか。欠けた行を返す。
+/// 右の枠線の上はスクロールバーのつまみでもよい（BUG-196）。
+fn broken_right_border_rows(grid: &[Vec<String>], area: ratatui::layout::Rect) -> Vec<String> {
+    let right = usize::from(area.right() - 1);
+    let (top, bottom) = (usize::from(area.y), usize::from(area.bottom() - 1));
+    (top..=bottom)
+        .filter_map(|y| {
+            let ok = match y {
+                y if y == top => grid[y][right] == "┐",
+                y if y == bottom => grid[y][right] == "┘",
+                _ => grid[y][right] == "│" || grid[y][right] == THUMB,
+            };
+            (!ok).then(|| format!("{y}行目: 「{}」 / {}", grid[y][right], grid[y].concat()))
+        })
+        .collect()
+}
+
+/// [BUG-200] **行の最後の文字が全角で、枠の中の最後の1桁から始まっても、右の枠線は欠けない。**
+///
+/// # 壊れた状態を一文で
+///
+/// ヘルプの1行目（`harness-policy-editor — LLMを介さずに「…」を決める道具`）は77桁で、枠の中は76桁
+/// なので、ratatuiの折り返しは「道具」の「具」を最後の1桁に置き、その後半が右の枠線を覆っていた
+/// （端末が78桁以上あればいつも）。確認ダイアログと説明欄も、同じ形の行が来れば同じように欠ける。
+#[test]
+fn a_wrapped_box_keeps_its_right_border_when_a_line_ends_with_a_wide_character() {
+    // 説明欄と同じ部品（`wrap::draw_box`）で描く枠。中は38桁。
+    let notes = |frame: &mut Frame| {
+        wrap::draw_box(
+            frame,
+            ratatui::layout::Rect::new(0, 0, 40, 6),
+            spilling_line(38),
+            Block::default().borders(Borders::ALL).title("説明"),
+        );
+    };
+    // 確認ダイアログ。枠は88桁（`MODAL_WIDTH`）で、中は86桁。
+    let modal = |frame: &mut Frame| {
+        let modal = state::Modal {
+            title: "承認の確認".to_string(),
+            lines: vec![spilling_line(86), "最後の行".to_string()],
+            confirm: Confirm::Approval,
+        };
+        draw_modal(frame, frame.area(), &modal, 0);
+    };
+    let boxes: [(&str, &str, Paint); 3] = [
+        ("ヘルプ", "ヘルプ", paint_help),
+        ("確認ダイアログ", "承認の確認", modal),
+        ("説明欄", "説明", notes),
+    ];
+    let mut failures = Vec::new();
+    for (name, title, paint) in boxes {
+        let grid = paint_grid(120, 100, paint);
+        let area = drawn_box(&grid, title).unwrap_or_else(|| panic!("{name}の枠が無い"));
+        let broken = broken_right_border_rows(&grid, area);
+        if !broken.is_empty() {
+            failures.push(format!("{name}:\n{}", broken.join("\n")));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "右の枠線が欠けた:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+/// [BUG-200] **枠の無い知らせの行も、端末の右端より先へはみ出さない。** 右端の1桁に全角文字の前半が
+/// 来ると、後半は端末の外になる（端末によっては次の行へ回り込み、画面が崩れる）。
+#[test]
+fn the_status_line_does_not_spill_past_the_right_edge() {
+    use ratatui::buffer::CellWidth;
+
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    let width = 100u16;
+    app.status = spilling_line(width);
+    let mut terminal = Terminal::new(TestBackend::new(width, 30)).expect("test terminal");
+    terminal
+        .draw(|f| {
+            draw(f, &app);
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let spilled: Vec<u16> = (0..30)
+        .filter(|&y| buffer[(width - 1, y)].cell_width() > 1)
+        .collect();
+    assert!(
+        spilled.is_empty(),
+        "右端の1桁に全角文字の前半がある行: {spilled:?}"
+    );
+}
+
+/// [BUG-200] **折り返して描く本文は、どれも`harness_term::wrap`を通る。** 描く幅と数える幅を
+/// 1か所で狭くしているので、`Wrap`や`line_count`を直接使う箇所が1つでもあると、そこだけ欠けが戻るか、
+/// 数えた行数と描いた行数が食い違う。重ねる枠の消し方（BUG-198）も同じく`harness_term::overlay`だけが持つ。
+#[test]
+fn every_wrapped_text_and_overlay_goes_through_harness_term() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = vec![root.clone()];
+    let mut offenders = Vec::new();
+    while let Some(path) = files.pop() {
+        if path.is_dir() {
+            files.extend(
+                std::fs::read_dir(&path)
+                    .expect("read_dir")
+                    .map(|entry| entry.expect("entry").path()),
+            );
+            continue;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read");
+        for needle in ["Wrap {", "line_count(", "render_widget(Clear"] {
+            let count = source.matches(needle).count();
+            if count > 0 {
+                offenders.push(format!("{}: {needle} ×{count}", path.display()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "harness_term を通さずに折り返す・重ねる箇所がある:\n{}",
+        offenders.join("\n")
     );
 }
 
