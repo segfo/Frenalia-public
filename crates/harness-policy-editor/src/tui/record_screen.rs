@@ -41,6 +41,7 @@ fn record_rows(area: Rect) -> std::rc::Rc<[Rect]> {
 }
 
 /// 記録画面の本文（フォームの下）。[`progress_areas`]へ渡す矩形で、テストからも使う。
+/// `area`は記録画面が描かれる本体（画面全体ではない。[`scroll_target`]のdoc）。
 pub fn record_body_area(area: Rect) -> Rect {
     record_rows(area)[1]
 }
@@ -142,9 +143,13 @@ fn progress_header(run: &RunState) -> (&'static str, Color, String) {
 ///
 /// 実行中でなければどの枠も無い（`None`）——待機画面は1枚のParagraphで、
 /// さかのぼる対象が無い。
+///
+/// `area`は**端末全体**。記録画面が描かれる本体の位置は、描画と同じ画面全体の割り付け
+/// （`tui::screen_rows`）から辿る。以前は端末全体をそのまま本体として扱っていたので、
+/// 反応する枠が見えている枠より1行上にずれ、知らせの行とキー案内の行まで伸びていた（BUG-194）。
 pub fn scroll_target(area: Rect, app: &App, column: u16, row: u16) -> Option<ScrollPane> {
     let run = app.run.as_ref()?;
-    let body = record_body_area(area);
+    let body = record_body_area(super::screen_rows(area, app).body);
     let areas = progress_areas(body, run);
     let at = Position::new(column, row);
     if areas.output.contains(at) {

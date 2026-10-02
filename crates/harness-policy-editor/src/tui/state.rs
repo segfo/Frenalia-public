@@ -1468,6 +1468,12 @@ impl App {
         if self.screen != Screen::Record {
             return;
         }
+        // **ヘルプ・確認ダイアログが開いている間は、後ろの枠を送らない**（BUG-194）。キー入力も
+        // その間は重ねた側だけが受ける（`on_key`）。送ると、ポインタの下に見えているのはヘルプなのに
+        // 隠れた枠が動き、閉じたときに位置が変わっている。
+        if self.help || self.modal.is_some() {
+            return;
+        }
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         let Some(pane) = scroll_target(area, self, column, row) else {
             return;

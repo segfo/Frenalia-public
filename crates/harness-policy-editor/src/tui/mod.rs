@@ -204,8 +204,9 @@ pub fn run(
             //
             // `↑/↓`は項目移動、`←/→`はパス切替で既に埋まっているので、キーを増やさずに
             // 済むホイールだけを入れている。枠の当たり判定は描画とまったく同じ計算を通す
-            // （`record_screen::scroll_target`）——別々に持つと「見えている枠と反応する枠」が
-            // ずれる。端末の大きさはここで聞き直すので、位置を状態に持ち越さない。
+            // （`record_screen::scroll_target`が画面全体の割り付け[`screen_rows`]から辿る）
+            // ——別々に持つと「見えている枠と反応する枠」がずれる（BUG-194は実際にずれていた）。
+            // 端末の大きさはここで聞き直すので、位置を状態に持ち越さない。
             Event::Mouse(mouse) => {
                 let delta = match mouse.kind {
                     event::MouseEventKind::ScrollUp => Some(true),
@@ -249,8 +250,22 @@ pub fn run(
     Ok(())
 }
 
-fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
-    let area = frame.area();
+/// 画面全体の縦割り（タブ1行・本体・知らせ・キー案内1行）。
+struct ScreenRows {
+    tabs: Rect,
+    body: Rect,
+    status: Rect,
+    keys: Rect,
+}
+
+/// 画面全体を[`ScreenRows`]に割る。**描画（[`draw`]）とマウスの当たり判定
+/// （`record_screen::scroll_target`）が同じこの関数を通る**（[BUG-194](../../../../docs/bugs/BUG-194.md)）。
+///
+/// 以前はこの割り付けを描画だけが持ち、当たり判定は**端末全体を本体として**記録画面の割り付けを
+/// 計算していた。反応する枠は見えている枠より1行上にずれ、下は知らせの行とキー案内の行まで
+/// 伸びていた。知らせの行は折り返して複数行になる（BUG-192）ので、別々に持つとずれ方も毎回変わる。
+/// `area`は端末全体。知らせの高さは中身と幅で決まるので`app`も受ける。
+fn screen_rows(area: Rect, app: &App) -> ScreenRows {
     let status = status_text(app);
     let chunks = Layout::vertical([
         Constraint::Length(1),                            // タブ
@@ -259,24 +274,35 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
         Constraint::Length(1),                            // キーの案内
     ])
     .split(area);
+    ScreenRows {
+        tabs: chunks[0],
+        body: chunks[1],
+        status: chunks[2],
+        keys: chunks[3],
+    }
+}
 
-    draw_tabs(frame, chunks[0], app);
+fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
+    let area = frame.area();
+    let rows = screen_rows(area, app);
+
+    draw_tabs(frame, rows.tabs, app);
     // 記録画面だけがさかのぼれる枠を持つ。上限は**描画してみないと分からない**
     // （折り返し後の行数は枠の幅に依存する）ので、ここで受け取って呼び出し側へ返す。
     let feedback = match app.screen {
         Screen::Record => DrawFeedback {
-            scroll: record_screen::draw(frame, chunks[1], app),
+            scroll: record_screen::draw(frame, rows.body, app),
             ..Default::default()
         },
         // 承認待ち画面は3つのタブを持つ（決定62）。遷移の2タブは別の描き手。
         Screen::Edit if app.pending.tab.0.is_transition() => {
-            transition_screen::draw(frame, chunks[1], app)
+            transition_screen::draw(frame, rows.body, app)
         }
-        Screen::Edit => edit_screen::draw(frame, chunks[1], app),
-        Screen::Declared => declared_screen::draw(frame, chunks[1], app),
+        Screen::Edit => edit_screen::draw(frame, rows.body, app),
+        Screen::Declared => declared_screen::draw(frame, rows.body, app),
     };
-    draw_status(frame, chunks[2], status);
-    draw_keys(frame, chunks[3], app);
+    draw_status(frame, rows.status, status_text(app));
+    draw_keys(frame, rows.keys, app);
 
     if app.help {
         draw_help(frame, area);

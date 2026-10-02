@@ -475,10 +475,11 @@ fn paint_rows(width: u16, height: u16, paint: impl FnOnce(&mut Frame)) -> Vec<St
         .collect()
 }
 
-/// 見出しに`title`を含む枠の**内側**（枠線を除いた行ごとの文字列）。
+/// 見出しに`title`を含む、**描かれた**枠の矩形（枠線を含む）。描かれていなければ`None`。
 ///
-/// 左右に別の枠が並ぶ画面でも、その枠の列だけを切り出す（行全体をつなぐと隣の枠の文字が混ざる）。
-fn box_inner(grid: &[Vec<String>], title: &str) -> Vec<String> {
+/// 画面のセルから読み取る（レイアウトの関数を呼ばない）——描画と当たり判定が同じ計算を
+/// 通っているかを確かめる試験で、その計算そのものを期待値に使うと何も測らないため。
+fn drawn_box(grid: &[Vec<String>], title: &str) -> Option<ratatui::layout::Rect> {
     let title = squash(title);
     for (top, row) in grid.iter().enumerate() {
         // 見出しは左上の角の直後に描かれる。
@@ -490,13 +491,32 @@ fn box_inner(grid: &[Vec<String>], title: &str) -> Vec<String> {
         let right = (left + 1..row.len())
             .find(|&x| row[x] == "┐")
             .expect("枠の右上の角が無い");
-        return grid[top + 1..]
-            .iter()
-            .take_while(|row| row[left] != "└")
-            .map(|row| row[left + 1..right].concat())
-            .collect();
+        let bottom = (top + 1..grid.len())
+            .find(|&y| grid[y][left] == "└")
+            .expect("枠の左下の角が無い");
+        let cell = |n: usize| u16::try_from(n).expect("端末の大きさはu16に収まる");
+        return Some(ratatui::layout::Rect::new(
+            cell(left),
+            cell(top),
+            cell(right - left + 1),
+            cell(bottom - top + 1),
+        ));
     }
-    panic!("見出しが「{title}」の枠が無い");
+    None
+}
+
+/// 見出しに`title`を含む枠の**内側**（枠線を除いた行ごとの文字列）。
+///
+/// 左右に別の枠が並ぶ画面でも、その枠の列だけを切り出す（行全体をつなぐと隣の枠の文字が混ざる）。
+fn box_inner(grid: &[Vec<String>], title: &str) -> Vec<String> {
+    let area =
+        drawn_box(grid, title).unwrap_or_else(|| panic!("見出しが「{}」の枠が無い", squash(title)));
+    let (left, right) = (usize::from(area.x), usize::from(area.right() - 1));
+    let (top, bottom) = (usize::from(area.y), usize::from(area.bottom() - 1));
+    grid[top + 1..bottom]
+        .iter()
+        .map(|row| row[left + 1..right].concat())
+        .collect()
 }
 
 /// 行を上から順につなぎ、空白と枠線を落とす。**折り返された1行は、これで元の1続きに戻る**
@@ -1077,4 +1097,178 @@ fn the_warning_box_still_says_how_many_lines_it_omitted_when_lines_wrap() {
         "先頭の警告（原因であることが多い）が見えない:\n{}",
         warnings.join("\n")
     );
+}
+
+// ---------------------------------------------------------------------------
+// ホイールの当たり判定。[BUG-194]
+//
+// **期待値は描いた画面から読む。** 当たり判定と描画が同じ割り付けの関数を通っているかを
+// 確かめるのに、その関数を期待値に使うと、ずれていても一致してしまう（直す前の試験
+// `state_tests::the_wheel_hits_the_same_panes_that_are_drawn`がそうだった）。
+// ---------------------------------------------------------------------------
+
+/// 記録中の記録画面。さかのぼれる3枠（進行・出力・起動時ノイズ）と、送れない警告枠が全部出ている。
+fn running_record_screen(ws: &std::path::Path) -> App {
+    let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+    app.command.set_text("cargo build");
+    press(&mut app, KeyCode::Enter);
+    app.on_worker(WorkerMsg::Pass1(RecordEvent::StartupNoise(
+        "警告: プロバイダの読み込みに失敗\n".to_string(),
+    )));
+    app.on_worker(WorkerMsg::Pass1(RecordEvent::Warning(
+        "実行ファイルへ届きません".to_string(),
+    )));
+    app.on_worker(WorkerMsg::Pass1(RecordEvent::ChildStarted));
+    app.on_worker(WorkerMsg::Pass1(RecordEvent::Stdout(
+        "Compiling harness-core\n".to_string(),
+    )));
+    app
+}
+
+/// `(x, y)`でホイールを上へ1刻み回したとき、さかのぼり位置が動いた枠（動かなければ`None`）。
+/// **製品の入口（`App::on_scroll`）を通す。** 回した分は同じ位置で下へ回して戻す。
+fn wheel_moves(
+    app: &mut App,
+    size: ratatui::layout::Size,
+    x: u16,
+    y: u16,
+) -> Option<record_screen::ScrollPane> {
+    use record_screen::ScrollPane;
+    let offsets = |app: &App| {
+        let run = app.run.as_ref().expect("記録中");
+        [
+            run.log_scroll.offset(),
+            run.output_scroll.offset(),
+            run.noise_scroll.offset(),
+        ]
+    };
+    let before = offsets(app);
+    app.on_scroll(size, x, y, true);
+    let after = offsets(app);
+    app.on_scroll(size, x, y, false);
+    assert_eq!(offsets(app), before, "({x},{y}) 回した分が戻っていない");
+    let moved: Vec<ScrollPane> = [ScrollPane::Log, ScrollPane::Output, ScrollPane::Noise]
+        .into_iter()
+        .zip(before.iter().zip(after.iter()))
+        .filter(|(_, (b, a))| b != a)
+        .map(|(pane, _)| pane)
+        .collect();
+    assert!(
+        moved.len() <= 1,
+        "({x},{y}) 2つの枠が同時に動いた: {moved:?}"
+    );
+    moved.first().copied()
+}
+
+/// [BUG-194] **ホイールが送る枠は、ポインタの下に描かれている枠である**（知らせの行が1行でも複数行でも）。
+///
+/// # 壊れた状態を一文で
+///
+/// 描画は画面を「タブ1行・本体・知らせ・キー案内1行」に割ってから本体に記録画面を描くが、
+/// 当たり判定は**端末全体を本体として**記録画面の割り付けを計算していた。反応する枠は見えている枠より
+/// 1行上にずれ、下は知らせの行とキー案内の行まで伸びていた——入力欄の枠の下辺で回すと進行の枠が送られ、
+/// 知らせの行の上で回すとその上の枠が送られた。知らせの行が折り返して複数行になると、ずれはその分広がる。
+///
+/// 画面の全セルを1つずつ回して、描かれた枠（枠線を含む）の中なら**その枠だけ**が、外なら**どれも**
+/// 動かないことを見る（許可側と禁止側を同じ走査で見る）。
+#[test]
+fn the_wheel_scrolls_the_pane_drawn_under_the_pointer() {
+    use record_screen::ScrollPane;
+
+    let (width, height) = (100u16, 30u16);
+    let size = ratatui::layout::Size::new(width, height);
+    let mut reports = Vec::new();
+    for (case, status) in [
+        ("知らせが1行", "短い知らせ".to_string()),
+        (
+            "知らせが複数行",
+            "長い知らせが折り返して行を増やします。".repeat(8),
+        ),
+    ] {
+        let ws = workspace();
+        let mut app = running_record_screen(ws.path());
+        app.status = status;
+        let grid = paint_grid(width, height, |f| {
+            draw(f, &app);
+        });
+        let rows: Vec<String> = grid.iter().map(|row| row.concat()).collect();
+        let status_rows = status_rows(&rows).len();
+        if case == "知らせが複数行" {
+            assert!(
+                status_rows > 1,
+                "台本の前提が崩れた（知らせが1行に収まった）"
+            );
+        } else {
+            assert_eq!(status_rows, 1, "台本の前提が崩れた");
+        }
+        let panes = [
+            (ScrollPane::Log, " 進行 "),
+            (ScrollPane::Output, " コマンドの出力"),
+            (ScrollPane::Noise, " シェル起動時のノイズ"),
+        ]
+        .map(|(pane, title)| {
+            let area = drawn_box(&grid, title)
+                .unwrap_or_else(|| panic!("{case}: 「{title}」の枠が描かれていない"));
+            (pane, area)
+        });
+
+        let mut wrong = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                let drawn = panes
+                    .iter()
+                    .find(|(_, area)| area.contains(ratatui::layout::Position::new(x, y)))
+                    .map(|(pane, _)| *pane);
+                let moved = wheel_moves(&mut app, size, x, y);
+                if drawn != moved {
+                    wrong.push(format!(
+                        "({x},{y}) 描かれた枠: {drawn:?} / 送られた枠: {moved:?}"
+                    ));
+                }
+            }
+        }
+        if !wrong.is_empty() {
+            reports.push(format!(
+                "{case}（知らせ{status_rows}行）: {}セルで、送られる枠が描かれた枠と違う（先頭20件）:\n{}\n\n画面:\n{}",
+                wrong.len(),
+                wrong.iter().take(20).cloned().collect::<Vec<_>>().join("\n"),
+                rows.join("\n")
+            ));
+        }
+    }
+    assert!(reports.is_empty(), "{}", reports.join("\n\n"));
+}
+
+/// [BUG-194] **ヘルプや確認ダイアログを重ねている間は、どこで回しても後ろの枠は送られない。**
+/// ポインタの下に見えているのは重ねた側で、キー入力もその間は重ねた側だけが受ける（`App::on_key`）。
+/// 後ろの枠を送ると、見えないところで位置が変わり、閉じたときに読んでいた場所が失われる。
+#[test]
+fn the_wheel_does_not_scroll_panes_hidden_behind_an_overlay() {
+    let (width, height) = (100u16, 30u16);
+    let size = ratatui::layout::Size::new(width, height);
+    for overlay in ["ヘルプ", "確認ダイアログ"] {
+        let ws = workspace();
+        let mut app = running_record_screen(ws.path());
+        if overlay == "ヘルプ" {
+            app.help = true;
+        } else {
+            app.modal = Some(state::Modal {
+                title: "報告".to_string(),
+                lines: vec!["読むだけ".to_string()],
+                confirm: Confirm::ReadOnly,
+            });
+        }
+        let moved: Vec<String> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| {
+                wheel_moves(&mut app, size, x, y).map(|pane| format!("({x},{y}) {pane:?}"))
+            })
+            .take(20)
+            .collect();
+        assert!(
+            moved.is_empty(),
+            "{overlay}を重ねているのに後ろの枠が送られた（先頭20件）:\n{}",
+            moved.join("\n")
+        );
+    }
 }

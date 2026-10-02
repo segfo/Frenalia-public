@@ -960,6 +960,11 @@ fn appending_lines_does_not_touch_the_scroll_position() {
 /// ここがずれると「見えている枠と反応する枠が違う」という、最も気付きにくい壊れ方になる。
 /// 枠の有無は`run`の中身で変わる（警告が無ければ枠を割かない・ノイズが無ければ割かない）ので、
 /// **ノイズ枠が無いときにその座標が他の枠を掴まないこと**まで見る。
+///
+/// **この試験は枠の位置を割り付けの関数から計算しているので、描いた画面とのずれは測れない。**
+/// 以前は端末全体を本体として計算しており、当たり判定と同じ誤りを共有していたため、1行のずれ
+/// （BUG-194）を素通りさせた。描いた画面を期待値にする試験は
+/// `render_tests::the_wheel_scrolls_the_pane_drawn_under_the_pointer`が持つ。
 #[test]
 fn the_wheel_hits_the_same_panes_that_are_drawn() {
     use crate::tui::record_screen::{progress_areas, record_body_area, scroll_target, ScrollPane};
@@ -975,7 +980,11 @@ fn the_wheel_hits_the_same_panes_that_are_drawn() {
     idle.run = None;
 
     let run = app.run.as_ref().unwrap();
-    let areas = progress_areas(record_body_area(area), run);
+    // 描画と同じく、画面全体をタブ・本体・知らせ・キー案内に割ってから本体を使う。
+    let areas = progress_areas(
+        record_body_area(crate::tui::screen_rows(area, &app).body),
+        run,
+    );
 
     // 各枠の内側の点が、その枠として判定される。
     let inside = |r: ratatui::layout::Rect| (r.x + r.width / 2, r.y + r.height / 2);
