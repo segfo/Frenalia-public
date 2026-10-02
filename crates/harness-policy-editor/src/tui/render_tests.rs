@@ -1110,6 +1110,191 @@ fn the_scrollbar_does_not_hide_the_last_character_of_a_full_width_line() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 後ろの画面の上に重ねる枠（確認ダイアログ・ヘルプ）の左の枠線。[BUG-198]
+//
+// 後ろの画面の全角文字が重ねる枠の左隣の桁から始まると、その2桁目が枠線の桁に掛かる。ratatuiは
+// 前のフレームとの差分を端末へ送るとき、全角文字の2桁目に当たるセルを飛ばすので、枠線がそのセルに
+// 置かれていても端末へは送られない。[`paint_grid`]が読むのは`TestBackend`が**受け取った差分**を
+// 書き込んだ画面なので、端末と同じ形で欠ける。
+// ---------------------------------------------------------------------------
+
+/// 後ろの画面の代わりに、`symbol`を行ごとに1桁ずつずらして敷き詰める。全角なら、どの桁にも
+/// 全角文字の前半が来る行と後半が来る行がある（重ねる枠の左隣の桁に前半が来る行が必ずある）。
+fn fill_background(frame: &mut Frame, symbol: &str) {
+    let area = frame.area();
+    let rows: Vec<Line> = (0..area.height)
+        .map(|y| {
+            Line::raw(format!(
+                "{}{}",
+                " ".repeat(usize::from(y % 2)),
+                symbol.repeat(usize::from(area.width))
+            ))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(rows), area);
+}
+
+/// 収まる短い確認ダイアログ（スクロールバーは出ない）。
+fn paint_short_modal(frame: &mut Frame) {
+    let modal = state::Modal {
+        title: "承認の確認".to_string(),
+        lines: (0..5).map(|i| format!("  + fs.read = C:/x/{i}")).collect(),
+        confirm: Confirm::Approval,
+    };
+    draw_modal(frame, frame.area(), &modal, 0);
+}
+
+fn paint_help(frame: &mut Frame) {
+    draw_help(frame, frame.area());
+}
+
+/// 画面へ重ねる枠を1つ描く手順。
+type Paint = fn(&mut Frame);
+
+/// 後ろの画面の上に重ねる枠のすべて（名前・見出し・描き方）。製品で`open_overlay`を通る枠と同じ組。
+const OVERLAYS: [(&str, &str, Paint); 2] = [
+    ("確認ダイアログ", "承認の確認", paint_short_modal),
+    ("ヘルプ", "ヘルプ", paint_help),
+];
+
+/// `background`を敷いた上に`paint`で重ねた枠と、その画面。枠の位置は、半角だけを敷いて描いたときの
+/// セルから読む（全角を敷いた画面では、位置を読むのに使う角の記号そのものが欠け得るため）。
+fn overlay_over(
+    width: u16,
+    height: u16,
+    title: &str,
+    background: &str,
+    paint: Paint,
+) -> (ratatui::layout::Rect, Vec<Vec<String>>) {
+    let plain = paint_grid(width, height, |f| {
+        fill_background(f, "x");
+        paint(f);
+    });
+    let area = drawn_box(&plain, title).unwrap_or_else(|| panic!("{title}の枠が描かれていない"));
+    let grid = paint_grid(width, height, |f| {
+        fill_background(f, background);
+        paint(f);
+    });
+    (area, grid)
+}
+
+/// 枠の行ごとに、左の枠線の記号（上から`┌`・`│`…・`└`）が欠けていないか。欠けた行を返す。
+///
+/// **右の枠線はここでは見ない。** 後ろの画面は右の枠線に掛からない（枠の中から始まる全角文字は
+/// `Clear`が消す）。右の枠線は別の形で欠けることがある——枠の中の折り返した本文が、行末の全角文字で
+/// 1桁はみ出す（ratatuiの単語折り返しの性質。BUG-198の「残っているもの」）。それをここで混ぜると、
+/// この試験が何で赤くなったのか分からなくなる。
+fn broken_left_border_rows(grid: &[Vec<String>], area: ratatui::layout::Rect) -> Vec<String> {
+    let left = usize::from(area.x);
+    let (top, bottom) = (usize::from(area.y), usize::from(area.bottom() - 1));
+    (top..=bottom)
+        .filter_map(|y| {
+            let want = match y {
+                y if y == top => "┌",
+                y if y == bottom => "└",
+                _ => "│",
+            };
+            (grid[y][left] != want)
+                .then(|| format!("{y}行目: 「{}」 / {}", grid[y][left], grid[y].concat()))
+        })
+        .collect()
+}
+
+/// [BUG-198] **後ろの画面に全角文字が並んでいても、重ねた枠の左の枠線はどの行でも欠けない。**
+///
+/// # 壊れた状態を一文で
+///
+/// 後ろの画面の全角文字が枠の左隣の桁から始まる行で、左の枠線が端末へ送られず、全角文字の2桁目が
+/// そのまま見えていた（BUG-196の報告で、付け替えの確認画面を描いた画面から見つけた）。
+/// 幅を変えて、枠の左隣の桁が偶数の場合と奇数の場合の両方を描く。
+#[test]
+fn an_overlay_keeps_its_left_border_over_wide_characters() {
+    let mut failures = Vec::new();
+    for (name, title, paint) in OVERLAYS {
+        for (width, height) in [(120u16, 30u16), (119, 30), (100, 24)] {
+            let (area, grid) = overlay_over(width, height, title, "あ", paint);
+            assert!(
+                area.x >= 2,
+                "{name} {width}×{height}: 台本の前提が崩れた（枠が左端に付いている）"
+            );
+            let broken = broken_left_border_rows(&grid, area);
+            if !broken.is_empty() {
+                failures.push(format!("{name} {width}×{height}:\n{}", broken.join("\n")));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "重ねた枠の左の枠線が欠けた:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+/// [BUG-198] **許可側**: 枠の左側の文字は、枠線に掛かる全角文字1つを除いて消さない。
+///
+/// 半角は1つも消えず、全角は枠線の桁に掛かるものだけが空白になる（重ねる枠を左右に1桁ずつ広く消す、
+/// という直し方なら半角も消える——その壊し方を止める）。
+#[test]
+fn an_overlay_erases_only_the_wide_character_that_reaches_its_border() {
+    for (name, title, paint) in OVERLAYS {
+        let (width, height) = (120u16, 30u16);
+        let (area, narrow) = overlay_over(width, height, title, "x", paint);
+        let (_, wide) = overlay_over(width, height, title, "あ", paint);
+        let left = usize::from(area.x);
+        for y in usize::from(area.y)..usize::from(area.bottom()) {
+            let offset = y % 2;
+            assert_eq!(
+                narrow[y][..left].concat(),
+                format!("{}{}", " ".repeat(offset), "x".repeat(left - offset)),
+                "{name}: {y}行目で、枠の左の半角が消えた"
+            );
+            // 枠の左に丸ごと入る全角文字は残り、枠線の桁に掛かるものは空白になる。
+            let whole = (left - offset) / 2;
+            assert_eq!(
+                squash(&wide[y][..left].concat()),
+                "あ".repeat(whole),
+                "{name}: {y}行目で、枠の左の全角文字が想定と違う: {}",
+                wide[y][..left].concat()
+            );
+        }
+    }
+}
+
+/// [BUG-198] **重ねる枠はどれも`open_overlay`を通る。** 上の2本は[`OVERLAYS`]の組しか描かないので、
+/// 重ねる枠を足したのに`open_overlay`を通さず`Clear`で直接消すと、その枠だけ欠けが戻っても気付けない。
+/// 重ねる枠は`draw`（`tui/mod.rs`）が画面の後に描くので、そのファイルで数える。
+#[test]
+fn every_overlay_goes_through_open_overlay() {
+    let source = include_str!("mod.rs");
+    assert_eq!(
+        source.matches("render_widget(Clear").count(),
+        1,
+        "`Clear`で直接消している箇所が`open_overlay`の外にある"
+    );
+    assert_eq!(
+        source.matches("open_overlay(frame,").count(),
+        OVERLAYS.len(),
+        "`open_overlay`を通る枠と、試験が描く枠の組（OVERLAYS）が食い違う"
+    );
+}
+
+/// [BUG-198] **実際の画面でも**、付け替えの確認画面の左の枠線は、後ろの宣言画面の全角文字に欠けない。
+/// BUG-196の報告で欠けを見つけた画面（宣言画面の上の付け替えの確認、120×20）を、描いて書き戻す経路で描く。
+#[test]
+fn the_reassignment_confirmation_keeps_its_left_border_over_the_declared_screen() {
+    let ws = workspace();
+    let mut app = reassignment_confirmation(ws.path());
+    let grid = frame(&mut app, 120, 20);
+    let area = modal_box(&grid, &app);
+    let broken = broken_left_border_rows(&grid, area);
+    assert!(
+        broken.is_empty(),
+        "確認画面の左の枠線が欠けた:\n{}",
+        broken.join("\n")
+    );
+}
+
 /// [BUG-192] ヘルプの高さも折り返した後の行数で数える。**端末が十分に高ければ最後の行まで読める。**
 ///
 /// 「高さは本文から数える」（B-09）はヘルプが先に直していたが、数えていたのは折り返す前の行だった。

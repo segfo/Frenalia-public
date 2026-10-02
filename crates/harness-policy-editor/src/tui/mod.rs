@@ -697,8 +697,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let width = HELP_WIDTH.min(area.width);
     let rows = wrap::rows(HELP_TEXT, width.saturating_sub(2));
     let height = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(2);
-    let area = centered(area, width, height);
-    frame.render_widget(Clear, area);
+    let area = open_overlay(frame, area, width, height);
     // ヘルプは送れない（何かキーを押すと閉じる）。端末が低くて収まらない分は、行数を枠に出す。
     wrap::draw_box(
         frame,
@@ -757,8 +756,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) 
         .unwrap_or(u16::MAX)
         .saturating_add(4)
         .min(area.height.saturating_sub(2));
-    let area = centered(area, width, height.max(6));
-    frame.render_widget(Clear, area);
+    let area = open_overlay(frame, area, width, height.max(6));
 
     let window = wrap::Window::new(total, usize::from(area.height.saturating_sub(2)), scroll);
     let keys = if modal.confirm.asks() {
@@ -805,6 +803,38 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) 
 #[cfg(test)]
 #[path = "render_tests.rs"]
 mod render_tests;
+
+/// 後ろの画面の上に枠を重ねる場所を空ける。**後ろの画面に重ねて描く枠（確認ダイアログ・ヘルプ）は
+/// どれもここを通る。** `area`の中央に`width`×`height`を取って中を消し、その矩形を返す。
+///
+/// # 枠線の桁に掛かる全角文字も消す（[BUG-198](../../../../docs/bugs/BUG-198.md)）
+///
+/// ratatuiの画面は全角文字を「前半のセルに記号、後半のセルは空白」で持ち、端末へ差分を送るときは
+/// **全角文字の後半に当たるセルを飛ばす**（`ratatui::buffer::Buffer::diff_iter`のdoc）。`Clear`は
+/// 枠の中しか消さないので、後ろの画面の全角文字が枠の左隣の桁から始まっていると、その後半に当たる
+/// 枠線のセルが飛ばされて端末へ届かず、全角文字がそのまま見えて左の枠線が欠けていた。
+/// だから枠より左にあって枠の中まで届く文字（全角文字の前半）を空白に置き換えてから消す。
+///
+/// 左右に1桁ずつ広く消す直し方は採らない。枠線に届かない半角や全角まで消え、ratatui自身も
+/// 「入り切らない全角文字は描かずに空けておく」を選んでいる（`Buffer::set_stringn`）ので、それに揃える。
+/// 右側は要らない——枠の中から始まって右へはみ出す全角文字は、`Clear`が前半ごと消す。
+fn open_overlay(frame: &mut Frame, area: Rect, width: u16, height: u16) -> Rect {
+    use ratatui::buffer::CellWidth;
+
+    let overlay = centered(area, width, height);
+    let buffer = frame.buffer_mut();
+    for y in overlay.top()..overlay.bottom() {
+        for x in buffer.area.left()..overlay.left() {
+            let cell = &mut buffer[(x, y)];
+            if x.saturating_add(cell.cell_width()) > overlay.left() {
+                // 色は残す（選択行の背景色などが途中で切れないように）。
+                cell.set_symbol(" ");
+            }
+        }
+    }
+    frame.render_widget(Clear, overlay);
+    overlay
+}
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
