@@ -25,6 +25,19 @@
 //! （[`crate::pointer`]へ登録する）。下辺の右の「N〜M/T行」はボタンの残りの幅に収まる形を選ぶので、
 //! **ボタンには重ならない**（押すべきものが案内に覆われない）。
 //!
+//! # 本文の行が描かれた場所も返す（[`Drawn::lines`]）
+//!
+//! 本文の中の行を押せるようにする枠がある（会話TUIの承認ダイアログの「毎回変わってよい引数」の候補、
+//! 差分ペインのハンクの見出し）。どの行が画面のどこに来たかは、折り返した行数と送り位置で決まるので、
+//! 描いたここで求めて返す——呼び出し側が折り返しと送りを計算し直すと、描いた場所と押せる場所がずれる
+//! （ポリシーエディタの[BUG-194](../../../docs/bugs/BUG-194.md)）。
+//!
+//! # 折り返さない枠もある（[`draw_unwrapped`]）
+//!
+//! 行の番号をそのまま表示行の番号として送る枠（会話TUIの差分ペイン。ハンクの見出しへ追従するとき、状態の側が
+//! 本文の何行目を一番上に出すかを決める）は、折り返すと番号がずれる。そういう枠は折り返さずに描き、
+//! 送る上限・スクロールバー・下辺の「N〜M/T行」だけを同じ形にする。
+//!
 //! # 限界
 //!
 //! - 折り返し方そのもの（空白で切り、日本語の禁則を見ない）は[`crate::wrap`]のまま。
@@ -34,10 +47,10 @@ use ratatui::layout::{Margin, Rect};
 use ratatui::style::Style;
 use ratatui::symbols;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
-use crate::wrap::{rows, Wrapped};
+use crate::wrap::{line_rows, Wrapped};
 
 /// 送れる枠の見せ方。入り切らないときにだけ使う（入り切る枠は何も変わらない）。
 #[derive(Debug, Clone, Copy)]
@@ -51,13 +64,17 @@ pub struct Look {
     pub bar: Style,
 }
 
-/// [`draw_with_buttons`]が描いた結果。
+/// [`draw_with_buttons`]・[`draw_unwrapped`]が描いた結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Drawn {
     /// この描画で分かった送れる上限（[`Window::max_top`]）。
     pub max_top: u16,
     /// ボタンが描かれた矩形（渡したボタンと同じ数・同じ順。入り切らなかったものは幅0）。
     pub buttons: Vec<Rect>,
+    /// 本文の各行（渡した`Text`の行と同じ数・同じ順）が描かれた矩形。折り返した行は複数行の高さを持ち、
+    /// 枠の上下で切れた行は見えている部分だけ、まったく見えていない行は高さ0（押せない）。
+    /// 本文の中の行を押せるようにするとき（一覧の候補・ハンクの見出し）に、その行の場所として使う。
+    pub lines: Vec<Rect>,
 }
 
 /// 送れる枠を描き、**この描画で分かった送れる上限**を返す。
@@ -79,6 +96,7 @@ pub fn draw<'a>(
 }
 
 /// [`draw`]に加えて、下辺の左に`buttons`を描き、それぞれが描かれた矩形を返す（モジュールdoc）。
+/// 本文の各行が描かれた矩形も返す（[`Drawn::lines`]）。
 pub fn draw_with_buttons<'a>(
     frame: &mut Frame,
     area: Rect,
@@ -88,13 +106,45 @@ pub fn draw_with_buttons<'a>(
     look: Look,
     buttons: &[Span],
 ) -> Drawn {
-    let text = text.into();
+    draw_text(frame, area, text.into(), block, top, look, buttons, true)
+}
+
+/// [`draw`]と同じ送れる枠を、**折り返さずに**描く（長い行は右で切る。1行は必ず1つの表示行）。
+///
+/// 行の番号がそのまま表示行の番号になるので、状態の側が「何行目を枠の一番上に出すか」を本文の行で決める枠
+/// （会話TUIの差分ペインのハンクへの追従）に使う。送る上限・スクロールバー・下辺の「N〜M/T行」は[`draw`]と同じ。
+/// 右で切った行の全角文字は、入り切らなければ描かれない（右の枠線を覆わない。ratatuiの切り方）。
+pub fn draw_unwrapped<'a>(
+    frame: &mut Frame,
+    area: Rect,
+    text: impl Into<Text<'a>>,
+    block: Block<'a>,
+    top: u16,
+    look: Look,
+) -> Drawn {
+    draw_text(frame, area, text.into(), block, top, look, &[], false)
+}
+
+/// [`draw_with_buttons`]と[`draw_unwrapped`]の本体（違うのは行を折り返すかだけ）。
+#[allow(clippy::too_many_arguments)]
+fn draw_text<'a>(
+    frame: &mut Frame,
+    area: Rect,
+    text: Text<'a>,
+    block: Block<'a>,
+    top: u16,
+    look: Look,
+    buttons: &[Span],
+    wrapped: bool,
+) -> Drawn {
     let inner = block.inner(area);
-    let window = Window::new(
-        rows(text.clone(), inner.width),
-        usize::from(inner.height),
-        top,
-    );
+    // 行ごとの表示行の数。合計が本文全体の表示行の数（`crate::wrap::line_rows`のdoc）。
+    let heights = if wrapped {
+        line_rows(text.clone(), inner.width)
+    } else {
+        vec![1; text.lines.len()]
+    };
+    let window = Window::new(heights.iter().sum(), usize::from(inner.height), top);
     // 下辺のうち、左右の角とボタン（とその後ろの1桁）を除いた幅。
     let taken = if buttons.is_empty() {
         0
@@ -106,33 +156,59 @@ pub fn draw_with_buttons<'a>(
         Some(notice) => block.title_bottom(Line::styled(notice, look.notice).right_aligned()),
         None => block,
     };
-    Wrapped::new(text)
-        .block(block)
-        .scroll(u16::try_from(window.top).unwrap_or(u16::MAX))
-        .render(frame, area);
-    if window.overflows() {
-        draw_scrollbar(frame, area, window, look.bar);
+    let scroll = u16::try_from(window.top).unwrap_or(u16::MAX);
+    if wrapped {
+        Wrapped::new(text)
+            .block(block)
+            .scroll(scroll)
+            .render(frame, area);
+    } else {
+        frame.render_widget(Paragraph::new(text).block(block).scroll((scroll, 0)), area);
     }
+    draw_scrollbar(frame, area, window, look.bar);
     let buttons = if buttons.is_empty() || area.height == 0 {
         vec![Rect::default(); buttons.len()]
     } else {
-        // 下辺の枠線のうち、左右の角を除いた部分（枠の見出しを左寄せで置くのと同じ場所）。
-        let edge = Rect::new(
-            area.x.saturating_add(1),
-            area.bottom() - 1,
-            area.width.saturating_sub(2),
-            1,
-        );
-        crate::row::draw(frame, edge, buttons)
+        crate::row::draw(frame, crate::row::bottom_edge(area), buttons)
     };
     Drawn {
         max_top: u16::try_from(window.max_top()).unwrap_or(u16::MAX),
         buttons,
+        lines: line_areas(inner, &heights, window),
     }
 }
 
+/// 行ごとの表示行の数`heights`と、いま見せている範囲`window`から、各行が描かれた矩形を求める
+/// （`Paragraph::scroll`が「上から`top`表示行を飛ばして描く」のと同じ規則）。
+fn line_areas(inner: Rect, heights: &[usize], window: Window) -> Vec<Rect> {
+    let (shown_from, shown_to) = (window.top, window.top + window.visible);
+    let mut start = 0usize;
+    heights
+        .iter()
+        .map(|&height| {
+            let (from, to) = (start.max(shown_from), (start + height).min(shown_to));
+            start += height;
+            let y = |row: usize| {
+                inner
+                    .y
+                    .saturating_add(u16::try_from(row - shown_from).unwrap_or(u16::MAX))
+            };
+            if from < to {
+                Rect::new(
+                    inner.x,
+                    y(from),
+                    inner.width,
+                    u16::try_from(to - from).unwrap_or(u16::MAX),
+                )
+            } else {
+                Rect::new(inner.x, y(from.min(shown_to)), inner.width, 0)
+            }
+        })
+        .collect()
+}
+
 /// 送れる枠で、いま見せている範囲（[BUG-196](../../../docs/bugs/BUG-196.md)）。
-/// **数えるのはどれも折り返した後の表示行**で、[`rows`]・`Paragraph::scroll`・下辺の「N〜M/T行」と同じ単位である。
+/// **数えるのはどれも折り返した後の表示行**で、[`crate::wrap::rows`]・`Paragraph::scroll`・下辺の「N〜M/T行」と同じ単位である。
 ///
 /// # 送る上限は「本文の最後の行が枠の一番下の行に来たところ」
 ///
@@ -203,14 +279,22 @@ impl Window {
 /// # スクロールバーは枠線の上に描く
 ///
 /// 内側に描くと、本文の右端に空けてある1桁（行末の全角文字のはみ出し用。BUG-200）を潰すので、
-/// 折り返しの幅をさらに減らし、[`rows`]で数える幅もそれに合わせることになる。枠線の上なら本文の幅は
+/// 折り返しの幅をさらに減らし、[`crate::wrap::rows`]で数える幅もそれに合わせることになる。枠線の上なら本文の幅は
 /// 変わらず、数えた行数と描いた行数の一致に触らない。線は枠線と同じ記号・同じ色にし、つまみだけを`█`にするので、
 /// 収まらないときは右の枠線の一部がつまみに変わって見える。上下の矢印は付けない（つまみが端に付いたことで
 /// 先頭・末尾を言うため。矢印を付けると、端に付いても矢印との間に線が残る）。
 ///
 /// **送れることはスクロールバーだけでは伝わらない**（キーやホイールで送れることは絵から読めない）ので、
 /// 下辺の「N〜M/T行」に送り方を添える（[`Look::how`]）。
-fn draw_scrollbar(frame: &mut Frame, area: Rect, window: Window, bar: Style) {
+///
+/// この枠の外でも使う——末尾追従の枠（[`crate::scrollback::render_with_bar`]）と、行を押せる一覧
+/// （会話TUIのレビューパネル。`window`は一覧の項目の数・見えている項目の数・表示を始める位置）が、同じ見た目の
+/// スクロールバーをここで描く。`area`は枠全体（上下の角を除いた右の枠線の上に描く）。**本文が収まっていれば
+/// （[`Window::overflows`]が偽）何も描かない**——送れない枠に「先頭に居る」つまみを出さない。
+pub fn draw_scrollbar(frame: &mut Frame, area: Rect, window: Window, bar: Style) {
+    if !window.overflows() {
+        return;
+    }
     // ratatuiの`ScrollbarState`は「送れる位置の数」と「見えている量」で数える。位置は0〜上限の
     // `上限+1`通り、見えている量は`visible`——こう渡すと、先頭でつまみが一番上、上限で一番下に付く。
     let mut state = ScrollbarState::new(window.max_top() + 1)
@@ -344,5 +428,132 @@ mod tests {
             "上限は最後の行が枠の一番下に来るところ"
         );
         assert!(overflowing.buttons.is_empty());
+    }
+
+    /// 本文の行`i`は`<i>`で始まり、`width`に応じて折り返す長さを持つ（どの行が画面のどこに描かれたかを読めるように）。
+    fn tagged_lines() -> Vec<Line<'static>> {
+        (0..12)
+            .map(|i| match i % 4 {
+                0 => Line::raw(format!("<{i}>")),
+                1 => Line::raw(format!("<{i}> {}", "word ".repeat(12))),
+                2 => Line::raw(format!("<{i}> {}", "あ".repeat(30))),
+                _ => Line::raw(format!("<{i}>")),
+            })
+            .collect()
+    }
+
+    /// 画面の各行に描かれている行の番号。**折り返した続きの行は、直前の番号を引き継ぐ**（`<i>`が無い行）。
+    /// 枠線の行と、本文の何も描かれていない行は`None`。
+    fn drawn_lines(buffer: &Buffer, inner: Rect) -> Vec<Option<usize>> {
+        let mut current = None;
+        (inner.top()..inner.bottom())
+            .map(|y| {
+                let line: String = (inner.left()..inner.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                if line.trim().is_empty() {
+                    return None;
+                }
+                if let (Some(start), Some(end)) = (line.find('<'), line.find('>')) {
+                    current = line[start + 1..end].parse().ok();
+                }
+                current
+            })
+            .collect()
+    }
+
+    /// **返した行の矩形には、その行が描かれている**——折り返した行・枠の上で切れた行・枠の外の行も含めて。
+    /// 送り位置を変え、折り返す枠と折り返さない枠の両方で確かめる（行の場所は押せる候補・見出しの当たり判定になる）。
+    #[test]
+    fn the_line_areas_returned_are_where_the_lines_are_drawn() {
+        for wrapped in [true, false] {
+            for top in [0u16, 1, 4, 9, 40] {
+                let mut term = Terminal::new(TestBackend::new(40, 10)).expect("test terminal");
+                let mut drawn = None;
+                let mut inner = Rect::default();
+                term.draw(|f| {
+                    let block = Block::default().borders(Borders::ALL);
+                    inner = block.inner(f.area());
+                    drawn = Some(if wrapped {
+                        draw_with_buttons(f, f.area(), tagged_lines(), block, top, LOOK, &[])
+                    } else {
+                        draw_unwrapped(f, f.area(), tagged_lines(), block, top, LOOK)
+                    });
+                })
+                .expect("draw");
+                let drawn = drawn.expect("描いた");
+                assert_eq!(drawn.lines.len(), tagged_lines().len());
+                let mut expected = vec![None; usize::from(inner.height)];
+                for (i, rect) in drawn.lines.iter().enumerate() {
+                    for y in rect.top()..rect.bottom() {
+                        expected[usize::from(y - inner.y)] = Some(i);
+                    }
+                }
+                let screen = drawn_lines(term.backend().buffer(), inner);
+                // 本文の無い行（`<i>`だけの短い行の後ろの空き）は画面から読めないので、描かれた行だけを突き合わせる。
+                for (y, (want, got)) in expected.iter().zip(&screen).enumerate() {
+                    if got.is_some() {
+                        assert_eq!(want, got, "折り返し{wrapped} 位置{top}: {y}行目");
+                    }
+                }
+                assert!(
+                    expected.iter().all(Option::is_some),
+                    "折り返し{wrapped} 位置{top}: 枠の中に、どの行の場所でもない行がある: {expected:?}"
+                );
+            }
+        }
+    }
+
+    /// **折り返さない枠も、送る上限は「最後の行が枠の一番下」**（[BUG-196](../../../docs/bugs/BUG-196.md)と同じ形）。
+    /// 長い行は右で切り、行の最後の全角文字が右の枠線を覆わない。
+    #[test]
+    fn an_unwrapped_box_stops_with_the_last_line_at_the_bottom_and_keeps_its_border() {
+        let mut term = Terminal::new(TestBackend::new(21, 6)).expect("test terminal");
+        let lines: Vec<Line> = (0..10)
+            .map(|i| Line::raw(format!("{i} {}", "あ".repeat(20))))
+            .collect();
+        let mut drawn = None;
+        term.draw(|f| {
+            drawn = Some(draw_unwrapped(
+                f,
+                f.area(),
+                lines,
+                Block::default().borders(Borders::ALL),
+                u16::MAX,
+                LOOK,
+            ));
+        })
+        .expect("draw");
+        let drawn = drawn.expect("描いた");
+        assert_eq!(drawn.max_top, 10 - 4);
+        let buffer = term.backend().buffer();
+        let last_row: String = (1..20).map(|x| buffer[(x, 4)].symbol()).collect();
+        assert!(
+            last_row.starts_with('9'),
+            "一番下の行が最後の行でない: {last_row}"
+        );
+        // 右の枠線は線かスクロールバーのつまみのどちらか（全角文字に覆われていない）。
+        for y in 1..5 {
+            let cell = buffer[(20, y)].symbol();
+            assert!(cell == "│" || cell == "█", "{y}行目の右の枠線: 「{cell}」");
+        }
+    }
+
+    /// **スクロールバーは本文が収まらないときだけ出る**（収まる枠の右の枠線は全部が線のまま）。
+    #[test]
+    fn the_scrollbar_appears_only_when_the_text_overflows() {
+        let right = |buffer: &Buffer| -> Vec<String> {
+            (1..7)
+                .map(|y| buffer[(39, y)].symbol().to_string())
+                .collect()
+        };
+        let (_, fits) = paint(40, 6, &[]);
+        assert!(right(&fits).iter().all(|c| c == "│"), "{:?}", right(&fits));
+        let (_, overflows) = paint(40, 20, &[]);
+        assert!(
+            right(&overflows).iter().any(|c| c == "█"),
+            "{:?}",
+            right(&overflows)
+        );
     }
 }

@@ -24,6 +24,7 @@
 //! （BUG-076の再発）。
 
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::Block;
 use ratatui::Frame;
@@ -104,11 +105,39 @@ pub fn render(
     block: Block<'static>,
     scroll: Scrollback,
 ) -> u16 {
+    render_inner(frame, area, lines, block, scroll, None)
+}
+
+/// [`render`]に加えて、本文が枠に収まらないときだけ右の枠線の上にスクロールバーを描く
+/// （先頭から読ませる枠と同じ見た目。[`crate::scrollable::draw_scrollbar`]）。`bar`は枠線と同じ色を渡す。
+///
+/// 下端に貼り付いている間は、つまみが一番下に付いている。会話TUIのtranscriptが使う
+/// （ポリシーエディタの記録画面の3枠は[`render`]のままで、スクロールバーを出さない）。
+pub fn render_with_bar(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    block: Block<'static>,
+    scroll: Scrollback,
+    bar: Style,
+) -> u16 {
+    render_inner(frame, area, lines, block, scroll, Some(bar))
+}
+
+fn render_inner(
+    frame: &mut Frame,
+    area: Rect,
+    lines: Vec<Line<'static>>,
+    block: Block<'static>,
+    scroll: Scrollback,
+    bar: Option<Style>,
+) -> u16 {
     // 折り返し後の行数で数える。ここをバッファ行にすると、長い行がある枠で
     // 末尾まで戻り切れなくなる（モジュールdoc）。数える幅と描く幅は`crate::wrap`が揃える
     // （行末の全角文字が右の枠線を覆わないよう、どちらも右端の1桁を空ける。BUG-200）。
     let inner = block.inner(area);
-    let total = u16::try_from(crate::wrap::rows(lines.clone(), inner.width)).unwrap_or(u16::MAX);
+    let rows = crate::wrap::rows(lines.clone(), inner.width);
+    let total = u16::try_from(rows).unwrap_or(u16::MAX);
     let max_offset = total.saturating_sub(inner.height);
     // 表示にはクランプ後の値を使う（状態そのものは呼び出し側が`clamp`で直す）。
     let offset = scroll.offset().min(max_offset);
@@ -118,6 +147,11 @@ pub fn render(
         .block(block)
         .scroll(top)
         .render(frame, area);
+    if let Some(bar) = bar {
+        // 末尾追従の位置（下端からの距離）を、上端からの位置へ直して渡す（同じ見た目のスクロールバー）。
+        let window = crate::scrollable::Window::new(rows, usize::from(inner.height), top);
+        crate::scrollable::draw_scrollbar(frame, area, window, bar);
+    }
     max_offset
 }
 
@@ -126,11 +160,17 @@ pub fn render(
 /// **言わないと「出力が止まった」と読まれる**——下端に貼り付いていないだけなのに、
 /// 新しい行が見えなくなるため。戻し方も一緒に出す。
 pub fn title_with_scroll(base: &str, scroll: Scrollback, hint: &str) -> String {
-    if scroll.is_pinned() {
-        base.to_string()
-    } else {
-        format!("{base}[{}行 さかのぼり中・{hint}] ", scroll.offset())
-    }
+    format!(
+        "{base}{}",
+        scrolled_notice(scroll, hint).unwrap_or_default()
+    )
+}
+
+/// [`title_with_scroll`]が見出しへ足す「さかのぼり中」の注記だけ。下端に貼り付いていれば`None`。
+///
+/// 注記を押せる項目として見出しとは別に描くとき（会話TUIのtranscriptは、押すと末尾へ戻る）に使う。
+pub fn scrolled_notice(scroll: Scrollback, hint: &str) -> Option<String> {
+    (!scroll.is_pinned()).then(|| format!("[{}行 さかのぼり中・{hint}] ", scroll.offset()))
 }
 
 #[cfg(test)]
@@ -242,5 +282,57 @@ mod tests {
                 "幅{width}: 右の枠線が欠けた"
             );
         }
+    }
+
+    /// スクロールバーを描く版で、`n`行の本文を下端から`offset`行さかのぼって描き、右の枠線（角を除く）を返す。
+    fn right_border_with_bar(n: usize, offset: i32) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Borders;
+        use ratatui::Terminal;
+
+        let lines: Vec<Line<'static>> = (0..n).map(|i| Line::raw(format!("{i}"))).collect();
+        let mut scroll = Scrollback::default();
+        scroll.scroll_lines(offset);
+        let mut term = Terminal::new(TestBackend::new(20, 8)).expect("test terminal");
+        term.draw(|frame| {
+            render_with_bar(
+                frame,
+                frame.area(),
+                lines,
+                Block::default().borders(Borders::ALL),
+                scroll,
+                Style::default(),
+            );
+        })
+        .expect("draw");
+        let buffer = term.backend().buffer();
+        (1..7)
+            .map(|y| buffer[(19, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// **スクロールバーは収まらないときだけ出て、つまみは下端追従なら一番下、先頭までさかのぼれば一番上に付く。**
+    #[test]
+    fn the_scrollbar_follows_the_bottom_and_appears_only_when_overflowing() {
+        assert!(right_border_with_bar(6, 0).iter().all(|c| c == "│"));
+        let pinned = right_border_with_bar(40, 0);
+        assert_eq!(pinned.last().map(String::as_str), Some("█"), "{pinned:?}");
+        assert_eq!(pinned.first().map(String::as_str), Some("│"), "{pinned:?}");
+        let top = right_border_with_bar(40, 1000);
+        assert_eq!(top.first().map(String::as_str), Some("█"), "{top:?}");
+        assert_eq!(top.last().map(String::as_str), Some("│"), "{top:?}");
+    }
+
+    /// 見出しへ足す注記と、注記だけを返す関数は同じ文字列（注記を押せる項目として別に描く側とずれない）。
+    #[test]
+    fn the_scrolled_notice_is_what_the_title_appends() {
+        let mut scroll = Scrollback::default();
+        assert_eq!(scrolled_notice(scroll, "戻す"), None);
+        scroll.scroll_lines(7);
+        let notice = scrolled_notice(scroll, "戻す").expect("さかのぼり中");
+        assert_eq!(
+            title_with_scroll(" 出力 ", scroll, "戻す"),
+            format!(" 出力 {notice}")
+        );
     }
 }

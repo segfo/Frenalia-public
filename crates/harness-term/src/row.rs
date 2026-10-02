@@ -73,6 +73,82 @@ pub fn width(spans: &[Span]) -> u16 {
     u16::try_from(total).unwrap_or(u16::MAX)
 }
 
+/// 枠の上辺の枠線のうち、左右の角を除いた1行（枠の見出しを左寄せで置くのと同じ場所）。
+/// 見出しを押せる項目にするときは、見出しを`Block`に持たせずにここへ[`draw`]で描く。
+pub fn top_edge(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y,
+        area.width.saturating_sub(2),
+        area.height.min(1),
+    )
+}
+
+/// 枠の下辺の枠線のうち、左右の角を除いた1行。
+pub fn bottom_edge(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.bottom().saturating_sub(1),
+        area.width.saturating_sub(2),
+        area.height.min(1),
+    )
+}
+
+/// `spans`を`area`へ左から並べ、**入り切らない項目は次の行の頭へ送って**描き、それぞれが描かれた矩形を返す
+/// （`spans`と同じ数・同じ順）。項目の間は`gap`桁空ける（行の頭には空けない）。
+///
+/// [`draw`]が1行で右端から切るのに対し、こちらは**項目の途中で折り返さない**——キー案内やボタンを
+/// 単語の折り返しで描くと、「[d] このセッション中は拒否」のような項目が2行に割れ、どこまでが1つの
+/// 項目（押せる場所）か分からなくなる。行の頭に置いても入り切らない項目だけは、右端で切れる（切れた先は押せない）。
+/// `area`の高さに入り切らなかった項目は幅0の矩形になる（押せない）。何行要るかは[`wrapped_rows`]が同じ置き方で数える。
+pub fn draw_wrapped(frame: &mut Frame, area: Rect, spans: &[Span], gap: u16) -> Vec<Rect> {
+    let buffer = frame.buffer_mut();
+    let area = area.intersection(buffer.area);
+    let places = place(spans, gap, area.width);
+    spans
+        .iter()
+        .zip(places)
+        .map(|(span, (row, x))| {
+            let (x, y) = (area.x.saturating_add(x), area.y.saturating_add(row));
+            if row >= area.height || x >= area.right() {
+                return Rect::new(x.min(area.right()), y.min(area.bottom()), 0, 0);
+            }
+            let (end, _) = buffer.set_span(x, y, span, area.right() - x);
+            Rect::new(x, y, end - x, 1)
+        })
+        .collect()
+}
+
+/// `spans`を幅`width`の場所へ[`draw_wrapped`]で描いたときの行数（項目が無ければ0）。
+pub fn wrapped_rows(spans: &[Span], gap: u16, width: u16) -> u16 {
+    place(spans, gap, width)
+        .last()
+        .map_or(0, |&(row, _)| row.saturating_add(1))
+}
+
+/// 各項目を置く（行, 桁）。[`draw_wrapped`]と[`wrapped_rows`]が共有する（数え方と描き方を1か所で決める）。
+fn place(spans: &[Span], gap: u16, width: u16) -> Vec<(u16, u16)> {
+    let mut row = 0u16;
+    let mut x = 0u16;
+    spans
+        .iter()
+        .map(|span| {
+            let item = u16::try_from(span.width()).unwrap_or(u16::MAX);
+            if x > 0 {
+                if x.saturating_add(gap).saturating_add(item) > width {
+                    row = row.saturating_add(1);
+                    x = 0;
+                } else {
+                    x = x.saturating_add(gap);
+                }
+            }
+            let at = (row, x);
+            x = x.saturating_add(item);
+            at
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::backend::TestBackend;
@@ -167,5 +243,72 @@ mod tests {
             }
         }
         assert_eq!(width(&spans), 9 + 1 + 13 + 1);
+    }
+
+    fn items() -> Vec<Span<'static>> {
+        vec![
+            Span::raw("[y] 一度だけ許可"),
+            Span::raw("[a] 恒久的に承認（台帳へ）"),
+            Span::raw("[n] 拒否"),
+            Span::raw("[d] このセッション中は拒否"),
+        ]
+    }
+
+    /// 1フレーム描いて、[`draw_wrapped`]が返した矩形と画面を返す。
+    fn wrapped(width: u16, height: u16, spans: &[Span]) -> (Vec<Rect>, Buffer) {
+        let mut term = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        let mut rects = Vec::new();
+        term.draw(|frame| rects = draw_wrapped(frame, frame.area(), spans, 3))
+            .expect("draw");
+        (rects, term.backend().buffer().clone())
+    }
+
+    /// **項目は途中で割れずに次の行へ送られ、返した矩形にはその項目の文字がちょうど描かれている。**
+    /// 数えた行数（[`wrapped_rows`]）は、項目が描かれた行の数と一致する。幅をいくつか変える。
+    #[test]
+    fn wrapped_items_stay_whole_and_the_counted_rows_match_the_drawn_rows() {
+        let spans = items();
+        for width in [120u16, 60, 40, 30] {
+            let (rects, buffer) = wrapped(width, 6, &spans);
+            for (span, rect) in spans.iter().zip(&rects) {
+                assert_eq!(usize::from(rect.width), span.width(), "幅{width}: {span:?}");
+                assert_eq!(
+                    text_in(&buffer, *rect).replace(' ', ""),
+                    span.content.replace(' ', ""),
+                    "幅{width}: {span:?}"
+                );
+            }
+            let used = rects.iter().map(|r| r.y).max().expect("項目がある") + 1;
+            assert_eq!(wrapped_rows(&spans, 3, width), used, "幅{width}");
+            // 同じ行に並ぶ項目は、3桁空けて左から並ぶ。
+            for pair in rects.windows(2) {
+                if pair[0].y == pair[1].y {
+                    assert_eq!(pair[0].right() + 3, pair[1].x, "幅{width}");
+                } else {
+                    assert_eq!(pair[1].x, 0, "幅{width}: 次の行の頭から");
+                }
+            }
+        }
+        assert_eq!(wrapped_rows(&spans, 3, 120), 1, "広ければ1行");
+        assert_eq!(wrapped_rows(&[], 3, 120), 0);
+    }
+
+    /// 高さに入り切らない項目は幅0（押せない）。行の頭でも入り切らない項目は右端で切れる。
+    #[test]
+    fn items_below_the_area_or_wider_than_it_are_not_pressable_past_the_edge() {
+        let spans = items();
+        let (rects, _) = wrapped(30, 2, &spans);
+        assert!(rects[..2].iter().all(|r| r.width > 0));
+        assert!(rects[2..].iter().all(|r| r.width == 0), "{rects:?}");
+        let (rects, _) = wrapped(10, 4, &spans[..1]);
+        assert_eq!(rects[0], Rect::new(0, 0, 10, 1));
+    }
+
+    /// 上辺と下辺の、角を除いた1行。
+    #[test]
+    fn the_edges_exclude_the_corners() {
+        let area = Rect::new(2, 3, 10, 5);
+        assert_eq!(top_edge(area), Rect::new(3, 3, 8, 1));
+        assert_eq!(bottom_edge(area), Rect::new(3, 7, 8, 1));
     }
 }

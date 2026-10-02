@@ -51,6 +51,18 @@ pub fn rows<'a>(text: impl Into<Text<'a>>, width: u16) -> usize {
         .line_count(text_width(width).max(1))
 }
 
+/// `text`の**行ごとに**、[`Wrapped::render`]で描いたときの行数（[`rows`]と同じ数え方を1行ずつ）。
+///
+/// 折り返しは行ごとに独立に進む（ある行の折り返しが次の行に持ち越されない）ので、合計は[`rows`]と同じになる
+/// （試験で固定している）。送れる枠の中で、ある行が画面のどこに描かれたかを求めるのに使う（`crate::scrollable`）。
+pub fn line_rows<'a>(text: impl Into<Text<'a>>, width: u16) -> Vec<usize> {
+    text.into()
+        .lines
+        .into_iter()
+        .map(|line| rows(line, width))
+        .collect()
+}
+
 /// 折り返して描く本文。`Paragraph`に`Wrap`を付けて描く代わりにこれを使う（モジュールdoc）。
 ///
 /// 枠（[`Self::block`]）を付けたときは、枠を描いてから枠の中へ本文を描く。`Paragraph`の`block`に
@@ -224,6 +236,30 @@ mod tests {
             );
         });
         assert_eq!(ours, plain);
+    }
+
+    /// **行ごとに数えた行数の合計は、まとめて数えた行数と同じ**（折り返しは行をまたがない）。空行・全角・
+    /// 長い語・はみ出す形の行を混ぜ、幅もいくつか変える。`crate::scrollable`はこの合計で行の位置を出す。
+    #[test]
+    fn rows_per_line_add_up_to_the_rows_of_the_whole_text() {
+        let lines = vec![
+            Line::raw(""),
+            Line::raw("short"),
+            Line::raw(crate::spilling_line(30)),
+            Line::raw("あ".repeat(50)),
+            Line::raw(""),
+            Line::raw("word ".repeat(30)),
+            Line::raw("x".repeat(70)),
+        ];
+        for width in [1u16, 10, 29, 31, 57, 200] {
+            let per_line = line_rows(lines.clone(), width);
+            assert_eq!(per_line.len(), lines.len());
+            assert_eq!(
+                per_line.iter().sum::<usize>(),
+                rows(lines.clone(), width),
+                "幅{width}"
+            );
+        }
     }
 
     /// 幅が1桁以下の場所でも落ちず、空けない（空けると何も描けない）。

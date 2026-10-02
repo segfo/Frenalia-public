@@ -114,8 +114,11 @@ impl<C: Clone, W: Clone> Targets<C, W> {
         None
     }
 
-    /// マウスのイベントを引く。左ボタンの押下とホイールの上下だけを扱う（モジュールdocの限界）。
+    /// マウスのイベントを引く。左ボタンの押下とホイールの上下だけを扱う（[`acts`]。モジュールdocの限界）。
     pub fn resolve(&self, event: &MouseEvent) -> Option<Pointer<C, W>> {
+        if !acts(event.kind) {
+            return None;
+        }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.clicked(event.column, event.row).map(Pointer::Click)
@@ -129,6 +132,21 @@ impl<C: Clone, W: Clone> Targets<C, W> {
             _ => None,
         }
     }
+}
+
+/// この種類のイベントが[`Targets::resolve`]で何かに当たり得るか（左ボタンの押下とホイールの上下）。
+///
+/// **当たり得ない種類（ポインタの移動・離す・ドラッグ・右/中ボタン・横スクロール）は、画面の何も変えない。**
+/// `EnableMouseCapture`はポインタの移動もすべて報告するので、イベントを1つ読むたびに描き直すループは、
+/// これで描き直しを省ける（省かないと、マウスを動かすだけで描き直し続ける）。[`Targets::resolve`]も
+/// 同じこれで絞るので、「描き直さなかったのに何かが変わった」は起きない。
+pub fn acts(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+    )
 }
 
 #[cfg(test)]
@@ -247,5 +265,32 @@ mod tests {
             assert_eq!(targets.resolve(&mouse(kind, 1, 1)), None, "{kind:?}");
         }
         assert_eq!(targets.resolve(&down(9, 9)), None, "押せる場所の外");
+    }
+
+    /// [`acts`]が偽の種類は、押せる場所と送れる場所の真上でも何にも当たらず、真の種類は当たる
+    /// （イベントループが[`acts`]で描き直しを省いても、省いたイベントで変わるものが無い）。
+    #[test]
+    fn acts_is_exactly_the_kinds_that_resolve() {
+        let mut targets: Targets<&str, &str> = Targets::default();
+        targets.click(Rect::new(0, 0, 5, 5), "button");
+        targets.wheel(Rect::new(0, 0, 5, 5), "box");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ] {
+            assert_eq!(
+                acts(kind),
+                targets.resolve(&mouse(kind, 1, 1)).is_some(),
+                "{kind:?}"
+            );
+        }
     }
 }
