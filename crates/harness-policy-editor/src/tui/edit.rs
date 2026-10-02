@@ -266,7 +266,8 @@ impl App {
             .map(|row| row.node)
     }
 
-    fn move_selection(&mut self, delta: isize) {
+    /// 選択を`delta`行動かす（`↑↓`・`PgUp/PgDn`、一覧の行のクリック。`tui::pointer`）。
+    pub(crate) fn move_selection(&mut self, delta: isize) {
         let (len, current) = match self.edit_focus {
             EditField::Sessions => (self.sessions.len(), self.selected_session),
             EditField::Proposals => (self.tree.rows(&self.expanded).len(), self.selected_row),

@@ -722,6 +722,8 @@ pub struct App {
     /// 説明欄とヘルプの送り位置（ホイールで送る。`tui::scroll`）。上限は`modal_scroll`と同じく描画が返し、
     /// [`Self::apply_draw_feedback`]が切り詰める。
     pub panels: crate::tui::scroll::PanelScroll,
+    /// 直前に描いた画面の、押せる場所とホイールで送れる枠（`tui::pointer`）。描くたびに入れ替わる。
+    pub pointer: crate::tui::pointer::Targets,
 
     // 記録画面
     pub pass: Pass,
@@ -889,6 +891,7 @@ impl App {
             modal: None,
             modal_scroll: 0,
             panels: Default::default(),
+            pointer: Default::default(),
             pass: Pass::One,
             net_mode: NetMode::RecordAll,
             command: TextInput::default(),
@@ -1437,6 +1440,7 @@ impl App {
             self.modal_scroll = self.modal_scroll.min(max);
         }
         self.panels.clamp(feedback.panels);
+        self.pointer = feedback.targets;
         if let Some(offset) = feedback.session_list_offset {
             self.session_list_offset = offset;
         }
@@ -1462,7 +1466,7 @@ impl App {
         run.noise_scroll.clamp(limits.noise);
     }
 
-    // ホイール（`on_scroll`）は`tui::scroll`が持つ（送れる枠の当たり判定と一緒に置く）。
+    // マウス（`on_mouse`）は`tui::pointer`、ホイールで送ること（`on_wheel`）は`tui::scroll`が持つ。
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         if key.kind != KeyEventKind::Press {

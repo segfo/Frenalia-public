@@ -22,17 +22,20 @@
 //! 記録画面の3枠も、`↑↓`が空いていたのにキーを足さずホイールだけを入れている（`tui::run`のイベントループの
 //! コメント）。ヘルプも「何かキーを押すと閉じる」を変えず、ホイールでだけ送る。
 //!
-//! # 当たり判定は描画と同じ割り付けを通る（BUG-194）
+//! # 当たり判定は描いた枠そのもの（BUG-194）
 //!
-//! [`target`]は画面全体の割り付け（`tui::screen_rows`）から本体を出し、各画面の描画が使うのと同じ
-//! 割り付けの関数（`record_screen::progress_areas`・各画面の`split`）で枠の位置を出す。
-//! **当たり判定のために割り付けを写さない**——写すと、中身で高さが変わる説明欄の位置を2か所で揃え続けることになる。
+//! どの枠を送るかは、各画面の描画が**枠を描いたその矩形で**登録したもの（`tui::pointer::Targets`）から引く
+//! （クリックと同じ登録。`tui::pointer`のモジュールdoc）。**当たり判定のために割り付けを写さない**——写すと、
+//! 中身で高さが変わる説明欄の位置を2か所で揃え続けることになる。2026-10-02の夕方までは、イベントのたびに
+//! 画面全体の割り付け（`tui::screen_rows`）と各画面の割り付けの関数を呼び直して枠の位置を出していた。
+//! 同じ関数を通していたので位置は一致していたが、クリックを足すときに当たり判定を1つの登録へ寄せた。
 //!
 //! # 重ねた枠が開いている間は、ポインタの位置に関係なくその枠を送る
 //!
 //! キー入力もその間は重ねた側だけが受ける（`App::on_key`）。後ろの枠を送ると、見えないところで位置が変わり、
 //! 閉じたときに読んでいた場所が失われる（BUG-194）。確認ダイアログとヘルプが両方開いているときは、上に描かれる
 //! 確認ダイアログを送る（`tui::draw`はヘルプの後に確認ダイアログを描き、キーも確認ダイアログが先に受ける）。
+//! 重ねた枠は描くときに画面全体を覆い（`Targets::cover`）、画面全体をその枠のホイールの場所として登録する。
 //!
 //! # 上限は描くまで分からない（BUG-076・BUG-196）
 //!
@@ -49,10 +52,8 @@
 //! - 送れることを言うのは、入り切らない枠の下辺（「N〜M/T行  ホイールで送る」）とスクロールバーだけで、
 //!   キー案内の行には出さない（送れるときに、その枠の上でだけ言う。キー案内の項目も増やさない）。
 
-use ratatui::layout::{Position, Rect, Size};
-
 use crate::tui::record_screen::ScrollPane;
-use crate::tui::state::{App, Screen};
+use crate::tui::state::App;
 
 /// 送れる説明欄。**中身が別物の欄には別の値を割り当てる**（承認待ちの注記とプロセスツリーは同じ場所に
 /// `t`で切り替えて出すが、位置を共有すると、切り替えた先が途中から始まる）。
@@ -154,42 +155,11 @@ pub enum Wheel {
     Record(ScrollPane),
 }
 
-/// `(column, row)`でホイールを回したときに送る枠。送る対象の無い場所なら`None`。
-///
-/// `area`は**端末全体**。重ねた枠が開いていればそれを返し（モジュールdoc）、そうでなければ描画と同じ
-/// 画面全体の割り付け（`tui::screen_rows`）から本体を出して、いまの画面の割り付けで探す。
-/// **画面の振り分けは`tui::draw`と同じ条件である**（承認待ちはタブで描き手が変わる）。
-pub fn target(area: Rect, app: &App, column: u16, row: u16) -> Option<Wheel> {
-    if app.modal.is_some() {
-        return Some(Wheel::Modal);
-    }
-    if app.help {
-        return Some(Wheel::Panel(Panel::Help));
-    }
-    let body = super::screen_rows(area, app).body;
-    let at = Position::new(column, row);
-    match app.screen {
-        Screen::Record => super::record_screen::wheel_target(body, app, at),
-        Screen::Edit if app.pending.tab.0.is_transition() => {
-            super::transition_screen::wheel_target(body, app, at)
-        }
-        Screen::Edit => super::edit_screen::wheel_target(body, app, at),
-        Screen::Declared => super::declared_screen::wheel_target(body, app, at),
-    }
-}
-
 impl App {
-    /// ホイールでポインタの下の枠を送る（[`target`]）。送る対象の無い場所では**何もしない**——
-    /// 「反応しない」ことは「壊れている」ではなく「そこは送る対象ではない」であり、外した位置で
-    /// 別の枠が動くほうが混乱する。
-    ///
-    /// 端末サイズを引数で受けるのは、状態に持ち越すとリサイズ直後に古い矩形で当たり判定を
-    /// してしまうため（呼び出し側がその場で聞く）。
-    pub fn on_scroll(&mut self, size: Size, column: u16, row: u16, up: bool) {
-        let area = Rect::new(0, 0, size.width, size.height);
-        let Some(target) = target(area, self, column, row) else {
-            return;
-        };
+    /// ポインタの下の枠をホイール1刻み送る。どの枠かは`App::on_mouse`が描いた枠の登録から引いて渡す
+    /// （モジュールdoc）。送る対象の無い場所では呼ばれない——「反応しない」ことは「壊れている」ではなく
+    /// 「そこは送る対象ではない」であり、外した位置で別の枠が動くほうが混乱する。
+    pub(crate) fn on_wheel(&mut self, target: Wheel, up: bool) {
         match target {
             Wheel::Modal => wheel_top(&mut self.modal_scroll, up),
             Wheel::Panel(panel) => self.panels.wheel(panel, up),

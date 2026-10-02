@@ -74,7 +74,8 @@ impl PendingTab {
         }
     }
 
-    fn next(self) -> Self {
+    /// `F2`で巡回する次のタブ（タブの行もこの順に並べる。`tui::draw_pending_tabs`）。
+    pub(crate) fn next(self) -> Self {
         match self {
             PendingTab::FsNet => PendingTab::TransitionsObserved,
             PendingTab::TransitionsObserved => PendingTab::TransitionsDenied,
@@ -260,7 +261,7 @@ impl PendingState {
         }
     }
 
-    fn row_mut(&mut self) -> &mut usize {
+    pub(crate) fn row_mut(&mut self) -> &mut usize {
         match self.tab.0 {
             PendingTab::TransitionsDenied => &mut self.denied_row,
             _ => &mut self.observed_row,
@@ -407,14 +408,20 @@ impl App {
         checkbox_tree::clamp_row(self.pending.row_mut(), rows);
     }
 
-    /// 承認待ち画面のタブを巡回する。**どのタブでも同じキー**（`Tab`/`Shift+Tab`）。
+    /// 承認待ち画面のタブを巡回する（`F2`。`App::on_key`）。
     pub(crate) fn cycle_pending_tab(&mut self, backward: bool) {
-        self.pending.tab = Tab(if backward {
+        self.select_pending_tab(if backward {
             self.pending.tab.0.prev()
         } else {
             self.pending.tab.0.next()
         });
-        if self.pending.tab.0.is_transition() {
+    }
+
+    /// 承認待ち画面のタブを`tab`にする。**`F2`の巡回とタブのクリックが同じこれを通る**（入ったときの読み直しを
+    /// 2か所に持たない。`tui::pointer`）。
+    pub(crate) fn select_pending_tab(&mut self, tab: PendingTab) {
+        self.pending.tab = Tab(tab);
+        if tab.is_transition() {
             // **入るたびに読み直す。** 記録し直した後にタブへ来ても古い一覧が出ない。
             self.reload_transitions();
         }

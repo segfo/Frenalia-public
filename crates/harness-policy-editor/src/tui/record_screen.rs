@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::tui::pointer::{Click, Field, Targets};
 use crate::tui::scroll::{Panel, PanelLimits, PanelScroll, Wheel};
 use crate::tui::state::{
     format_elapsed, progress_bar, spinner_frame, App, Pass, RecordField, RunState,
@@ -21,37 +22,32 @@ use crate::tui::wrap;
 /// 入力欄のラベル幅（全角6文字ぶん）。
 const LABEL_WIDTH: u16 = 12;
 
-/// 戻り値はこの描画で判明した送りの上限（3枠の[`ScrollLimits`]と、説明欄の`PanelLimits`）。
-/// 呼び出し側が`App::apply_draw_feedback`へ渡す（BUG-076と同じ理由。`scrollback`のdoc）。
+/// 戻り値はこの描画で判明した送りの上限（3枠の[`ScrollLimits`]と、説明欄の`PanelLimits`）と、押せる場所・送れる枠
+/// （入力欄と、本文の枠。`tui::pointer`）。呼び出し側が`App::apply_draw_feedback`へ渡す（BUG-076と同じ理由。`scrollback`のdoc）。
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
-    let chunks = record_rows(area);
-    draw_form(frame, chunks[0], app);
+    let chunks = Layout::vertical([Constraint::Length(7), Constraint::Min(3)]).split(area);
     let mut feedback = crate::tui::DrawFeedback::default();
+    draw_form(frame, chunks[0], app, &mut feedback.targets);
     match app.run.as_ref() {
         Some(run) => {
-            feedback.scroll =
-                draw_progress(frame, chunks[1], run, app.panels, &mut feedback.panels);
+            feedback.scroll = draw_progress(
+                frame,
+                chunks[1],
+                run,
+                app.panels,
+                &mut feedback.panels,
+                &mut feedback.targets,
+            );
         }
-        None => feedback
-            .panels
-            .set(Panel::RecordNotice, draw_notice(frame, chunks[1], app)),
+        None => feedback.panels.set(
+            Panel::RecordNotice,
+            draw_notice(frame, chunks[1], app, &mut feedback.targets),
+        ),
     }
     feedback
 }
 
-/// 記録画面の縦割り（フォーム／本文）。**描画とマウスの当たり判定が同じ関数を通る**
-/// ——別々に計算すると、片方だけ直したときに「見えている枠と反応する枠がずれる」。
-fn record_rows(area: Rect) -> std::rc::Rc<[Rect]> {
-    Layout::vertical([Constraint::Length(7), Constraint::Min(3)]).split(area)
-}
-
-/// 記録画面の本文（フォームの下）。[`progress_areas`]へ渡す矩形で、記録を始める前は「実行するとどうなるか」の枠
-/// そのもの。テストからも使う。`area`は記録画面が描かれる本体（画面全体ではない。[`wheel_target`]のdoc）。
-pub fn record_body_area(area: Rect) -> Rect {
-    record_rows(area)[1]
-}
-
-/// 実行中に出る枠の位置。[`draw_progress`]と[`wheel_target`]が共有する。
+/// 実行中に出る枠の位置（[`draw_progress`]が使う）。
 pub struct ProgressAreas {
     /// 左の列の一番上の見出し枠（「いま待っているもの」／「終わりました」）。
     pub header: Rect,
@@ -65,10 +61,10 @@ pub struct ProgressAreas {
 /// 見出し枠の高さの下限（枠の2行＋中身2行）。中身が収まる幅では、この高さのまま割り付けが変わらない。
 const HEADER_FLOOR: u16 = 4;
 
-/// 実行中の枠割りを計算する（**純粋関数**。描画と当たり判定の唯一の正本）。
+/// 実行中の枠割りを計算する（**純粋関数**）。ホイールの当たり判定は、ここで出した矩形へ描いた枠を
+/// そのまま登録する（[`draw_progress`]。`tui::pointer`）。
 ///
-/// 枠の有無が`run`の中身で変わる（警告が無ければ枠を割かない・起動時ノイズが無ければ
-/// 割かない）ので、当たり判定側も同じ`run`を見なければ一致しない。
+/// 枠の有無が`run`の中身で変わる（警告が無ければ枠を割かない・起動時ノイズが無ければ割かない）。
 pub fn progress_areas(area: Rect, run: &RunState) -> ProgressAreas {
     let columns =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
@@ -144,34 +140,6 @@ fn progress_header(run: &RunState) -> (&'static str, Color, String) {
     }
 }
 
-/// ホイールの位置から、記録画面のどの枠を送るかを決める（`tui::scroll::target`から呼ぶ）。
-///
-/// 記録を始める前は「実行するとどうなるか」の1枠だけ。始めた後は、新着を追う3枠（進行・出力・起動時ノイズ）と、
-/// 先頭から読む2枠（見出し・警告）である。枠の位置は描画と同じ[`progress_areas`]で出す。
-///
-/// `body`は記録画面が描かれる本体で、呼び出し側が描画と同じ画面全体の割り付け（`tui::screen_rows`）から出す。
-/// 以前は端末全体をそのまま本体として扱っていたので、反応する枠が見えている枠より1行上にずれ、
-/// 知らせの行とキー案内の行まで伸びていた（BUG-194）。
-pub(super) fn wheel_target(body: Rect, app: &App, at: Position) -> Option<Wheel> {
-    let below_form = record_body_area(body);
-    let Some(run) = app.run.as_ref() else {
-        return below_form
-            .contains(at)
-            .then_some(Wheel::Panel(Panel::RecordNotice));
-    };
-    let areas = progress_areas(below_form, run);
-    [
-        (Some(areas.output), Wheel::Record(ScrollPane::Output)),
-        (Some(areas.log), Wheel::Record(ScrollPane::Log)),
-        (areas.noise, Wheel::Record(ScrollPane::Noise)),
-        (Some(areas.header), Wheel::Panel(Panel::RecordHeader)),
-        (areas.warnings, Wheel::Panel(Panel::RecordWarnings)),
-    ]
-    .into_iter()
-    .find(|(area, _)| area.is_some_and(|r| r.contains(at)))
-    .map(|(_, wheel)| wheel)
-}
-
 /// スクロールできる枠の識別子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollPane {
@@ -180,7 +148,8 @@ pub enum ScrollPane {
     Noise,
 }
 
-fn draw_form(frame: &mut Frame, area: Rect, app: &App) {
+/// 入力欄は、`Tab`で入るのと同じ状態にする場所として登録する（ラベルも含めた1行。`tui::pointer`）。
+fn draw_form(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
     let block = Block::default().borders(Borders::ALL).title(" 記録 ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -210,6 +179,7 @@ fn draw_form(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
     frame.render_widget(Paragraph::new(Line::from(pass_line)), rows[0]);
+    targets.click(rows[0], Click::Field(Field::Record(RecordField::Pass)));
 
     draw_input(
         frame,
@@ -218,6 +188,7 @@ fn draw_form(frame: &mut Frame, area: Rect, app: &App) {
         &app.command,
         app.record_focus == RecordField::Command,
     );
+    targets.click(rows[1], Click::Field(Field::Record(RecordField::Command)));
     draw_input(
         frame,
         rows[2],
@@ -225,6 +196,7 @@ fn draw_form(frame: &mut Frame, area: Rect, app: &App) {
         &app.cwd,
         app.record_focus == RecordField::Cwd,
     );
+    targets.click(rows[2], Click::Field(Field::Record(RecordField::Cwd)));
     if app.pass == Pass::Two {
         draw_input(
             frame,
@@ -233,6 +205,7 @@ fn draw_form(frame: &mut Frame, area: Rect, app: &App) {
             &app.run_domain,
             app.record_focus == RecordField::Domain,
         );
+        targets.click(rows[3], Click::Field(Field::Record(RecordField::Domain)));
     }
 
     if let Some(run) = app.run.as_ref() {
@@ -350,7 +323,7 @@ fn label_style(focused: bool) -> Style {
 
 /// 実行前に「何が起きるか」を出す。**UACが何回出るか・マシンに何が残るか**が判断材料なので、
 /// 文言は実行する側（`record`/`record_net`）が持つものをそのまま見せる。戻り値は送れる上限。
-fn draw_notice(frame: &mut Frame, area: Rect, app: &App) -> u16 {
+fn draw_notice(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) -> u16 {
     let mut text = app.pass.elevation_notice();
     if app.pass == Pass::Two {
         text.push_str(
@@ -368,7 +341,8 @@ fn draw_notice(frame: &mut Frame, area: Rect, app: &App) -> u16 {
         }
     }
     // この枠は本文の残り全部を使うので、伸ばす先が無い。低い端末で入らない分はホイールで送る（`tui::scroll`）。
-    wrap::draw_scrollable(
+    targets.wheel(area, Wheel::Panel(Panel::RecordNotice));
+    harness_term::scrollable::draw(
         frame,
         area,
         text,
@@ -376,17 +350,19 @@ fn draw_notice(frame: &mut Frame, area: Rect, app: &App) -> u16 {
             .borders(Borders::ALL)
             .title(" 実行するとどうなるか "),
         app.panels.top(Panel::RecordNotice),
-        wrap::Look::panel(Style::default()),
+        wrap::panel_look(Style::default()),
     )
 }
 
 /// 実行中の枠を描く。見出し枠と警告枠の送れる上限は`limits`へ入れ、3枠のさかのぼり上限を返す。
+/// 描いた5枠は、ホイールで送る枠として`targets`へ登録する。
 fn draw_progress(
     frame: &mut Frame,
     area: Rect,
     run: &RunState,
     panels: PanelScroll,
     limits: &mut PanelLimits,
+    targets: &mut Targets,
 ) -> ScrollLimits {
     // **対応が要る事実は専用の枠へ出す。** 進行ログは末尾だけを見せる窓なので、早い段階で
     // 出た警告（実行ファイルへ届かない等）は実行が終わる頃には流れて**見えなくなる**。
@@ -394,16 +370,25 @@ fn draw_progress(
     // 進行ログに出ていたのにユーザーの画面には残っていなかった。
     // **無いときは枠を割かない**（空枠は何も伝えない。起動時ノイズの枠と同じ方針）。
     //
-    // 枠の位置は見出し枠・警告枠を含めて[`progress_areas`]が持つ（マウスの当たり判定と同じ計算を
-    // 通すため）。以前は見出し枠と警告枠の割り付けをここでも書き直しており、高さを中身から決める
-    // ようにした時点で2か所を揃え続ける必要が生じたので、1か所へ寄せた（BUG-192）。
+    // 枠の位置は見出し枠・警告枠を含めて[`progress_areas`]が持つ。以前は見出し枠と警告枠の割り付けを
+    // ここでも書き直しており、高さを中身から決めるようにした時点で2か所を揃え続ける必要が生じたので、
+    // 1か所へ寄せた（BUG-192）。ホイールの当たり判定は、描いた矩形をそのまま登録する（`tui::pointer`）。
     let areas = progress_areas(area, run);
+    targets.wheel(areas.header, Wheel::Panel(Panel::RecordHeader));
+    if let Some(warnings) = areas.warnings {
+        targets.wheel(warnings, Wheel::Panel(Panel::RecordWarnings));
+    }
+    targets.wheel(areas.log, Wheel::Record(ScrollPane::Log));
+    targets.wheel(areas.output, Wheel::Record(ScrollPane::Output));
+    if let Some(noise) = areas.noise {
+        targets.wheel(noise, Wheel::Record(ScrollPane::Noise));
+    }
     let log_area = areas.log;
     let (header_title, header_color, header_text) = progress_header(run);
     let header_border = Style::default().fg(header_color);
     limits.set(
         Panel::RecordHeader,
-        wrap::draw_scrollable(
+        harness_term::scrollable::draw(
             frame,
             areas.header,
             header_text,
@@ -412,7 +397,7 @@ fn draw_progress(
                 .border_style(header_border)
                 .title(header_title),
             panels.top(Panel::RecordHeader),
-            wrap::Look::panel(header_border),
+            wrap::panel_look(header_border),
         ),
     );
 
@@ -430,7 +415,7 @@ fn draw_progress(
             .collect();
         limits.set(
             Panel::RecordWarnings,
-            wrap::draw_scrollable(
+            harness_term::scrollable::draw(
                 frame,
                 warnings_area,
                 lines,
@@ -439,7 +424,7 @@ fn draw_progress(
                     .border_style(border)
                     .title(format!(" ⚠ 対応が要ります（{}件） ", run.warnings.len())),
                 panels.top(Panel::RecordWarnings),
-                wrap::Look::panel(border),
+                wrap::panel_look(border),
             ),
         );
     }

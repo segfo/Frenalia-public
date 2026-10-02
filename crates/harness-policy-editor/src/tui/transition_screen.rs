@@ -6,14 +6,15 @@
 //! （インデントと開閉記号）を前提にしている。**ここは平坦な一覧である**
 //! （理由は`crate::tui::transition`のモジュールdoc）。
 
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use crate::transition_candidates::{Candidate, Declared, Source};
 use crate::tui::checkbox_tree::Mark;
+use crate::tui::pointer::{register_rows, Click, Field, Hot, ListId, Targets};
 use crate::tui::scroll::{Panel, Wheel};
 use crate::tui::state::App;
 use crate::tui::transition::{Counts, PendingFilter, PendingTab};
@@ -23,31 +24,37 @@ use crate::tui::wrap;
 /// 選択中のフルパス2行で、折り返さずに収まる端末ではこの高さのまま割り付けが変わらない。
 const NOTES_FLOOR: u16 = 8;
 
+/// 遷移先の欄・一覧の行・`[x]`は押せる場所として、下の枠はホイールで送る枠として、描いた矩形で登録する
+/// （`tui::pointer`）。
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
     let notes = notes_text(app);
     let chunks = split(area, &notes);
+    let mut feedback = crate::tui::DrawFeedback::default();
     draw_destination(frame, chunks[0], app);
-    let offset = draw_list(frame, chunks[1], app);
-    let mut feedback = crate::tui::DrawFeedback {
-        candidate_list_offset: Some(offset),
-        ..Default::default()
-    };
+    feedback
+        .targets
+        .click(chunks[0], Click::Field(Field::Destination));
+    feedback.candidate_list_offset = Some(draw_list(frame, chunks[1], app, &mut feedback.targets));
     // 入り切らない分はホイールで送る（`tui::scroll`）。
+    feedback
+        .targets
+        .wheel(chunks[2], Wheel::Panel(Panel::TransitionNotes));
     feedback.panels.set(
         Panel::TransitionNotes,
-        wrap::draw_scrollable(
+        harness_term::scrollable::draw(
             frame,
             chunks[2],
             notes,
             Block::default().borders(Borders::ALL).title(" この画面 "),
             app.panels.top(Panel::TransitionNotes),
-            wrap::Look::panel(Style::default()),
+            wrap::panel_look(Style::default()),
         ),
     );
     feedback
 }
 
-/// 遷移先の欄・一覧・下の枠の割り付け。**描画とホイールの当たり判定（[`wheel_target`]）が同じこれを通る**（BUG-194）。
+/// 遷移先の欄・一覧・下の枠の割り付け。押せる場所・送れる枠は、ここで出した矩形へ描いたものをそのまま登録する
+/// （BUG-194。`tui::pointer`）。
 ///
 /// 下の枠は**中身を折り返した行数ぶん**の高さを取る（BUG-192。`tui::wrap`）。以前は8行固定で、
 /// 狭い端末で注記が折り返すと下から黙って切れていた。上限は本文の半分（一覧を潰さない）で、
@@ -61,13 +68,6 @@ fn split(area: Rect, notes: &str) -> std::rc::Rc<[Rect]> {
         Constraint::Length(height),
     ])
     .split(area)
-}
-
-/// ホイールの位置が下の枠の上なら、その枠を送る（`tui::scroll::target`から呼ぶ。`area`は本体）。
-pub(super) fn wheel_target(area: Rect, app: &App, at: Position) -> Option<Wheel> {
-    split(area, &notes_text(app))[2]
-        .contains(at)
-        .then_some(Wheel::Panel(Panel::TransitionNotes))
 }
 
 /// 遷移先ドメインの欄。**名前の横に、`harness.exe`が用意する見込みを出す**——書いた後で
@@ -107,7 +107,8 @@ fn draw_destination(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// 戻り値はratatuiが選択を見せるために定めた表示開始位置（呼び出し側が保存する）。
-fn draw_list(frame: &mut Frame, area: Rect, app: &App) -> usize {
+/// 描いた行と`[x]`は押せる場所として登録する。
+fn draw_list(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) -> usize {
     let tab = app.pending.tab.0;
     let counts = app.pending.counts(tab);
     // **件数を必ず見出しに出す**——「無い」と「隠している」が区別できないと、
@@ -136,24 +137,32 @@ fn draw_list(frame: &mut Frame, area: Rect, app: &App) -> usize {
 
     // **同じ実行ファイル名が2つ以上あるときだけ、置き場を添える**（下記[`exe_label`]）。
     let ambiguous = ambiguous_file_names(&visible);
-    let items: Vec<ListItem> = visible
+    let lines: Vec<Line> = visible
         .iter()
-        .map(|candidate| ListItem::new(vec![row_line(app, candidate, &ambiguous)]))
+        .map(|candidate| row_line(app, candidate, &ambiguous))
         .collect();
+    // チェックの記号は行の先頭のspan（[`row_line`]）。
+    let hot: Vec<Hot> = lines
+        .iter()
+        .map(|line| Hot::of(&line.spans, Some(0), None))
+        .collect();
+    let items: Vec<ListItem> = lines.into_iter().map(ListItem::new).collect();
 
     let mut state = ListState::default().with_offset(app.candidate_list_offset);
     state.select(Some(app.pending.row()));
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(block)
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+    let rows = harness_term::list::draw(
+        frame,
         area,
+        items,
+        Some(block),
+        Style::default().add_modifier(Modifier::REVERSED),
         &mut state,
     );
+    register_rows(targets, ListId::Transitions, &rows, &hot);
     state.offset()
 }
 
-/// 1行を組み立てる。
+/// 1行を組み立てる。**チェックの記号は先頭のspanに置く**（押せる場所を求めるのに使う。[`draw_list`]）。
 ///
 /// **`[x]`は「確定したらこのプログラムを起こせる」**という意味に統一してある
 /// ——いま宣言済みで取り消し予約もしていない行も、これから承認する行も`[x]`である。

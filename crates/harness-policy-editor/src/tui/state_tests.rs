@@ -955,66 +955,6 @@ fn appending_lines_does_not_touch_the_scroll_position() {
     assert_eq!(app.run.as_ref().unwrap().output_scroll.offset(), 4);
 }
 
-/// **当たり判定が描画と同じ枠割りを通っていること。**
-///
-/// ここがずれると「見えている枠と反応する枠が違う」という、最も気付きにくい壊れ方になる。
-/// 枠の有無は`run`の中身で変わる（警告が無ければ枠を割かない・ノイズが無ければ割かない）ので、
-/// **ノイズ枠が無いときにその座標が他の枠を掴まないこと**まで見る。
-///
-/// **この試験は枠の位置を割り付けの関数から計算しているので、描いた画面とのずれは測れない。**
-/// 以前は端末全体を本体として計算しており、当たり判定と同じ誤りを共有していたため、1行のずれ
-/// （BUG-194）を素通りさせた。描いた画面を期待値にする試験は
-/// `render_tests::the_wheel_scrolls_the_pane_drawn_under_the_pointer`が持つ（2026-10-02から全画面の説明欄も見る）。
-#[test]
-fn the_wheel_hits_the_same_panes_that_are_drawn() {
-    use crate::tui::record_screen::{progress_areas, record_body_area, ScrollPane};
-    use crate::tui::scroll::{target, Panel, Wheel};
-    use ratatui::layout::Rect;
-
-    let area = Rect::new(0, 0, 120, 40);
-    let mut app = App::new(PathBuf::from("C:/w"), harness_core::RequireSandbox::None);
-    app.run = Some(RunState::new(Pass::One));
-
-    // 記録を始める前は「実行するとどうなるか」の1枠だけが送る対象（2026-10-02から。それまでは何も無かった）。
-    let idle = App::new(PathBuf::from("C:/w"), harness_core::RequireSandbox::None);
-    assert_eq!(
-        target(area, &idle, 80, 20),
-        Some(Wheel::Panel(Panel::RecordNotice))
-    );
-
-    let run = app.run.as_ref().unwrap();
-    // 描画と同じく、画面全体をタブ・本体・知らせ・キー案内に割ってから本体を使う。
-    let areas = progress_areas(
-        record_body_area(crate::tui::screen_rows(area, &app).body),
-        run,
-    );
-
-    // 各枠の内側の点が、その枠として判定される。
-    let inside = |r: ratatui::layout::Rect| (r.x + r.width / 2, r.y + r.height / 2);
-    let (c, r) = inside(areas.output);
-    assert_eq!(
-        target(area, &app, c, r),
-        Some(Wheel::Record(ScrollPane::Output))
-    );
-    let (c, r) = inside(areas.log);
-    assert_eq!(
-        target(area, &app, c, r),
-        Some(Wheel::Record(ScrollPane::Log))
-    );
-    let (c, r) = inside(areas.header);
-    assert_eq!(
-        target(area, &app, c, r),
-        Some(Wheel::Panel(Panel::RecordHeader))
-    );
-
-    // ノイズが無いのでノイズ枠は存在せず、その位置は出力枠が占めている。
-    assert!(areas.noise.is_none(), "ノイズが無ければ枠を割かない");
-
-    // 上のフォーム（記録の入力欄）は送る対象ではない。
-    assert_eq!(target(area, &app, 10, 1), None);
-    assert_eq!(target(area, &idle, 10, 1), None);
-}
-
 /// **一覧の表示開始位置はフレームをまたいで保たれる。**
 ///
 /// 保たないと、ratatuiは毎フレーム「offset 0 から最小限スクロールして選択を見せる」計算を

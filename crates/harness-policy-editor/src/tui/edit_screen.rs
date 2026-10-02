@@ -7,34 +7,39 @@
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
+use crate::tui::checkbox_tree::{FOLD_SPAN, MARK_SPAN};
+use crate::tui::pointer::{register_rows, Click, Field, Hot, ListId, Targets};
 use crate::tui::scroll::{Panel, Wheel};
 use crate::tui::state::{App, EditField};
 use crate::tui::wrap;
 
+/// 一覧の行・`[x]`・`▾`/`▸`・ドメイン欄は押せる場所として、注記の枠はホイールで送る枠として、描いた矩形で
+/// 登録する（`tui::pointer`）。
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
     let (panel, title, notes) = notes_content(app);
     let areas = split(area, &notes);
-    let session_list_offset = draw_sessions(frame, areas.sessions, app);
+    let mut feedback = crate::tui::DrawFeedback::default();
+    let targets = &mut feedback.targets;
+    let session_list_offset = draw_sessions(frame, areas.sessions, app, targets);
     draw_domain(frame, areas.domain, app);
-    let candidate_list_offset = draw_proposals(frame, areas.proposals, app);
-    let mut feedback = crate::tui::DrawFeedback {
-        session_list_offset: Some(session_list_offset),
-        candidate_list_offset: Some(candidate_list_offset),
-        ..Default::default()
-    };
+    targets.click(areas.domain, Click::Field(Field::Domain));
+    let candidate_list_offset = draw_proposals(frame, areas.proposals, app, targets);
     // 入り切らない分はホイールで送る（`tui::scroll`）。
+    targets.wheel(areas.notes, Wheel::Panel(panel));
+    feedback.session_list_offset = Some(session_list_offset);
+    feedback.candidate_list_offset = Some(candidate_list_offset);
     feedback.panels.set(
         panel,
-        wrap::draw_scrollable(
+        harness_term::scrollable::draw(
             frame,
             areas.notes,
             notes,
             Block::default().borders(Borders::ALL).title(title),
             app.panels.top(panel),
-            wrap::Look::panel(Style::default()),
+            wrap::panel_look(Style::default()),
         ),
     );
     feedback
@@ -48,7 +53,7 @@ struct Areas {
     notes: Rect,
 }
 
-/// 画面の割り付け。**描画とホイールの当たり判定（[`wheel_target`]）が同じこれを通る**（BUG-194）。
+/// 画面の割り付け。押せる場所・送れる枠は、ここで出した矩形へ描いたものをそのまま登録する（BUG-194。`tui::pointer`）。
 ///
 /// 注記の枠は**中身を折り返した行数ぶん**の高さを取る（BUG-192。`tui::wrap`）。以前は9行固定で、
 /// 入り切らない分が黙って切れていた。上限は右の列の半分（候補一覧を潰さない）で、プロセスツリーの
@@ -72,17 +77,9 @@ fn split(area: Rect, notes: &str) -> Areas {
     }
 }
 
-/// ホイールの位置が注記の枠の上なら、その枠を送る（`tui::scroll::target`から呼ぶ。`area`は本体）。
-pub(super) fn wheel_target(area: Rect, app: &App, at: Position) -> Option<Wheel> {
-    let (panel, _, notes) = notes_content(app);
-    split(area, &notes)
-        .notes
-        .contains(at)
-        .then_some(Wheel::Panel(panel))
-}
-
 /// 戻り値はratatuiが選択を見せるために定めた表示開始位置（呼び出し側が保存する）。
-fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) -> usize {
+/// 描いた行は、押すとその記録を選ぶ場所として登録する（記録が無いときの案内の行は押せない）。
+fn draw_sessions(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) -> usize {
     let items: Vec<ListItem> = if app.sessions.is_empty() {
         vec![ListItem::new(Line::styled(
             "（記録がありません。F1でコマンドを記録してください）",
@@ -117,18 +114,22 @@ fn draw_sessions(frame: &mut Frame, area: Rect, app: &App) -> usize {
     if !app.sessions.is_empty() {
         state.select(Some(app.selected_session));
     }
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(focus_style(app.edit_focus == EditField::Sessions))
-                    .title(" 記録セッション（新しい順） "),
-            )
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+    let rows = harness_term::list::draw(
+        frame,
         area,
+        items,
+        Some(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(focus_style(app.edit_focus == EditField::Sessions))
+                .title(" 記録セッション（新しい順） "),
+        ),
+        Style::default().add_modifier(Modifier::REVERSED),
         &mut state,
     );
+    if !app.sessions.is_empty() {
+        register_rows(targets, ListId::Sessions, &rows, &[]);
+    }
     // ratatuiが選択を見せるために動かしたoffsetを返す（呼び出し側が保存する）。
     state.offset()
 }
@@ -164,7 +165,8 @@ fn draw_domain(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// 戻り値はratatuiが選択を見せるために定めた表示開始位置（呼び出し側が保存する）。
-fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
+/// 描いた行・`[x]`・`▾`/`▸`は押せる場所として登録する（ロック行は押せない。カーソルが乗らないのと同じ）。
+fn draw_proposals(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) -> usize {
     let visible = app.visible_proposals();
     // **隠している件数を必ず出す**（B-09）。既定のフィルタは承認できるものだけなので、
     // 出していないものがあることが分からないと「候補が少ない」と誤解される。
@@ -229,6 +231,8 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
 
     // パスの木として描く。1本道は畳んであるので、意味のある分岐だけが行になる。
     let rows = app.tree.rows(&app.expanded);
+    // 行ごとの`[x]`と`▾`/`▸`の位置（押せる場所。spanの並びは`checkbox_tree::row_line`と同じ）。
+    let mut hot = Vec::with_capacity(rows.len());
     let items: Vec<ListItem> = rows
         .iter()
         .map(|row| {
@@ -284,6 +288,11 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
                 ),
                 Span::raw(format!(" {}", node.label)),
             ];
+            hot.push(Hot::of(
+                &spans,
+                Some(MARK_SPAN),
+                has_children.then_some((FOLD_SPAN, opened)),
+            ));
             // [D-63] 再帰指定。**書かれる値そのもの（`/**`）を出す**——「再帰」という語より、
             // 実際にpolicy.jsonへ入る文字列を見せた方が誤解が無い。色は赤（この1行が他の全部より
             // 重い操作なので、一覧の中で埋もれてはいけない）。
@@ -395,9 +404,9 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
     // 貼り付き、カーソルが窓の中を動かない（`App::candidate_list_offset`のdoc）。
     let mut state = ListState::default().with_offset(app.candidate_list_offset);
     state.select(Some(app.selected_row));
-    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let highlight = Style::default().add_modifier(Modifier::REVERSED);
 
-    match locked {
+    let drawn = match locked {
         // ロック行はブロックの内側の先頭を占め、リストはその下に描く。
         //
         // **高さはロック行を折り返した行数ぶん取る**（BUG-192。`tui::wrap`）。以前は2行固定で、
@@ -412,10 +421,11 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
             let rows =
                 Layout::vertical([Constraint::Length(lock_rows), Constraint::Min(1)]).split(inner);
             harness_term::wrap::Wrapped::new(lines).render(frame, rows[0]);
-            frame.render_stateful_widget(list, rows[1], &mut state);
+            harness_term::list::draw(frame, rows[1], items, None, highlight, &mut state)
         }
-        None => frame.render_stateful_widget(list.block(block), area, &mut state),
-    }
+        None => harness_term::list::draw(frame, area, items, Some(block), highlight, &mut state),
+    };
+    register_rows(targets, ListId::Proposals, &drawn, &hot);
     state.offset()
 }
 

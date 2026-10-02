@@ -4,13 +4,14 @@
 //! 組み立て・選択の移動は共通で、この画面が足すのは「どのドメインの宣言か」だけである
 //! （`docs/CODE-STRUCTURE-RULES.md`§5.1）。
 
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
+use ratatui::widgets::{Block, Borders, ListItem, ListState};
 use ratatui::Frame;
 
-use crate::tui::checkbox_tree::{self, Mark};
+use crate::tui::checkbox_tree::{self, Mark, FOLD_SPAN, MARK_SPAN};
+use crate::tui::pointer::{register_rows, Hot, ListId, Targets};
 use crate::tui::scroll::{Panel, Wheel};
 use crate::tui::state::App;
 use crate::tui::wrap;
@@ -18,30 +19,33 @@ use crate::tui::wrap;
 /// 説明欄の高さの下限（枠の2行を含む）。中身が収まる端末では、この高さのまま割り付けが変わらない。
 const NOTES_FLOOR: u16 = 10;
 
+/// 一覧の行・`[x]`・`▾`/`▸`は押せる場所として、説明欄はホイールで送る枠として、描いた矩形で登録する
+/// （`tui::pointer`）。
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
     let notes = notes_text(app);
     let chunks = split(area, &notes);
-    let declared_list_offset = draw_tree(frame, chunks[0], app);
-    let mut feedback = crate::tui::DrawFeedback {
-        declared_list_offset: Some(declared_list_offset),
-        ..Default::default()
-    };
+    let mut feedback = crate::tui::DrawFeedback::default();
+    feedback.declared_list_offset = Some(draw_tree(frame, chunks[0], app, &mut feedback.targets));
     // 入り切らない分はホイールで送る（`tui::scroll`）。
+    feedback
+        .targets
+        .wheel(chunks[1], Wheel::Panel(Panel::DeclaredNotes));
     feedback.panels.set(
         Panel::DeclaredNotes,
-        wrap::draw_scrollable(
+        harness_term::scrollable::draw(
             frame,
             chunks[1],
             notes,
             Block::default().borders(Borders::ALL).title(" この画面 "),
             app.panels.top(Panel::DeclaredNotes),
-            wrap::Look::panel(Style::default()),
+            wrap::panel_look(Style::default()),
         ),
     );
     feedback
 }
 
-/// 一覧と説明欄の割り付け。**描画とホイールの当たり判定（[`wheel_target`]）が同じこれを通る**（BUG-194）。
+/// 一覧と説明欄の割り付け。押せる場所・送れる枠は、ここで出した矩形へ描いたものをそのまま登録する
+/// （BUG-194。`tui::pointer`）。
 ///
 /// 説明欄は**中身を折り返した行数ぶん**の高さを取る（BUG-192。`tui::wrap`）。
 /// 以前は「操作の案内（折り返して最大2行）＋未承認の案内（折り返して最大2行）＋取り消しの注記4行」
@@ -54,15 +58,9 @@ fn split(area: Rect, notes: &str) -> std::rc::Rc<[Rect]> {
     Layout::vertical([Constraint::Min(3), Constraint::Length(height)]).split(area)
 }
 
-/// ホイールの位置が説明欄の上なら、説明欄を送る（`tui::scroll::target`から呼ぶ。`area`は本体）。
-pub(super) fn wheel_target(area: Rect, app: &App, at: Position) -> Option<Wheel> {
-    split(area, &notes_text(app))[1]
-        .contains(at)
-        .then_some(Wheel::Panel(Panel::DeclaredNotes))
-}
-
 /// 戻り値はratatuiが選択を見せるために定めた表示開始位置（呼び出し側が保存する）。
-fn draw_tree(frame: &mut Frame, area: Rect, app: &App) -> usize {
+/// 描いた行・`[x]`・`▾`/`▸`は押せる場所として登録する。
+fn draw_tree(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) -> usize {
     let title = format!(
         " 承認済みの宣言: {}件（このマシンで未承認 {}件・承認予約 {}件・付け替え予約 {}件・取り消し予約 {}件）／policy.json ",
         app.declared.len(),
@@ -91,6 +89,8 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &App) -> usize {
     }
 
     let rows = app.declared_tree.rows(&app.declared_expanded);
+    // 行ごとの`[x]`と`▾`/`▸`の位置（押せる場所。spanの並びは`checkbox_tree::row_line`）。
+    let mut hot = Vec::with_capacity(rows.len());
     let items: Vec<ListItem> = rows
         .iter()
         .map(|row| {
@@ -161,27 +161,31 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &App) -> usize {
                     }
                 }
             }
-            ListItem::new(vec![checkbox_tree::row_line(
-                &app.declared_tree,
-                node,
-                row.depth,
-                opened,
-                mark,
-                extra,
-            )])
+            let line =
+                checkbox_tree::row_line(&app.declared_tree, node, row.depth, opened, mark, extra);
+            hot.push(Hot::of(
+                &line.spans,
+                Some(MARK_SPAN),
+                app.declared_tree
+                    .has_children(node)
+                    .then_some((FOLD_SPAN, opened)),
+            ));
+            ListItem::new(vec![line])
         })
         .collect();
 
     // **offsetをフレームをまたいで保つ**（`App::declared_list_offset`のdoc）。
     let mut state = ListState::default().with_offset(app.declared_list_offset);
     state.select(Some(app.declared_row));
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(block)
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+    let drawn = harness_term::list::draw(
+        frame,
         area,
+        items,
+        Some(block),
+        Style::default().add_modifier(Modifier::REVERSED),
         &mut state,
     );
+    register_rows(targets, ListId::Declared, &drawn, &hot);
     state.offset()
 }
 

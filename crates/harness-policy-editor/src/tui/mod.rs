@@ -19,6 +19,10 @@
 //! 一方通行ではない。**ヘルプは`F4`**で、`F2`をもう一度押すと承認待ちのタブが切り替わる
 //! （決定62。`Tab`は承認待ち画面が項目移動に使っているので奪えない——詳細は`state::App::on_key`）。
 //!
+//! **マウスでも操作できる**（2026-10-02）——タブ・一覧の行と`[x]`・`▾`/`▸`・入力欄・キー案内の項目・確認ダイアログの
+//! ボタンを押すと、対応するキーを押したのと同じになり、ホイールはポインタの下の枠を送る。当たり判定は、描いた矩形を
+//! 描くときにそのまま登録したもの（[`pointer`]。土台は会話TUIと共有する`harness_term::pointer`）。
+//!
 //! # 承認待ちは3つのタブを持つ（決定62、段階⑦）
 //!
 //! ファイル・通信の候補と、**遷移（どのプログラムが何を起こしてよいか）**の候補は
@@ -61,9 +65,13 @@ mod declared;
 mod declared_screen;
 mod edit;
 mod edit_screen;
+/// 画面の一番下のキー案内（項目はクリックでそのキーを押せる）。
+mod key_hints;
+/// マウスのクリックとホイール。押せる場所と送れる枠は描くときに登録する（2026-10-02）。
+mod pointer;
 mod proposal_tree;
 pub mod record_screen;
-/// 送れる枠（説明欄・ヘルプ・確認ダイアログ・記録画面の3枠）の位置と、ホイールの当たり判定（2026-10-02）。
+/// 送れる枠（説明欄・ヘルプ・確認ダイアログ・記録画面の3枠）の位置と、ホイールで送ること（2026-10-02）。
 mod scroll;
 mod stderr_capture;
 mod text_input;
@@ -83,27 +91,31 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders};
 use ratatui::{Frame, Terminal};
 
+use pointer::{Click, Targets};
+use scroll::Wheel;
 use state::{Action, App, Screen};
+use transition::PendingTab;
 
 /// **1フレーム描いて初めて分かること。** 呼び出し側が[`App::apply_draw_feedback`]で状態へ書き戻す。
 ///
-/// 描画時にしか決まらない値が2種類ある。
+/// 描画時にしか決まらない値が3種類ある。
 ///
 /// 1. さかのぼり・送りの上限（記録画面の3枠・確認ダイアログ・説明欄とヘルプ。折り返し後の行数は枠の幅に
 ///    依存する。`harness_term::scrollback`・`tui::scroll`のdoc）
 /// 2. 一覧の表示開始位置（ratatuiが「選択を見せる」ために動かした結果）
+/// 3. 押せる場所とホイールで送れる枠（描いた矩形そのもの。`tui::pointer`）
 ///
-/// どちらも**書き戻さないと壊れる**——1を怠ると端で空回りし（BUG-076）、
-/// 2を怠るとカーソルが窓の中を動かず一覧の方が滑る。
-#[derive(Debug, Default, Clone, Copy)]
+/// どれも**書き戻さないと壊れる**——1を怠ると端で空回りし（BUG-076）、
+/// 2を怠るとカーソルが窓の中を動かず一覧の方が滑り、3を怠るとマウスが前の画面の場所で当たる。
+#[derive(Debug, Default, Clone)]
 pub struct DrawFeedback {
     pub scroll: record_screen::ScrollLimits,
     /// 確認ダイアログを送れる上限（本文の最後の行が枠の一番下に来る位置。[BUG-196](../../../../docs/bugs/BUG-196.md)）。
@@ -116,6 +128,8 @@ pub struct DrawFeedback {
     pub session_list_offset: Option<usize>,
     pub candidate_list_offset: Option<usize>,
     pub declared_list_offset: Option<usize>,
+    /// この描画で描いた、押せる場所と送れる枠（重なりは描いた順。後が上）。
+    pub targets: Targets,
 }
 
 /// 描画とworkerの取り込みの間隔。キー入力はこの待ちの中で拾う。
@@ -179,7 +193,7 @@ pub fn run(
     // 会話TUI（`harness-tui`の`lib.rs`）と同じ形。
     let mut feedback = DrawFeedback::default();
     term.draw(|frame| feedback = draw(frame, &app))?;
-    app.apply_draw_feedback(feedback);
+    app.apply_draw_feedback(std::mem::take(&mut feedback));
     app.prewarm_netfilterd();
 
     loop {
@@ -193,43 +207,23 @@ pub fn run(
         // **描画で判明した上限を状態へ戻す。** これを怠ると、先頭まで遡った後も
         // 回した分だけ内部の値が伸び続け、下へ戻すときに同じ回数だけ空回りする（BUG-076）。
         term.draw(|frame| feedback = draw(frame, &app))?;
-        app.apply_draw_feedback(feedback);
+        app.apply_draw_feedback(std::mem::take(&mut feedback));
 
+        // **イベントは1周に1つだけ読み、読んだら必ず描き直す。** マウスの当たり判定は直前に描いた画面の
+        // 登録で引く（`tui::pointer`）ので、2つ目のイベントを描かずに処理すると、1つ目で変わった画面ではなく
+        // その前の画面の場所で当たる。リサイズも同じく、次の周回で描き直してから次のイベントを読む。
         if !event::poll(TICK)? {
             continue;
         }
-        match event::read()? {
-            Event::Key(key) => match app.on_key(key) {
-                Some(Action::Quit) => break,
-                Some(Action::StartPass1(request)) => {
-                    app.attach_handle(worker::spawn_pass1(*request));
-                }
-                Some(Action::StartPass2(request)) => {
-                    app.attach_handle(worker::spawn_pass2(*request));
-                }
-                None => {}
-            },
-            // **ホイールはポインタの下の枠を送る**（記録画面の3枠・各画面の説明欄。確認ダイアログと
-            // ヘルプが開いている間は、ポインタの位置に関係なくそれを送る。`tui::scroll`）。
-            //
-            // `↑/↓`は項目移動、`←/→`はパス切替で既に埋まっているので、キーを増やさずに
-            // 済むホイールだけを入れている。枠の当たり判定は描画とまったく同じ計算を通す
-            // （`scroll::target`が画面全体の割り付け[`screen_rows`]から辿る）
-            // ——別々に持つと「見えている枠と反応する枠」がずれる（BUG-194は実際にずれていた）。
-            // 端末の大きさはここで聞き直すので、位置を状態に持ち越さない。
-            Event::Mouse(mouse) => {
-                let delta = match mouse.kind {
-                    event::MouseEventKind::ScrollUp => Some(true),
-                    event::MouseEventKind::ScrollDown => Some(false),
-                    _ => None,
-                };
-                if let Some(up) = delta {
-                    app.on_scroll(term.size()?, mouse.column, mouse.row, up);
-                }
+        match handle_event(&mut app, event::read()?) {
+            Some(Action::Quit) => break,
+            Some(Action::StartPass1(request)) => {
+                app.attach_handle(worker::spawn_pass1(*request));
             }
-            // リサイズは次のdrawで反映される。
-            Event::Resize(_, _) | Event::Paste(_) => {}
-            _ => {}
+            Some(Action::StartPass2(request)) => {
+                app.attach_handle(worker::spawn_pass2(*request));
+            }
+            None => {}
         }
     }
 
@@ -260,6 +254,19 @@ pub fn run(
     Ok(())
 }
 
+/// イベント1つを状態へ渡す。**イベントループ（[`run`]）と試験が同じこれを通る**（製品の入口）。
+///
+/// キーは`App::on_key`、マウスは`App::on_mouse`（クリックとホイール。当たり判定は直前に描いた画面の登録）。
+/// クリックで起きる操作（記録の開始・終了）もキーと同じ[`Action`]で返る。リサイズ・貼り付けは何もしない
+/// （リサイズは次の描画で反映される）。
+pub(crate) fn handle_event(app: &mut App, event: Event) -> Option<Action> {
+    match event {
+        Event::Key(key) => app.on_key(key),
+        Event::Mouse(mouse) => app.on_mouse(mouse),
+        _ => None,
+    }
+}
+
 /// 画面全体の縦割り（タブ1行・本体・知らせ・キー案内1行）。
 struct ScreenRows {
     tabs: Rect,
@@ -268,12 +275,12 @@ struct ScreenRows {
     keys: Rect,
 }
 
-/// 画面全体を[`ScreenRows`]に割る。**描画（[`draw`]）とマウスの当たり判定
-/// （`scroll::target`）が同じこの関数を通る**（[BUG-194](../../../../docs/bugs/BUG-194.md)）。
+/// 画面全体を[`ScreenRows`]に割る（[`draw`]）。マウスの当たり判定は、この割り付けで描いたものを
+/// そのまま登録する（`tui::pointer`。[BUG-194](../../../../docs/bugs/BUG-194.md)）。
 ///
-/// 以前はこの割り付けを描画だけが持ち、当たり判定は**端末全体を本体として**記録画面の割り付けを
-/// 計算していた。反応する枠は見えている枠より1行上にずれ、下は知らせの行とキー案内の行まで
-/// 伸びていた。知らせの行は折り返して複数行になる（BUG-192）ので、別々に持つとずれ方も毎回変わる。
+/// BUG-194の前は、当たり判定が**端末全体を本体として**記録画面の割り付けを計算していた。反応する枠は
+/// 見えている枠より1行上にずれ、下は知らせの行とキー案内の行まで伸びていた。知らせの行は折り返して
+/// 複数行になる（BUG-192）ので、別々に持つとずれ方も毎回変わる。
 /// `area`は端末全体。知らせの高さは中身と幅で決まるので`app`も受ける。
 fn screen_rows(area: Rect, app: &App) -> ScreenRows {
     let status = status_text(app);
@@ -296,76 +303,126 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
     let area = frame.area();
     let rows = screen_rows(area, app);
 
-    draw_tabs(frame, rows.tabs, app);
     // 送れる枠（記録画面の3枠・説明欄）の上限は**描画してみないと分からない**
     // （折り返し後の行数は枠の幅に依存する）ので、各画面から受け取って呼び出し側へ返す。
-    // **この振り分けは`scroll::target`（ホイールの当たり判定）と同じ条件である。**
+    // 押せる場所と送れる枠も、各画面が描いた矩形で登録して返す（`tui::pointer`）。重なりは描いた順
+    // （後が上）なので、画面の上に重ねるヘルプと確認ダイアログは最後に描いて登録する。
     let mut feedback = match app.screen {
         Screen::Record => record_screen::draw(frame, rows.body, app),
-        // 承認待ち画面は3つのタブを持つ（決定62）。遷移の2タブは別の描き手。
-        Screen::Edit if app.pending.tab.0.is_transition() => {
-            transition_screen::draw(frame, rows.body, app)
+        // 承認待ち画面は3つのタブを持つ（決定62）。タブの行を本体の一番上に置き、遷移の2タブは別の描き手。
+        Screen::Edit => {
+            let [tabs, body] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(rows.body);
+            let mut feedback = if app.pending.tab.0.is_transition() {
+                transition_screen::draw(frame, body, app)
+            } else {
+                edit_screen::draw(frame, body, app)
+            };
+            draw_pending_tabs(frame, tabs, app, &mut feedback.targets);
+            feedback
         }
-        Screen::Edit => edit_screen::draw(frame, rows.body, app),
         Screen::Declared => declared_screen::draw(frame, rows.body, app),
     };
+    draw_tabs(frame, rows.tabs, app, &mut feedback.targets);
     draw_status(frame, rows.status, status_text(app));
-    draw_keys(frame, rows.keys, app);
+    key_hints::draw(frame, rows.keys, app, &mut feedback.targets);
 
     if app.help {
         let top = app.panels.top(scroll::Panel::Help);
-        feedback
-            .panels
-            .set(scroll::Panel::Help, draw_help(frame, area, top));
+        let max = draw_help(frame, area, top, &mut feedback.targets);
+        feedback.panels.set(scroll::Panel::Help, max);
     }
     if let Some(modal) = app.modal.as_ref() {
         // 送りの上限も描いて初めて分かる（折り返し後の行数）。記録画面の枠と同じく状態へ返す。
-        feedback.modal_scroll_max = Some(draw_modal(frame, area, modal, app.modal_scroll));
+        feedback.modal_scroll_max = Some(draw_modal(
+            frame,
+            area,
+            modal,
+            app.modal_scroll,
+            &mut feedback.targets,
+        ));
     }
     feedback
 }
 
-fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
-    let active = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let idle = Style::default().fg(Color::Gray);
-    let line = Line::from(vec![
-        Span::styled(
-            " F1 記録 ",
-            if app.screen == Screen::Record {
-                active
-            } else {
-                idle
-            },
-        ),
-        Span::raw(" "),
-        Span::styled(
-            " F2 承認待ち ",
-            if app.screen == Screen::Edit {
-                active
-            } else {
-                idle
-            },
-        ),
-        Span::raw(" "),
-        Span::styled(
-            " F3 宣言 ",
-            if app.screen == Screen::Declared {
-                active
-            } else {
-                idle
-            },
-        ),
-        Span::styled("  Ctrl+N で切替", Style::default().fg(Color::DarkGray)),
-        Span::raw("   "),
-        Span::styled(
-            format!("workspace: {}", app.workspace_root.display()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+/// タブの見た目（一番上の画面のタブと、承認待ちのタブで同じ）。
+fn tab_style(active: bool) -> Style {
+    if active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+/// 一番上の行（画面のタブ）。タブはクリックでその画面へ移る場所として登録する（`F1`〜`F3`を押したのと同じ）。
+fn draw_tabs(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
+    let screens = [
+        (Screen::Record, " F1 記録 "),
+        (Screen::Edit, " F2 承認待ち "),
+        (Screen::Declared, " F3 宣言 "),
+    ];
+    let mut spans = Vec::new();
+    let mut at = Vec::new();
+    for (i, (screen, label)) in screens.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        at.push(spans.len());
+        spans.push(Span::styled(*label, tab_style(app.screen == *screen)));
+    }
+    spans.push(Span::styled(
+        "  Ctrl+N で切替",
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(
+        format!("workspace: {}", app.workspace_root.display()),
+        Style::default().fg(Color::DarkGray),
+    ));
+    let drawn = harness_term::row::draw(frame, area, &spans);
+    for ((screen, _), index) in screens.iter().zip(at) {
+        targets.click(drawn[index], Click::Screen(*screen));
+    }
+}
+
+/// 承認待ち（`F2`）のタブの行（2026-10-02）。並びは`F2`で巡回する順（[`PendingTab`]の`next`）。
+///
+/// それまでタブは画面に出ておらず、どのタブに居るかは遷移タブの一覧の見出しにしか無かった
+/// （FS/ネットのタブでは何も出ていなかった）。クリックで切り替えるには押す場所が要るので、決定62の図と
+/// 同じく承認待ちの本体の一番上に1行で並べる。押すと`F2`の巡回と同じ処理でそのタブへ移る。
+fn draw_pending_tabs(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
+    // タブの一覧を別に持たない（`F2`の巡回の順そのものを辿る。片方だけ足すと並びがずれる）。
+    let mut tabs = vec![PendingTab::FsNet];
+    loop {
+        let next = tabs[tabs.len() - 1].next();
+        if next == PendingTab::FsNet {
+            break;
+        }
+        tabs.push(next);
+    }
+    let mut spans = Vec::new();
+    let mut at = Vec::new();
+    for (i, tab) in tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        at.push(spans.len());
+        spans.push(Span::styled(
+            format!(" {} ", tab.label()),
+            tab_style(app.pending.tab.0 == *tab),
+        ));
+    }
+    spans.push(Span::styled(
+        "  F2 で切替",
+        Style::default().fg(Color::DarkGray),
+    ));
+    let drawn = harness_term::row::draw(frame, area, &spans);
+    for (tab, index) in tabs.iter().zip(at) {
+        targets.click(drawn[index], Click::PendingTab(*tab));
+    }
 }
 
 /// 知らせの行（キー案内の1行上）に出す文。
@@ -391,186 +448,6 @@ fn status_height(status: &Text, area: Rect) -> u16 {
 fn draw_status(frame: &mut Frame, area: Rect, status: Text<'static>) {
     // 数える幅（`status_height`の`wrap::rows`）と同じ幅で折り返す（BUG-200）。
     harness_term::wrap::Wrapped::new(status).render(frame, area);
-}
-
-/// 画面ごとのキー案内。押せるキーだけを出す。**効かない操作を案内しない**（B-32）。
-///
-/// 全画面に共通の案内（[`COMMON_KEYS`]）はここに含めない——幅が足りないときの扱いが
-/// 違うからである（[`fit_key_hints`]）。
-fn screen_keys(app: &App) -> Vec<String> {
-    let mut keys: Vec<String> = Vec::new();
-    match app.screen {
-        Screen::Record => {
-            // 枠が出ている間だけ案内する（実行前は遡る対象が無い）。ホイールは
-            // **見えていないと誰も試さない**ので、キー以外でもここへ出す（B-32）。
-            if app.run.is_some() {
-                keys.push("ホイール 枠内をさかのぼる".to_string());
-            }
-            if app.is_running() {
-                let run = app.run.as_ref().expect("is_running implies a run");
-                if run.phase.stop_takes_effect_now() {
-                    keys.push("Esc 停止".to_string());
-                } else if run.phase.stop_can_be_queued() {
-                    keys.push("Esc 停止を予約".to_string());
-                }
-            } else {
-                // 終わった記録の結果を見ている間も、次の操作は同じ（もう一度実行する／
-                // 候補を見に行く）。**押せるものを隠さない**——結果を読んだ後に何をすれば
-                // よいかが画面から消えると、そこで手が止まる。
-                keys.push("Tab 項目移動".to_string());
-                keys.push("Enter 記録を開始".to_string());
-                if app.has_finished_run() {
-                    keys.push("F2 候補を見る".to_string());
-                }
-                keys.push("Esc 編集画面へ".to_string());
-            }
-        }
-        // 遷移のタブは操作が違う。**効かない操作を案内しない**（`B-32`）。
-        //
-        // # 並びは「押す頻度と重要度」の順である（2026-09-19、実機で見つけた）
-        //
-        // **この行は折り返さない。** 幅が足りないと**末尾から黙って切れる**ので、
-        // 並び順がそのまま「消えてよい順」になる。実際に100桁ほどの端末で試したところ
-        // `a 確定` が画面の外へ出ており、**予約したものを書き込むキーだけが見えない**
-        // という形になっていた。だから状態を変える2つ（`Space`・`a`）を先頭へ置き、
-        // 文言も短くしてある。切り捨てそのものは全画面に共通の性質で、ここでは直していない。
-        // 却下（`x`）も予約を変えるキーなので`a`の直後に置く。まとめての却下（`X`）は頻度が
-        // 低いので`f`の後ろ——**まとめて承認するキーは無い**（決定62・決定51）。
-        Screen::Edit if app.pending.tab.0.is_transition() => {
-            keys.push("Space 選ぶ/外す".to_string());
-            let reserved = app.pending.reserved_count();
-            if reserved == 0 {
-                keys.push("a 確定".to_string());
-            } else {
-                // 予約件数を出す（何件書かれるのかが確定の直前まで見えている必要がある）。
-                keys.push(format!("a 確定（{reserved}件）"));
-            }
-            keys.push("x 却下/戻す".to_string());
-            keys.push("u 引数の広さ".to_string());
-            // 遷移先の欄（2026-10-01）。確定の中身を変える設定なので、`u`と同じ並びに置く。
-            keys.push("Tab 遷移先".to_string());
-            keys.push(format!("f 表示: {}", app.pending.filter.label()));
-            keys.push("X 表示中を却下".to_string());
-            keys.push("↑↓ 選択".to_string());
-            keys.push("r 読み直し".to_string());
-            keys.push("F2 タブ切替".to_string());
-            keys.push("Esc 戻る".to_string());
-        }
-        Screen::Edit => {
-            keys.push("Esc 記録画面へ".to_string());
-            keys.push("F2 タブ切替".to_string());
-            keys.push("Tab 項目移動".to_string());
-            keys.push("↑↓ 選択".to_string());
-            keys.push("→← 展開/折畳".to_string());
-            keys.push("Space この配下をまとめて選択".to_string());
-            keys.push("c access変更".to_string());
-            keys.push("d この行自身も選ぶ".to_string());
-            keys.push("R 再帰(**)".to_string());
-            keys.push(format!("f 一覧: {}", app.filter.label()));
-            keys.push("t プロセスツリー".to_string());
-            keys.push("a 承認".to_string());
-        }
-        Screen::Declared => {
-            keys.push("Esc 記録画面へ".to_string());
-            keys.push("↑↓ 選択".to_string());
-            keys.push("Space 取り消しを予約".to_string());
-            keys.push("A 全件".to_string());
-            // [D-112] 未承認の宣言があるときだけ出す（無いときに押しても何も起きない）。
-            if !app.declared_approval.not_approved.is_empty() {
-                keys.push("y このマシンで承認を予約".to_string());
-            }
-            // 付け替え（1行ずつ）。キーは候補画面の`c`・`R`と同じ。
-            keys.push("c 種類を変える".to_string());
-            keys.push("R ** の付け外し".to_string());
-            keys.push("r 読み直し".to_string());
-            // 予約件数を出す（何件が変わるのかが確定の直前まで見えている必要がある）。
-            // 付け替えは取り消しが勝つ分を除いた、実際に書く件数で数える。
-            let counts = [
-                (app.declared_approval.reserved.len(), "承認"),
-                (
-                    app.declared_reassign.effective(&app.unapproved).len(),
-                    "付け替え",
-                ),
-                (app.unapproved.len(), "取り消し"),
-            ];
-            let parts: Vec<String> = counts
-                .iter()
-                .filter(|(count, _)| *count > 0)
-                .map(|(count, what)| format!("{count}件を{what}"))
-                .collect();
-            if parts.is_empty() {
-                keys.push("a 確定".to_string());
-            } else {
-                keys.push(format!("a 確定（{}）", parts.join("・")));
-            }
-        }
-    }
-    keys
-}
-
-/// 全画面に共通のキー案内。画面ごとの項目の後ろに並べる。
-///
-/// **Esc×2は案内しないと見つけられない。** 単押しは画面遷移なので、二度押しが終了である
-/// ことは画面から推測できない。
-const COMMON_KEYS: [&str; 3] = ["F4 ヘルプ", "Esc×2 終了", "Ctrl+C 終了"];
-
-/// キー案内の項目の区切り。
-const KEY_SEPARATOR: &str = "  |  ";
-
-fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            fit_key_hints(&screen_keys(app), area.width as usize),
-            Style::default().fg(Color::DarkGray),
-        )),
-        area,
-    );
-}
-
-/// キー案内の1行を`width`桁に収める。
-///
-/// # 共通の案内（ヘルプ・終了）は削らない（2026-10-01、実機で見つけた）
-///
-/// この行は折り返さず、幅が足りないと**末尾から黙って切れる**。以前は共通の案内を
-/// 画面ごとの項目の後ろへそのまま足していたので、**画面ごとの項目が多いほど、ヘルプと
-/// 終了の案内から先に消えた**——承認待ちの遷移タブは約200桁を要し、全画面に近い幅でも
-/// `… | Esc 戻る | F4`で切れて`Esc×2 終了`が見えなかった。
-///
-/// だから収まらないときは、**画面ごとの項目を後ろから丸ごと落とし**、落とした件数を
-/// `… 他N件`で出してから共通の案内を置く。
-///
-/// - **後ろから落とす**のは、画面ごとの並びが「押す頻度と重要度」の順だからである
-///   （遷移タブの並びのコメント。並び順がそのまま「消えてよい順」になっている）。
-/// - **項目の途中で切らない。** `F4`だけが残るような切れ方は、別のキーに読める。
-/// - **件数を出す**のは、省略したことを黙らないためである（B-09）。落とした項目はヘルプ（`F4`）に載っている。
-///
-/// 全部収まるときは以前と1文字も変わらない。共通の案内そのものより狭い端末では、
-/// 共通の案内も末尾から切れる（描画が落ちないことだけを保つ）。
-fn fit_key_hints(screen: &[String], width: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
-
-    let line = |kept: &[String], omitted: Option<&str>| -> String {
-        kept.iter()
-            .map(String::as_str)
-            .chain(omitted)
-            .chain(COMMON_KEYS)
-            .collect::<Vec<_>>()
-            .join(KEY_SEPARATOR)
-    };
-    let full = line(screen, None);
-    if full.width() <= width {
-        return full;
-    }
-    // 画面ごとの項目を後ろから1件ずつ落とし、収まった時点で止める。
-    for kept in (0..screen.len()).rev() {
-        let omitted = format!("… 他{}件", screen.len() - kept);
-        let fitted = line(&screen[..kept], Some(&omitted));
-        if fitted.width() <= width {
-            return fitted;
-        }
-    }
-    // 画面ごとの項目を全部落としても収まらない幅。共通の案内だけを出す。
-    line(&[], None)
 }
 
 /// ヘルプの本文（`F4`）。試験が末尾の行まで読めるかを見るので、関数の外に置く。
@@ -676,6 +553,14 @@ harness-policy-editor — LLMを介さずに「このコマンドに何を許す
   受理するとサンドボックスの意味が消える範囲）は f で切り替えると見られます。
   隠している件数は候補一覧の見出しに出ています。
 
+マウス
+  クリック  タブ（F1〜F3 と承認待ちのタブ）・一覧の行・[x] / [ ]・▸ / ▾・入力欄・
+            下のキー案内・確認画面の y=書く と n / Esc=やめる を押せます
+            （どれもキーを押したのと同じ動きです。入力欄は Tab で入ったのと同じ）
+            一括の操作（宣言画面の A・遷移タブの X）はキーでだけ押せます
+  ホイール  ポインタの下の枠を送ります（ヘルプか確認画面が開いている間はそれを送ります）
+  ヘルプはクリックでも閉じます。
+
 停止（Esc）が効く範囲
   停止フラグを見ているのは、対象コマンドを回しているループの中だけです。収集器の起動
   （UACの応答待ち）・ETWのウォームアップ・終了後のドレインの間は見ていません。その区間で
@@ -695,7 +580,10 @@ CLIも同じことができます: record / approve / record-net / show / sessio
 const HELP_WIDTH: u16 = 78;
 
 /// ヘルプ（`F4`）を描き、送れる上限を返す（`top`は送り位置。`App::panels`）。
-fn draw_help(frame: &mut Frame, area: Rect, top: u16) -> u16 {
+///
+/// 開いている間は、画面のどこでホイールを回してもヘルプを送り、どこを押しても閉じる
+/// （「何かキーを押すと閉じる」と同じ。`tui::pointer`）。後ろの画面は押せない（[`open_overlay`]）。
+fn draw_help(frame: &mut Frame, area: Rect, top: u16, targets: &mut Targets) -> u16 {
     // **高さは本文から数える。** 固定値（26行）だった頃、本文はとうに44行あり
     // 半分以上が枠の外で切れていた——ヘルプに書いたのに読めない状態は「書いていない」のと
     // 同じである（B-09）。行数を手で持つと本文を足すたびにまたずれるので持たない（B-05）。
@@ -705,17 +593,20 @@ fn draw_help(frame: &mut Frame, area: Rect, top: u16) -> u16 {
     let width = HELP_WIDTH.min(area.width);
     let rows = wrap::rows(HELP_TEXT, width.saturating_sub(2));
     let height = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(2);
-    let area = open_overlay(frame, area, width, height);
+    let screen = area;
+    let area = open_overlay(frame, screen, width, height, targets);
+    targets.wheel(screen, Wheel::Panel(scroll::Panel::Help));
+    targets.click(screen, Click::CloseHelp);
     // 端末が低くて収まらない分は、ホイールで送る（`tui::scroll`）。キーは今までどおり、どれでも閉じる。
-    wrap::draw_scrollable(
+    harness_term::scrollable::draw(
         frame,
         area,
         HELP_TEXT,
         Block::default()
             .borders(Borders::ALL)
-            .title(" ヘルプ（何かキーを押すと閉じます） "),
+            .title(" ヘルプ（何かキーを押すかクリックすると閉じます） "),
         top,
-        wrap::Look::panel(Style::default()),
+        wrap::panel_look(Style::default()),
     )
 }
 
@@ -748,11 +639,26 @@ const MODAL_WIDTH: u16 = 88;
 /// ホイールでも送れる（`tui::scroll`）ので、下辺の送り方にホイールも書く——**見えていないと誰も試さない**
 /// （記録画面のキー案内が「ホイール 枠内をさかのぼる」を出しているのと同じ理由）。
 ///
+/// # 下辺の操作の案内はボタンとしても押せる（2026-10-02）
+///
+/// `y=書く`・`n / Esc=やめる`（読むだけのダイアログは`Enter / Esc=閉じる`）は、クリックでそのキーを
+/// 押せる。**`a`で確認ダイアログを開いてから書く2段構えは変えない**——押せるようになったのは2段目の`y`で、
+/// 1段目の`a`を押さずに書くことはできない。ボタンは枠の見出しではなく自分で下辺へ描き、描いた位置を
+/// 登録する（`harness_term::scrollable::draw_with_buttons`）。見た目は見出しに置いていた頃と同じで、
+/// 下辺の右の「N〜M/T行」はボタンの残りの幅に収まる形を選ぶ（ボタンを覆わない）。
+/// ダイアログの外側は押せない（決定32: 書き込みの確認は`y`か`n`/`Esc`を選ばせる）。
+///
 /// **末尾の空行は数えも描きもしない。** 明細の組み立ては節の区切りに空行を足すので（付け替えの明細など）、
 /// 後ろに何も続かないと本文が空行で終わる。数えると、末尾まで送ったときの一番下の行が空行になり、
 /// 「どこで終わったのか」がまた見えなくなる。組み立ては画面ごとに何か所もあるので、描く側の1か所で落とす
 /// （`modal.lines`そのものは変えない）。
-fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) -> u16 {
+fn draw_modal(
+    frame: &mut Frame,
+    area: Rect,
+    modal: &state::Modal,
+    scroll: u16,
+    targets: &mut Targets,
+) -> u16 {
     let written = modal
         .lines
         .iter()
@@ -769,41 +675,57 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) 
         .unwrap_or(u16::MAX)
         .saturating_add(4)
         .min(area.height.saturating_sub(2));
-    let area = open_overlay(frame, area, width, height.max(6));
+    let screen = area;
+    let area = open_overlay(frame, screen, width, height.max(6), targets);
+    // 開いている間は、画面のどこでホイールを回しても確認ダイアログを送る（`tui::scroll`）。
+    targets.wheel(screen, Wheel::Modal);
 
-    let keys = if modal.confirm.asks() {
-        " y=書く   n / Esc=やめる "
+    // ボタンとその間（見た目は1つの見出しだった頃の「 y=書く   n / Esc=やめる 」と同じ）。
+    let buttons: &[(&str, Option<KeyCode>)] = if modal.confirm.asks() {
+        &[
+            (" y=書く ", Some(KeyCode::Char('y'))),
+            (" ", None),
+            (" n / Esc=やめる ", Some(KeyCode::Char('n'))),
+        ]
     } else {
-        " Enter / Esc=閉じる "
+        &[(" Enter / Esc=閉じる ", Some(KeyCode::Enter))]
     };
     let color = if modal.confirm.asks() {
         Color::Yellow
     } else {
         Color::Red
     };
+    let button_style = Style::default()
+        .fg(Color::Black)
+        .bg(color)
+        .add_modifier(Modifier::BOLD);
+    let spans: Vec<Span> = buttons
+        .iter()
+        .map(|(label, _)| Span::styled(*label, button_style))
+        .collect();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(color))
-        .title(format!(" {} ", modal.title))
-        .title_bottom(Line::styled(
-            keys,
-            Style::default()
-                .fg(Color::Black)
-                .bg(color)
-                .add_modifier(Modifier::BOLD),
-        ));
-    wrap::draw_scrollable(
+        .title(format!(" {} ", modal.title));
+    let drawn = harness_term::scrollable::draw_with_buttons(
         frame,
         area,
         text,
         block,
         scroll,
-        wrap::Look {
+        harness_term::scrollable::Look {
             how: "↑↓ PgUp/PgDn・ホイールで送る",
             notice: Style::default().fg(Color::DarkGray),
             bar: Style::default().fg(color),
         },
-    )
+        &spans,
+    );
+    for ((_, code), rect) in buttons.iter().zip(drawn.buttons) {
+        if let Some(code) = code {
+            targets.click(rect, Click::Keys(vec![pointer::key(*code)]));
+        }
+    }
+    drawn.max_top
 }
 
 #[cfg(test)]
@@ -816,7 +738,18 @@ mod render_tests;
 /// 消し方は会話TUIと共有する`harness_term::overlay::clear`が持つ——`Clear`は矩形の中しか消さないので、
 /// 後ろの画面の全角文字が枠の左隣から始まると左の枠線が端末へ届かない。その全角文字も消す
 /// （[BUG-198](../../../../docs/bugs/BUG-198.md)。理由と採らなかった直し方は同モジュールのdoc）。
-fn open_overlay(frame: &mut Frame, area: Rect, width: u16, height: u16) -> Rect {
+///
+/// **マウスでも後ろを押せなくする**——`area`（画面全体）を覆う（`Targets::cover`）。開いている間に後ろの
+/// 一覧やタブが押せると、見えないところで状態が変わる（キー入力も重ねた側だけが受ける。`App::on_key`）。
+/// 重ねた枠の押せる場所は、呼び出し側がこの後に登録する。
+fn open_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    width: u16,
+    height: u16,
+    targets: &mut Targets,
+) -> Rect {
+    targets.cover(area);
     let overlay = centered(area, width, height);
     harness_term::overlay::clear(frame, overlay);
     overlay

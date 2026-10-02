@@ -7,8 +7,10 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
+use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
+use super::key_hints::{common_keys, screen_keys, KEY_SEPARATOR};
 use super::*;
 use crate::record::RecordEvent;
 use crate::session_dir::{self, RecordManifest, RecordSessionDir, RecordStatus};
@@ -336,6 +338,19 @@ fn key_hint_row(app: &App, width: u16) -> String {
     )
 }
 
+/// 画面ごとのキー案内の文言（`key_hints::screen_keys`）。
+fn screen_labels(app: &App) -> Vec<String> {
+    screen_keys(app)
+        .into_iter()
+        .map(|hint| hint.label)
+        .collect()
+}
+
+/// 全画面に共通のキー案内の文言（`key_hints::common_keys`）。
+fn common_labels() -> Vec<String> {
+    common_keys().into_iter().map(|hint| hint.label).collect()
+}
+
 /// キー案内の項目が違う画面を全部並べる（承認待ちは3タブそれぞれ）。
 fn apps_on_every_screen(ws: &std::path::Path) -> Vec<(&'static str, App)> {
     let app = || App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
@@ -366,16 +381,16 @@ fn apps_on_every_screen(ws: &std::path::Path) -> Vec<(&'static str, App)> {
 /// **画面ごとの項目が多いと、ヘルプと終了の案内から先に画面の外へ出る。** 共通の案内を
 /// 末尾に足していたので、切れるのはいつもそこだった。実機（全画面に近い幅）の遷移タブで
 /// `… | F2 タブ切替 | Esc 戻る | F4`と切れ、`Esc×2 終了`が見えなかった（2026-10-01）。
-/// `Esc×2`は案内しないと見つけられない操作である（`COMMON_KEYS`のdoc）。
+/// `Esc×2`は案内しないと見つけられない操作である（`key_hints::common_keys`のdoc）。
 #[test]
 fn the_help_and_quit_hints_survive_a_narrow_terminal_on_every_screen() {
     let ws = workspace();
     for (screen, app) in apps_on_every_screen(ws.path()) {
         for width in [80u16, 100, 120, 160] {
             let row = key_hint_row(&app, width);
-            for hint in COMMON_KEYS {
+            for hint in common_labels() {
                 assert!(
-                    row.contains(&squash(hint)),
+                    row.contains(&squash(&hint)),
                     "{screen}の画面を{width}桁で描くと「{hint}」が見えない:\n{row}"
                 );
             }
@@ -391,9 +406,10 @@ fn the_help_and_quit_hints_survive_a_narrow_terminal_on_every_screen() {
 fn every_screen_hint_is_shown_in_order_when_the_terminal_is_wide_enough() {
     let ws = workspace();
     for (screen, app) in apps_on_every_screen(ws.path()) {
-        let keys = screen_keys(&app);
+        let keys = screen_labels(&app);
         assert!(!keys.is_empty(), "{screen}の画面に固有の案内が1つも無い");
-        let expected: Vec<&str> = keys.iter().map(String::as_str).chain(COMMON_KEYS).collect();
+        let common = common_labels();
+        let expected: Vec<&str> = keys.iter().chain(&common).map(String::as_str).collect();
         assert_eq!(
             key_hint_row(&app, 400),
             squash(&expected.join(KEY_SEPARATOR)),
@@ -412,7 +428,8 @@ fn every_screen_hint_is_shown_in_order_when_the_terminal_is_wide_enough() {
 fn a_narrow_terminal_drops_screen_hints_from_the_tail_and_says_how_many() {
     let ws = workspace();
     for (screen, app) in apps_on_every_screen(ws.path()) {
-        let keys = screen_keys(&app);
+        let keys = screen_labels(&app);
+        let common = common_labels();
         let row = key_hint_row(&app, 100);
         let expected = |kept: usize| -> String {
             let omitted = format!("… 他{}件", keys.len() - kept);
@@ -420,11 +437,11 @@ fn a_narrow_terminal_drops_screen_hints_from_the_tail_and_says_how_many() {
                 .iter()
                 .map(String::as_str)
                 .chain(std::iter::once(omitted.as_str()))
-                .chain(COMMON_KEYS)
+                .chain(common.iter().map(String::as_str))
                 .collect();
             squash(&line.join(KEY_SEPARATOR))
         };
-        let full: Vec<&str> = keys.iter().map(String::as_str).chain(COMMON_KEYS).collect();
+        let full: Vec<&str> = keys.iter().chain(&common).map(String::as_str).collect();
         if row == squash(&full.join(KEY_SEPARATOR)) {
             // 100桁に全部収まる画面（今日の記録画面）は落とすものが無い。
             continue;
@@ -683,7 +700,7 @@ fn the_last_line_of_a_confirmation_is_never_cut_off_silently() {
             .into_iter()
             .filter_map(|(width, height)| {
                 let rows = paint_rows(width, height, |f| {
-                    draw_modal(f, f.area(), modal, 0);
+                    draw_modal(f, f.area(), modal, 0, &mut Targets::default());
                 });
                 let screen = flatten(&rows);
                 (!screen.contains(&last) && !screen.contains(MODAL_SCROLL_HINT))
@@ -745,7 +762,7 @@ fn a_confirmation_that_fits_is_drawn_as_before_and_does_not_offer_scrolling() {
         confirm: Confirm::Approval,
     };
     let rows = paint_rows(120, 40, |f| {
-        draw_modal(f, f.area(), &modal, 0);
+        draw_modal(f, f.area(), &modal, 0, &mut Targets::default());
     });
     assert_eq!(
         box_height(&rows),
@@ -775,7 +792,7 @@ fn a_wrapped_confirmation_that_fits_shows_every_line_without_a_scroll_hint() {
     for (name, app) in [("遷移", &transition), ("付け替え", &reassign)] {
         let modal = app.modal.as_ref().expect("確認ダイアログ");
         let screen = flatten(&paint_rows(120, 60, |f| {
-            draw_modal(f, f.area(), modal, 0);
+            draw_modal(f, f.area(), modal, 0, &mut Targets::default());
         }));
         for line in &modal.lines {
             assert!(
@@ -821,7 +838,7 @@ fn right_edge(grid: &[Vec<String>], area: ratatui::layout::Rect) -> Vec<String> 
         .collect()
 }
 
-/// スクロールバーのつまみの記号（`wrap::draw_scrollable`）。
+/// スクロールバーのつまみの記号（`harness_term::scrollable`）。
 const THUMB: &str = "█";
 
 /// 確認ダイアログの下辺の「N〜M/T行」。出ていなければ`None`（＝本文が枠に収まっている）。
@@ -1145,11 +1162,11 @@ fn paint_short_modal(frame: &mut Frame) {
         lines: (0..5).map(|i| format!("  + fs.read = C:/x/{i}")).collect(),
         confirm: Confirm::Approval,
     };
-    draw_modal(frame, frame.area(), &modal, 0);
+    draw_modal(frame, frame.area(), &modal, 0, &mut Targets::default());
 }
 
 fn paint_help(frame: &mut Frame) {
-    draw_help(frame, frame.area(), 0);
+    draw_help(frame, frame.area(), 0, &mut Targets::default());
 }
 
 /// 画面へ重ねる枠を1つ描く手順。
@@ -1344,15 +1361,15 @@ fn broken_right_border_rows(grid: &[Vec<String>], area: ratatui::layout::Rect) -
 /// （端末が78桁以上あればいつも）。確認ダイアログと説明欄も、同じ形の行が来れば同じように欠ける。
 #[test]
 fn a_wrapped_box_keeps_its_right_border_when_a_line_ends_with_a_wide_character() {
-    // 説明欄と同じ部品（`wrap::draw_scrollable`）で描く枠。中は38桁。
+    // 説明欄と同じ部品（`harness_term::scrollable::draw`）で描く枠。中は38桁。
     let notes = |frame: &mut Frame| {
-        wrap::draw_scrollable(
+        harness_term::scrollable::draw(
             frame,
             ratatui::layout::Rect::new(0, 0, 40, 6),
             spilling_line(38),
             Block::default().borders(Borders::ALL).title("説明"),
             0,
-            wrap::Look::panel(Style::default()),
+            wrap::panel_look(Style::default()),
         );
     };
     // 確認ダイアログ。枠は88桁（`MODAL_WIDTH`）で、中は86桁。
@@ -1362,7 +1379,7 @@ fn a_wrapped_box_keeps_its_right_border_when_a_line_ends_with_a_wide_character()
             lines: vec![spilling_line(86), "最後の行".to_string()],
             confirm: Confirm::Approval,
         };
-        draw_modal(frame, frame.area(), &modal, 0);
+        draw_modal(frame, frame.area(), &modal, 0, &mut Targets::default());
     };
     let boxes: [(&str, &str, Paint); 3] = [
         ("ヘルプ", "ヘルプ", paint_help),
@@ -1453,7 +1470,7 @@ fn every_wrapped_text_and_overlay_goes_through_harness_term() {
 #[test]
 fn the_help_box_is_as_tall_as_its_wrapped_text() {
     let screen = flatten(&paint_rows(100, 400, |f| {
-        draw_help(f, f.area(), 0);
+        draw_help(f, f.area(), 0, &mut Targets::default());
     }));
     let last = squash(HELP_TEXT.lines().last().expect("ヘルプが空"));
     assert!(
@@ -1472,12 +1489,12 @@ fn the_help_box_is_as_tall_as_its_wrapped_text() {
 #[test]
 fn a_help_taller_than_the_terminal_says_how_many_lines_are_cut() {
     let text_rows = box_height(&paint_rows(100, 400, |f| {
-        draw_help(f, f.area(), 0);
+        draw_help(f, f.area(), 0, &mut Targets::default());
     })) - 2;
     let height = 40u16;
     let visible = usize::from(height - 2);
     let screen = flatten(&paint_rows(100, height, |f| {
-        draw_help(f, f.area(), 0);
+        draw_help(f, f.area(), 0, &mut Targets::default());
     }));
     assert!(
         screen.contains(&format!("1〜{visible}/{text_rows}行ホイールで送る")),
@@ -1806,6 +1823,24 @@ fn running_record_screen(ws: &std::path::Path) -> App {
     app
 }
 
+/// 記録中で、起動時ノイズも警告も無い状態。**その2枠は割かない**ので、ノイズ枠の場所は出力の枠が、
+/// 警告枠の場所は進行の枠が占める（割かない枠の場所で、別の枠が反応しないこと・隣の枠が反応することを見る）。
+fn running_record_screen_without_noise(ws: &std::path::Path) -> App {
+    let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+    app.command.set_text("cargo build");
+    press(&mut app, KeyCode::Enter);
+    app.on_worker(WorkerMsg::Pass1(RecordEvent::ChildStarted));
+    app.on_worker(WorkerMsg::Pass1(RecordEvent::Stdout(
+        "Compiling harness-core\n".to_string(),
+    )));
+    let run = app.run.as_ref().expect("記録中");
+    assert!(
+        run.noise.is_empty() && run.warnings.is_empty(),
+        "台本の前提が崩れた"
+    );
+    app
+}
+
 /// 送れる枠の位置を全部（確認ダイアログ・説明欄とヘルプ・記録中なら記録画面の3枠）。
 fn scroll_positions(app: &App) -> Vec<(scroll::Wheel, u16)> {
     use record_screen::ScrollPane;
@@ -1845,19 +1880,38 @@ fn move_every_box_off_its_ends(app: &mut App) {
     }
 }
 
+/// マウスのイベント1つを、イベントループと同じ製品の入口（[`handle_event`]）から入れる。
+fn mouse(app: &mut App, kind: crossterm::event::MouseEventKind, x: u16, y: u16) -> Option<Action> {
+    handle_event(
+        app,
+        crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }),
+    )
+}
+
+/// `(x, y)`でホイールを1刻み回す（`up`が真なら上）。
+fn scroll_at(app: &mut App, x: u16, y: u16, up: bool) {
+    let kind = if up {
+        crossterm::event::MouseEventKind::ScrollUp
+    } else {
+        crossterm::event::MouseEventKind::ScrollDown
+    };
+    assert!(mouse(app, kind, x, y).is_none(), "ホイールが操作を返した");
+}
+
 /// `(x, y)`でホイールを上へ1刻み回したとき、位置が動いた枠（動かなければ`None`）。
-/// **製品の入口（`App::on_scroll`）を通す。** 回した分は同じ位置で下へ回して戻す。
-/// 先に[`move_every_box_off_its_ends`]を通しておくこと。
-fn wheel_moves(
-    app: &mut App,
-    size: ratatui::layout::Size,
-    x: u16,
-    y: u16,
-) -> Option<scroll::Wheel> {
+/// **製品の入口（[`handle_event`]）を通す。** 回した分は同じ位置で下へ回して戻す。
+/// 当たり判定は直前に描いた画面の登録で引くので、先に[`frame`]で描き、その後で
+/// [`move_every_box_off_its_ends`]を通しておくこと（枠の位置は送り量では変わらない）。
+fn wheel_moves(app: &mut App, x: u16, y: u16) -> Option<scroll::Wheel> {
     let before = scroll_positions(app);
-    app.on_scroll(size, x, y, true);
+    scroll_at(app, x, y, true);
     let after = scroll_positions(app);
-    app.on_scroll(size, x, y, false);
+    scroll_at(app, x, y, false);
     assert_eq!(
         scroll_positions(app),
         before,
@@ -1907,7 +1961,6 @@ fn the_wheel_scrolls_the_pane_drawn_under_the_pointer() {
     use scroll::{Panel, Wheel};
 
     let (width, height) = (100u16, 30u16);
-    let size = ratatui::layout::Size::new(width, height);
     let long_status = "長い知らせが折り返して行を増やします。".repeat(8);
     let record_panes = vec![
         (Wheel::Record(ScrollPane::Log), " 進行 "),
@@ -1945,6 +1998,16 @@ fn the_wheel_scrolls_the_pane_drawn_under_the_pointer() {
             running_record_screen,
             Some(&long_status),
             record_panes,
+        ),
+        scan(
+            "記録・記録中（ノイズも警告も無い）",
+            running_record_screen_without_noise,
+            None,
+            vec![
+                (Wheel::Record(ScrollPane::Log), " 進行 "),
+                (Wheel::Record(ScrollPane::Output), " コマンドの出力"),
+                (Wheel::Panel(Panel::RecordHeader), " いま待っているもの "),
+            ],
         ),
         scan(
             "承認待ち・FS/ネット（注記）",
@@ -1995,9 +2058,8 @@ fn the_wheel_scrolls_the_pane_drawn_under_the_pointer() {
         if let Some(status) = status {
             app.status = status;
         }
-        let grid = paint_grid(width, height, |f| {
-            draw(f, &app);
-        });
+        // 描いて書き戻す（当たり判定はこの画面の登録で引く。実際のイベントループと同じ）。
+        let grid = frame(&mut app, width, height);
         let rows: Vec<String> = grid.iter().map(|row| row.concat()).collect();
         let status_rows = status_rows(&rows).len();
         assert_eq!(
@@ -2022,7 +2084,7 @@ fn the_wheel_scrolls_the_pane_drawn_under_the_pointer() {
                     .iter()
                     .find(|(_, area)| area.contains(ratatui::layout::Position::new(x, y)))
                     .map(|(wheel, _)| *wheel);
-                let moved = wheel_moves(&mut app, size, x, y);
+                let moved = wheel_moves(&mut app, x, y);
                 if drawn != moved {
                     wrong.push(format!(
                         "({x},{y}) 描かれた枠: {drawn:?} / 送られた枠: {moved:?}"
@@ -2053,7 +2115,6 @@ fn the_wheel_does_not_scroll_panes_hidden_behind_an_overlay() {
     use scroll::{Panel, Wheel};
 
     let (width, height) = (100u16, 30u16);
-    let size = ratatui::layout::Size::new(width, height);
     let screens: [(&str, MakeApp); 2] = [
         ("記録中の記録画面", running_record_screen),
         ("宣言画面", declared_screen_with_long_notes),
@@ -2075,11 +2136,13 @@ fn the_wheel_does_not_scroll_panes_hidden_behind_an_overlay() {
             } else {
                 Wheel::Panel(Panel::Help)
             };
+            // 重ねた枠を開いた画面を描く（イベントループは状態が変わるたびに描き直す）。
+            frame(&mut app, width, height);
             move_every_box_off_its_ends(&mut app);
             let wrong: Vec<String> = (0..height)
                 .flat_map(|y| (0..width).map(move |x| (x, y)))
                 .filter_map(|(x, y)| {
-                    let moved = wheel_moves(&mut app, size, x, y);
+                    let moved = wheel_moves(&mut app, x, y);
                     (moved != Some(expected)).then(|| format!("({x},{y}) {moved:?}"))
                 })
                 .take(20)
@@ -2102,7 +2165,7 @@ fn the_wheel_does_not_scroll_panes_hidden_behind_an_overlay() {
 // 送れるようにし、ポインタの下の説明欄をホイールで送る。
 //
 // **期待値は描いた画面から読む**（BUG-194。当たり判定と同じ計算で期待値を作らない）。ホイールは製品の
-// 入口`App::on_scroll`から回し、回すたびに[`frame`]（描いて状態へ書き戻す）を通す。
+// 入口[`handle_event`]から回し、回すたびに[`frame`]（描いて状態へ書き戻す）を通す。
 // ---------------------------------------------------------------------------
 
 /// ホイール1刻みで送る行数（端末の既定の送り量。記録画面の3枠と同じ値）。
@@ -2112,7 +2175,7 @@ fn wheel_step() -> usize {
 
 /// `(x, y)`でホイールを1刻み回し（`up`が偽なら下へ＝先を読む向き）、1フレーム描く。
 fn wheel_and_draw(app: &mut App, size: (u16, u16), at: (u16, u16), up: bool) -> Vec<Vec<String>> {
-    app.on_scroll(ratatui::layout::Size::new(size.0, size.1), at.0, at.1, up);
+    scroll_at(app, at.0, at.1, up);
     frame(app, size.0, size.1)
 }
 
@@ -2549,3 +2612,7 @@ fn every_box_that_overflows_moves_one_notch_on_the_wheel() {
         failures.join("\n")
     );
 }
+
+/// マウスのクリック（`tui::pointer`）の試験。このファイルの描画の道具を使うので、子に置く。
+#[path = "pointer_tests.rs"]
+mod pointer_tests;

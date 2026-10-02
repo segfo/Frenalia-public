@@ -22,3 +22,5 @@ crossterm = "0.29"
 # ここを折り返し前のバッファ行で代用すると、長い行があるだけでスクロール量と
 # 見えているものがずれる（実際にポリシーエディタでそうなった）。
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
+# 送れる枠（`scrollable`）の下辺の「N〜M/T行」が下辺に入るかを、表示桁で数える。
+unicode-width = "0.2.2"
