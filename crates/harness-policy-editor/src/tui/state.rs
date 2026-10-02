@@ -719,6 +719,9 @@ pub struct App {
     /// **折り返した後の表示行**で数える（下辺の「N〜M/T行」と同じ単位）。上限は描くまで分からないので
     /// 描画が返し、[`Self::apply_draw_feedback`]が切り詰める（`tui::wrap::Window`。BUG-196）。
     pub modal_scroll: u16,
+    /// 説明欄とヘルプの送り位置（ホイールで送る。`tui::scroll`）。上限は`modal_scroll`と同じく描画が返し、
+    /// [`Self::apply_draw_feedback`]が切り詰める。
+    pub panels: crate::tui::scroll::PanelScroll,
 
     // 記録画面
     pub pass: Pass,
@@ -885,6 +888,7 @@ impl App {
             status: String::new(),
             modal: None,
             modal_scroll: 0,
+            panels: Default::default(),
             pass: Pass::One,
             net_mode: NetMode::RecordAll,
             command: TextInput::default(),
@@ -1432,6 +1436,7 @@ impl App {
         if let Some(max) = feedback.modal_scroll_max {
             self.modal_scroll = self.modal_scroll.min(max);
         }
+        self.panels.clamp(feedback.panels);
         if let Some(offset) = feedback.session_list_offset {
             self.session_list_offset = offset;
         }
@@ -1457,41 +1462,7 @@ impl App {
         run.noise_scroll.clamp(limits.noise);
     }
 
-    /// ホイールでポインタの下の枠をさかのぼる／戻す。
-    ///
-    /// 記録画面の3枠だけが対象で、他の画面や枠の外では**何もしない**——「反応しない」ことは
-    /// 「壊れている」ではなく「そこはスクロールする対象ではない」であり、外した位置で
-    /// 別の枠が動くほうが混乱する。
-    ///
-    /// 端末サイズを引数で受けるのは、状態に持ち越すとリサイズ直後に古い矩形で当たり判定を
-    /// してしまうため（呼び出し側がその場で聞く）。
-    pub fn on_scroll(&mut self, size: ratatui::layout::Size, column: u16, row: u16, up: bool) {
-        use crate::tui::record_screen::{scroll_target, ScrollPane};
-
-        if self.screen != Screen::Record {
-            return;
-        }
-        // **ヘルプ・確認ダイアログが開いている間は、後ろの枠を送らない**（BUG-194）。キー入力も
-        // その間は重ねた側だけが受ける（`on_key`）。送ると、ポインタの下に見えているのはヘルプなのに
-        // 隠れた枠が動き、閉じたときに位置が変わっている。
-        if self.help || self.modal.is_some() {
-            return;
-        }
-        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-        let Some(pane) = scroll_target(area, self, column, row) else {
-            return;
-        };
-        let Some(run) = self.run.as_mut() else {
-            return;
-        };
-        let scroll = match pane {
-            ScrollPane::Log => &mut run.log_scroll,
-            ScrollPane::Output => &mut run.output_scroll,
-            ScrollPane::Noise => &mut run.noise_scroll,
-        };
-        // 送り量は`harness_term::scrollback`が持つ（会話TUIと共通）。
-        scroll.wheel(up);
-    }
+    // ホイール（`on_scroll`）は`tui::scroll`が持つ（送れる枠の当たり判定と一緒に置く）。
 
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         if key.kind != KeyEventKind::Press {

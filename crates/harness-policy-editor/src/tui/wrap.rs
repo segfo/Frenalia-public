@@ -1,4 +1,4 @@
-//! 折り返す枠の行数を数え、枠に入り切らなかった分を黙らせない部品（[BUG-192](../../../../docs/bugs/BUG-192.md)）。
+//! 折り返す枠の行数を数え、枠に入り切らなかった分を送って読ませる部品（[BUG-192](../../../../docs/bugs/BUG-192.md)）。
 //!
 //! # 何のためにあるのか
 //!
@@ -18,12 +18,18 @@
 //! ——ratatuiの折り返しは行末の全角文字で1桁はみ出し、右の枠線を覆うため（[BUG-200](../../../../docs/bugs/BUG-200.md)）。
 //! このエディタで`Wrap`や`line_count`を直接使わない（`render_tests`が数えている）。
 //!
+//! # 入り切らない枠はどれも同じ部品で送る（[`draw_scrollable`]）
+//!
+//! 確認ダイアログ・ヘルプ・各画面の説明欄は、入り切らないとき同じ形になる——送る上限は「本文の最後の行が
+//! 枠の一番下に来たところ」（[`Window`]。BUG-196）、右の枠線の上にスクロールバー、下辺に「N〜M/T行」と
+//! 送り方。違うのは送り方（確認ダイアログはキーとホイール、説明欄とヘルプはホイールだけ。`tui::scroll`）と
+//! 色だけで、それは[`Look`]で渡す。以前は説明欄とヘルプが送れず、入り切らない行数を言うだけだった。
+//!
 //! # 限界
 //!
 //! - **折り返し方そのものは変えていない。** ratatuiの単語折り返しは空白で切り、日本語の禁則を見ない。
 //!   英数字の後ろに空白の無い長い日本語が続くと、英数字だけの短い行が残る（「注:」だけの行など）。
-//! - **送れない枠（説明欄・ヘルプ）は、入り切らなかった行数を言うだけ**で、残りを読ませる手段は
-//!   持たない。読むには端末を広げる。送れるのは確認ダイアログだけである（[`Window`]・[`draw_scrolled`]）。
+//! - 送れることを言うのは、入り切らない枠の下辺とスクロールバーだけである（キー案内の行には出さない）。
 
 use ratatui::layout::{Margin, Rect};
 use ratatui::style::{Color, Style};
@@ -42,7 +48,7 @@ use harness_term::wrap::Wrapped;
 /// - **`floor`より低くしない。** 収まる中身で画面の割り付けが動かないように、今までの固定の高さを渡す。
 /// - **`ceiling`を超えない。** 隣の一覧を潰さないための上限で、呼び出し側が決める
 ///   （説明欄は一覧と高さを分け合うので、一覧に半分を残す値を渡している）。超えた分は
-///   [`draw_box`]が行数で言う。
+///   [`draw_scrollable`]で送って読む。
 pub(super) fn box_height<'a>(
     text: impl Into<Text<'a>>,
     width: u16,
@@ -55,33 +61,67 @@ pub(super) fn box_height<'a>(
         .clamp(floor, ceiling.max(floor))
 }
 
-/// 折り返す枠を描き、**入り切らなかった行数を枠の下辺に出す**（黙って切らない、`B-09`）。
+/// 送れる枠の見せ方。入り切らないときにだけ使う（入り切る枠は今までと1セルも変わらない）。
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Look {
+    /// 下辺の「N〜M/T行」の後ろに添える送り方。**効く手段だけを書く**（B-32）。
+    pub how: &'static str,
+    /// 下辺の「N〜M/T行」の色。
+    pub notice: Style,
+    /// スクロールバーの色。**枠線と同じ色を渡す**（スクロールバーは右の枠線の上に描くので、
+    /// 違う色にすると枠線の途中で色が変わる）。
+    pub bar: Style,
+}
+
+impl Look {
+    /// 説明欄とヘルプ。ホイールだけで送る（`tui::scroll`のモジュールdoc）。`border`は枠線の色。
+    ///
+    /// 位置の案内を黄色にするのは、以前の「下のN行が枠に収まっていません」と同じく、**残りがあることを
+    /// 読み落とさせない**ためである（読み切ったつもりで判断してしまう）。
+    pub(super) fn panel(border: Style) -> Self {
+        Self {
+            how: "ホイールで送る",
+            notice: Style::default().fg(Color::Yellow),
+            bar: border,
+        }
+    }
+}
+
+/// 送れる枠を描き、**この描画で分かった送れる上限**を返す（確認ダイアログ・ヘルプ・説明欄が共有する）。
 ///
-/// 送れない枠（説明欄・ヘルプ）に使う。送れる枠（確認ダイアログ）は、何行目を見ているかを自分で出す。
-pub(super) fn draw_box<'a>(
+/// `top`は状態が持つ送り量（枠の一番上に見せる表示行）。上限を超えていても、描く位置だけを上限へ切り詰める。
+/// 呼び出し側は戻り値を`DrawFeedback`で状態へ返し、状態の側を切り詰める（[`Window`]のdoc。BUG-076）。
+///
+/// 本文が入り切らないときだけ、下辺の右に「N〜M/T行  送り方」を出し、右の枠線の上にスクロールバーを出す。
+/// 入り切るときは何も足さない。下辺が狭い枠では送り方を落とす（[`Window::notice`]）。
+pub(super) fn draw_scrollable<'a>(
     frame: &mut Frame,
     area: Rect,
     text: impl Into<Text<'a>>,
     block: Block<'a>,
-) {
+    top: u16,
+    look: Look,
+) -> u16 {
     let text = text.into();
     let inner = block.inner(area);
-    let hidden = rows(text.clone(), inner.width).saturating_sub(usize::from(inner.height));
-    let block = if hidden == 0 {
-        block
-    } else {
-        block.title_bottom(overflow_notice(hidden))
+    let window = Window::new(
+        rows(text.clone(), inner.width),
+        usize::from(inner.height),
+        top,
+    );
+    // 下辺のうち、左右の角を除いた幅。
+    let block = match window.notice(look.how, area.width.saturating_sub(2)) {
+        Some(notice) => block.title_bottom(Line::styled(notice, look.notice).right_aligned()),
+        None => block,
     };
-    Wrapped::new(text).block(block).render(frame, area);
-}
-
-/// 入り切らなかった行数の案内。**残りがあることが分からないと、読み切ったつもりで判断してしまう**。
-fn overflow_notice(hidden: usize) -> Line<'static> {
-    Line::styled(
-        format!(" 下の{hidden}行が枠に収まっていません（端末を広げると見えます） "),
-        Style::default().fg(Color::Yellow),
-    )
-    .right_aligned()
+    Wrapped::new(text)
+        .block(block)
+        .scroll(u16::try_from(window.top).unwrap_or(u16::MAX))
+        .render(frame, area);
+    if window.overflows() {
+        draw_scrollbar(frame, area, window, look.bar);
+    }
+    u16::try_from(window.max_top()).unwrap_or(u16::MAX)
 }
 
 /// 送れる枠で、いま見せている範囲（[BUG-196](../../../../docs/bugs/BUG-196.md)）。
@@ -94,27 +134,27 @@ fn overflow_notice(hidden: usize) -> Line<'static> {
 ///
 /// # 上限は描くまで分からない
 ///
-/// 総行数は枠の幅で折り返した結果なので、キーを受けた時点では決まらない。だからキーの側は上限を
+/// 総行数は枠の幅で折り返した結果なので、キーやホイールを受けた時点では決まらない。だから受けた側は上限を
 /// 掛けずに進め、描画が[`Self::max_top`]を返し、呼び出し側が状態を切り詰める
 /// （`harness_term::scrollback`・会話TUIの承認ダイアログと同じ形。描画の側だけで切り詰めると、
 /// 末尾で押した分が状態に溜まって戻すときに空回りする——BUG-076）。
 ///
 /// `harness_term::scrollback::Scrollback`を流用しないのは向きが逆だからである。あちらは**下端からの距離**で
-/// 持ち、既定は末尾に貼り付く（新着に追従するログ用）。確認ダイアログは**先頭から**読ませる
+/// 持ち、既定は末尾に貼り付く（新着に追従するログ用）。確認ダイアログ・説明欄は**先頭から**読ませる
 /// （決定33: 判断材料を明細より前に置いている）ので、上端からの位置で持つ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct Window {
+struct Window {
     /// 本文を折り返した後の行数。
-    pub total: usize,
+    total: usize,
     /// 枠の中に見える行数。
-    pub visible: usize,
+    visible: usize,
     /// 枠の一番上に見せる表示行（0始まり）。**上限で切り詰め済み**。
-    pub top: usize,
+    top: usize,
 }
 
 impl Window {
     /// `scroll`は状態が持つ送り量。上限を超えていても、ここでは描く位置だけを上限へ切り詰める。
-    pub(super) fn new(total: usize, visible: usize, scroll: u16) -> Self {
+    fn new(total: usize, visible: usize, scroll: u16) -> Self {
         let top = usize::from(scroll).min(total.saturating_sub(visible));
         Self {
             total,
@@ -124,17 +164,41 @@ impl Window {
     }
 
     /// 送れる上限（最後の行が枠の一番下の行に来るときの[`Self::top`]）。
-    pub(super) fn max_top(self) -> usize {
+    fn max_top(self) -> usize {
         self.total.saturating_sub(self.visible)
     }
 
     /// 本文が枠に収まらない（＝送れる）か。
-    pub(super) fn overflows(self) -> bool {
+    fn overflows(self) -> bool {
         self.total > self.visible
+    }
+
+    /// 下辺に出す「いま何行目から何行目を見ているか」と送り方。**残りがあることが分からないと、
+    /// 読み切ったつもりで判断してしまう**（B-09）。本文が収まっていれば`None`（何も出さない）。
+    ///
+    /// `room`は下辺に使える桁数。**入らなければ送り方を落とし、それでも入らなければ出さない**——右寄せの見出しは
+    /// 入り切らないと**左から**切れるので、「1〜3/10行」の頭の行番号が消えて別の範囲に読める
+    /// （記録画面の見出し枠は左の列の45%しか幅が無く、80桁未満の端末でそうなる）。落としても
+    /// スクロールバーは残る。
+    fn notice(self, how: &str, room: u16) -> Option<String> {
+        use unicode_width::UnicodeWidthStr;
+
+        if !self.overflows() {
+            return None;
+        }
+        let position = format!(
+            "{}〜{}/{}行",
+            (self.top + 1).min(self.total),
+            (self.top + self.visible).min(self.total),
+            self.total
+        );
+        [format!(" {position}  {how} "), format!(" {position} ")]
+            .into_iter()
+            .find(|notice| notice.width() <= usize::from(room))
     }
 }
 
-/// 送れる枠を描く。本文を[`Window::top`]行目から見せ、**収まらないときだけ右の枠線の上にスクロールバーを出す**。
+/// 右の枠線の上にスクロールバーを描く。
 ///
 /// # スクロールバーは枠線の上に描く
 ///
@@ -144,23 +208,9 @@ impl Window {
 /// 右の枠線の一部がつまみに変わって見える。上下の矢印は付けない（つまみが端に付いたことで先頭・末尾を
 /// 言うため。矢印を付けると、端に付いても矢印との間に線が残る）。
 ///
-/// **送れることはスクロールバーだけでは伝わらない**（キーで送れることは絵から読めない）ので、
-/// 下辺の「↑↓ PgUp/PgDn で送る」は呼び出し側が引き続き出す。
-pub(super) fn draw_scrolled<'a>(
-    frame: &mut Frame,
-    area: Rect,
-    text: impl Into<Text<'a>>,
-    block: Block<'a>,
-    window: Window,
-    bar: Style,
-) {
-    Wrapped::new(text)
-        .block(block)
-        .scroll(u16::try_from(window.top).unwrap_or(u16::MAX))
-        .render(frame, area);
-    if !window.overflows() {
-        return;
-    }
+/// **送れることはスクロールバーだけでは伝わらない**（キーやホイールで送れることは絵から読めない）ので、
+/// 下辺の「N〜M/T行」に送り方を添える（[`Look::how`]）。
+fn draw_scrollbar(frame: &mut Frame, area: Rect, window: Window, bar: Style) {
     // ratatuiの`ScrollbarState`は「送れる位置の数」と「見えている量」で数える。位置は0〜上限の
     // `上限+1`通り、見えている量は`visible`——こう渡すと、先頭でつまみが一番上、上限で一番下に付く。
     let mut state = ScrollbarState::new(window.max_top() + 1)

@@ -63,6 +63,8 @@ mod edit;
 mod edit_screen;
 mod proposal_tree;
 pub mod record_screen;
+/// 送れる枠（説明欄・ヘルプ・確認ダイアログ・記録画面の3枠）の位置と、ホイールの当たり判定（2026-10-02）。
+mod scroll;
 mod stderr_capture;
 mod text_input;
 /// [段階⑦] 承認待ち画面（`F2`）の遷移2タブの状態遷移。
@@ -74,7 +76,7 @@ pub mod transition_dismissed;
 mod transition_destination;
 mod transition_screen;
 mod worker;
-/// 折り返す枠の行数を数え、入り切らなかった分を黙らせない部品（BUG-192）。
+/// 折り返す枠の行数を数え、入り切らなかった分を送って読ませる部品（BUG-192）。
 mod wrap;
 
 use std::io;
@@ -95,8 +97,8 @@ use state::{Action, App, Screen};
 ///
 /// 描画時にしか決まらない値が2種類ある。
 ///
-/// 1. さかのぼり・送りの上限（記録画面の3枠と確認ダイアログ。折り返し後の行数は枠の幅に依存する。
-///    `harness_term::scrollback`のdoc）
+/// 1. さかのぼり・送りの上限（記録画面の3枠・確認ダイアログ・説明欄とヘルプ。折り返し後の行数は枠の幅に
+///    依存する。`harness_term::scrollback`・`tui::scroll`のdoc）
 /// 2. 一覧の表示開始位置（ratatuiが「選択を見せる」ために動かした結果）
 ///
 /// どちらも**書き戻さないと壊れる**——1を怠ると端で空回りし（BUG-076）、
@@ -107,6 +109,9 @@ pub struct DrawFeedback {
     /// 確認ダイアログを送れる上限（本文の最後の行が枠の一番下に来る位置。[BUG-196](../../../../docs/bugs/BUG-196.md)）。
     /// `None`＝確認ダイアログを描いていない（触らない）。
     pub modal_scroll_max: Option<u16>,
+    /// 説明欄とヘルプを送れる上限。**描かなかった欄は0**（既定値）で、書き戻すとその欄は先頭へ戻る
+    /// （`tui::scroll`のモジュールdoc）。
+    pub panels: scroll::PanelLimits,
     /// `None`＝この画面はその一覧を描いていない（触らない）。
     pub session_list_offset: Option<usize>,
     pub candidate_list_offset: Option<usize>,
@@ -204,11 +209,12 @@ pub fn run(
                 }
                 None => {}
             },
-            // **ホイールはポインタの下の枠をさかのぼる。**
+            // **ホイールはポインタの下の枠を送る**（記録画面の3枠・各画面の説明欄。確認ダイアログと
+            // ヘルプが開いている間は、ポインタの位置に関係なくそれを送る。`tui::scroll`）。
             //
             // `↑/↓`は項目移動、`←/→`はパス切替で既に埋まっているので、キーを増やさずに
             // 済むホイールだけを入れている。枠の当たり判定は描画とまったく同じ計算を通す
-            // （`record_screen::scroll_target`が画面全体の割り付け[`screen_rows`]から辿る）
+            // （`scroll::target`が画面全体の割り付け[`screen_rows`]から辿る）
             // ——別々に持つと「見えている枠と反応する枠」がずれる（BUG-194は実際にずれていた）。
             // 端末の大きさはここで聞き直すので、位置を状態に持ち越さない。
             Event::Mouse(mouse) => {
@@ -263,7 +269,7 @@ struct ScreenRows {
 }
 
 /// 画面全体を[`ScreenRows`]に割る。**描画（[`draw`]）とマウスの当たり判定
-/// （`record_screen::scroll_target`）が同じこの関数を通る**（[BUG-194](../../../../docs/bugs/BUG-194.md)）。
+/// （`scroll::target`）が同じこの関数を通る**（[BUG-194](../../../../docs/bugs/BUG-194.md)）。
 ///
 /// 以前はこの割り付けを描画だけが持ち、当たり判定は**端末全体を本体として**記録画面の割り付けを
 /// 計算していた。反応する枠は見えている枠より1行上にずれ、下は知らせの行とキー案内の行まで
@@ -291,13 +297,11 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
     let rows = screen_rows(area, app);
 
     draw_tabs(frame, rows.tabs, app);
-    // 記録画面だけがさかのぼれる枠を持つ。上限は**描画してみないと分からない**
-    // （折り返し後の行数は枠の幅に依存する）ので、ここで受け取って呼び出し側へ返す。
+    // 送れる枠（記録画面の3枠・説明欄）の上限は**描画してみないと分からない**
+    // （折り返し後の行数は枠の幅に依存する）ので、各画面から受け取って呼び出し側へ返す。
+    // **この振り分けは`scroll::target`（ホイールの当たり判定）と同じ条件である。**
     let mut feedback = match app.screen {
-        Screen::Record => DrawFeedback {
-            scroll: record_screen::draw(frame, rows.body, app),
-            ..Default::default()
-        },
+        Screen::Record => record_screen::draw(frame, rows.body, app),
         // 承認待ち画面は3つのタブを持つ（決定62）。遷移の2タブは別の描き手。
         Screen::Edit if app.pending.tab.0.is_transition() => {
             transition_screen::draw(frame, rows.body, app)
@@ -309,7 +313,10 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
     draw_keys(frame, rows.keys, app);
 
     if app.help {
-        draw_help(frame, area);
+        let top = app.panels.top(scroll::Panel::Help);
+        feedback
+            .panels
+            .set(scroll::Panel::Help, draw_help(frame, area, top));
     }
     if let Some(modal) = app.modal.as_ref() {
         // 送りの上限も描いて初めて分かる（折り返し後の行数）。記録画面の枠と同じく状態へ返す。
@@ -535,8 +542,7 @@ fn draw_keys(frame: &mut Frame, area: Rect, app: &App) {
 /// - **後ろから落とす**のは、画面ごとの並びが「押す頻度と重要度」の順だからである
 ///   （遷移タブの並びのコメント。並び順がそのまま「消えてよい順」になっている）。
 /// - **項目の途中で切らない。** `F4`だけが残るような切れ方は、別のキーに読める。
-/// - **件数を出す**のは、省略したことを黙らないためである（`record_screen`の警告枠の
-///   `… 他 N行`と同じ。B-09）。落とした項目はヘルプ（`F4`）に載っている。
+/// - **件数を出す**のは、省略したことを黙らないためである（B-09）。落とした項目はヘルプ（`F4`）に載っている。
 ///
 /// 全部収まるときは以前と1文字も変わらない。共通の案内そのものより狭い端末では、
 /// 共通の案内も末尾から切れる（描画が落ちないことだけを保つ）。
@@ -688,7 +694,8 @@ CLIも同じことができます: record / approve / record-net / show / sessio
 /// ヘルプの枠の幅（端末がこれより狭ければ端末の幅）。
 const HELP_WIDTH: u16 = 78;
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+/// ヘルプ（`F4`）を描き、送れる上限を返す（`top`は送り位置。`App::panels`）。
+fn draw_help(frame: &mut Frame, area: Rect, top: u16) -> u16 {
     // **高さは本文から数える。** 固定値（26行）だった頃、本文はとうに44行あり
     // 半分以上が枠の外で切れていた——ヘルプに書いたのに読めない状態は「書いていない」のと
     // 同じである（B-09）。行数を手で持つと本文を足すたびにまたずれるので持たない（B-05）。
@@ -699,15 +706,17 @@ fn draw_help(frame: &mut Frame, area: Rect) {
     let rows = wrap::rows(HELP_TEXT, width.saturating_sub(2));
     let height = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(2);
     let area = open_overlay(frame, area, width, height);
-    // ヘルプは送れない（何かキーを押すと閉じる）。端末が低くて収まらない分は、行数を枠に出す。
-    wrap::draw_box(
+    // 端末が低くて収まらない分は、ホイールで送る（`tui::scroll`）。キーは今までどおり、どれでも閉じる。
+    wrap::draw_scrollable(
         frame,
         area,
         HELP_TEXT,
         Block::default()
             .borders(Borders::ALL)
             .title(" ヘルプ（何かキーを押すと閉じます） "),
-    );
+        top,
+        wrap::Look::panel(Style::default()),
+    )
 }
 
 /// 確認ダイアログの枠の幅（端末がこれより狭ければ端末の幅）。
@@ -731,10 +740,13 @@ const MODAL_WIDTH: u16 = 88;
 /// # 送るのは「本文の最後の行が枠の一番下の行に来たところ」まで（[BUG-196](../../../../docs/bugs/BUG-196.md)）
 ///
 /// `scroll`は**折り返した後の表示行**で、枠の一番上に見せる行である（下辺の「N〜M/T行」と同じ単位）。
-/// 上限は描いて初めて分かるので、ここで[`wrap::Window`]に切り詰めて描き、**上限を返す**——呼び出し側が
+/// 上限は描いて初めて分かるので、描く側（[`wrap::draw_scrollable`]）が切り詰めて描き、**上限を返す**——呼び出し側が
 /// [`DrawFeedback::modal_scroll_max`]で状態へ書き戻す（`App::apply_draw_feedback`）。以前は上限が
 /// 「最後の行が枠の一番上に来る位置」で、末尾では枠がほぼ空になるまで送れた。
-/// 収まらないときだけ右の枠線の上にスクロールバーを出す（[`wrap::draw_scrolled`]）。
+/// 収まらないときだけ右の枠線の上にスクロールバーを出す。説明欄・ヘルプと同じ部品で描く。
+///
+/// ホイールでも送れる（`tui::scroll`）ので、下辺の送り方にホイールも書く——**見えていないと誰も試さない**
+/// （記録画面のキー案内が「ホイール 枠内をさかのぼる」を出しているのと同じ理由）。
 ///
 /// **末尾の空行は数えも描きもしない。** 明細の組み立ては節の区切りに空行を足すので（付け替えの明細など）、
 /// 後ろに何も続かないと本文が空行で終わる。数えると、末尾まで送ったときの一番下の行が空行になり、
@@ -759,29 +771,17 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) 
         .min(area.height.saturating_sub(2));
     let area = open_overlay(frame, area, width, height.max(6));
 
-    let window = wrap::Window::new(total, usize::from(area.height.saturating_sub(2)), scroll);
     let keys = if modal.confirm.asks() {
         " y=書く   n / Esc=やめる "
     } else {
         " Enter / Esc=閉じる "
     };
-    let position = if window.overflows() {
-        format!(
-            " {}〜{}/{}行  ↑↓ PgUp/PgDn で送る ",
-            (window.top + 1).min(total),
-            (window.top + window.visible).min(total),
-            total
-        )
-    } else {
-        String::new()
-    };
-
     let color = if modal.confirm.asks() {
         Color::Yellow
     } else {
         Color::Red
     };
-    let mut block = Block::default()
+    let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(color))
         .title(format!(" {} ", modal.title))
@@ -792,13 +792,18 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) 
                 .bg(color)
                 .add_modifier(Modifier::BOLD),
         ));
-    if !position.is_empty() {
-        block = block.title_bottom(
-            Line::styled(position, Style::default().fg(Color::DarkGray)).right_aligned(),
-        );
-    }
-    wrap::draw_scrolled(frame, area, text, block, window, Style::default().fg(color));
-    u16::try_from(window.max_top()).unwrap_or(u16::MAX)
+    wrap::draw_scrollable(
+        frame,
+        area,
+        text,
+        block,
+        scroll,
+        wrap::Look {
+            how: "↑↓ PgUp/PgDn・ホイールで送る",
+            notice: Style::default().fg(Color::DarkGray),
+            bar: Style::default().fg(color),
+        },
+    )
 }
 
 #[cfg(test)]

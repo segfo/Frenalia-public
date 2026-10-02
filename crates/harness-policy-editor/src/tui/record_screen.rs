@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
+use crate::tui::scroll::{Panel, PanelLimits, PanelScroll, Wheel};
 use crate::tui::state::{
     format_elapsed, progress_bar, spinner_frame, App, Pass, RecordField, RunState,
 };
@@ -20,18 +21,22 @@ use crate::tui::wrap;
 /// 入力欄のラベル幅（全角6文字ぶん）。
 const LABEL_WIDTH: u16 = 12;
 
-/// 戻り値はこの描画で判明したさかのぼり上限（[`ScrollLimits`]）。
-/// 呼び出し側が`App::clamp_scroll`へ渡す（BUG-076と同じ理由。`scrollback`のdoc）。
-pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> ScrollLimits {
+/// 戻り値はこの描画で判明した送りの上限（3枠の[`ScrollLimits`]と、説明欄の`PanelLimits`）。
+/// 呼び出し側が`App::apply_draw_feedback`へ渡す（BUG-076と同じ理由。`scrollback`のdoc）。
+pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
     let chunks = record_rows(area);
     draw_form(frame, chunks[0], app);
+    let mut feedback = crate::tui::DrawFeedback::default();
     match app.run.as_ref() {
-        Some(run) => draw_progress(frame, chunks[1], run),
-        None => {
-            draw_notice(frame, chunks[1], app);
-            ScrollLimits::default()
+        Some(run) => {
+            feedback.scroll =
+                draw_progress(frame, chunks[1], run, app.panels, &mut feedback.panels);
         }
+        None => feedback
+            .panels
+            .set(Panel::RecordNotice, draw_notice(frame, chunks[1], app)),
     }
+    feedback
 }
 
 /// 記録画面の縦割り（フォーム／本文）。**描画とマウスの当たり判定が同じ関数を通る**
@@ -40,13 +45,13 @@ fn record_rows(area: Rect) -> std::rc::Rc<[Rect]> {
     Layout::vertical([Constraint::Length(7), Constraint::Min(3)]).split(area)
 }
 
-/// 記録画面の本文（フォームの下）。[`progress_areas`]へ渡す矩形で、テストからも使う。
-/// `area`は記録画面が描かれる本体（画面全体ではない。[`scroll_target`]のdoc）。
+/// 記録画面の本文（フォームの下）。[`progress_areas`]へ渡す矩形で、記録を始める前は「実行するとどうなるか」の枠
+/// そのもの。テストからも使う。`area`は記録画面が描かれる本体（画面全体ではない。[`wheel_target`]のdoc）。
 pub fn record_body_area(area: Rect) -> Rect {
     record_rows(area)[1]
 }
 
-/// 実行中に出る枠の位置。[`draw_progress`]と[`scroll_target`]が共有する。
+/// 実行中に出る枠の位置。[`draw_progress`]と[`wheel_target`]が共有する。
 pub struct ProgressAreas {
     /// 左の列の一番上の見出し枠（「いま待っているもの」／「終わりました」）。
     pub header: Rect,
@@ -139,29 +144,32 @@ fn progress_header(run: &RunState) -> (&'static str, Color, String) {
     }
 }
 
-/// ホイールの位置から、どの枠のスクロール位置を動かすかを決める。
+/// ホイールの位置から、記録画面のどの枠を送るかを決める（`tui::scroll::target`から呼ぶ）。
 ///
-/// 実行中でなければどの枠も無い（`None`）——待機画面は1枚のParagraphで、
-/// さかのぼる対象が無い。
+/// 記録を始める前は「実行するとどうなるか」の1枠だけ。始めた後は、新着を追う3枠（進行・出力・起動時ノイズ）と、
+/// 先頭から読む2枠（見出し・警告）である。枠の位置は描画と同じ[`progress_areas`]で出す。
 ///
-/// `area`は**端末全体**。記録画面が描かれる本体の位置は、描画と同じ画面全体の割り付け
-/// （`tui::screen_rows`）から辿る。以前は端末全体をそのまま本体として扱っていたので、
-/// 反応する枠が見えている枠より1行上にずれ、知らせの行とキー案内の行まで伸びていた（BUG-194）。
-pub fn scroll_target(area: Rect, app: &App, column: u16, row: u16) -> Option<ScrollPane> {
-    let run = app.run.as_ref()?;
-    let body = record_body_area(super::screen_rows(area, app).body);
-    let areas = progress_areas(body, run);
-    let at = Position::new(column, row);
-    if areas.output.contains(at) {
-        return Some(ScrollPane::Output);
-    }
-    if areas.log.contains(at) {
-        return Some(ScrollPane::Log);
-    }
-    if areas.noise.is_some_and(|r| r.contains(at)) {
-        return Some(ScrollPane::Noise);
-    }
-    None
+/// `body`は記録画面が描かれる本体で、呼び出し側が描画と同じ画面全体の割り付け（`tui::screen_rows`）から出す。
+/// 以前は端末全体をそのまま本体として扱っていたので、反応する枠が見えている枠より1行上にずれ、
+/// 知らせの行とキー案内の行まで伸びていた（BUG-194）。
+pub(super) fn wheel_target(body: Rect, app: &App, at: Position) -> Option<Wheel> {
+    let below_form = record_body_area(body);
+    let Some(run) = app.run.as_ref() else {
+        return below_form
+            .contains(at)
+            .then_some(Wheel::Panel(Panel::RecordNotice));
+    };
+    let areas = progress_areas(below_form, run);
+    [
+        (Some(areas.output), Wheel::Record(ScrollPane::Output)),
+        (Some(areas.log), Wheel::Record(ScrollPane::Log)),
+        (areas.noise, Wheel::Record(ScrollPane::Noise)),
+        (Some(areas.header), Wheel::Panel(Panel::RecordHeader)),
+        (areas.warnings, Wheel::Panel(Panel::RecordWarnings)),
+    ]
+    .into_iter()
+    .find(|(area, _)| area.is_some_and(|r| r.contains(at)))
+    .map(|(_, wheel)| wheel)
 }
 
 /// スクロールできる枠の識別子。
@@ -341,8 +349,8 @@ fn label_style(focused: bool) -> Style {
 }
 
 /// 実行前に「何が起きるか」を出す。**UACが何回出るか・マシンに何が残るか**が判断材料なので、
-/// 文言は実行する側（`record`/`record_net`）が持つものをそのまま見せる。
-fn draw_notice(frame: &mut Frame, area: Rect, app: &App) {
+/// 文言は実行する側（`record`/`record_net`）が持つものをそのまま見せる。戻り値は送れる上限。
+fn draw_notice(frame: &mut Frame, area: Rect, app: &App) -> u16 {
     let mut text = app.pass.elevation_notice();
     if app.pass == Pass::Two {
         text.push_str(
@@ -359,18 +367,27 @@ fn draw_notice(frame: &mut Frame, area: Rect, app: &App) {
             text.push('\n');
         }
     }
-    // この枠は本文の残り全部を使うので、伸ばす先が無い。低い端末で入らない分は行数を言う（BUG-192）。
-    wrap::draw_box(
+    // この枠は本文の残り全部を使うので、伸ばす先が無い。低い端末で入らない分はホイールで送る（`tui::scroll`）。
+    wrap::draw_scrollable(
         frame,
         area,
         text,
         Block::default()
             .borders(Borders::ALL)
             .title(" 実行するとどうなるか "),
-    );
+        app.panels.top(Panel::RecordNotice),
+        wrap::Look::panel(Style::default()),
+    )
 }
 
-fn draw_progress(frame: &mut Frame, area: Rect, run: &RunState) -> ScrollLimits {
+/// 実行中の枠を描く。見出し枠と警告枠の送れる上限は`limits`へ入れ、3枠のさかのぼり上限を返す。
+fn draw_progress(
+    frame: &mut Frame,
+    area: Rect,
+    run: &RunState,
+    panels: PanelScroll,
+    limits: &mut PanelLimits,
+) -> ScrollLimits {
     // **対応が要る事実は専用の枠へ出す。** 進行ログは末尾だけを見せる窓なので、早い段階で
     // 出た警告（実行ファイルへ届かない等）は実行が終わる頃には流れて**見えなくなる**。
     // 実際にそうなった——`cargo test`が`Access is denied`で落ちたとき、原因と次の操作は
@@ -383,30 +400,48 @@ fn draw_progress(frame: &mut Frame, area: Rect, run: &RunState) -> ScrollLimits 
     let areas = progress_areas(area, run);
     let log_area = areas.log;
     let (header_title, header_color, header_text) = progress_header(run);
-    wrap::draw_box(
-        frame,
-        areas.header,
-        header_text,
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(header_color))
-            .title(header_title),
+    let header_border = Style::default().fg(header_color);
+    limits.set(
+        Panel::RecordHeader,
+        wrap::draw_scrollable(
+            frame,
+            areas.header,
+            header_text,
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(header_border)
+                .title(header_title),
+            panels.top(Panel::RecordHeader),
+            wrap::Look::panel(header_border),
+        ),
     );
 
+    // 警告は**先頭から**見せる。最初に出た警告がたいてい原因そのもの（後続の失敗はその結果）なので、
+    // 入り切らないときに最初に見えているべきは古い方である。残りはホイールで送って読む（`tui::scroll`）。
+    // 以前は入るだけを先頭から取り、残りは「… 他 N行」と件数を言うだけだった（全文は記録セッションの
+    // マニフェストにしか無かった）。
     if let Some(warnings_area) = areas.warnings {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(format!(" ⚠ 対応が要ります（{}件） ", run.warnings.len()));
-        let inner = block.inner(warnings_area);
-        let all: Vec<&str> = run.warnings.iter().flat_map(|w| w.lines()).collect();
-        harness_term::wrap::Wrapped::new(fit_warning_lines(
-            &all,
-            inner.width,
-            usize::from(inner.height),
-        ))
-        .block(block)
-        .render(frame, warnings_area);
+        let border = Style::default().fg(Color::Yellow);
+        let lines: Vec<Line> = run
+            .warnings
+            .iter()
+            .flat_map(|w| w.lines())
+            .map(Line::raw)
+            .collect();
+        limits.set(
+            Panel::RecordWarnings,
+            wrap::draw_scrollable(
+                frame,
+                warnings_area,
+                lines,
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border)
+                    .title(format!(" ⚠ 対応が要ります（{}件） ", run.warnings.len())),
+                panels.top(Panel::RecordWarnings),
+                wrap::Look::panel(border),
+            ),
+        );
     }
 
     // 描画と上限の算出は`harness_term::scrollback`が持つ（会話TUIのtranscriptと共有）。
@@ -477,46 +512,6 @@ pub struct ScrollLimits {
     pub log: u16,
     pub output: u16,
     pub noise: u16,
-}
-
-/// 警告枠に出す行。`width`桁×`rows`行の枠に**折り返した後で**収まるだけを先頭から取る。
-///
-/// **末尾ではなく先頭から出す。** 最初に出た警告がたいてい原因そのもの（後続の失敗は
-/// その結果）なので、あふれたときに残すべきは古い方である。収まらないときは最後に
-/// `… 他 N行`を置き（**省略したことを黙らない**、B-09。全文は記録セッションのマニフェストに残る）、
-/// その行が折り返して占める分も先に空けておく。
-///
-/// 以前は折り返す前の行数で数えていたので、長い警告が折り返した分だけ下が押し出され、
-/// **`… 他 N行`そのものが枠の外へ出て**省略が黙って起きていた（BUG-192）。
-fn fit_warning_lines(all: &[&str], width: u16, rows: usize) -> Vec<Line<'static>> {
-    let lines = |taken: &[&str]| -> Vec<Line<'static>> {
-        taken.iter().map(|l| Line::raw(l.to_string())).collect()
-    };
-    let summary = |omitted: usize| {
-        Line::raw(format!(
-            "… 他 {omitted}行（全文は record-session.json の warnings）"
-        ))
-    };
-    // 先頭からk行が占める表示行（`used[k]`）。折り返しは1行ずつ独立なので、行ごとの数の和になる。
-    // 毎フレーム呼ばれるので、取る行数を変えるたびに数え直さない。
-    let mut used = vec![0usize];
-    for line in all {
-        let last = *used.last().expect("0から始めている");
-        used.push(last + wrap::rows(*line, width));
-    }
-    if used[all.len()] <= rows {
-        return lines(all);
-    }
-    for kept in (0..all.len()).rev() {
-        let omitted = summary(all.len() - kept);
-        if used[kept] + wrap::rows(omitted.clone(), width) <= rows {
-            let mut shown = lines(&all[..kept]);
-            shown.push(omitted);
-            return shown;
-        }
-    }
-    // 要約の1行すら入らない（極端に低い・狭い枠）。要約だけを渡す（切れても描画は落ちない）。
-    vec![summary(all.len())]
 }
 
 /// 枠の全行を`Line`へ写す（窓切りはしない）。

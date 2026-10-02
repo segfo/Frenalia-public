@@ -407,8 +407,7 @@ fn every_screen_hint_is_shown_in_order_when_the_terminal_is_wide_enough() {
 /// 後ろから落とすのは、画面ごとの並びが「押す頻度と重要度」の順だからである
 /// （遷移タブの並びのコメント）。**先頭（遷移タブなら`Space`）は残る**ことと、
 /// 項目の途中で切れていないこと（行が「先頭からk件・`… 他N件`・共通の案内」の形に
-/// ぴったり一致すること）を見る。件数を出すのは、省略したことを黙らないためである
-/// （`record_screen`の警告枠の`… 他 N行`と同じ）。
+/// ぴったり一致すること）を見る。件数を出すのは、省略したことを黙らないためである（B-09）。
 #[test]
 fn a_narrow_terminal_drops_screen_hints_from_the_tail_and_says_how_many() {
     let ws = workspace();
@@ -642,6 +641,9 @@ fn reassignment_confirmation(ws: &std::path::Path) -> App {
     app
 }
 
+/// 確認ダイアログが収まらないときに下辺へ出す送り方（空白を落とした形）。2026-10-02からホイールも書く。
+const MODAL_SCROLL_HINT: &str = "↑↓PgUp/PgDn・ホイールで送る";
+
 /// [BUG-192] **禁止側**: 確認ダイアログの最後の行が、黙って枠の外へ切れない。
 ///
 /// # 壊れた状態を一文で
@@ -684,7 +686,7 @@ fn the_last_line_of_a_confirmation_is_never_cut_off_silently() {
                     draw_modal(f, f.area(), modal, 0);
                 });
                 let screen = flatten(&rows);
-                (!screen.contains(&last) && !screen.contains("PgUp/PgDnで送る"))
+                (!screen.contains(&last) && !screen.contains(MODAL_SCROLL_HINT))
                     .then(|| format!("{width}×{height}:\n{}", rows.join("\n")))
             })
             .collect();
@@ -721,7 +723,7 @@ fn the_end_key_reaches_the_last_line_even_when_every_line_wraps() {
         flatten(&rows)
     };
     assert!(
-        modal_screen(&mut app).contains("PgUp/PgDnで送る"),
+        modal_screen(&mut app).contains(MODAL_SCROLL_HINT),
         "収まらないのに送れると言っていない"
     );
 
@@ -819,7 +821,7 @@ fn right_edge(grid: &[Vec<String>], area: ratatui::layout::Rect) -> Vec<String> 
         .collect()
 }
 
-/// スクロールバーのつまみの記号（`wrap::draw_scrolled`）。
+/// スクロールバーのつまみの記号（`wrap::draw_scrollable`）。
 const THUMB: &str = "█";
 
 /// 確認ダイアログの下辺の「N〜M/T行」。出ていなければ`None`（＝本文が枠に収まっている）。
@@ -1147,7 +1149,7 @@ fn paint_short_modal(frame: &mut Frame) {
 }
 
 fn paint_help(frame: &mut Frame) {
-    draw_help(frame, frame.area());
+    draw_help(frame, frame.area(), 0);
 }
 
 /// 画面へ重ねる枠を1つ描く手順。
@@ -1342,13 +1344,15 @@ fn broken_right_border_rows(grid: &[Vec<String>], area: ratatui::layout::Rect) -
 /// （端末が78桁以上あればいつも）。確認ダイアログと説明欄も、同じ形の行が来れば同じように欠ける。
 #[test]
 fn a_wrapped_box_keeps_its_right_border_when_a_line_ends_with_a_wide_character() {
-    // 説明欄と同じ部品（`wrap::draw_box`）で描く枠。中は38桁。
+    // 説明欄と同じ部品（`wrap::draw_scrollable`）で描く枠。中は38桁。
     let notes = |frame: &mut Frame| {
-        wrap::draw_box(
+        wrap::draw_scrollable(
             frame,
             ratatui::layout::Rect::new(0, 0, 40, 6),
             spilling_line(38),
             Block::default().borders(Borders::ALL).title("説明"),
+            0,
+            wrap::Look::panel(Style::default()),
         );
     };
     // 確認ダイアログ。枠は88桁（`MODAL_WIDTH`）で、中は86桁。
@@ -1448,29 +1452,36 @@ fn every_wrapped_text_and_overlay_goes_through_harness_term() {
 /// 「高さは本文から数える」（B-09）はヘルプが先に直していたが、数えていたのは折り返す前の行だった。
 #[test]
 fn the_help_box_is_as_tall_as_its_wrapped_text() {
-    let screen = flatten(&paint_rows(100, 400, |f| draw_help(f, f.area())));
+    let screen = flatten(&paint_rows(100, 400, |f| {
+        draw_help(f, f.area(), 0);
+    }));
     let last = squash(HELP_TEXT.lines().last().expect("ヘルプが空"));
     assert!(
         screen.contains(&last),
         "背の高い端末でもヘルプの最後の行が切れている:\n{screen}"
     );
     assert!(
-        !screen.contains("収まっていません"),
-        "収まっているのに切れたと言っている"
+        !screen.contains("ホイールで送る"),
+        "収まっているのに送れると言っている"
     );
 }
 
-/// [BUG-192] **端末が低くて収まらないときは、切れた行数を枠に出す**（黙って切らない、`B-09`）。
-/// 行数は背の高い端末で描いたときの枠の中の行数から測る（描画と同じ数え方を試験に写さない）。
+/// [BUG-192] **端末が低くて収まらないときは、何行中どこを見ているかを枠に出す**（黙って切らない、`B-09`）。
+/// 2026-10-02からは送れる（「ホイールで送る」）。行数は背の高い端末で描いたときの枠の中の行数から測る
+/// （描画と同じ数え方を試験に写さない）。
 #[test]
 fn a_help_taller_than_the_terminal_says_how_many_lines_are_cut() {
-    let text_rows = box_height(&paint_rows(100, 400, |f| draw_help(f, f.area()))) - 2;
+    let text_rows = box_height(&paint_rows(100, 400, |f| {
+        draw_help(f, f.area(), 0);
+    })) - 2;
     let height = 40u16;
-    let hidden = text_rows - usize::from(height - 2);
-    let screen = flatten(&paint_rows(100, height, |f| draw_help(f, f.area())));
+    let visible = usize::from(height - 2);
+    let screen = flatten(&paint_rows(100, height, |f| {
+        draw_help(f, f.area(), 0);
+    }));
     assert!(
-        screen.contains(&format!("下の{hidden}行")),
-        "切れた行数（{hidden}行）を言っていない:\n{screen}"
+        screen.contains(&format!("1〜{visible}/{text_rows}行ホイールで送る")),
+        "見えている範囲（1〜{visible}/{text_rows}行）と送り方を言っていない:\n{screen}"
     );
 }
 
@@ -1652,9 +1663,19 @@ fn the_transition_tab_notes_show_the_selected_program_on_a_narrow_terminal() {
     assert_eq!(wide.len() + 2, 8, "{}", wide.join("\n"));
 }
 
-/// [BUG-192] **送れない枠は、入り切らなかった行を黙って捨てない。** 編集画面の注記は
+/// 見出しに`title`を含む枠の下辺（空白を落とした文字列）。「N〜M/T行」はここに出る。
+fn box_bottom(grid: &[Vec<String>], title: &str) -> String {
+    let area = drawn_box(grid, title).unwrap_or_else(|| panic!("見出しが「{title}」の枠が無い"));
+    squash(
+        &grid[usize::from(area.bottom() - 1)][usize::from(area.x)..usize::from(area.right())]
+            .concat(),
+    )
+}
+
+/// [BUG-192] **入り切らない枠は、入り切らなかった行を黙って捨てない。** 編集画面の注記は
 /// 記録の中身次第で長くなる（プロセスツリーは何十行にもなる）ので、伸ばせる高さに上限がある。
-/// そこで止まったときは、入り切らなかった行数を枠の下辺に出す。
+/// そこで止まったときは、何行中どこを見ているかと送り方を枠の下辺に出す（2026-10-02からは送れる。
+/// それまでは入り切らなかった行数を言うだけだった）。
 #[test]
 fn a_notes_box_that_cannot_grow_any_further_says_how_many_lines_are_cut() {
     let ws = workspace();
@@ -1685,10 +1706,10 @@ fn a_notes_box_that_cannot_grow_any_further_says_how_many_lines_are_cut() {
         .filter(|row| squash(row).contains("注記の"))
         .count();
     assert!(shown < 60, "台本の前提が崩れた（全部入ってしまった）");
-    let hidden = 60 - shown;
+    let bottom = box_bottom(&grid, " 記録の読み方");
     assert!(
-        flatten(&screen).contains(&format!("下の{hidden}行が枠に収まっていません")),
-        "入り切らなかった{hidden}行を言っていない:\n{}",
+        bottom.contains(&format!("1〜{shown}/60行ホイールで送る")),
+        "見えている範囲（1〜{shown}/60行）と送り方を言っていない:\n{}",
         screen.join("\n")
     );
 }
@@ -1723,9 +1744,11 @@ fn the_record_screen_header_shows_the_whole_hint() {
     );
 }
 
-/// [BUG-192] **警告枠の「… 他 N行」は、長い警告が折り返しても枠の中に残る。**
+/// [BUG-192] **警告枠は、長い警告が折り返しても、入り切らないことを言う。**
 /// 以前は折り返す前の行数で「何行入るか」を数えていたので、折り返した分だけ下が押し出され、
-/// 省略したことを言う行そのものが枠の外へ出ていた（省略が黙って起きる）。
+/// 省略したことを言う行（当時は「… 他 N行」）そのものが枠の外へ出ていた（省略が黙って起きる）。
+/// 2026-10-02からは送れるので、下辺に「N〜M/T行  ホイールで送る」を出す（最後まで送れることは
+/// [`the_warning_box_can_be_scrolled_to_the_last_warning`]が見る）。
 #[test]
 fn the_warning_box_still_says_how_many_lines_it_omitted_when_lines_wrap() {
     let ws = workspace();
@@ -1739,16 +1762,15 @@ fn the_warning_box_still_says_how_many_lines_it_omitted_when_lines_wrap() {
         .join("\n");
     app.on_worker(WorkerMsg::Pass1(RecordEvent::Warning(message)));
 
-    let warnings = box_inner(
-        &paint_grid(100, 30, |f| {
-            draw(f, &app);
-        }),
-        " ⚠ 対応が要ります",
-    );
+    let grid = paint_grid(100, 30, |f| {
+        draw(f, &app);
+    });
+    let warnings = box_inner(&grid, " ⚠ 対応が要ります");
     let text = flatten(&warnings);
+    let bottom = box_bottom(&grid, " ⚠ 対応が要ります");
     assert!(
-        text.contains("…他") && text.contains("record-session.jsonのwarnings"),
-        "省略したことを言う行が見えない:\n{}",
+        bottom.contains(&format!("1〜{}/", warnings.len())) && bottom.contains("行ホイールで送る"),
+        "入り切らないことを下辺で言っていない: {bottom}\n{}",
         warnings.join("\n")
     );
     assert!(
@@ -1766,7 +1788,7 @@ fn the_warning_box_still_says_how_many_lines_it_omitted_when_lines_wrap() {
 // `state_tests::the_wheel_hits_the_same_panes_that_are_drawn`がそうだった）。
 // ---------------------------------------------------------------------------
 
-/// 記録中の記録画面。さかのぼれる3枠（進行・出力・起動時ノイズ）と、送れない警告枠が全部出ている。
+/// 記録中の記録画面。さかのぼれる3枠（進行・出力・起動時ノイズ）と、先頭から読む見出し枠・警告枠が全部出ている。
 fn running_record_screen(ws: &std::path::Path) -> App {
     let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
     app.command.set_text("cargo build");
@@ -1784,39 +1806,85 @@ fn running_record_screen(ws: &std::path::Path) -> App {
     app
 }
 
-/// `(x, y)`でホイールを上へ1刻み回したとき、さかのぼり位置が動いた枠（動かなければ`None`）。
+/// 送れる枠の位置を全部（確認ダイアログ・説明欄とヘルプ・記録中なら記録画面の3枠）。
+fn scroll_positions(app: &App) -> Vec<(scroll::Wheel, u16)> {
+    use record_screen::ScrollPane;
+    use scroll::{Panel, Wheel};
+    let mut all = vec![(Wheel::Modal, app.modal_scroll)];
+    all.extend(Panel::ALL.map(|panel| (Wheel::Panel(panel), app.panels.top(panel))));
+    if let Some(run) = app.run.as_ref() {
+        all.extend([
+            (Wheel::Record(ScrollPane::Log), run.log_scroll.offset()),
+            (
+                Wheel::Record(ScrollPane::Output),
+                run.output_scroll.offset(),
+            ),
+            (Wheel::Record(ScrollPane::Noise), run.noise_scroll.offset()),
+        ]);
+    }
+    all
+}
+
+/// どの枠も、上下どちらへも動ける位置へ置く。先頭や末尾にあると片方の向きには動かないので、
+/// 「回したら動いたか」で当たりを判定できない。**描かずに置く**（描くと上限で切り詰められる）。
+fn move_every_box_off_its_ends(app: &mut App) {
+    app.modal_scroll = 30;
+    for panel in scroll::Panel::ALL {
+        for _ in 0..10 {
+            app.panels.wheel(panel, false);
+        }
+    }
+    if let Some(run) = app.run.as_mut() {
+        for scroll in [
+            &mut run.log_scroll,
+            &mut run.output_scroll,
+            &mut run.noise_scroll,
+        ] {
+            scroll.scroll_lines(30);
+        }
+    }
+}
+
+/// `(x, y)`でホイールを上へ1刻み回したとき、位置が動いた枠（動かなければ`None`）。
 /// **製品の入口（`App::on_scroll`）を通す。** 回した分は同じ位置で下へ回して戻す。
+/// 先に[`move_every_box_off_its_ends`]を通しておくこと。
 fn wheel_moves(
     app: &mut App,
     size: ratatui::layout::Size,
     x: u16,
     y: u16,
-) -> Option<record_screen::ScrollPane> {
-    use record_screen::ScrollPane;
-    let offsets = |app: &App| {
-        let run = app.run.as_ref().expect("記録中");
-        [
-            run.log_scroll.offset(),
-            run.output_scroll.offset(),
-            run.noise_scroll.offset(),
-        ]
-    };
-    let before = offsets(app);
+) -> Option<scroll::Wheel> {
+    let before = scroll_positions(app);
     app.on_scroll(size, x, y, true);
-    let after = offsets(app);
+    let after = scroll_positions(app);
     app.on_scroll(size, x, y, false);
-    assert_eq!(offsets(app), before, "({x},{y}) 回した分が戻っていない");
-    let moved: Vec<ScrollPane> = [ScrollPane::Log, ScrollPane::Output, ScrollPane::Noise]
-        .into_iter()
-        .zip(before.iter().zip(after.iter()))
-        .filter(|(_, (b, a))| b != a)
-        .map(|(pane, _)| pane)
+    assert_eq!(
+        scroll_positions(app),
+        before,
+        "({x},{y}) 回した分が戻っていない"
+    );
+    let moved: Vec<scroll::Wheel> = before
+        .iter()
+        .zip(&after)
+        .filter(|(b, a)| b.1 != a.1)
+        .map(|(b, _)| b.0)
         .collect();
     assert!(
         moved.len() <= 1,
         "({x},{y}) 2つの枠が同時に動いた: {moved:?}"
     );
     moved.first().copied()
+}
+
+/// 試験用の画面を作る手順（作業ディレクトリを受け取る）。
+type MakeApp = fn(&std::path::Path) -> App;
+
+/// ホイールの全セル走査の1件: 画面の作り方・知らせの行の差し替え・送れる枠（送る先と見出し）。
+struct WheelScan {
+    name: &'static str,
+    make: MakeApp,
+    status: Option<String>,
+    boxes: Vec<(scroll::Wheel, &'static str)>,
 }
 
 /// [BUG-194] **ホイールが送る枠は、ポインタの下に描かれている枠である**（知らせの行が1行でも複数行でも）。
@@ -1828,56 +1896,132 @@ fn wheel_moves(
 /// 1行上にずれ、下は知らせの行とキー案内の行まで伸びていた——入力欄の枠の下辺で回すと進行の枠が送られ、
 /// 知らせの行の上で回すとその上の枠が送られた。知らせの行が折り返して複数行になると、ずれはその分広がる。
 ///
+/// 2026-10-02から、記録画面の見出し枠・警告枠・「実行するとどうなるか」と、ほかの3画面の説明欄も
+/// ホイールで送る。**画面ごとに枠の割り付けが違う**ので、全画面で測る。
+///
 /// 画面の全セルを1つずつ回して、描かれた枠（枠線を含む）の中なら**その枠だけ**が、外なら**どれも**
 /// 動かないことを見る（許可側と禁止側を同じ走査で見る）。
 #[test]
 fn the_wheel_scrolls_the_pane_drawn_under_the_pointer() {
     use record_screen::ScrollPane;
+    use scroll::{Panel, Wheel};
 
     let (width, height) = (100u16, 30u16);
     let size = ratatui::layout::Size::new(width, height);
-    let mut reports = Vec::new();
-    for (case, status) in [
-        ("知らせが1行", "短い知らせ".to_string()),
-        (
-            "知らせが複数行",
-            "長い知らせが折り返して行を増やします。".repeat(8),
+    let long_status = "長い知らせが折り返して行を増やします。".repeat(8);
+    let record_panes = vec![
+        (Wheel::Record(ScrollPane::Log), " 進行 "),
+        (Wheel::Record(ScrollPane::Output), " コマンドの出力"),
+        (Wheel::Record(ScrollPane::Noise), " シェル起動時のノイズ"),
+        (Wheel::Panel(Panel::RecordHeader), " いま待っているもの "),
+        (Wheel::Panel(Panel::RecordWarnings), " ⚠ 対応が要ります"),
+    ];
+    let declared_notes = vec![(Wheel::Panel(Panel::DeclaredNotes), DECLARED_NOTES)];
+    let scan = |name: &'static str,
+                make: MakeApp,
+                status: Option<&str>,
+                boxes: Vec<(Wheel, &'static str)>| WheelScan {
+        name,
+        make,
+        status: status.map(str::to_string),
+        boxes,
+    };
+    // 知らせの行が折り返して複数行になると、本体の位置が変わる（BUG-194のずれが広がった形）。
+    let cases = vec![
+        scan(
+            "記録・始める前",
+            |ws| App::new(ws.to_path_buf(), harness_core::RequireSandbox::None),
+            None,
+            vec![(Wheel::Panel(Panel::RecordNotice), " 実行するとどうなるか ")],
         ),
-    ] {
+        scan(
+            "記録・記録中（知らせが1行）",
+            running_record_screen,
+            None,
+            record_panes.clone(),
+        ),
+        scan(
+            "記録・記録中（知らせが複数行）",
+            running_record_screen,
+            Some(&long_status),
+            record_panes,
+        ),
+        scan(
+            "承認待ち・FS/ネット（注記）",
+            edit_screen_with_a_locked_workspace,
+            None,
+            vec![(Wheel::Panel(Panel::EditNotes), " 記録の読み方")],
+        ),
+        scan(
+            "承認待ち・FS/ネット（プロセスツリー）",
+            |ws| {
+                let mut app = edit_screen_with_a_locked_workspace(ws);
+                app.show_tree = true;
+                app
+            },
+            None,
+            vec![(Wheel::Panel(Panel::EditProcessTree), " 観測したプロセス")],
+        ),
+        scan(
+            "承認待ち・遷移",
+            transition_tab_with_one_candidate,
+            None,
+            vec![(Wheel::Panel(Panel::TransitionNotes), " この画面 ")],
+        ),
+        scan(
+            "宣言（知らせが1行）",
+            declared_screen_with_long_notes,
+            None,
+            declared_notes.clone(),
+        ),
+        scan(
+            "宣言（知らせが複数行）",
+            declared_screen_with_long_notes,
+            Some(&long_status),
+            declared_notes,
+        ),
+    ];
+
+    let mut reports = Vec::new();
+    for WheelScan {
+        name: case,
+        make,
+        status,
+        boxes,
+    } in cases
+    {
         let ws = workspace();
-        let mut app = running_record_screen(ws.path());
-        app.status = status;
+        let mut app = make(ws.path());
+        if let Some(status) = status {
+            app.status = status;
+        }
         let grid = paint_grid(width, height, |f| {
             draw(f, &app);
         });
         let rows: Vec<String> = grid.iter().map(|row| row.concat()).collect();
         let status_rows = status_rows(&rows).len();
-        if case == "知らせが複数行" {
-            assert!(
-                status_rows > 1,
-                "台本の前提が崩れた（知らせが1行に収まった）"
-            );
-        } else {
-            assert_eq!(status_rows, 1, "台本の前提が崩れた");
-        }
-        let panes = [
-            (ScrollPane::Log, " 進行 "),
-            (ScrollPane::Output, " コマンドの出力"),
-            (ScrollPane::Noise, " シェル起動時のノイズ"),
-        ]
-        .map(|(pane, title)| {
-            let area = drawn_box(&grid, title)
-                .unwrap_or_else(|| panic!("{case}: 「{title}」の枠が描かれていない"));
-            (pane, area)
-        });
+        assert_eq!(
+            status_rows > 1,
+            case.contains("複数行"),
+            "{case}: 台本の前提が崩れた（知らせが{status_rows}行）"
+        );
+        let boxes: Vec<(Wheel, ratatui::layout::Rect)> = boxes
+            .into_iter()
+            .map(|(wheel, title)| {
+                let area = drawn_box(&grid, title)
+                    .unwrap_or_else(|| panic!("{case}: 「{title}」の枠が描かれていない"));
+                (wheel, area)
+            })
+            .collect();
 
+        move_every_box_off_its_ends(&mut app);
         let mut wrong = Vec::new();
         for y in 0..height {
             for x in 0..width {
-                let drawn = panes
+                let drawn = boxes
                     .iter()
                     .find(|(_, area)| area.contains(ratatui::layout::Position::new(x, y)))
-                    .map(|(pane, _)| *pane);
+                    .map(|(wheel, _)| *wheel);
                 let moved = wheel_moves(&mut app, size, x, y);
                 if drawn != moved {
                     wrong.push(format!(
@@ -1901,33 +2045,507 @@ fn the_wheel_scrolls_the_pane_drawn_under_the_pointer() {
 /// [BUG-194] **ヘルプや確認ダイアログを重ねている間は、どこで回しても後ろの枠は送られない。**
 /// ポインタの下に見えているのは重ねた側で、キー入力もその間は重ねた側だけが受ける（`App::on_key`）。
 /// 後ろの枠を送ると、見えないところで位置が変わり、閉じたときに読んでいた場所が失われる。
+///
+/// 2026-10-02からは、ポインタの位置に関係なく**重ねた側が送られる**（両方が開いているときは上に描かれる
+/// 確認ダイアログ）。後ろが記録画面（3枠と見出し・警告）でも、説明欄のある宣言画面でも同じ。
 #[test]
 fn the_wheel_does_not_scroll_panes_hidden_behind_an_overlay() {
+    use scroll::{Panel, Wheel};
+
     let (width, height) = (100u16, 30u16);
     let size = ratatui::layout::Size::new(width, height);
-    for overlay in ["ヘルプ", "確認ダイアログ"] {
-        let ws = workspace();
-        let mut app = running_record_screen(ws.path());
-        if overlay == "ヘルプ" {
-            app.help = true;
-        } else {
-            app.modal = Some(state::Modal {
-                title: "報告".to_string(),
-                lines: vec!["読むだけ".to_string()],
-                confirm: Confirm::ReadOnly,
-            });
+    let screens: [(&str, MakeApp); 2] = [
+        ("記録中の記録画面", running_record_screen),
+        ("宣言画面", declared_screen_with_long_notes),
+    ];
+    for (screen, make) in screens {
+        for overlay in ["ヘルプ", "確認ダイアログ", "両方"] {
+            let ws = workspace();
+            let mut app = make(ws.path());
+            app.help = overlay != "確認ダイアログ";
+            if overlay != "ヘルプ" {
+                app.modal = Some(state::Modal {
+                    title: "報告".to_string(),
+                    lines: vec!["読むだけ".to_string()],
+                    confirm: Confirm::ReadOnly,
+                });
+            }
+            let expected = if app.modal.is_some() {
+                Wheel::Modal
+            } else {
+                Wheel::Panel(Panel::Help)
+            };
+            move_every_box_off_its_ends(&mut app);
+            let wrong: Vec<String> = (0..height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .filter_map(|(x, y)| {
+                    let moved = wheel_moves(&mut app, size, x, y);
+                    (moved != Some(expected)).then(|| format!("({x},{y}) {moved:?}"))
+                })
+                .take(20)
+                .collect();
+            assert!(
+                wrong.is_empty(),
+                "{screen}に{overlay}を重ねているのに、{expected:?}以外が送られた（先頭20件）:\n{}",
+                wrong.join("\n")
+            );
         }
-        let moved: Vec<String> = (0..height)
-            .flat_map(|y| (0..width).map(move |x| (x, y)))
-            .filter_map(|(x, y)| {
-                wheel_moves(&mut app, size, x, y).map(|pane| format!("({x},{y}) {pane:?}"))
-            })
-            .take(20)
-            .collect();
-        assert!(
-            moved.is_empty(),
-            "{overlay}を重ねているのに後ろの枠が送られた（先頭20件）:\n{}",
-            moved.join("\n")
-        );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 説明欄をホイールで送る（2026-10-02、ユーザーが実機で見て希望した）。
+//
+// 説明欄（各画面の「この画面」・記録画面の「実行するとどうなるか」など）は中身に合わせて高さを伸ばすが、
+// 一覧に半分を残す上限があり、それでも入り切らない分は「下のN行が枠に収まっていません」と言うだけで、
+// **読む手段が無かった**（実機では記録画面の「実行するとどうなるか」で13行）。確認ダイアログと同じ部品で
+// 送れるようにし、ポインタの下の説明欄をホイールで送る。
+//
+// **期待値は描いた画面から読む**（BUG-194。当たり判定と同じ計算で期待値を作らない）。ホイールは製品の
+// 入口`App::on_scroll`から回し、回すたびに[`frame`]（描いて状態へ書き戻す）を通す。
+// ---------------------------------------------------------------------------
+
+/// ホイール1刻みで送る行数（端末の既定の送り量。記録画面の3枠と同じ値）。
+fn wheel_step() -> usize {
+    usize::try_from(harness_term::scrollback::WHEEL_SCROLL_LINES).expect("正の数")
+}
+
+/// `(x, y)`でホイールを1刻み回し（`up`が偽なら下へ＝先を読む向き）、1フレーム描く。
+fn wheel_and_draw(app: &mut App, size: (u16, u16), at: (u16, u16), up: bool) -> Vec<Vec<String>> {
+    app.on_scroll(ratatui::layout::Size::new(size.0, size.1), at.0, at.1, up);
+    frame(app, size.0, size.1)
+}
+
+/// 枠の真ん中のセル。
+fn center_of(area: ratatui::layout::Rect) -> (u16, u16) {
+    (area.x + area.width / 2, area.y + area.height / 2)
+}
+
+/// 宣言画面の説明欄の見出し。
+const DECLARED_NOTES: &str = " この画面 ";
+
+/// 宣言画面で、説明欄の案内が長くなる状態（このマシンで未承認の宣言が2件ある）。
+fn declared_screen_with_long_notes(ws: &std::path::Path) -> App {
+    let mut domain = crate::policy_file::PolicyDomain::new("view-check");
+    for leaf in ["data", "more"] {
+        domain
+            .fs
+            .read
+            .push(format!("C:/harness-e2e/view-check-outside/{leaf}"));
+    }
+    let app = declared_screen_with(ws, domain);
+    assert_eq!(
+        app.declared_approval.not_approved.len(),
+        2,
+        "台本の前提が崩れた（未承認の宣言が2件ではない）"
+    );
+    app
+}
+
+/// 宣言画面の説明欄の最後の文（取り消しの注記の最後の行）。
+fn declared_notes_tail() -> String {
+    squash(
+        crate::unapprove::ACE_NOTICE
+            .lines()
+            .last()
+            .expect("注記が空"),
+    )
+}
+
+/// 説明欄が入り切らない大きさ（80×16）。
+const SMALL: (u16, u16) = (80, 16);
+
+/// [説明欄の送り] **ポインタの下の説明欄をホイールで回すと、その欄が送られる。一覧の選択も一覧の枠も動かない。**
+///
+/// # 直す前の形を一文で
+///
+/// ホイールは記録画面の3枠（進行・出力・ノイズ）しか送らず、説明欄の上で回しても何も起きなかった。
+#[test]
+fn the_wheel_scrolls_the_notes_under_the_pointer_and_leaves_the_list_alone() {
+    let ws = workspace();
+    let mut app = declared_screen_with_long_notes(ws.path());
+    let before = frame(&mut app, SMALL.0, SMALL.1);
+    let notes = drawn_box(&before, DECLARED_NOTES).expect("説明欄が描かれていない");
+    let shown = box_inner(&before, DECLARED_NOTES);
+    assert!(
+        !flatten(&shown).contains(&declared_notes_tail()),
+        "台本の前提が崩れた（説明欄が入り切っている）:\n{}",
+        shown.join("\n")
+    );
+    let row = app.declared_row;
+
+    let after = wheel_and_draw(&mut app, SMALL, center_of(notes), false);
+    let moved = box_inner(&after, DECLARED_NOTES);
+    let step = wheel_step();
+    assert_eq!(
+        moved[..moved.len() - step],
+        shown[step..],
+        "ホイール1刻みで説明欄が{step}行送られていない:\n前:\n{}\n後:\n{}",
+        shown.join("\n"),
+        moved.join("\n")
+    );
+    assert_eq!(
+        app.declared_row, row,
+        "説明欄を送ったのに一覧の選択が動いた"
+    );
+    let top = usize::from(notes.y);
+    assert!(
+        after[..top] == before[..top],
+        "説明欄より上（タブと一覧）が変わった"
+    );
+}
+
+/// [説明欄の送り] **送るのは「最後の行が枠の一番下に来たところ」まで。そこから先は回しても動かず、
+/// 回した分を溜めない**（確認ダイアログと同じ上限。BUG-196・BUG-076）。
+#[test]
+fn the_wheel_stops_when_the_last_line_of_the_notes_reaches_the_bottom() {
+    let ws = workspace();
+    let mut app = declared_screen_with_long_notes(ws.path());
+    let first = frame(&mut app, SMALL.0, SMALL.1);
+    let at = center_of(drawn_box(&first, DECLARED_NOTES).expect("説明欄"));
+    let mut end = first;
+    for _ in 0..30 {
+        end = wheel_and_draw(&mut app, SMALL, at, false);
+    }
+    let inner = box_inner(&end, DECLARED_NOTES);
+    let screen = inner.join("\n");
+    let bottom = squash(inner.last().expect("枠の中が無い"));
+    assert!(
+        !bottom.is_empty() && declared_notes_tail().ends_with(&bottom),
+        "最後の文が枠の一番下の行に無い:\n{screen}"
+    );
+    assert!(
+        !squash(&inner[0]).is_empty(),
+        "枠の一番上が空（本文で詰まっていない）:\n{screen}"
+    );
+
+    let again = wheel_and_draw(&mut app, SMALL, at, false);
+    assert!(again == end, "末尾より先へ動いた:\n{screen}");
+    let back = box_inner(&wheel_and_draw(&mut app, SMALL, at, true), DECLARED_NOTES);
+    let step = wheel_step();
+    assert_eq!(
+        back[step..],
+        inner[..inner.len() - step],
+        "末尾で回した分だけ戻りが空回りした（{step}行戻っていない）:\n{}",
+        back.join("\n")
+    );
+}
+
+/// [説明欄の送り] **スクロールバーは説明欄が入り切らないときだけ出る。** 入り切るときは右の枠線のまま。
+#[test]
+fn the_notes_scrollbar_is_drawn_only_when_the_notes_overflow() {
+    for (size, overflows) in [(SMALL, true), ((200, 40), false)] {
+        let ws = workspace();
+        let mut app = declared_screen_with_long_notes(ws.path());
+        let grid = frame(&mut app, size.0, size.1);
+        let area = drawn_box(&grid, DECLARED_NOTES).expect("説明欄");
+        assert_eq!(
+            !flatten(&box_inner(&grid, DECLARED_NOTES)).contains(&declared_notes_tail()),
+            overflows,
+            "{size:?}: 台本の前提が崩れた"
+        );
+        let edge = right_edge(&grid, area);
+        if overflows {
+            assert!(
+                edge.iter().any(|cell| cell == THUMB),
+                "{size:?}: 入り切らないのにスクロールバーが無い: {edge:?}"
+            );
+        } else {
+            assert!(
+                edge.iter().all(|cell| cell == "│"),
+                "{size:?}: 入り切るのに右の枠線が枠線でない: {edge:?}"
+            );
+        }
+    }
+}
+
+/// [説明欄の送り] **確認ダイアログが開いている間は、ポインタがどこにあってもホイールは確認ダイアログを送る。**
+/// 後ろの説明欄・一覧は動かない（BUG-194の「重ねた画面が開いている間は後ろを送らない」）。
+///
+/// 後ろの画面は確認ダイアログに隠れて見えないので、閉じてから描いた画面が、開く前と1セルも違わないことで見る。
+#[test]
+fn while_a_confirmation_is_open_the_wheel_scrolls_it_and_nothing_behind_it() {
+    let ws = workspace();
+    let mut app = declared_screen_with_long_notes(ws.path());
+    let screen = frame(&mut app, SMALL.0, SMALL.1);
+    let notes = drawn_box(&screen, DECLARED_NOTES).expect("説明欄");
+    let list = drawn_box(&screen, " 承認済みの宣言").expect("一覧");
+    let row = app.declared_row;
+
+    app.modal = Some(state::Modal {
+        title: "報告".to_string(),
+        lines: (0..50).map(|i| format!("{i}行目")).collect(),
+        confirm: Confirm::ReadOnly,
+    });
+    let opened = frame(&mut app, SMALL.0, SMALL.1);
+    let modal = modal_box(&opened, &app);
+    let (first, _, _) = modal_position(&opened, modal)
+        .expect("台本の前提が崩れた（確認ダイアログが入り切っている）");
+    let pointers = [
+        center_of(notes),
+        center_of(list),
+        center_of(modal),
+        (0, 0),
+        (SMALL.0 - 1, SMALL.1 - 1),
+    ];
+    let mut grid = opened;
+    for at in pointers {
+        grid = wheel_and_draw(&mut app, SMALL, at, false);
+    }
+    let (now, _, _) = modal_position(&grid, modal).expect("位置の表示が消えた");
+    assert_eq!(
+        now,
+        first + pointers.len() * wheel_step(),
+        "確認ダイアログが、ホイールを回した分だけ送られていない"
+    );
+    let bottom = squash(&grid[usize::from(modal.bottom() - 1)].concat());
+    assert!(
+        bottom.contains("ホイール"),
+        "ホイールで送れることを下辺で言っていない（見えていないと誰も試さない）: {bottom}"
+    );
+    assert_eq!(app.declared_row, row, "後ろの一覧の選択が動いた");
+
+    press(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none(), "確認ダイアログが閉じない");
+    let closed = frame(&mut app, SMALL.0, SMALL.1);
+    assert!(
+        closed == screen,
+        "確認ダイアログを開いている間に、後ろの画面（説明欄か一覧）が動いた"
+    );
+}
+
+/// [説明欄の送り] **許可側**（`B-35`）: 入り切る説明欄は、ホイールを回しても画面が1セルも動かない。
+#[test]
+fn a_notes_box_that_fits_does_not_move_on_the_wheel() {
+    let size = (200u16, 40u16);
+    let ws = workspace();
+    let mut app = declared_screen_with_long_notes(ws.path());
+    let before = frame(&mut app, size.0, size.1);
+    let at = center_of(drawn_box(&before, DECLARED_NOTES).expect("説明欄"));
+    for up in [false, false, true, false] {
+        let after = wheel_and_draw(&mut app, size, at, up);
+        assert!(after == before, "入り切る説明欄がホイールで動いた");
+    }
+}
+
+/// [説明欄の送り] **記録画面の「実行するとどうなるか」も、最後の行（`Enter で開始します。`）まで送れる。**
+/// ユーザーが実機で「下の13行が枠に収まっていません」と見た欄である。
+#[test]
+fn the_record_screen_notice_can_be_scrolled_to_its_last_line() {
+    let size = (80u16, 20u16);
+    let title = " 実行するとどうなるか ";
+    let last = squash("Enter で開始します。");
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    let first = frame(&mut app, size.0, size.1);
+    assert!(
+        !flatten(&box_inner(&first, title)).contains(&last),
+        "台本の前提が崩れた（入り切っている）"
+    );
+    let at = center_of(drawn_box(&first, title).expect("説明欄"));
+    let mut grid = first;
+    for _ in 0..30 {
+        grid = wheel_and_draw(&mut app, size, at, false);
+    }
+    let inner = box_inner(&grid, title);
+    assert_eq!(
+        squash(inner.last().expect("枠の中が無い")),
+        last,
+        "最後の行が枠の一番下に無い:\n{}",
+        inner.join("\n")
+    );
+}
+
+/// [説明欄の送り] **ヘルプ（`F4`）も、低い端末で最後の行までホイールで送れる。** ヘルプは画面に重ねる枠なので、
+/// 確認ダイアログと同じく、ポインタがどこにあってもヘルプを送る。
+#[test]
+fn the_help_can_be_scrolled_to_its_last_line_with_the_wheel() {
+    let size = (100u16, 30u16);
+    let last = squash(HELP_TEXT.lines().last().expect("ヘルプが空"));
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    press(&mut app, KeyCode::F(4));
+    let first = frame(&mut app, size.0, size.1);
+    assert!(
+        !flatten(&box_inner(&first, " ヘルプ")).contains(&last),
+        "台本の前提が崩れた（ヘルプが入り切っている）"
+    );
+    let mut grid = first;
+    for _ in 0..60 {
+        grid = wheel_and_draw(&mut app, size, (0, size.1 - 1), false);
+    }
+    let inner = box_inner(&grid, " ヘルプ");
+    assert_eq!(
+        squash(inner.last().expect("枠の中が無い")),
+        last,
+        "ヘルプの最後の行が枠の一番下に無い:\n{}",
+        inner.join("\n")
+    );
+    assert!(app.help, "ホイールでヘルプが閉じた");
+}
+
+/// [説明欄の送り] **記録画面の警告枠も、最後の警告までホイールで送れる。** 以前は先頭から入るだけを出し、
+/// 残りは「… 他 N行」と件数を言うだけだった（全文は記録セッションのファイルにしか無かった）。
+#[test]
+fn the_warning_box_can_be_scrolled_to_the_last_warning() {
+    let size = (100u16, 30u16);
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    app.command.set_text("cargo build");
+    press(&mut app, KeyCode::Enter);
+    let long = "実行ファイルへ届きません。宣言に read_exec が要ります。".repeat(2);
+    let message = (0..12)
+        .map(|i| format!("{i}: {long}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.on_worker(WorkerMsg::Pass1(RecordEvent::Warning(message)));
+    let title = " ⚠ 対応が要ります";
+    let first = frame(&mut app, size.0, size.1);
+    let shown = flatten(&box_inner(&first, title));
+    assert!(
+        shown.contains(&squash(&format!("0: {long}"))),
+        "先頭の警告（原因であることが多い）が最初に見えていない:\n{shown}"
+    );
+    let at = center_of(drawn_box(&first, title).expect("警告枠"));
+    let mut grid = first;
+    for _ in 0..30 {
+        grid = wheel_and_draw(&mut app, size, at, false);
+    }
+    let inner = box_inner(&grid, title);
+    let tail = squash(&format!("11: {long}"));
+    let bottom = squash(inner.last().expect("枠の中が無い"));
+    assert!(
+        !bottom.is_empty() && tail.ends_with(&bottom),
+        "最後の警告が枠の一番下に無い:\n{}",
+        inner.join("\n")
+    );
+}
+
+/// 承認待ち（FS/ネット）で記録を1件開き、注記かプロセスツリーを60行にした状態（右の列の半分には入り切らない）。
+fn edit_screen_with_long_notes(ws: &std::path::Path, show_tree: bool) -> App {
+    let dir = RecordSessionDir::create(ws, "s1").expect("session dir");
+    let mut manifest = RecordManifest::new("s1", "cargo build", ws, ws, 1);
+    manifest.status = RecordStatus::Finished;
+    manifest.collector_started = true;
+    manifest.etw_available = true;
+    dir.write_manifest(&manifest).expect("manifest");
+    let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+    app.screen = Screen::Edit;
+    app.open_selected_session();
+    let view = app.view.as_mut().expect("記録が開けていない");
+    let long = (0..60)
+        .map(|i| format!("{i}行目です。"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    view.notes = long.clone();
+    view.tree = long;
+    view.common_warnings.clear();
+    app.show_tree = show_tree;
+    app
+}
+
+/// [説明欄の送り] **入り切らない枠は、どれもホイール1刻みで送られる**（`B-06`: 送れる枠を描く箇所の全部）。
+///
+/// 送るには、当たり判定（どの枠か）・状態（位置）・描画が返す上限（切り詰め）・描画（その位置から見せる）の
+/// 4つが揃っている必要がある。描く箇所が上限を返し忘れると、その枠の上限は0として切り詰められ、
+/// **回しても何も起きない**——当たり判定の試験では見つからない。だから枠ごとに、描いた画面の下辺の
+/// 「N〜M/T行」が回す前は1行目から、回した後は1刻み先から始まっていることを見る。
+#[test]
+fn every_box_that_overflows_moves_one_notch_on_the_wheel() {
+    let notch = wheel_step() + 1;
+    let cases: [(&str, MakeApp, (u16, u16), &str); 8] = [
+        (
+            "記録・実行するとどうなるか",
+            |ws| App::new(ws.to_path_buf(), harness_core::RequireSandbox::None),
+            (80, 20),
+            " 実行するとどうなるか ",
+        ),
+        (
+            "記録・いま待っているもの",
+            |ws| {
+                let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+                app.command.set_text("cargo build");
+                press(&mut app, KeyCode::Enter);
+                app
+            },
+            (60, 20),
+            " いま待っているもの ",
+        ),
+        (
+            "記録・警告",
+            |ws| {
+                let mut app = running_record_screen(ws);
+                let lines = (0..20)
+                    .map(|i| format!("{i}: 実行ファイルへ届きません"))
+                    .collect::<Vec<_>>();
+                app.on_worker(WorkerMsg::Pass1(RecordEvent::Warning(lines.join("\n"))));
+                app
+            },
+            (100, 30),
+            " ⚠ 対応が要ります",
+        ),
+        (
+            "承認待ち・記録の読み方",
+            |ws| edit_screen_with_long_notes(ws, false),
+            (120, 30),
+            " 記録の読み方",
+        ),
+        (
+            "承認待ち・観測したプロセス",
+            |ws| edit_screen_with_long_notes(ws, true),
+            (120, 30),
+            " 観測したプロセス",
+        ),
+        (
+            "承認待ち・遷移",
+            transition_tab_with_one_candidate,
+            (60, 16),
+            " この画面 ",
+        ),
+        (
+            "宣言",
+            declared_screen_with_long_notes,
+            SMALL,
+            DECLARED_NOTES,
+        ),
+        (
+            "ヘルプ",
+            |ws| {
+                let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+                press(&mut app, KeyCode::F(4));
+                app
+            },
+            (100, 30),
+            " ヘルプ",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (name, make, size, title) in cases {
+        let ws = workspace();
+        let mut app = make(ws.path());
+        let before = frame(&mut app, size.0, size.1);
+        let bottom = box_bottom(&before, title);
+        // 「N〜」の直前は枠線（`─`）。`14〜`が`4〜`に当たらないよう、枠線ごと照合する。
+        // 狭い枠（記録画面の見出し枠は60桁の端末で27桁）では送り方を落とすので、行番号だけを見る——
+        // 落とさずに右寄せすると見出しは左から切れ、「1〜」の「1」が消えていた。
+        assert!(
+            bottom.contains("─1〜"),
+            "{name}: 入り切らないことを言っていないか、行番号の頭が切れている: {bottom}"
+        );
+        let at = center_of(drawn_box(&before, title).expect("枠"));
+        wheel_and_draw(&mut app, size, at, false);
+        // **もう1フレーム描いてから見る。** 状態を上限で切り詰めるのは描いた後なので、上限を返し忘れた枠も
+        // 回した直後の1フレームだけは送られて見え、次のフレームで先頭へ戻る（実機では一瞬動いて戻る）。
+        let after = frame(&mut app, size.0, size.1);
+        let moved = box_bottom(&after, title);
+        if !moved.contains(&format!("─{notch}〜")) {
+            failures.push(format!("{name}: 前「{bottom}」→ 後「{moved}」"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "ホイール1刻みで{}行送られない枠がある:\n{}",
+        wheel_step(),
+        failures.join("\n")
+    );
 }

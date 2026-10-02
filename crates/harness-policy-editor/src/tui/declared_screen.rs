@@ -4,13 +4,14 @@
 //! 組み立て・選択の移動は共通で、この画面が足すのは「どのドメインの宣言か」だけである
 //! （`docs/CODE-STRUCTURE-RULES.md`§5.1）。
 
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use ratatui::Frame;
 
 use crate::tui::checkbox_tree::{self, Mark};
+use crate::tui::scroll::{Panel, Wheel};
 use crate::tui::state::App;
 use crate::tui::wrap;
 
@@ -18,27 +19,46 @@ use crate::tui::wrap;
 const NOTES_FLOOR: u16 = 10;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
-    // 説明欄は**中身を折り返した行数ぶん**の高さを取る（BUG-192。`tui::wrap`）。
-    //
-    // 以前は「操作の案内（折り返して最大2行）＋未承認の案内（折り返して最大2行）＋取り消しの注記4行」
-    // と手で数えた固定の10行で、端末が狭くて注記まで折り返すと、注記の末尾
-    // （「消した宣言にはこの先許可が付きません」）が黙って切れていた。手で数えた行数は、
-    // 文言を足すたびにも端末の幅が変わるたびにもずれる。
-    // 上限は本文の半分（一覧を潰さない）。それでも入らない分は枠の下辺に行数で出す。
     let notes = notes_text(app);
-    let height = wrap::box_height(notes.as_str(), area.width, NOTES_FLOOR, area.height / 2);
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(height)]).split(area);
+    let chunks = split(area, &notes);
     let declared_list_offset = draw_tree(frame, chunks[0], app);
-    wrap::draw_box(
-        frame,
-        chunks[1],
-        notes,
-        Block::default().borders(Borders::ALL).title(" この画面 "),
-    );
-    crate::tui::DrawFeedback {
+    let mut feedback = crate::tui::DrawFeedback {
         declared_list_offset: Some(declared_list_offset),
         ..Default::default()
-    }
+    };
+    // 入り切らない分はホイールで送る（`tui::scroll`）。
+    feedback.panels.set(
+        Panel::DeclaredNotes,
+        wrap::draw_scrollable(
+            frame,
+            chunks[1],
+            notes,
+            Block::default().borders(Borders::ALL).title(" この画面 "),
+            app.panels.top(Panel::DeclaredNotes),
+            wrap::Look::panel(Style::default()),
+        ),
+    );
+    feedback
+}
+
+/// 一覧と説明欄の割り付け。**描画とホイールの当たり判定（[`wheel_target`]）が同じこれを通る**（BUG-194）。
+///
+/// 説明欄は**中身を折り返した行数ぶん**の高さを取る（BUG-192。`tui::wrap`）。
+/// 以前は「操作の案内（折り返して最大2行）＋未承認の案内（折り返して最大2行）＋取り消しの注記4行」
+/// と手で数えた固定の10行で、端末が狭くて注記まで折り返すと、注記の末尾
+/// （「消した宣言にはこの先許可が付きません」）が黙って切れていた。手で数えた行数は、
+/// 文言を足すたびにも端末の幅が変わるたびにもずれる。
+/// 上限は本文の半分（一覧を潰さない）。それでも入らない分はホイールで送る。
+fn split(area: Rect, notes: &str) -> std::rc::Rc<[Rect]> {
+    let height = wrap::box_height(notes, area.width, NOTES_FLOOR, area.height / 2);
+    Layout::vertical([Constraint::Min(3), Constraint::Length(height)]).split(area)
+}
+
+/// ホイールの位置が説明欄の上なら、説明欄を送る（`tui::scroll::target`から呼ぶ。`area`は本体）。
+pub(super) fn wheel_target(area: Rect, app: &App, at: Position) -> Option<Wheel> {
+    split(area, &notes_text(app))[1]
+        .contains(at)
+        .then_some(Wheel::Panel(Panel::DeclaredNotes))
 }
 
 /// 戻り値はratatuiが選択を見せるために定めた表示開始位置（呼び出し側が保存する）。

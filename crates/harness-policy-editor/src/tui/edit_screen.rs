@@ -10,43 +10,75 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
+use crate::tui::scroll::{Panel, Wheel};
 use crate::tui::state::{App, EditField};
 use crate::tui::wrap;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
+    let (panel, title, notes) = notes_content(app);
+    let areas = split(area, &notes);
+    let session_list_offset = draw_sessions(frame, areas.sessions, app);
+    draw_domain(frame, areas.domain, app);
+    let candidate_list_offset = draw_proposals(frame, areas.proposals, app);
+    let mut feedback = crate::tui::DrawFeedback {
+        session_list_offset: Some(session_list_offset),
+        candidate_list_offset: Some(candidate_list_offset),
+        ..Default::default()
+    };
+    // 入り切らない分はホイールで送る（`tui::scroll`）。
+    feedback.panels.set(
+        panel,
+        wrap::draw_scrollable(
+            frame,
+            areas.notes,
+            notes,
+            Block::default().borders(Borders::ALL).title(title),
+            app.panels.top(panel),
+            wrap::Look::panel(Style::default()),
+        ),
+    );
+    feedback
+}
+
+/// 承認待ち（FS/ネット）の枠の位置。
+struct Areas {
+    sessions: Rect,
+    domain: Rect,
+    proposals: Rect,
+    notes: Rect,
+}
+
+/// 画面の割り付け。**描画とホイールの当たり判定（[`wheel_target`]）が同じこれを通る**（BUG-194）。
+///
+/// 注記の枠は**中身を折り返した行数ぶん**の高さを取る（BUG-192。`tui::wrap`）。以前は9行固定で、
+/// 入り切らない分が黙って切れていた。上限は右の列の半分（候補一覧を潰さない）で、プロセスツリーの
+/// ように長いものはそこで止まり、入らない分はホイールで送る。
+fn split(area: Rect, notes: &str) -> Areas {
     let columns =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).split(area);
-    let session_list_offset = draw_sessions(frame, columns[0], app);
-
-    // 注記の枠は**中身を折り返した行数ぶん**の高さを取る（BUG-192。`tui::wrap`）。以前は9行固定で、
-    // 入り切らない分が黙って切れていた。上限は右の列の半分（候補一覧を潰さない）で、プロセスツリーの
-    // ように長いものはそこで止まり、入らなかった行数を枠の下辺に出す。
-    let (title, notes) = notes_content(app);
-    let notes_height = wrap::box_height(
-        notes.as_str(),
-        columns[1].width,
-        NOTES_FLOOR,
-        columns[1].height / 2,
-    );
+    let notes_height =
+        wrap::box_height(notes, columns[1].width, NOTES_FLOOR, columns[1].height / 2);
     let rows = Layout::vertical([
         Constraint::Length(3),            // ドメイン名
         Constraint::Min(5),               // 候補一覧
         Constraint::Length(notes_height), // 注記 or プロセスツリー
     ])
     .split(columns[1]);
-    draw_domain(frame, rows[0], app);
-    let candidate_list_offset = draw_proposals(frame, rows[1], app);
-    wrap::draw_box(
-        frame,
-        rows[2],
-        notes,
-        Block::default().borders(Borders::ALL).title(title),
-    );
-    crate::tui::DrawFeedback {
-        session_list_offset: Some(session_list_offset),
-        candidate_list_offset: Some(candidate_list_offset),
-        ..Default::default()
+    Areas {
+        sessions: columns[0],
+        domain: rows[0],
+        proposals: rows[1],
+        notes: rows[2],
     }
+}
+
+/// ホイールの位置が注記の枠の上なら、その枠を送る（`tui::scroll::target`から呼ぶ。`area`は本体）。
+pub(super) fn wheel_target(area: Rect, app: &App, at: Position) -> Option<Wheel> {
+    let (panel, _, notes) = notes_content(app);
+    split(area, &notes)
+        .notes
+        .contains(at)
+        .then_some(Wheel::Panel(panel))
 }
 
 /// 戻り値はratatuiが選択を見せるために定めた表示開始位置（呼び出し側が保存する）。
@@ -415,19 +447,29 @@ fn workspace_lock_line(view: &crate::tui::state::SessionView) -> Option<Vec<Line
 /// 注記の枠の高さの下限（枠の2行を含む）。中身が収まる端末では、この高さのまま割り付けが変わらない。
 const NOTES_FLOOR: u16 = 9;
 
-/// 注記の枠の見出しと中身（高さを決めるのにも描くのにも同じ文を使う）。
-fn notes_content(app: &App) -> (&'static str, String) {
+/// 注記の枠の中身・見出し・送り位置の置き場（高さを決めるのにも描くのにも同じ文を使う）。
+///
+/// 注記とプロセスツリーは同じ枠に`t`で切り替えて出すが、**送り位置は別に持つ**（`tui::scroll::Panel`のdoc）。
+fn notes_content(app: &App) -> (Panel, &'static str, String) {
     match (app.view.as_ref(), app.show_tree) {
-        (Some(view), true) => (" 観測したプロセス（t で注記へ戻る） ", view.tree.clone()),
+        (Some(view), true) => (
+            Panel::EditProcessTree,
+            " 観測したプロセス（t で注記へ戻る） ",
+            view.tree.clone(),
+        ),
         (Some(view), false) => {
             let mut text = view.notes.clone();
             // 全候補に共通の警告は、候補の数だけ繰り返さずここへ1度だけ出す。
             for warning in &view.common_warnings {
                 text.push_str(&format!("\n全候補に共通: {warning}\n"));
             }
-            (" 記録の読み方（t でプロセスツリー） ", text)
+            (
+                Panel::EditNotes,
+                " 記録の読み方（t でプロセスツリー） ",
+                text,
+            )
         }
-        (None, _) => (" 記録の読み方 ", String::new()),
+        (None, _) => (Panel::EditNotes, " 記録の読み方 ", String::new()),
     }
 }
 
