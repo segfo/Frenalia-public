@@ -95,14 +95,18 @@ use state::{Action, App, Screen};
 ///
 /// 描画時にしか決まらない値が2種類ある。
 ///
-/// 1. さかのぼりの上限（折り返し後の行数は枠の幅に依存する。`harness_term::scrollback`のdoc）
+/// 1. さかのぼり・送りの上限（記録画面の3枠と確認ダイアログ。折り返し後の行数は枠の幅に依存する。
+///    `harness_term::scrollback`のdoc）
 /// 2. 一覧の表示開始位置（ratatuiが「選択を見せる」ために動かした結果）
 ///
-/// どちらも**書き戻さないと壊れる**——1を怠ると先頭で空回りし（BUG-076）、
+/// どちらも**書き戻さないと壊れる**——1を怠ると端で空回りし（BUG-076）、
 /// 2を怠るとカーソルが窓の中を動かず一覧の方が滑る。
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DrawFeedback {
     pub scroll: record_screen::ScrollLimits,
+    /// 確認ダイアログを送れる上限（本文の最後の行が枠の一番下に来る位置。[BUG-196](../../../../docs/bugs/BUG-196.md)）。
+    /// `None`＝確認ダイアログを描いていない（触らない）。
+    pub modal_scroll_max: Option<u16>,
     /// `None`＝この画面はその一覧を描いていない（触らない）。
     pub session_list_offset: Option<usize>,
     pub candidate_list_offset: Option<usize>,
@@ -289,7 +293,7 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
     draw_tabs(frame, rows.tabs, app);
     // 記録画面だけがさかのぼれる枠を持つ。上限は**描画してみないと分からない**
     // （折り返し後の行数は枠の幅に依存する）ので、ここで受け取って呼び出し側へ返す。
-    let feedback = match app.screen {
+    let mut feedback = match app.screen {
         Screen::Record => DrawFeedback {
             scroll: record_screen::draw(frame, rows.body, app),
             ..Default::default()
@@ -308,7 +312,8 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
         draw_help(frame, area);
     }
     if let Some(modal) = app.modal.as_ref() {
-        draw_modal(frame, area, modal, app.modal_scroll);
+        // 送りの上限も描いて初めて分かる（折り返し後の行数）。記録画面の枠と同じく状態へ返す。
+        feedback.modal_scroll_max = Some(draw_modal(frame, area, modal, app.modal_scroll));
     }
     feedback
 }
@@ -723,16 +728,30 @@ const MODAL_WIDTH: u16 = 88;
 /// 「配下へ付いた継承ACEは残って効き続けます」が確定の前に見えなかった）。いまは3つとも
 /// 折り返した後の行で数える（[`wrap::rows`]。描画と同じ折り返し器）。
 ///
-/// `scroll`は**`modal.lines`の何行目から見せるか**である（`App::on_modal_key`がその行数で
-/// 上限を掛ける）。ratatuiの`scroll`は折り返した後の行で数えるので、手前の行が折り返した分を
-/// 足して直してから渡す——そのまま渡すと、折り返しの多い本文では`End`が末尾に届かない。
-/// **限界**: 送る単位が`modal.lines`の1行なので、1行だけで枠の高さを超える行は途中を見られない
-/// （枠は最低でも4行あり、確認の本文の1行はそこまで長くない）。
-fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) {
-    let text: Vec<Line> = modal.lines.iter().map(|l| Line::raw(l.as_str())).collect();
+/// # 送るのは「本文の最後の行が枠の一番下の行に来たところ」まで（[BUG-196](../../../../docs/bugs/BUG-196.md)）
+///
+/// `scroll`は**折り返した後の表示行**で、枠の一番上に見せる行である（下辺の「N〜M/T行」と同じ単位）。
+/// 上限は描いて初めて分かるので、ここで[`wrap::Window`]に切り詰めて描き、**上限を返す**——呼び出し側が
+/// [`DrawFeedback::modal_scroll_max`]で状態へ書き戻す（`App::apply_draw_feedback`）。以前は上限が
+/// 「最後の行が枠の一番上に来る位置」で、末尾では枠がほぼ空になるまで送れた。
+/// 収まらないときだけ右の枠線の上にスクロールバーを出す（[`wrap::draw_scrolled`]）。
+///
+/// **末尾の空行は数えも描きもしない。** 明細の組み立ては節の区切りに空行を足すので（付け替えの明細など）、
+/// 後ろに何も続かないと本文が空行で終わる。数えると、末尾まで送ったときの一番下の行が空行になり、
+/// 「どこで終わったのか」がまた見えなくなる。組み立ては画面ごとに何か所もあるので、描く側の1か所で落とす
+/// （`modal.lines`そのものは変えない）。
+fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) -> u16 {
+    let written = modal
+        .lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map_or(0, |last| last + 1);
+    let text: Vec<Line> = modal.lines[..written]
+        .iter()
+        .map(|l| Line::raw(l.as_str()))
+        .collect();
     let width = MODAL_WIDTH.min(area.width);
-    let text_width = width.saturating_sub(2);
-    let total = wrap::rows(text.clone(), text_width);
+    let total = wrap::rows(text.clone(), width.saturating_sub(2));
     // 枠の2行と下の余白2行（折り返さない本文では以前と同じ高さになる）。
     let height = u16::try_from(total)
         .unwrap_or(u16::MAX)
@@ -741,43 +760,37 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) 
     let area = centered(area, width, height.max(6));
     frame.render_widget(Clear, area);
 
-    let visible = area.height.saturating_sub(2) as usize;
-    // 見せ始める`modal.lines`の行 → その手前が折り返して占める表示行。
-    let first = usize::from(scroll).min(text.len());
-    let top = wrap::rows(text[..first].to_vec(), text_width);
+    let window = wrap::Window::new(total, usize::from(area.height.saturating_sub(2)), scroll);
     let keys = if modal.confirm.asks() {
         " y=書く   n / Esc=やめる "
     } else {
         " Enter / Esc=閉じる "
     };
-    let position = if total > visible {
+    let position = if window.overflows() {
         format!(
             " {}〜{}/{}行  ↑↓ PgUp/PgDn で送る ",
-            (top + 1).min(total),
-            (top + visible).min(total),
+            (window.top + 1).min(total),
+            (window.top + window.visible).min(total),
             total
         )
     } else {
         String::new()
     };
 
+    let color = if modal.confirm.asks() {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if modal.confirm.asks() {
-            Color::Yellow
-        } else {
-            Color::Red
-        }))
+        .border_style(Style::default().fg(color))
         .title(format!(" {} ", modal.title))
         .title_bottom(Line::styled(
             keys,
             Style::default()
                 .fg(Color::Black)
-                .bg(if modal.confirm.asks() {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                })
+                .bg(color)
                 .add_modifier(Modifier::BOLD),
         ));
     if !position.is_empty() {
@@ -785,13 +798,8 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) 
             Line::styled(position, Style::default().fg(Color::DarkGray)).right_aligned(),
         );
     }
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
-            .block(block),
-        area,
-    );
+    wrap::draw_scrolled(frame, area, text, block, window, Style::default().fg(color));
+    u16::try_from(window.max_top()).unwrap_or(u16::MAX)
 }
 
 #[cfg(test)]

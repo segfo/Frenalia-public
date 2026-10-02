@@ -716,8 +716,8 @@ pub struct App {
     pub status: String,
     pub modal: Option<Modal>,
     /// 確認ダイアログの表示開始行（長い差分を最後まで読めるようにするため）。
-    /// **`Modal::lines`の何行目か**で数える。本文は折り返して描くので、画面の行へ直すのは描画の側
-    /// （`tui::draw_modal`。BUG-192）。
+    /// **折り返した後の表示行**で数える（下辺の「N〜M/T行」と同じ単位）。上限は描くまで分からないので
+    /// 描画が返し、[`Self::apply_draw_feedback`]が切り詰める（`tui::wrap::Window`。BUG-196）。
     pub modal_scroll: u16,
 
     // 記録画面
@@ -1423,12 +1423,15 @@ impl App {
 
     /// **1フレーム描いて初めて分かったことを状態へ書き戻す**（[`crate::tui::DrawFeedback`]）。
     ///
-    /// 描画時にしか決まらない値が2つある。さかのぼりの上限（折り返し後の行数は枠の幅に依存）と、
+    /// 描画時にしか決まらない値が2つある。さかのぼり・送りの上限（折り返し後の行数は枠の幅に依存）と、
     /// 一覧の表示開始位置（ratatuiが「選択を見せる」ために動かした結果）である。
-    /// **どちらも書き戻さないと壊れる**——前者を怠ると先頭で空回りし（BUG-076）、
+    /// **どちらも書き戻さないと壊れる**——前者を怠ると端で空回りし（BUG-076）、
     /// 後者を怠るとカーソルが窓の中を動かず一覧の方が滑る。
     pub fn apply_draw_feedback(&mut self, feedback: crate::tui::DrawFeedback) {
         self.clamp_scroll(feedback.scroll);
+        if let Some(max) = feedback.modal_scroll_max {
+            self.modal_scroll = self.modal_scroll.min(max);
+        }
         if let Some(offset) = feedback.session_list_offset {
             self.session_list_offset = offset;
         }
@@ -1759,11 +1762,8 @@ impl App {
         let kind = self.modal.as_ref().map(|m| m.confirm);
         let confirm = kind.is_some_and(Confirm::asks);
         // 差分が長いと画面に収まらない。**最後まで読めないと確認にならない**ので送れるようにする。
-        let last = self
-            .modal
-            .as_ref()
-            .map(|m| m.lines.len().saturating_sub(1) as u16)
-            .unwrap_or(0);
+        // 上限（最後の行が枠の一番下に来る位置）はここでは掛けない——折り返した後の行数は描くまで
+        // 分からない。行き過ぎた分は次の描画の後に`apply_draw_feedback`が切り詰める（BUG-196・BUG-076）。
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') if confirm => {
                 self.modal = None;
@@ -1793,7 +1793,7 @@ impl App {
                 None
             }
             KeyCode::Down => {
-                self.modal_scroll = (self.modal_scroll + 1).min(last);
+                self.modal_scroll = self.modal_scroll.saturating_add(1);
                 None
             }
             KeyCode::Up => {
@@ -1801,7 +1801,7 @@ impl App {
                 None
             }
             KeyCode::PageDown => {
-                self.modal_scroll = (self.modal_scroll + 10).min(last);
+                self.modal_scroll = self.modal_scroll.saturating_add(10);
                 None
             }
             KeyCode::PageUp => {
@@ -1813,7 +1813,7 @@ impl App {
                 None
             }
             KeyCode::End => {
-                self.modal_scroll = last;
+                self.modal_scroll = u16::MAX;
                 None
             }
             _ => None,

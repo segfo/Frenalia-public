@@ -680,7 +680,9 @@ fn the_last_line_of_a_confirmation_is_never_cut_off_silently() {
         let failures: Vec<String> = [(80u16, 24u16), (100, 30), (120, 30), (120, 40), (140, 30)]
             .into_iter()
             .filter_map(|(width, height)| {
-                let rows = paint_rows(width, height, |f| draw_modal(f, f.area(), modal, 0));
+                let rows = paint_rows(width, height, |f| {
+                    draw_modal(f, f.area(), modal, 0);
+                });
                 let screen = flatten(&rows);
                 (!screen.contains(&last) && !screen.contains("PgUp/PgDnで送る"))
                     .then(|| format!("{width}×{height}:\n{}", rows.join("\n")))
@@ -694,9 +696,10 @@ fn the_last_line_of_a_confirmation_is_never_cut_off_silently() {
     }
 }
 
-/// [BUG-192] **送った先で最後の行まで読める。** 送る量は`Modal::lines`の行で数えている
-/// （`on_modal_key`の上限は`lines.len() - 1`）ので、描く側が折り返した後の行へ直さないと、
-/// 折り返しの多い本文では`End`を押しても末尾に届かない。
+/// [BUG-192] **送った先で最後の行まで読める。** BUG-192の当時は送る量を`Modal::lines`の行で数えており、
+/// 描く側が折り返した後の行へ直さないと、折り返しの多い本文では`End`を押しても末尾に届かなかった。
+/// いまは送る量そのものを折り返した後の行で数え、上限は描画が返す（BUG-196）——描いて書き戻す経路
+/// （[`frame`]）を通して、同じ「末尾に届く」を見る。
 #[test]
 fn the_end_key_reaches_the_last_line_even_when_every_line_wraps() {
     let ws = workspace();
@@ -710,23 +713,20 @@ fn the_end_key_reaches_the_last_line_even_when_every_line_wraps() {
         lines,
         confirm: Confirm::Approval,
     });
-    let modal_screen = |app: &App| {
-        flatten(&paint_rows(80, 24, |f| {
-            draw_modal(
-                f,
-                f.area(),
-                app.modal.as_ref().expect("modal"),
-                app.modal_scroll,
-            )
-        }))
+    let modal_screen = |app: &mut App| {
+        let rows: Vec<String> = frame(app, 80, 24)
+            .into_iter()
+            .map(|row| row.concat())
+            .collect();
+        flatten(&rows)
     };
     assert!(
-        modal_screen(&app).contains("PgUp/PgDnで送る"),
+        modal_screen(&mut app).contains("PgUp/PgDnで送る"),
         "収まらないのに送れると言っていない"
     );
 
     press(&mut app, KeyCode::End);
-    let screen = modal_screen(&app);
+    let screen = modal_screen(&mut app);
     assert!(
         screen.contains("ここが最後の行です"),
         "End で末尾へ届かない:\n{screen}"
@@ -742,7 +742,9 @@ fn a_confirmation_that_fits_is_drawn_as_before_and_does_not_offer_scrolling() {
         lines: (0..10).map(|i| format!("  + fs.read = C:/x/{i}")).collect(),
         confirm: Confirm::Approval,
     };
-    let rows = paint_rows(120, 40, |f| draw_modal(f, f.area(), &modal, 0));
+    let rows = paint_rows(120, 40, |f| {
+        draw_modal(f, f.area(), &modal, 0);
+    });
     assert_eq!(
         box_height(&rows),
         modal.lines.len() + 4,
@@ -770,7 +772,9 @@ fn a_wrapped_confirmation_that_fits_shows_every_line_without_a_scroll_hint() {
     let reassign = reassignment_confirmation(ws_reassign.path());
     for (name, app) in [("遷移", &transition), ("付け替え", &reassign)] {
         let modal = app.modal.as_ref().expect("確認ダイアログ");
-        let screen = flatten(&paint_rows(120, 60, |f| draw_modal(f, f.area(), modal, 0)));
+        let screen = flatten(&paint_rows(120, 60, |f| {
+            draw_modal(f, f.area(), modal, 0);
+        }));
         for line in &modal.lines {
             assert!(
                 screen.contains(&squash(line)),
@@ -782,6 +786,328 @@ fn a_wrapped_confirmation_that_fits_shows_every_line_without_a_scroll_hint() {
             "{name}: 収まっているのに送れと言っている:\n{screen}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 確認ダイアログを送る上限とスクロールバー。[BUG-196]
+//
+// **上限は「本文の最後の行が枠の一番下の行に来たところ」。** 以前は最後の行が枠の一番上に来るまで
+// 送れたので、末尾では枠がほぼ空になり、どこまで読めば終わりかが分からなかった。上限は折り返した
+// 後の行数で決まり、描くまで分からないので、キーを押したら必ず[`frame`]（描いて状態へ書き戻す）を通す。
+// ---------------------------------------------------------------------------
+
+/// 実際のイベントループ（`tui::run`）と同じく、1フレーム描いて**描画で判明したことを状態へ書き戻し**、
+/// 描いたセルの格子を返す。描くだけで書き戻さないと、送りの上限が状態へ届かない形を測れない（BUG-076）。
+fn frame(app: &mut App, width: u16, height: u16) -> Vec<Vec<String>> {
+    let mut feedback = DrawFeedback::default();
+    let grid = paint_grid(width, height, |f| feedback = draw(f, app));
+    app.apply_draw_feedback(feedback);
+    grid
+}
+
+/// 描かれた確認ダイアログの枠（枠線を含む）。
+fn modal_box(grid: &[Vec<String>], app: &App) -> ratatui::layout::Rect {
+    let title = &app.modal.as_ref().expect("確認ダイアログ").title;
+    drawn_box(grid, title).unwrap_or_else(|| panic!("確認ダイアログ（{title}）が描かれていない"))
+}
+
+/// 確認ダイアログの右の枠線のうち、角を除いた部分（上から順）。スクロールバーはここに描く。
+fn right_edge(grid: &[Vec<String>], area: ratatui::layout::Rect) -> Vec<String> {
+    let x = usize::from(area.right() - 1);
+    (usize::from(area.y) + 1..usize::from(area.bottom()) - 1)
+        .map(|y| grid[y][x].clone())
+        .collect()
+}
+
+/// スクロールバーのつまみの記号（`wrap::draw_scrolled`）。
+const THUMB: &str = "█";
+
+/// 確認ダイアログの下辺の「N〜M/T行」。出ていなければ`None`（＝本文が枠に収まっている）。
+fn modal_position(
+    grid: &[Vec<String>],
+    area: ratatui::layout::Rect,
+) -> Option<(usize, usize, usize)> {
+    let row = &grid[usize::from(area.bottom() - 1)];
+    let bottom = squash(&row[usize::from(area.x)..usize::from(area.right())].concat());
+    let head = &bottom[..bottom.find("行↑↓")?];
+    let digits = head
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_digit() || *c == '〜' || *c == '/')
+        .last()
+        .map(|(i, _)| i)?;
+    let (first, rest) = head[digits..].split_once('〜')?;
+    let (last, total) = rest.split_once('/')?;
+    Some((first.parse().ok()?, last.parse().ok()?, total.parse().ok()?))
+}
+
+/// 本文のうち、文字のある最後の行（付け替えの明細は区切りの空行で終わる）。
+fn last_written_line(app: &App) -> String {
+    squash(
+        app.modal
+            .as_ref()
+            .expect("確認ダイアログ")
+            .lines
+            .iter()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .expect("本文が空"),
+    )
+}
+
+/// [BUG-196] **`End`で送ると、本文の最後の行が枠の一番下の行に来て、そこで止まる。**
+///
+/// # 壊れた状態を一文で
+///
+/// 送る上限が「最後の行が枠の一番上に来る位置」だったので、`↓`を押し続けると本文の最後の行
+/// （付け替えの確認では区切りの空行）だけが枠の一番上に残り、**枠がほぼ空になるまで送れた**。
+/// 実機（2026-10-02、付け替えの確認・幅120）では下辺が`1〜16/19行`→…→`19〜19/19行`と進んだ。
+///
+/// 見るのは描いた画面のセルである——最下行に最後の行が見え、一番上の行も空でなく（枠が本文で
+/// 詰まっている）、下辺の「N〜M/T行」が描いた行数と食い違わず、それ以上`↓`・`PgDn`・`End`を
+/// 押しても画面も状態も動かないこと。
+#[test]
+fn the_end_key_stops_when_the_last_line_reaches_the_bottom_of_the_box() {
+    // (120, 20)は実機で見た形（枠の中16行）。ほかは幅を変えて折り返し方を変えたもの。
+    for (width, height) in [(120u16, 20u16), (80, 20), (100, 16)] {
+        let ws = workspace();
+        let mut app = reassignment_confirmation(ws.path());
+        let last = last_written_line(&app);
+        let before = frame(&mut app, width, height);
+        let area = modal_box(&before, &app);
+        assert!(
+            modal_position(&before, area).is_some(),
+            "{width}×{height}: 台本の前提が崩れた（本文が枠に収まっていて、送る試験にならない）"
+        );
+
+        press(&mut app, KeyCode::End);
+        let grid = frame(&mut app, width, height);
+        let inner = box_inner(&grid, &app.modal.as_ref().expect("modal").title);
+        let screen = format!("{width}×{height}:\n{}", inner.join("\n"));
+        let bottom = squash(inner.last().expect("枠の中が無い"));
+        assert!(
+            !bottom.is_empty() && last.ends_with(&bottom),
+            "最後の行（{last}）が枠の一番下の行に無い:\n{screen}"
+        );
+        assert!(
+            !squash(&inner[0]).is_empty(),
+            "枠の一番上が空（本文で詰まっていない）:\n{screen}"
+        );
+        let (first, shown_last, total) =
+            modal_position(&grid, area).unwrap_or_else(|| panic!("位置の表示が消えた:\n{screen}"));
+        assert_eq!(
+            shown_last, total,
+            "末尾なのに下辺が末尾と言っていない:\n{screen}"
+        );
+        assert_eq!(
+            shown_last - first + 1,
+            inner.len(),
+            "下辺の「{first}〜{shown_last}」が、枠の中の行数（{}）と食い違う:\n{screen}",
+            inner.len()
+        );
+
+        let scroll = app.modal_scroll;
+        for code in [KeyCode::Down, KeyCode::PageDown, KeyCode::End] {
+            press(&mut app, code);
+            let again = frame(&mut app, width, height);
+            assert!(again == grid, "{code:?}で末尾より先へ動いた:\n{screen}");
+            assert_eq!(app.modal_scroll, scroll, "{code:?}で状態だけが先へ進んだ");
+        }
+    }
+}
+
+/// [BUG-196] **許可側**（`B-35`）: 本文が枠に収まるなら、どのキーでも送れない（画面が1セルも動かない）。
+///
+/// 以前は収まっている本文でも`End`で最後の行が枠の一番上へ動き、枠がほぼ空になった（決定32の
+/// 残課題に書いてあった形）。
+#[test]
+fn a_confirmation_that_fits_does_not_move_on_any_scroll_key() {
+    let ws_transition = workspace();
+    let ws_reassign = workspace();
+    for (name, mut app) in [
+        (
+            "遷移",
+            transition_confirmation_to(ws_transition.path(), "build"),
+        ),
+        ("付け替え", reassignment_confirmation(ws_reassign.path())),
+    ] {
+        let before = frame(&mut app, 120, 60);
+        assert!(
+            modal_position(&before, modal_box(&before, &app)).is_none(),
+            "{name}: 台本の前提が崩れた（収まっていない）"
+        );
+        for code in [KeyCode::Down, KeyCode::PageDown, KeyCode::End] {
+            press(&mut app, code);
+            let after = frame(&mut app, 120, 60);
+            assert!(
+                after == before,
+                "{name}: 収まっている本文が{code:?}で動いた"
+            );
+            assert_eq!(app.modal_scroll, 0, "{name}: {code:?}で状態だけが動いた");
+        }
+    }
+}
+
+/// [BUG-196] **末尾で押した`↓`の分を溜めない**（BUG-076と同じ形）。送りの上限は描くまで分からないので、
+/// キーの側は上限を掛けずに進め、描いた後に状態を切り詰める。切り詰めを忘れると、末尾で押した分だけ
+/// `↑`が空回りする。
+#[test]
+fn pressing_down_at_the_end_does_not_bank_up_rows_to_unwind() {
+    let ws = workspace();
+    let mut app = reassignment_confirmation(ws.path());
+    frame(&mut app, 80, 20);
+    press(&mut app, KeyCode::End);
+    let grid = frame(&mut app, 80, 20);
+    let area = modal_box(&grid, &app);
+    let (first, _, _) = modal_position(&grid, area).expect("台本の前提が崩れた（収まっている）");
+    for _ in 0..5 {
+        press(&mut app, KeyCode::Down);
+        frame(&mut app, 80, 20);
+    }
+    press(&mut app, KeyCode::Up);
+    let grid = frame(&mut app, 80, 20);
+    let (moved, _, _) = modal_position(&grid, area).expect("位置の表示が消えた");
+    assert_eq!(moved + 1, first, "末尾で押した↓の分だけ↑が空回りした");
+}
+
+/// [BUG-196] **長い差分は1行ずつ・10行ずつ送れて、`Home`で先頭へ戻り、閉じたら次は先頭から。**
+/// 送る単位は折り返した後の表示行で、下辺の「N〜M/T行」の数え方と同じである。
+///
+/// 以前は`edit_tests`が状態だけで「`End`で`lines.len() - 1`」を見ていた。上限が描画から来るようになった
+/// ので、描いて書き戻す経路（[`frame`]）を通してここで見る。
+#[test]
+fn a_long_diff_scrolls_row_by_row_and_page_by_page_and_stops_at_the_end() {
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    app.modal = Some(state::Modal {
+        title: "承認の確認".to_string(),
+        lines: (0..50).map(|i| format!("  + fs.read = C:/x/{i}")).collect(),
+        confirm: Confirm::Approval,
+    });
+    // 下辺の「N〜M/T行」と、枠の中の行数。
+    let shown = |app: &mut App| {
+        let grid = frame(app, 120, 40);
+        let (first, last, total) =
+            modal_position(&grid, modal_box(&grid, app)).expect("収まらない本文で位置が出ていない");
+        (first, last, total, box_inner(&grid, "承認の確認").len())
+    };
+    assert_eq!(shown(&mut app).0, 1);
+    press(&mut app, KeyCode::Down);
+    assert_eq!(shown(&mut app).0, 2);
+    press(&mut app, KeyCode::PageDown);
+    assert_eq!(shown(&mut app).0, 12);
+    press(&mut app, KeyCode::End);
+    let at_end = shown(&mut app);
+    let (first, last, total, rows) = at_end;
+    assert_eq!((last, total), (50, 50), "End で末尾へ届かない");
+    assert_eq!(
+        last - first + 1,
+        rows,
+        "End で最後の行が枠の一番下に来ていない（{first}〜{last}を{rows}行の枠に見せている）"
+    );
+    press(&mut app, KeyCode::Down);
+    assert_eq!(shown(&mut app), at_end, "末尾より先へ進んだ");
+    press(&mut app, KeyCode::Home);
+    assert_eq!(shown(&mut app).0, 1);
+
+    // 送った状態から閉じても、次に開いたときは先頭から。
+    press(&mut app, KeyCode::End);
+    frame(&mut app, 120, 40);
+    press(&mut app, KeyCode::Esc);
+    assert!(app.modal.is_none());
+    assert_eq!(app.modal_scroll, 0);
+}
+
+/// [BUG-196] **スクロールバーは本文が枠に収まらないときだけ出る。** 収まるときは右の枠線のまま。
+#[test]
+fn the_scrollbar_is_drawn_only_when_the_text_overflows() {
+    for (size, overflows) in [((80u16, 20u16), true), ((120, 60), false)] {
+        let ws = workspace();
+        let mut app = reassignment_confirmation(ws.path());
+        let grid = frame(&mut app, size.0, size.1);
+        let area = modal_box(&grid, &app);
+        assert_eq!(
+            modal_position(&grid, area).is_some(),
+            overflows,
+            "{size:?}: 台本の前提が崩れた"
+        );
+        let edge = right_edge(&grid, area);
+        if overflows {
+            assert!(
+                edge.iter().any(|cell| cell == THUMB),
+                "{size:?}: 収まらないのにスクロールバーが無い: {edge:?}"
+            );
+        } else {
+            assert!(
+                edge.iter().all(|cell| cell == "│"),
+                "{size:?}: 収まっているのに右の枠線が枠線でない: {edge:?}"
+            );
+        }
+    }
+}
+
+/// [BUG-196] **つまみは先頭では一番上、末尾では一番下に付く。** どこを見ているかを、つまみの位置が
+/// 下辺の「N〜M/T行」と同じ向きで言う。
+#[test]
+fn the_scrollbar_thumb_touches_the_top_at_the_start_and_the_bottom_at_the_end() {
+    let ws = workspace();
+    let mut app = reassignment_confirmation(ws.path());
+    let grid = frame(&mut app, 80, 20);
+    let edge = right_edge(&grid, modal_box(&grid, &app));
+    assert_eq!(
+        edge.first().map(String::as_str),
+        Some(THUMB),
+        "先頭でつまみが一番上に無い: {edge:?}"
+    );
+    assert_ne!(
+        edge.last().map(String::as_str),
+        Some(THUMB),
+        "先頭でつまみが一番下まで伸びている: {edge:?}"
+    );
+
+    press(&mut app, KeyCode::End);
+    let grid = frame(&mut app, 80, 20);
+    let edge = right_edge(&grid, modal_box(&grid, &app));
+    assert_eq!(
+        edge.last().map(String::as_str),
+        Some(THUMB),
+        "末尾でつまみが一番下に無い: {edge:?}"
+    );
+    assert_ne!(
+        edge.first().map(String::as_str),
+        Some(THUMB),
+        "末尾でつまみが一番上に残っている: {edge:?}"
+    );
+}
+
+/// [BUG-196] **許可側**: スクロールバーは本文の右端の文字を隠さない。枠の中の幅をちょうど埋める行の
+/// 最後の文字が、送れる状態でも見えている（スクロールバーを枠の内側へ描いたのに折り返しの幅を
+/// 減らさない、という壊し方を止める）。
+#[test]
+fn the_scrollbar_does_not_hide_the_last_character_of_a_full_width_line() {
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    // 80桁の端末では枠も80桁、中は78桁。各行をちょうど78桁にして、最後の1桁を`Z`にする。
+    app.modal = Some(state::Modal {
+        title: "承認の確認".to_string(),
+        lines: (0..40)
+            .map(|i| format!("{i:02}{}Z", "-".repeat(75)))
+            .collect(),
+        confirm: Confirm::Approval,
+    });
+    let grid = frame(&mut app, 80, 24);
+    assert!(
+        right_edge(&grid, modal_box(&grid, &app)).contains(&THUMB.to_string()),
+        "台本の前提が崩れた（スクロールバーが出ていない）"
+    );
+    let inner = box_inner(&grid, "承認の確認");
+    assert!(
+        inner
+            .iter()
+            .all(|row| row.len() == 78 && row.ends_with('Z')),
+        "行の最後の文字が見えない（隠れたか、折り返した）:\n{}",
+        inner.join("\n")
+    );
 }
 
 /// [BUG-192] ヘルプの高さも折り返した後の行数で数える。**端末が十分に高ければ最後の行まで読める。**

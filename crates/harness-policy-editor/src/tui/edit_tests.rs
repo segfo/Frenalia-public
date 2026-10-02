@@ -372,34 +372,8 @@ fn enter_closes_a_read_only_dialog() {
     assert!(app.modal.is_none());
 }
 
-/// **長い差分は最後まで送れる。** 送れないと、確認できないまま`y`を押すことになる。
-#[test]
-fn a_long_diff_can_be_scrolled_to_the_end() {
-    let ws = workspace();
-    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
-    let mut app = open_edit(&ws);
-    app.modal = Some(crate::tui::state::Modal {
-        title: "承認の確認".to_string(),
-        lines: (0..50).map(|i| format!("  + fs.read = C:/x/{i}")).collect(),
-        confirm: Confirm::Approval,
-    });
-
-    app.on_key(key(KeyCode::Down));
-    assert_eq!(app.modal_scroll, 1);
-    app.on_key(key(KeyCode::PageDown));
-    assert_eq!(app.modal_scroll, 11);
-    app.on_key(key(KeyCode::End));
-    assert_eq!(app.modal_scroll, 49, "末尾まで行ける");
-    app.on_key(key(KeyCode::Down));
-    assert_eq!(app.modal_scroll, 49, "末尾より先へは進まない");
-    app.on_key(key(KeyCode::Home));
-    assert_eq!(app.modal_scroll, 0);
-
-    // 送った状態から閉じても、次に開いたときは先頭から。
-    app.on_key(key(KeyCode::End));
-    app.on_key(key(KeyCode::Esc));
-    assert_eq!(app.modal_scroll, 0);
-}
+// 「長い差分は最後まで送れる」は、送りの上限が描画から来る（BUG-196）ので、描いて書き戻す経路を通す
+// `render_tests::a_long_diff_scrolls_row_by_row_and_page_by_page_and_stops_at_the_end`が見る。
 
 /// `n`で中止したら何も書かない。**中止したことも伝える**（黙って閉じない）。
 #[test]
