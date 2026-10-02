@@ -15,6 +15,7 @@ use crate::tui::state::{
     format_elapsed, progress_bar, spinner_frame, App, Pass, RecordField, RunState,
 };
 use crate::tui::text_input::TextInput;
+use crate::tui::wrap;
 
 /// 入力欄のラベル幅（全角6文字ぶん）。
 const LABEL_WIDTH: u16 = 12;
@@ -44,12 +45,19 @@ pub fn record_body_area(area: Rect) -> Rect {
     record_rows(area)[1]
 }
 
-/// 実行中に出る3つの枠の位置。[`draw_progress`]と[`scroll_target`]が共有する。
+/// 実行中に出る枠の位置。[`draw_progress`]と[`scroll_target`]が共有する。
 pub struct ProgressAreas {
+    /// 左の列の一番上の見出し枠（「いま待っているもの」／「終わりました」）。
+    pub header: Rect,
+    /// 対応が要る警告の枠。警告が無いときは割かない（`None`）。
+    pub warnings: Option<Rect>,
     pub log: Rect,
     pub output: Rect,
     pub noise: Option<Rect>,
 }
+
+/// 見出し枠の高さの下限（枠の2行＋中身2行）。中身が収まる幅では、この高さのまま割り付けが変わらない。
+const HEADER_FLOOR: u16 = 4;
 
 /// 実行中の枠割りを計算する（**純粋関数**。描画と当たり判定の唯一の正本）。
 ///
@@ -59,11 +67,22 @@ pub fn progress_areas(area: Rect, run: &RunState) -> ProgressAreas {
     let columns =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
 
+    // 見出し枠は**中身を折り返した行数ぶん**の高さを取る（BUG-192。`tui::wrap`）。以前は4行固定で、
+    // 段階の説明（「UACのダイアログが別画面に出ていないか確認してください」等）が左の列の幅で
+    // 折り返すと、後ろが黙って切れていた。上限は左の列の半分（進行ログを潰さない）。
+    let (_, _, header_text) = progress_header(run);
+    let header = wrap::box_height(
+        header_text.as_str(),
+        columns[0].width,
+        HEADER_FLOOR,
+        columns[0].height / 2,
+    );
     let left = if run.warnings.is_empty() {
-        Layout::vertical([Constraint::Length(4), Constraint::Min(3)]).split(columns[0])
+        Layout::vertical([Constraint::Length(header), Constraint::Min(3)]).split(columns[0])
     } else {
         Layout::vertical([
-            Constraint::Length(4),
+            Constraint::Length(header),
+            // 警告は数行で終わるものが多いが、実行ファイルの診断は3〜4行ある。
             Constraint::Max(10),
             Constraint::Min(3),
         ])
@@ -80,9 +99,42 @@ pub fn progress_areas(area: Rect, run: &RunState) -> ProgressAreas {
     };
 
     ProgressAreas {
+        header: left[0],
+        warnings: (left.len() == 3).then(|| left[1]),
         log,
         output: right[0],
         noise: right.get(1).copied(),
+    }
+}
+
+/// 見出し枠の見出し・色・中身。**高さを決める[`progress_areas`]と描く[`draw_progress`]が
+/// 同じ文を使う**（別々に組むと、数えた文と描いた文がずれる）。
+///
+/// 進行ログの一番上に「いま何を待っているのか」を出す。**無言の待ちは「壊れた」と読まれる**。
+/// 終わったあとは待っていないので、代わりに**次にできること**を出す（画面は自動で
+/// 動かさないので、ここが唯一の道案内になる）。
+fn progress_header(run: &RunState) -> (&'static str, Color, String) {
+    if run.finished {
+        (
+            " 終わりました ",
+            Color::Green,
+            format!(
+                "所要 {}。結果はこの画面に残ります（画面を往復しても消えません）。\n\
+                 F2 / Ctrl+N で候補一覧へ。Enter でもう一度実行できます。",
+                format_elapsed(run.elapsed())
+            ),
+        )
+    } else {
+        (
+            " いま待っているもの ",
+            Color::Cyan,
+            format!(
+                "{}（この段階の経過 {}）\n{}",
+                run.phase.label(),
+                format_elapsed(run.phase_started.elapsed()),
+                run.phase.hint()
+            ),
+        )
     }
 }
 
@@ -302,109 +354,56 @@ fn draw_notice(frame: &mut Frame, area: Rect, app: &App) {
             text.push('\n');
         }
     }
-    frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" 実行するとどうなるか "),
-        ),
+    // この枠は本文の残り全部を使うので、伸ばす先が無い。低い端末で入らない分は行数を言う（BUG-192）。
+    wrap::draw_box(
+        frame,
         area,
+        text,
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" 実行するとどうなるか "),
     );
 }
 
 fn draw_progress(frame: &mut Frame, area: Rect, run: &RunState) -> ScrollLimits {
-    let columns =
-        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
-
-    // 進行ログの一番上に「いま何を待っているのか」を出す。**無言の待ちは「壊れた」と読まれる**。
-    // 終わったあとは待っていないので、代わりに**次にできること**を出す（画面は自動で
-    // 動かさないので、ここが唯一の道案内になる）。
     // **対応が要る事実は専用の枠へ出す。** 進行ログは末尾だけを見せる窓なので、早い段階で
     // 出た警告（実行ファイルへ届かない等）は実行が終わる頃には流れて**見えなくなる**。
     // 実際にそうなった——`cargo test`が`Access is denied`で落ちたとき、原因と次の操作は
     // 進行ログに出ていたのにユーザーの画面には残っていなかった。
     // **無いときは枠を割かない**（空枠は何も伝えない。起動時ノイズの枠と同じ方針）。
     //
-    // 枠の位置そのものは[`progress_areas`]が持つ（マウスの当たり判定と同じ計算を通すため）。
-    // ここで再計算しているのは、警告枠のように**描画にしか使わない**中間の枠である。
-    let left = if run.warnings.is_empty() {
-        Layout::vertical([Constraint::Length(4), Constraint::Min(3)]).split(columns[0])
-    } else {
-        Layout::vertical([
-            Constraint::Length(4),
-            // 警告は数行で終わるものが多いが、実行ファイルの診断は3〜4行ある。
-            Constraint::Max(10),
-            Constraint::Min(3),
-        ])
-        .split(columns[0])
-    };
+    // 枠の位置は見出し枠・警告枠を含めて[`progress_areas`]が持つ（マウスの当たり判定と同じ計算を
+    // 通すため）。以前は見出し枠と警告枠の割り付けをここでも書き直しており、高さを中身から決める
+    // ようにした時点で2か所を揃え続ける必要が生じたので、1か所へ寄せた（BUG-192）。
     let areas = progress_areas(area, run);
     let log_area = areas.log;
-    let (header_title, header_color, header_text) = if run.finished {
-        (
-            " 終わりました ",
-            Color::Green,
-            format!(
-                "所要 {}。結果はこの画面に残ります（画面を往復しても消えません）。\n\
-                 F2 / Ctrl+N で候補一覧へ。Enter でもう一度実行できます。",
-                format_elapsed(run.elapsed())
-            ),
-        )
-    } else {
-        (
-            " いま待っているもの ",
-            Color::Cyan,
-            format!(
-                "{}（この段階の経過 {}）\n{}",
-                run.phase.label(),
-                format_elapsed(run.phase_started.elapsed()),
-                run.phase.hint()
-            ),
-        )
-    };
-    frame.render_widget(
-        Paragraph::new(header_text)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(header_color))
-                    .title(header_title),
-            ),
-        left[0],
+    let (header_title, header_color, header_text) = progress_header(run);
+    wrap::draw_box(
+        frame,
+        areas.header,
+        header_text,
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(header_color))
+            .title(header_title),
     );
 
-    if !run.warnings.is_empty() {
-        // **末尾ではなく先頭から出す。** 最初に出た警告がたいてい原因そのもの（後続の
-        // 失敗はその結果）なので、あふれたときに残すべきは古い方である。
-        let shown = left[1].height.saturating_sub(2) as usize;
-        let mut lines: Vec<Line<'static>> = run
-            .warnings
-            .iter()
-            .flat_map(|w| {
-                w.lines()
-                    .map(|l| Line::raw(l.to_string()))
-                    .collect::<Vec<_>>()
-            })
-            .take(shown)
-            .collect();
-        let total: usize = run.warnings.iter().map(|w| w.lines().count()).sum();
-        if total > shown && shown > 0 {
-            // **省略したことを黙らない**（B-09）。全文は記録セッションのマニフェストに残る。
-            lines.pop();
-            lines.push(Line::raw(format!(
-                "… 他 {}行（全文は record-session.json の warnings）",
-                total - shown + 1
-            )));
-        }
+    if let Some(warnings_area) = areas.warnings {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(format!(" ⚠ 対応が要ります（{}件） ", run.warnings.len()));
+        let inner = block.inner(warnings_area);
+        let all: Vec<&str> = run.warnings.iter().flat_map(|w| w.lines()).collect();
         frame.render_widget(
-            Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow))
-                    .title(format!(" ⚠ 対応が要ります（{}件） ", run.warnings.len())),
-            ),
-            left[1],
+            Paragraph::new(fit_warning_lines(
+                &all,
+                inner.width,
+                usize::from(inner.height),
+            ))
+            .wrap(Wrap { trim: false })
+            .block(block),
+            warnings_area,
         );
     }
 
@@ -476,6 +475,46 @@ pub struct ScrollLimits {
     pub log: u16,
     pub output: u16,
     pub noise: u16,
+}
+
+/// 警告枠に出す行。`width`桁×`rows`行の枠に**折り返した後で**収まるだけを先頭から取る。
+///
+/// **末尾ではなく先頭から出す。** 最初に出た警告がたいてい原因そのもの（後続の失敗は
+/// その結果）なので、あふれたときに残すべきは古い方である。収まらないときは最後に
+/// `… 他 N行`を置き（**省略したことを黙らない**、B-09。全文は記録セッションのマニフェストに残る）、
+/// その行が折り返して占める分も先に空けておく。
+///
+/// 以前は折り返す前の行数で数えていたので、長い警告が折り返した分だけ下が押し出され、
+/// **`… 他 N行`そのものが枠の外へ出て**省略が黙って起きていた（BUG-192）。
+fn fit_warning_lines(all: &[&str], width: u16, rows: usize) -> Vec<Line<'static>> {
+    let lines = |taken: &[&str]| -> Vec<Line<'static>> {
+        taken.iter().map(|l| Line::raw(l.to_string())).collect()
+    };
+    let summary = |omitted: usize| {
+        Line::raw(format!(
+            "… 他 {omitted}行（全文は record-session.json の warnings）"
+        ))
+    };
+    // 先頭からk行が占める表示行（`used[k]`）。折り返しは1行ずつ独立なので、行ごとの数の和になる。
+    // 毎フレーム呼ばれるので、取る行数を変えるたびに数え直さない。
+    let mut used = vec![0usize];
+    for line in all {
+        let last = *used.last().expect("0から始めている");
+        used.push(last + wrap::rows(*line, width));
+    }
+    if used[all.len()] <= rows {
+        return lines(all);
+    }
+    for kept in (0..all.len()).rev() {
+        let omitted = summary(all.len() - kept);
+        if used[kept] + wrap::rows(omitted.clone(), width) <= rows {
+            let mut shown = lines(&all[..kept]);
+            shown.push(omitted);
+            return shown;
+        }
+    }
+    // 要約の1行すら入らない（極端に低い・狭い枠）。要約だけを渡す（切れても描画は落ちない）。
+    vec![summary(all.len())]
 }
 
 /// 枠の全行を`Line`へ写す（窓切りはしない）。

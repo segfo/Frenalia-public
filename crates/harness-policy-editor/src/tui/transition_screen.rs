@@ -16,21 +16,33 @@ use crate::transition_candidates::{Candidate, Declared, Source};
 use crate::tui::checkbox_tree::Mark;
 use crate::tui::state::App;
 use crate::tui::transition::{Counts, PendingFilter, PendingTab};
+use crate::tui::wrap;
+
+/// 下の枠（「この画面」）の高さの下限（枠線2＋中身6）。中身はACEの注記2行・予約の案内1行・
+/// 選択中のフルパス2行で、折り返さずに収まる端末ではこの高さのまま割り付けが変わらない。
+const NOTES_FLOOR: u16 = 8;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
-    // 下の枠を**8行**にしてある（枠線2＋中身6）。中身はACEの注記2行・予約の案内1行・
-    // 選択中のフルパス2行で、読めなかった事実が出た回はそのぶん押し出される
-    // ——押し出される順序は[`draw_notes`]のdocが持つ。
+    // 下の枠は**中身を折り返した行数ぶん**の高さを取る（BUG-192。`tui::wrap`）。以前は8行固定で、
+    // 狭い端末で注記が折り返すと下から黙って切れていた。上限は本文の半分（一覧を潰さない）で、
+    // それでも入らない分は下から切れて、その行数を枠の下辺に出す——切れる順序は[`notes_text`]のdocが持つ。
     // 上の3行は遷移先ドメインの欄（2026-10-01。承認待ちのFS/ネットタブのドメイン欄と同じ高さ）。
+    let notes = notes_text(app);
+    let height = wrap::box_height(notes.as_str(), area.width, NOTES_FLOOR, area.height / 2);
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(3),
-        Constraint::Length(8),
+        Constraint::Length(height),
     ])
     .split(area);
     draw_destination(frame, chunks[0], app);
     let offset = draw_list(frame, chunks[1], app);
-    draw_notes(frame, chunks[2], app);
+    wrap::draw_box(
+        frame,
+        chunks[2],
+        notes,
+        Block::default().borders(Borders::ALL).title(" この画面 "),
+    );
     crate::tui::DrawFeedback {
         candidate_list_offset: Some(offset),
         ..Default::default()
@@ -404,11 +416,11 @@ fn empty_text(tab: PendingTab, filter: PendingFilter, counts: Counts) -> String 
 ///
 /// # 並びは「消えてはいけない順」である
 ///
-/// 枠の高さは固定で、**入り切らない分は下から黙って切れる**。だから
+/// 枠の高さは中身を折り返した行数ぶん取る（[`draw`]）が、一覧に半分を残す上限があり、
+/// **それを超えた分は下から切れる**（切れた行数は枠の下辺に出る。`tui::wrap::draw_box`）。だから
 /// (1)ACEの注記（何が起きないかの宣言。常に出す）→(2)予約件数→(3)読めなかった事実→
 /// (4)選択中のフルパス、の順に置く。**4が消えるのは許容できるが、1が消えると嘘になる。**
-fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title(" この画面 ");
+fn notes_text(app: &App) -> String {
     // 文言の持ち主は`transition_approve`（表示側で書き写さない、`B-05`）。
     let mut text = format!("{}\n", crate::transition_approve::ACE_NOTICE);
 
@@ -451,11 +463,7 @@ fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
         text.push_str(&format!("選択中: {}\n", candidate.exe));
         text.push_str(&format!("  観測された引数: {}", candidate.argv));
     }
-
-    frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
-        area,
-    );
+    text
 }
 
 #[cfg(test)]

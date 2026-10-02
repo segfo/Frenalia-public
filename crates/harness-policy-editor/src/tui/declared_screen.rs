@@ -12,14 +12,29 @@ use ratatui::Frame;
 
 use crate::tui::checkbox_tree::{self, Mark};
 use crate::tui::state::App;
+use crate::tui::wrap;
+
+/// 説明欄の高さの下限（枠の2行を含む）。中身が収まる端末では、この高さのまま割り付けが変わらない。
+const NOTES_FLOOR: u16 = 10;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
-    // 説明欄は「操作の案内（折り返して最大2行）＋未承認の案内（折り返して最大2行）＋
-    // 取り消しの注記4行」が入る高さ（枠の2行を足して10）。足りないと注記の末尾が黙って切れる。
-    // 付け替えのキー（`c`・`R`）を案内へ足したときに1行増やした。
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(10)]).split(area);
+    // 説明欄は**中身を折り返した行数ぶん**の高さを取る（BUG-192。`tui::wrap`）。
+    //
+    // 以前は「操作の案内（折り返して最大2行）＋未承認の案内（折り返して最大2行）＋取り消しの注記4行」
+    // と手で数えた固定の10行で、端末が狭くて注記まで折り返すと、注記の末尾
+    // （「消した宣言にはこの先許可が付きません」）が黙って切れていた。手で数えた行数は、
+    // 文言を足すたびにも端末の幅が変わるたびにもずれる。
+    // 上限は本文の半分（一覧を潰さない）。それでも入らない分は枠の下辺に行数で出す。
+    let notes = notes_text(app);
+    let height = wrap::box_height(notes.as_str(), area.width, NOTES_FLOOR, area.height / 2);
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(height)]).split(area);
     let declared_list_offset = draw_tree(frame, chunks[0], app);
-    draw_notes(frame, chunks[1], app);
+    wrap::draw_box(
+        frame,
+        chunks[1],
+        notes,
+        Block::default().borders(Borders::ALL).title(" この画面 "),
+    );
     crate::tui::DrawFeedback {
         declared_list_offset: Some(declared_list_offset),
         ..Default::default()
@@ -153,8 +168,8 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &App) -> usize {
     state.offset()
 }
 
-fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title(" この画面 ");
+/// 説明欄（「この画面」）の中身。高さを決めるのにも描くのにも同じ文を使う。
+fn notes_text(app: &App) -> String {
     let mut text = String::new();
     if app.unapproved.is_empty() {
         text.push_str(
@@ -178,8 +193,5 @@ fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
     }
     // 文言の持ち主は`unapprove`（表示側で書き写さない）。
     text.push_str(crate::unapprove::ACE_NOTICE);
-    frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
-        area,
-    );
+    text
 }

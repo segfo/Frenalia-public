@@ -11,21 +11,37 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use ratatui::Frame;
 
 use crate::tui::state::{App, EditField};
+use crate::tui::wrap;
 
 pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedback {
     let columns =
         Layout::horizontal([Constraint::Percentage(32), Constraint::Percentage(68)]).split(area);
     let session_list_offset = draw_sessions(frame, columns[0], app);
 
+    // 注記の枠は**中身を折り返した行数ぶん**の高さを取る（BUG-192。`tui::wrap`）。以前は9行固定で、
+    // 入り切らない分が黙って切れていた。上限は右の列の半分（候補一覧を潰さない）で、プロセスツリーの
+    // ように長いものはそこで止まり、入らなかった行数を枠の下辺に出す。
+    let (title, notes) = notes_content(app);
+    let notes_height = wrap::box_height(
+        notes.as_str(),
+        columns[1].width,
+        NOTES_FLOOR,
+        columns[1].height / 2,
+    );
     let rows = Layout::vertical([
-        Constraint::Length(3), // ドメイン名
-        Constraint::Min(5),    // 候補一覧
-        Constraint::Length(9), // 注記 or プロセスツリー
+        Constraint::Length(3),            // ドメイン名
+        Constraint::Min(5),               // 候補一覧
+        Constraint::Length(notes_height), // 注記 or プロセスツリー
     ])
     .split(columns[1]);
     draw_domain(frame, rows[0], app);
     let candidate_list_offset = draw_proposals(frame, rows[1], app);
-    draw_notes(frame, rows[2], app);
+    wrap::draw_box(
+        frame,
+        rows[2],
+        notes,
+        Block::default().borders(Borders::ALL).title(title),
+    );
     crate::tui::DrawFeedback {
         session_list_offset: Some(session_list_offset),
         candidate_list_offset: Some(candidate_list_offset),
@@ -353,11 +369,19 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App) -> usize {
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     match locked {
-        // ロック行はブロックの内側の先頭2行を占め、リストはその下に描く。
+        // ロック行はブロックの内側の先頭を占め、リストはその下に描く。
+        //
+        // **高さはロック行を折り返した行数ぶん取る**（BUG-192。`tui::wrap`）。以前は2行固定で、
+        // 2行目の説明（約110桁）が枠の幅で折り返すと、後ろの「配下 N件は候補にしません」——
+        // 候補に出ない理由——が黙って切れていた。リストには最低1行を残す。
         Some(lines) => {
             let inner = block.inner(area);
             frame.render_widget(block, area);
-            let rows = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
+            let lock_rows = u16::try_from(wrap::rows(lines.clone(), inner.width))
+                .unwrap_or(u16::MAX)
+                .min(inner.height.saturating_sub(1));
+            let rows =
+                Layout::vertical([Constraint::Length(lock_rows), Constraint::Min(1)]).split(inner);
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), rows[0]);
             frame.render_stateful_widget(list, rows[1], &mut state);
         }
@@ -391,8 +415,12 @@ fn workspace_lock_line(view: &crate::tui::state::SessionView) -> Option<Vec<Line
     ])
 }
 
-fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
-    let (title, text) = match (app.view.as_ref(), app.show_tree) {
+/// 注記の枠の高さの下限（枠の2行を含む）。中身が収まる端末では、この高さのまま割り付けが変わらない。
+const NOTES_FLOOR: u16 = 9;
+
+/// 注記の枠の見出しと中身（高さを決めるのにも描くのにも同じ文を使う）。
+fn notes_content(app: &App) -> (&'static str, String) {
+    match (app.view.as_ref(), app.show_tree) {
         (Some(view), true) => (" 観測したプロセス（t で注記へ戻る） ", view.tree.clone()),
         (Some(view), false) => {
             let mut text = view.notes.clone();
@@ -403,13 +431,7 @@ fn draw_notes(frame: &mut Frame, area: Rect, app: &App) {
             (" 記録の読み方（t でプロセスツリー） ", text)
         }
         (None, _) => (" 記録の読み方 ", String::new()),
-    };
-    frame.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(title)),
-        area,
-    );
+    }
 }
 
 fn focus_style(focused: bool) -> Style {

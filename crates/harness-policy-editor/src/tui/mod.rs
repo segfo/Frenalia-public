@@ -74,6 +74,8 @@ pub mod transition_dismissed;
 mod transition_destination;
 mod transition_screen;
 mod worker;
+/// 折り返す枠の行数を数え、入り切らなかった分を黙らせない部品（BUG-192）。
+mod wrap;
 
 use std::io;
 use std::path::PathBuf;
@@ -83,7 +85,7 @@ use crossterm::event::{self, Event};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
@@ -249,11 +251,12 @@ pub fn run(
 
 fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
     let area = frame.area();
+    let status = status_text(app);
     let chunks = Layout::vertical([
-        Constraint::Length(1), // タブ
-        Constraint::Min(3),    // 本体
-        Constraint::Length(1), // ステータス
-        Constraint::Length(1), // キーの案内
+        Constraint::Length(1),                            // タブ
+        Constraint::Min(3),                               // 本体
+        Constraint::Length(status_height(&status, area)), // 知らせ（折り返す）
+        Constraint::Length(1),                            // キーの案内
     ])
     .split(area);
 
@@ -272,7 +275,7 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
         Screen::Edit => edit_screen::draw(frame, chunks[1], app),
         Screen::Declared => declared_screen::draw(frame, chunks[1], app),
     };
-    draw_status(frame, chunks[2], app);
+    draw_status(frame, chunks[2], status);
     draw_keys(frame, chunks[3], app);
 
     if app.help {
@@ -327,12 +330,28 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    let style = Style::default().fg(Color::Yellow);
-    frame.render_widget(
-        Paragraph::new(Line::styled(app.status.clone(), style)),
-        area,
-    );
+/// 知らせの行（キー案内の1行上）に出す文。
+fn status_text(app: &App) -> Text<'static> {
+    Text::styled(app.status.clone(), Style::default().fg(Color::Yellow))
+}
+
+/// 知らせの行の高さ。**折り返して全文を出す**（[BUG-192](../../../../docs/bugs/BUG-192.md)）。
+///
+/// 以前は1行固定で折り返さず、右端で黙って切れていた。知らせは文の後ろに注意を置くことが多く
+/// （付け替えの「…にします。権限が広がります。」）、切れると**いちばん読ませたい部分から消える**。
+/// 1行に収まる知らせは今までどおり1行で、本文の割り付けは変わらない。
+///
+/// 上限は、タブとキー案内に1行ずつ、本文に最低3行（`draw`の`Min(3)`）を残した高さ。
+/// それより低い端末では切れる（そこまで低いと本文も読めない）。
+fn status_height(status: &Text, area: Rect) -> u16 {
+    let ceiling = area.height.saturating_sub(5).max(1);
+    u16::try_from(wrap::rows(status.clone(), area.width))
+        .unwrap_or(u16::MAX)
+        .clamp(1, ceiling)
+}
+
+fn draw_status(frame: &mut Frame, area: Rect, status: Text<'static>) {
+    frame.render_widget(Paragraph::new(status).wrap(Wrap { trim: false }), area);
 }
 
 /// 画面ごとのキー案内。押せるキーだけを出す。**効かない操作を案内しない**（B-32）。
@@ -516,8 +535,8 @@ fn fit_key_hints(screen: &[String], width: usize) -> String {
     line(&[], None)
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
-    let text = "\
+/// ヘルプの本文（`F4`）。試験が末尾の行まで読めるかを見るので、関数の外に置く。
+const HELP_TEXT: &str = "\
 harness-policy-editor — LLMを介さずに「このコマンドに何を許すか」を決める道具
 
 記録は2パスで行います（FSのpermissiveさとネットワーク強制は同一トークンでは両立しない
@@ -633,21 +652,35 @@ harness-policy-editor — LLMを介さずに「このコマンドに何を許す
 
 CLIも同じことができます: record / approve / record-net / show / sessions
 ";
+
+/// ヘルプの枠の幅（端末がこれより狭ければ端末の幅）。
+const HELP_WIDTH: u16 = 78;
+
+fn draw_help(frame: &mut Frame, area: Rect) {
     // **高さは本文から数える。** 固定値（26行）だった頃、本文はとうに44行あり
     // 半分以上が枠の外で切れていた——ヘルプに書いたのに読めない状態は「書いていない」のと
     // 同じである（B-09）。行数を手で持つと本文を足すたびにまたずれるので持たない（B-05）。
-    let height = text.lines().count() as u16 + 2;
-    let area = centered(area, 78, height);
+    //
+    // **数えるのは折り返した後の行である**（BUG-192）。本文の行数で数えていた間は、
+    // 枠の幅を超える行が折り返した分だけ、背の高い端末でも末尾が切れていた。
+    let width = HELP_WIDTH.min(area.width);
+    let rows = wrap::rows(HELP_TEXT, width.saturating_sub(2));
+    let height = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(2);
+    let area = centered(area, width, height);
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" ヘルプ（何かキーを押すと閉じます） "),
-        ),
+    // ヘルプは送れない（何かキーを押すと閉じる）。端末が低くて収まらない分は、行数を枠に出す。
+    wrap::draw_box(
+        frame,
         area,
+        HELP_TEXT,
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" ヘルプ（何かキーを押すと閉じます） "),
     );
 }
+
+/// 確認ダイアログの枠の幅（端末がこれより狭ければ端末の幅）。
+const MODAL_WIDTH: u16 = 88;
 
 /// 確認ダイアログ。
 ///
@@ -655,13 +688,37 @@ CLIも同じことができます: record / approve / record-net / show / sessio
 /// ときに`y`を押せばよいことが画面から消える——実際に「確認画面は出たが、承認されたのか
 /// 分からない」という形で踏んだ。長い差分は`↑↓/PgUp/PgDn`で送れるようにし、いま何行目を
 /// 見ているかも出す（残りがあることが分からないと、読み切ったつもりで判断してしまう）。
+///
+/// # 行は折り返した後で数える（[BUG-192](../../../../docs/bugs/BUG-192.md)）
+///
+/// 本文は枠の幅で折り返す。以前は枠の高さ・「続きがあるか」・何行目かを**折り返す前の行数**で
+/// 数えていたので、枠より長い行が折り返した分だけ下が枠の外へ出て切れ、送れるという案内も
+/// 出なかった——上の「読み切ったつもり」がそのまま起きた（宣言の付け替えの確認で、
+/// 「配下へ付いた継承ACEは残って効き続けます」が確定の前に見えなかった）。いまは3つとも
+/// 折り返した後の行で数える（[`wrap::rows`]。描画と同じ折り返し器）。
+///
+/// `scroll`は**`modal.lines`の何行目から見せるか**である（`App::on_modal_key`がその行数で
+/// 上限を掛ける）。ratatuiの`scroll`は折り返した後の行で数えるので、手前の行が折り返した分を
+/// 足して直してから渡す——そのまま渡すと、折り返しの多い本文では`End`が末尾に届かない。
+/// **限界**: 送る単位が`modal.lines`の1行なので、1行だけで枠の高さを超える行は途中を見られない
+/// （枠は最低でも4行あり、確認の本文の1行はそこまで長くない）。
 fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) {
-    let height = (modal.lines.len() as u16 + 4).min(area.height.saturating_sub(2));
-    let area = centered(area, 88, height.max(6));
+    let text: Vec<Line> = modal.lines.iter().map(|l| Line::raw(l.as_str())).collect();
+    let width = MODAL_WIDTH.min(area.width);
+    let text_width = width.saturating_sub(2);
+    let total = wrap::rows(text.clone(), text_width);
+    // 枠の2行と下の余白2行（折り返さない本文では以前と同じ高さになる）。
+    let height = u16::try_from(total)
+        .unwrap_or(u16::MAX)
+        .saturating_add(4)
+        .min(area.height.saturating_sub(2));
+    let area = centered(area, width, height.max(6));
     frame.render_widget(Clear, area);
 
-    let total = modal.lines.len();
     let visible = area.height.saturating_sub(2) as usize;
+    // 見せ始める`modal.lines`の行 → その手前が折り返して占める表示行。
+    let first = usize::from(scroll).min(text.len());
+    let top = wrap::rows(text[..first].to_vec(), text_width);
     let keys = if modal.confirm.asks() {
         " y=書く   n / Esc=やめる "
     } else {
@@ -670,15 +727,14 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) 
     let position = if total > visible {
         format!(
             " {}〜{}/{}行  ↑↓ PgUp/PgDn で送る ",
-            (scroll as usize + 1).min(total),
-            (scroll as usize + visible).min(total),
+            (top + 1).min(total),
+            (top + visible).min(total),
             total
         )
     } else {
         String::new()
     };
 
-    let text: Vec<Line> = modal.lines.iter().map(|l| Line::raw(l.clone())).collect();
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(if modal.confirm.asks() {
@@ -706,7 +762,7 @@ fn draw_modal(frame: &mut Frame, area: Rect, modal: &state::Modal, scroll: u16) 
     frame.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
-            .scroll((scroll, 0))
+            .scroll((u16::try_from(top).unwrap_or(u16::MAX), 0))
             .block(block),
         area,
     );

@@ -34,7 +34,11 @@ clap = { version = "4.6.1", features = ["derive"] }
 # （`record`/`record_net`）が同期ブロッキング関数なのでイベントループも同期にする
 # ——`event-stream` featureは要らない。
 crossterm = "0.29"
-ratatui = "0.30.2"
+# 折り返す枠の行数を`Paragraph::line_count`で数える（`tui::wrap`、BUG-192）。**描くときと同じ
+# 折り返し器で数える**のに要るのが`unstable-rendered-line-info`。`harness-term`も同じ機能を有効に
+# しているので無くてもビルドは通るが、それは他のクレートの都合に乗っているだけなので、使う側で書く
+# （`harness-tui`・`harness-term`と同じ形）。
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 # 端末の生モード/オルタネートスクリーン復帰（`harness-tui`と共有、規則5）。
 harness-term = { version = "0.1.0", path = "../harness-term" }
 unicode-width = "0.2.2"

@@ -716,6 +716,8 @@ pub struct App {
     pub status: String,
     pub modal: Option<Modal>,
     /// 確認ダイアログの表示開始行（長い差分を最後まで読めるようにするため）。
+    /// **`Modal::lines`の何行目か**で数える。本文は折り返して描くので、画面の行へ直すのは描画の側
+    /// （`tui::draw_modal`。BUG-192）。
     pub modal_scroll: u16,
 
     // 記録画面

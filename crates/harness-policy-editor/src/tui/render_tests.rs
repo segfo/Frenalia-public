@@ -5,6 +5,7 @@
 //! 同型の事故（BUG-075: 範囲外スライスでTUIごと落ちた）があるので、極端に狭い端末を含めて
 //! 一通り描いておく。
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
@@ -127,37 +128,7 @@ fn the_edit_screen_and_the_overlays_render() {
 #[test]
 fn the_edit_screen_shows_the_workspace_as_a_locked_row() {
     let ws = workspace();
-    let dir = RecordSessionDir::create(ws.path(), "s1").expect("session dir");
-    let mut manifest = RecordManifest::new("s1", "cargo build", ws.path(), ws.path(), 1);
-    manifest.status = RecordStatus::Finished;
-    manifest.collector_started = true;
-    manifest.etw_available = true;
-    dir.write_manifest(&manifest).expect("manifest");
-    // workspace配下（候補にならない）と、workspace外（候補になる）を1件ずつ。
-    let inside = ws.path().join("src").join("lib.rs");
-    let lines: Vec<String> = [
-        (inside.to_string_lossy().into_owned(), 1u64),
-        (r"C:\Users\me\.cargo\registry\a.rs".to_string(), 2),
-    ]
-    .iter()
-    .map(|(path, ts)| {
-        harness_policy::FsAuditEvent::observed(
-            harness_policy::FsAuditKind::Etw,
-            path,
-            harness_config::FsAccess::Read,
-            true,
-            "record_all",
-            *ts,
-        )
-        .to_jsonl_line()
-        .expect("jsonl")
-    })
-    .collect();
-    std::fs::write(dir.audit_log_path(), format!("{}\n", lines.join("\n"))).expect("audit log");
-
-    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
-    app.screen = Screen::Edit;
-    app.open_selected_session();
+    let app = edit_screen_with_a_locked_workspace(ws.path());
 
     let mut terminal = Terminal::new(TestBackend::new(200, 40)).expect("test terminal");
     terminal
@@ -190,6 +161,70 @@ fn the_edit_screen_shows_the_workspace_as_a_locked_row() {
     assert!(
         screen.contains("registry"),
         "paths outside the workspace must still be candidates:\n{screen}"
+    );
+}
+
+/// 編集画面で、workspace配下（候補にならない）と外（候補になる）を1件ずつ記録した記録を開いた状態。
+fn edit_screen_with_a_locked_workspace(ws: &std::path::Path) -> App {
+    let dir = RecordSessionDir::create(ws, "s1").expect("session dir");
+    let mut manifest = RecordManifest::new("s1", "cargo build", ws, ws, 1);
+    manifest.status = RecordStatus::Finished;
+    manifest.collector_started = true;
+    manifest.etw_available = true;
+    dir.write_manifest(&manifest).expect("manifest");
+    // workspace配下（候補にならない）と、workspace外（候補になる）を1件ずつ。
+    let inside = ws.join("src").join("lib.rs");
+    let lines: Vec<String> = [
+        (inside.to_string_lossy().into_owned(), 1u64),
+        (r"C:\Users\me\.cargo\registry\a.rs".to_string(), 2),
+    ]
+    .iter()
+    .map(|(path, ts)| {
+        harness_policy::FsAuditEvent::observed(
+            harness_policy::FsAuditKind::Etw,
+            path,
+            harness_config::FsAccess::Read,
+            true,
+            "record_all",
+            *ts,
+        )
+        .to_jsonl_line()
+        .expect("jsonl")
+    })
+    .collect();
+    std::fs::write(dir.audit_log_path(), format!("{}\n", lines.join("\n"))).expect("audit log");
+
+    let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+    app.screen = Screen::Edit;
+    app.open_selected_session();
+    app
+}
+
+/// [BUG-192] **ロック行の説明は、狭い端末でも最後まで読める。** 以前は2行固定で、2行目の説明
+/// （約110桁）が候補の枠の幅で折り返すと、後ろの「配下 N件は候補にしません」——workspace配下が
+/// 候補に出ない理由——が黙って切れていた。
+#[test]
+fn the_workspace_lock_row_is_not_cut_on_a_narrow_terminal() {
+    let ws = workspace();
+    let app = edit_screen_with_a_locked_workspace(ws.path());
+    let failures: Vec<String> = [100u16, 120, 200]
+        .into_iter()
+        .filter_map(|width| {
+            let candidates = box_inner(
+                &paint_grid(width, 40, |f| {
+                    draw(f, &app);
+                }),
+                " 候補:",
+            );
+            let text = flatten(&candidates);
+            (!text.contains("配下1件は候補にしません") || !text.contains("registry"))
+                .then(|| format!("{width}桁:\n{}", candidates.join("\n")))
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "ロック行の説明か候補が見えない:\n{}",
+        failures.join("\n\n")
     );
 }
 
@@ -402,4 +437,644 @@ fn a_narrow_terminal_drops_screen_hints_from_the_tail_and_says_how_many() {
              なっていない:\n{row}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 折り返す枠（確認ダイアログ・ヘルプ・知らせの行・説明欄）。[BUG-192]
+//
+// **行数は折り返した後で数える。** 日本語は1文字2桁なので、枠の幅を超える行はすぐ出る。
+// 折り返す前の行数で高さや「続きがあるか」を決めると、折り返した分だけ下が黙って切れる。
+// ---------------------------------------------------------------------------
+
+/// 枠線の文字（`Borders::ALL`の既定の線）。本文の照合の前に落とす。
+const BOX_CHARS: [char; 6] = ['─', '│', '┌', '┐', '└', '┘'];
+
+fn press(app: &mut App, code: KeyCode) {
+    app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+}
+
+/// 空の`width`×`height`の端末へ`paint`だけを描き、セルの格子（行ごとに1セル1記号）を返す。
+fn paint_grid(width: u16, height: u16, paint: impl FnOnce(&mut Frame)) -> Vec<Vec<String>> {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    terminal.draw(paint).expect("描画は落ちてはいけない");
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// [`paint_grid`]の行ごとの文字列。
+fn paint_rows(width: u16, height: u16, paint: impl FnOnce(&mut Frame)) -> Vec<String> {
+    paint_grid(width, height, paint)
+        .into_iter()
+        .map(|row| row.concat())
+        .collect()
+}
+
+/// 見出しに`title`を含む枠の**内側**（枠線を除いた行ごとの文字列）。
+///
+/// 左右に別の枠が並ぶ画面でも、その枠の列だけを切り出す（行全体をつなぐと隣の枠の文字が混ざる）。
+fn box_inner(grid: &[Vec<String>], title: &str) -> Vec<String> {
+    let title = squash(title);
+    for (top, row) in grid.iter().enumerate() {
+        // 見出しは左上の角の直後に描かれる。
+        let Some(left) = (0..row.len())
+            .find(|&x| row[x] == "┌" && squash(&row[x + 1..].concat()).starts_with(&title))
+        else {
+            continue;
+        };
+        let right = (left + 1..row.len())
+            .find(|&x| row[x] == "┐")
+            .expect("枠の右上の角が無い");
+        return grid[top + 1..]
+            .iter()
+            .take_while(|row| row[left] != "└")
+            .map(|row| row[left + 1..right].concat())
+            .collect();
+    }
+    panic!("見出しが「{title}」の枠が無い");
+}
+
+/// 行を上から順につなぎ、空白と枠線を落とす。**折り返された1行は、これで元の1続きに戻る**
+/// （間に挟まるのは枠の左右の線と行末の余白だけなので）。
+fn flatten(rows: &[String]) -> String {
+    rows.iter()
+        .flat_map(|row| row.chars())
+        .filter(|c| !c.is_whitespace() && !BOX_CHARS.contains(c))
+        .collect()
+}
+
+/// 枠が占める行数（枠線を含む行の数。空の端末に枠を1つだけ描いたときに使う）。
+fn box_height(rows: &[String]) -> usize {
+    rows.iter()
+        .filter(|row| row.chars().any(|c| BOX_CHARS.contains(&c)))
+        .count()
+}
+
+/// 遷移タブ（観測から）に候補が1件ある状態。
+fn transition_tab_with_one_candidate(ws: &std::path::Path) -> App {
+    use harness_sandbox::tier2a::policy_learnd::observed::{observed_path, ObservedRecord, Spawn};
+
+    let path = observed_path(ws);
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("transitions dir");
+    let record = ObservedRecord::ObservedSpawn(Spawn {
+        parent_exe: Some("C:/pwsh.exe".to_string()),
+        exe: "C:/Program Files/Git/cmd/git.exe".to_string(),
+        argv: "git --version".to_string(),
+        count: 1,
+        first_ts: 1,
+        last_ts: 1,
+        argv_truncation: false,
+    });
+    let line = serde_json::to_string(&record).expect("jsonl");
+    std::fs::write(&path, format!("{line}\n")).expect("observed.jsonl");
+
+    let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+    app.screen = Screen::Edit;
+    app.pending.tab = transition::Tab(transition::PendingTab::TransitionsObserved);
+    app.reload_transitions();
+    assert_eq!(app.pending.observed.len(), 1, "候補が読めていない");
+    app
+}
+
+/// 遷移タブで1件選び、遷移先を`destination`にして`a`を押した状態。
+/// **実機で切れた確認ダイアログと同じ経路で組み立てる**（本文を試験の側で書かない）。
+fn transition_confirmation_to(ws: &std::path::Path, destination: &str) -> App {
+    let mut app = transition_tab_with_one_candidate(ws);
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Tab);
+    for _ in 0..64 {
+        press(&mut app, KeyCode::Backspace);
+    }
+    for ch in destination.chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char('a'));
+    assert!(
+        matches!(
+            app.modal.as_ref().map(|m| m.confirm),
+            Some(Confirm::Transition)
+        ),
+        "確認ダイアログが出ていない: {}",
+        app.status
+    );
+    app
+}
+
+/// `policy.json`に`domain`だけを書き、宣言画面（`F3`）を開いた状態。
+fn declared_screen_with(ws: &std::path::Path, domain: crate::policy_file::PolicyDomain) -> App {
+    crate::policy_file::save(
+        ws,
+        &crate::policy_file::PolicyFile {
+            schema_version: crate::policy_file::POLICY_SCHEMA_VERSION,
+            domains: vec![domain],
+        },
+    )
+    .expect("policy.json");
+    let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+    press(&mut app, KeyCode::F(3));
+    assert_eq!(app.screen, Screen::Declared);
+    app
+}
+
+/// 宣言画面で`**`を外す付け替えを予約して`a`を押した状態。**実機で権限の注意が切れた確認ダイアログ**
+/// （`tools/**`に`R`、`data`に`c`。2026-10-02）と同じ形を、1行ずつ選んで作る。
+fn reassignment_confirmation(ws: &std::path::Path) -> App {
+    let mut domain = crate::policy_file::PolicyDomain::new("view-check");
+    domain
+        .fs
+        .read
+        .push("C:/harness-e2e/view-check-outside/data".to_string());
+    domain
+        .fs
+        .read
+        .push("C:/harness-e2e/view-check-outside/tools/**".to_string());
+    let mut app = declared_screen_with(ws, domain);
+    // 行0は2つの宣言の共通の親（`…/view-check-outside`。開いた状態で始まる）、その下に data・tools。
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('c'));
+    assert!(
+        app.status.contains("data") && app.status.contains("fs.read_write"),
+        "台本の前提が崩れた（dataの付け替えを予約できていない）: {}",
+        app.status
+    );
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char('R'));
+    assert!(
+        app.status.contains("tools") && app.status.contains("そのパス1つだけ"),
+        "台本の前提が崩れた（tools の ** を外す予約ができていない）: {}",
+        app.status
+    );
+    press(&mut app, KeyCode::Char('a'));
+    assert!(
+        matches!(
+            app.modal.as_ref().map(|m| m.confirm),
+            Some(Confirm::DeclaredChanges)
+        ),
+        "確認ダイアログが出ていない: {}",
+        app.status
+    );
+    app
+}
+
+/// [BUG-192] **禁止側**: 確認ダイアログの最後の行が、黙って枠の外へ切れない。
+///
+/// # 壊れた状態を一文で
+///
+/// 枠の高さと「続きがあるか」を**折り返す前の行数**で数えていたので、枠より長い行が折り返した
+/// 分だけ本文の下が枠の外へ出て切れ、`↑↓ PgUp/PgDn で送る`も出なかった。実機では
+/// (1) 別ドメイン（`build`）への遷移の確認が「…だけでこのドメインを用意し」で止まり、
+/// (2) 宣言の付け替え（`**`を外す）の確認が、**「配下へ付いた継承ACEは残って効き続けます」の
+/// 注意ごと**枠の外にあった（どちらも2026-10-02）。
+/// **最後の行まで見えているか、続きがあると言っているか**のどちらかでなければならない。
+#[test]
+fn the_last_line_of_a_confirmation_is_never_cut_off_silently() {
+    let ws_transition = workspace();
+    let ws_reassign = workspace();
+    let transition = transition_confirmation_to(ws_transition.path(), "build");
+    let reassign = reassignment_confirmation(ws_reassign.path());
+    for (name, app, tail) in [
+        ("遷移", &transition, "このドメインを用意します。"),
+        ("付け替え", &reassign, "を実行してください）。"),
+    ] {
+        let modal = app.modal.as_ref().expect("確認ダイアログ");
+        // 付け替えの明細は区切りの空行で終わるので、文字のある最後の行を見る。
+        let last = squash(
+            modal
+                .lines
+                .iter()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .expect("本文が空"),
+        );
+        assert!(
+            last.ends_with(&squash(tail)),
+            "{name}: 台本の前提が崩れた（最後の行が違う）: {last}"
+        );
+        // 1つ落ちたところで止めず、どの大きさで落ちるかを全部出す。
+        let failures: Vec<String> = [(80u16, 24u16), (100, 30), (120, 30), (120, 40), (140, 30)]
+            .into_iter()
+            .filter_map(|(width, height)| {
+                let rows = paint_rows(width, height, |f| draw_modal(f, f.area(), modal, 0));
+                let screen = flatten(&rows);
+                (!screen.contains(&last) && !screen.contains("PgUp/PgDnで送る"))
+                    .then(|| format!("{width}×{height}:\n{}", rows.join("\n")))
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{name}の確認の最後の行が切れているのに、続きがあると言っていない:\n{}",
+            failures.join("\n\n")
+        );
+    }
+}
+
+/// [BUG-192] **送った先で最後の行まで読める。** 送る量は`Modal::lines`の行で数えている
+/// （`on_modal_key`の上限は`lines.len() - 1`）ので、描く側が折り返した後の行へ直さないと、
+/// 折り返しの多い本文では`End`を押しても末尾に届かない。
+#[test]
+fn the_end_key_reaches_the_last_line_even_when_every_line_wraps() {
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    let mut lines: Vec<String> = (0..40)
+        .map(|i| format!("{i:02}{}", "折り返す長さの行".repeat(6)))
+        .collect();
+    lines.push("ここが最後の行です".to_string());
+    app.modal = Some(state::Modal {
+        title: "承認の確認".to_string(),
+        lines,
+        confirm: Confirm::Approval,
+    });
+    let modal_screen = |app: &App| {
+        flatten(&paint_rows(80, 24, |f| {
+            draw_modal(
+                f,
+                f.area(),
+                app.modal.as_ref().expect("modal"),
+                app.modal_scroll,
+            )
+        }))
+    };
+    assert!(
+        modal_screen(&app).contains("PgUp/PgDnで送る"),
+        "収まらないのに送れると言っていない"
+    );
+
+    press(&mut app, KeyCode::End);
+    let screen = modal_screen(&app);
+    assert!(
+        screen.contains("ここが最後の行です"),
+        "End で末尾へ届かない:\n{screen}"
+    );
+}
+
+/// [BUG-192] **許可側**（`B-35`）: 折り返さずに収まる本文は、枠の高さも今までどおりで、
+/// 「送る」の案内も出さない（続きが無いのに送れと言わない、`B-32`）。
+#[test]
+fn a_confirmation_that_fits_is_drawn_as_before_and_does_not_offer_scrolling() {
+    let modal = state::Modal {
+        title: "承認の確認".to_string(),
+        lines: (0..10).map(|i| format!("  + fs.read = C:/x/{i}")).collect(),
+        confirm: Confirm::Approval,
+    };
+    let rows = paint_rows(120, 40, |f| draw_modal(f, f.area(), &modal, 0));
+    assert_eq!(
+        box_height(&rows),
+        modal.lines.len() + 4,
+        "収まる本文で枠の高さが変わった"
+    );
+    let screen = flatten(&rows);
+    for line in &modal.lines {
+        assert!(
+            screen.contains(&squash(line)),
+            "{line} が見えない:\n{screen}"
+        );
+    }
+    assert!(
+        !screen.contains("で送る"),
+        "続きが無いのに送れと言っている:\n{screen}"
+    );
+}
+
+/// [BUG-192] **許可側**: 折り返しても枠に収まる端末では、全部の行が見えて「送る」は出ない。
+#[test]
+fn a_wrapped_confirmation_that_fits_shows_every_line_without_a_scroll_hint() {
+    let ws_transition = workspace();
+    let ws_reassign = workspace();
+    let transition = transition_confirmation_to(ws_transition.path(), "build");
+    let reassign = reassignment_confirmation(ws_reassign.path());
+    for (name, app) in [("遷移", &transition), ("付け替え", &reassign)] {
+        let modal = app.modal.as_ref().expect("確認ダイアログ");
+        let screen = flatten(&paint_rows(120, 60, |f| draw_modal(f, f.area(), modal, 0)));
+        for line in &modal.lines {
+            assert!(
+                screen.contains(&squash(line)),
+                "{name}: {line} が見えない:\n{screen}"
+            );
+        }
+        assert!(
+            !screen.contains("で送る"),
+            "{name}: 収まっているのに送れと言っている:\n{screen}"
+        );
+    }
+}
+
+/// [BUG-192] ヘルプの高さも折り返した後の行数で数える。**端末が十分に高ければ最後の行まで読める。**
+///
+/// 「高さは本文から数える」（B-09）はヘルプが先に直していたが、数えていたのは折り返す前の行だった。
+#[test]
+fn the_help_box_is_as_tall_as_its_wrapped_text() {
+    let screen = flatten(&paint_rows(100, 400, |f| draw_help(f, f.area())));
+    let last = squash(HELP_TEXT.lines().last().expect("ヘルプが空"));
+    assert!(
+        screen.contains(&last),
+        "背の高い端末でもヘルプの最後の行が切れている:\n{screen}"
+    );
+    assert!(
+        !screen.contains("収まっていません"),
+        "収まっているのに切れたと言っている"
+    );
+}
+
+/// [BUG-192] **端末が低くて収まらないときは、切れた行数を枠に出す**（黙って切らない、`B-09`）。
+/// 行数は背の高い端末で描いたときの枠の中の行数から測る（描画と同じ数え方を試験に写さない）。
+#[test]
+fn a_help_taller_than_the_terminal_says_how_many_lines_are_cut() {
+    let text_rows = box_height(&paint_rows(100, 400, |f| draw_help(f, f.area()))) - 2;
+    let height = 40u16;
+    let hidden = text_rows - usize::from(height - 2);
+    let screen = flatten(&paint_rows(100, height, |f| draw_help(f, f.area())));
+    assert!(
+        screen.contains(&format!("下の{hidden}行")),
+        "切れた行数（{hidden}行）を言っていない:\n{screen}"
+    );
+}
+
+/// 知らせの行（`app.status`）。宣言画面の下の枠の下辺と、最下行（キー案内）の間にある。
+fn status_rows(rows: &[String]) -> &[String] {
+    let bottom = rows
+        .iter()
+        .rposition(|row| row.contains('└'))
+        .expect("枠が無い");
+    &rows[bottom + 1..rows.len() - 1]
+}
+
+/// [BUG-192] **知らせの行は、幅に収まらなくても最後まで読める。**
+///
+/// # 壊れた状態を一文で
+///
+/// 知らせの行は1行固定で折り返さず、右端で黙って切れていた。宣言画面で`c`（種類の付け替え）を
+/// 押すと「…（そのパス1つだけ）にします。権限が広がり」で切れ、**付け替えでいちばん読ませたい
+/// 「権限が広がります」が見えなかった**（2026-10-02、実機）。
+#[test]
+fn the_status_line_wraps_instead_of_being_cut_at_the_right_edge() {
+    let ws = workspace();
+    let mut domain = crate::policy_file::PolicyDomain::new("view-check");
+    domain
+        .fs
+        .read
+        .push("C:/harness-e2e/view-check-outside/data".to_string());
+    let mut app = declared_screen_with(ws.path(), domain);
+    press(&mut app, KeyCode::Char('c'));
+    assert!(
+        app.status.contains("権限が広がります"),
+        "台本の前提が崩れた: {}",
+        app.status
+    );
+
+    let failures: Vec<String> = [80u16, 100, 120, 142, 200]
+        .into_iter()
+        .filter_map(|width| {
+            let rows = paint_rows(width, 30, |f| {
+                draw(f, &app);
+            });
+            (flatten(status_rows(&rows)) != squash(&app.status))
+                .then(|| format!("{width}桁:\n{}", status_rows(&rows).join("\n")))
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "知らせの行が切れている（全文: {}）:\n{}",
+        app.status,
+        failures.join("\n\n")
+    );
+}
+
+/// [BUG-192] **許可側**: 1行に収まる知らせは今までどおり1行で、本文の枠を押し上げない。
+#[test]
+fn a_short_status_stays_on_one_row() {
+    let ws = workspace();
+    let mut domain = crate::policy_file::PolicyDomain::new("view-check");
+    domain
+        .fs
+        .read
+        .push("C:/harness-e2e/view-check-outside/data".to_string());
+    let mut app = declared_screen_with(ws.path(), domain);
+    app.status = "短い知らせ".to_string();
+    let rows = paint_rows(120, 30, |f| {
+        draw(f, &app);
+    });
+    assert_eq!(status_rows(&rows).len(), 1, "{}", rows.join("\n"));
+    assert_eq!(flatten(status_rows(&rows)), "短い知らせ");
+}
+
+/// [BUG-192] **宣言画面の説明欄は、各文の最後まで読める。**
+///
+/// 実機（幅およそ120桁）で「…yで配下をまとめて承認を予約できま」の後ろが見えないと報告された
+/// （2026-10-02）。描画を測ると、118〜134桁のどの幅でも続き（「す。」など）は次の行の頭に出ていた。
+/// 描画の上で実際に切れていたのは、手で数えた固定の高さ（10行）に入り切らない80桁で、
+/// **注記（`unapprove::ACE_NOTICE`）の末尾が黙って消える**形だった。両方の文の最後まで見る。
+#[test]
+fn the_declared_screen_notes_show_every_sentence_to_the_end() {
+    let ws = workspace();
+    let mut domain = crate::policy_file::PolicyDomain::new("view-check");
+    domain
+        .fs
+        .read
+        .push("C:/harness-e2e/view-check-outside/data".to_string());
+    domain
+        .fs
+        .read
+        .push("C:/harness-e2e/view-check-outside/more".to_string());
+    let app = declared_screen_with(ws.path(), domain);
+    assert_eq!(
+        app.declared_approval.not_approved.len(),
+        2,
+        "台本の前提が崩れた（未承認の宣言が2件ではない）"
+    );
+    let unapproved =
+        "このマシンで未承認の宣言が2件あります（リポジトリに同梱・手書き・以前の承認）。\
+                      許可は付きません。yで配下をまとめて承認を予約できます。";
+    let notice_tail = squash(
+        crate::unapprove::ACE_NOTICE
+            .lines()
+            .last()
+            .expect("注記が空"),
+    );
+    let failures: Vec<String> = [80u16, 100, 120, 130, 200]
+        .into_iter()
+        .filter_map(|width| {
+            let notes = box_inner(
+                &paint_grid(width, 40, |f| {
+                    draw(f, &app);
+                }),
+                " この画面 ",
+            );
+            let text = flatten(&notes);
+            (!text.contains(unapproved) || !text.contains(&notice_tail))
+                .then(|| format!("{width}桁:\n{}", notes.join("\n")))
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "説明欄の文が途中で切れている:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+/// [BUG-192] **許可側**: 折り返さずに収まる幅では、説明欄の高さは今までの10行のまま
+/// （一覧の割り付けが変わらない）。
+#[test]
+fn the_declared_screen_notes_keep_their_height_when_they_fit() {
+    let ws = workspace();
+    let mut domain = crate::policy_file::PolicyDomain::new("view-check");
+    domain
+        .fs
+        .read
+        .push("C:/harness-e2e/view-check-outside/data".to_string());
+    let app = declared_screen_with(ws.path(), domain);
+    let notes = box_inner(
+        &paint_grid(200, 40, |f| {
+            draw(f, &app);
+        }),
+        " この画面 ",
+    );
+    assert_eq!(notes.len() + 2, 10, "{}", notes.join("\n"));
+}
+
+/// [BUG-192] **遷移タブの下の枠（「この画面」）も、狭い端末で注記を黙って切らない。**
+/// 中身は「消えてはいけない順」（ACEの注記→予約→読めなかった事実→選択中のフルパス）に並んでおり、
+/// 以前は8行固定だったので、狭い端末では末尾の「選択中」から黙って消えていた。
+#[test]
+fn the_transition_tab_notes_show_the_selected_program_on_a_narrow_terminal() {
+    let ws = workspace();
+    let app = transition_tab_with_one_candidate(ws.path());
+    let last = squash("  観測された引数: git --version");
+    let failures: Vec<String> = [80u16, 100, 120]
+        .into_iter()
+        .filter_map(|width| {
+            let notes = box_inner(
+                &paint_grid(width, 30, |f| {
+                    draw(f, &app);
+                }),
+                " この画面 ",
+            );
+            (!flatten(&notes).contains(&last)).then(|| format!("{width}桁:\n{}", notes.join("\n")))
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "遷移タブの説明欄の末尾が切れている:\n{}",
+        failures.join("\n\n")
+    );
+
+    // 許可側: 収まる幅では今までの8行のまま。
+    let wide = box_inner(
+        &paint_grid(200, 30, |f| {
+            draw(f, &app);
+        }),
+        " この画面 ",
+    );
+    assert_eq!(wide.len() + 2, 8, "{}", wide.join("\n"));
+}
+
+/// [BUG-192] **送れない枠は、入り切らなかった行を黙って捨てない。** 編集画面の注記は
+/// 記録の中身次第で長くなる（プロセスツリーは何十行にもなる）ので、伸ばせる高さに上限がある。
+/// そこで止まったときは、入り切らなかった行数を枠の下辺に出す。
+#[test]
+fn a_notes_box_that_cannot_grow_any_further_says_how_many_lines_are_cut() {
+    let ws = workspace();
+    let dir = RecordSessionDir::create(ws.path(), "s1").expect("session dir");
+    let mut manifest = RecordManifest::new("s1", "cargo build", ws.path(), ws.path(), 1);
+    manifest.status = RecordStatus::Finished;
+    manifest.collector_started = true;
+    manifest.etw_available = true;
+    dir.write_manifest(&manifest).expect("manifest");
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    app.screen = Screen::Edit;
+    app.open_selected_session();
+    let view = app.view.as_mut().expect("記録が開けていない");
+    // 長い注記（プロセスツリーの代わり）。どの幅でも列の半分には入り切らない量にする。
+    view.notes = (0..60)
+        .map(|i| format!("注記の{i}行目です。"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    view.common_warnings.clear();
+
+    let grid = paint_grid(120, 30, |f| {
+        draw(f, &app);
+    });
+    let notes = box_inner(&grid, " 記録の読み方");
+    let screen = grid.iter().map(|row| row.concat()).collect::<Vec<_>>();
+    let shown = notes
+        .iter()
+        .filter(|row| squash(row).contains("注記の"))
+        .count();
+    assert!(shown < 60, "台本の前提が崩れた（全部入ってしまった）");
+    let hidden = 60 - shown;
+    assert!(
+        flatten(&screen).contains(&format!("下の{hidden}行が枠に収まっていません")),
+        "入り切らなかった{hidden}行を言っていない:\n{}",
+        screen.join("\n")
+    );
+}
+
+/// [BUG-192] **記録画面の見出し枠（いま待っているもの）は、段階の説明を最後まで出す。**
+/// 以前は4行固定で、左の列（画面の45%）の幅で説明が折り返すと後ろが黙って切れていた——
+/// 収集器を起動する段階では、その後ろが「UACのダイアログが別画面に出ていないか確認してください」だった。
+#[test]
+fn the_record_screen_header_shows_the_whole_hint() {
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    app.command.set_text("cargo build");
+    press(&mut app, KeyCode::Enter);
+    let hint = squash(app.run.as_ref().expect("記録が始まっていない").phase.hint());
+    let failures: Vec<String> = [80u16, 100, 120]
+        .into_iter()
+        .filter_map(|width| {
+            let header = box_inner(
+                &paint_grid(width, 30, |f| {
+                    draw(f, &app);
+                }),
+                " いま待っているもの ",
+            );
+            (!flatten(&header).contains(&hint))
+                .then(|| format!("{width}桁:\n{}", header.join("\n")))
+        })
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "見出し枠の説明が途中で切れている:\n{}",
+        failures.join("\n\n")
+    );
+}
+
+/// [BUG-192] **警告枠の「… 他 N行」は、長い警告が折り返しても枠の中に残る。**
+/// 以前は折り返す前の行数で「何行入るか」を数えていたので、折り返した分だけ下が押し出され、
+/// 省略したことを言う行そのものが枠の外へ出ていた（省略が黙って起きる）。
+#[test]
+fn the_warning_box_still_says_how_many_lines_it_omitted_when_lines_wrap() {
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    app.command.set_text("cargo build");
+    press(&mut app, KeyCode::Enter);
+    let long = "実行ファイルへ届きません。宣言に read_exec が要ります。".repeat(2);
+    let message = (0..12)
+        .map(|i| format!("{i}: {long}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.on_worker(WorkerMsg::Pass1(RecordEvent::Warning(message)));
+
+    let warnings = box_inner(
+        &paint_grid(100, 30, |f| {
+            draw(f, &app);
+        }),
+        " ⚠ 対応が要ります",
+    );
+    let text = flatten(&warnings);
+    assert!(
+        text.contains("…他") && text.contains("record-session.jsonのwarnings"),
+        "省略したことを言う行が見えない:\n{}",
+        warnings.join("\n")
+    );
+    assert!(
+        text.contains(&squash(&format!("0: {long}"))),
+        "先頭の警告（原因であることが多い）が見えない:\n{}",
+        warnings.join("\n")
+    );
 }
