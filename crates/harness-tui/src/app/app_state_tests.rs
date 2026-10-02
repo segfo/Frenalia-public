@@ -877,7 +877,7 @@ fn scrolling_past_the_top_does_not_bank_up_an_invisible_offset() {
     let mut app = AppState::new("mock".into(), "mock-model".into());
     // 遡れるのは3行分しかない画面で、ホイールを10ノッチ（=30行分）上へ回す。
     for _ in 0..10 {
-        app.on_mouse(MouseEventKind::ScrollUp);
+        app.on_wheel(Wheel::Transcript, true);
     }
     assert_eq!(app.scroll_offset(), 30, "入力の時点では素直に加算される");
 
@@ -885,7 +885,7 @@ fn scrolling_past_the_top_does_not_bank_up_an_invisible_offset() {
     assert_eq!(app.scroll_offset(), 3);
 
     // 下へ1ノッチで最新へ戻る（修正前は27行分の空回りが残っていた）。
-    app.on_mouse(MouseEventKind::ScrollDown);
+    app.on_wheel(Wheel::Transcript, false);
     assert_eq!(app.scroll_offset(), 0);
 }
 
@@ -936,26 +936,17 @@ fn ctrl_o_returns_transcript_to_latest() {
     assert_eq!(app.scroll_offset(), 0);
 }
 
+/// transcriptのホイール1刻みは3行（どこで回したときにtranscriptを送るかは`app::pointer_tests`が固定する。
+/// 承認待ちの間の`mouse_scroll_works_even_while_permission_modal_is_pending`もそちらへ移した）。
 #[test]
 fn mouse_wheel_scrolls_up_and_down() {
     let mut app = AppState::new("mock".into(), "mock-model".into());
-    app.on_mouse(MouseEventKind::ScrollUp);
+    app.on_wheel(Wheel::Transcript, true);
     assert_eq!(app.scroll_offset(), 3);
-    app.on_mouse(MouseEventKind::ScrollDown);
+    app.on_wheel(Wheel::Transcript, false);
     assert_eq!(app.scroll_offset(), 0);
-    app.on_mouse(MouseEventKind::ScrollDown);
+    app.on_wheel(Wheel::Transcript, false);
     assert_eq!(app.scroll_offset(), 0, "should not go below 0");
-}
-
-/// スクロール操作は承認モーダル表示中でも通る（過去ログ閲覧を妨げないため、
-/// `on_key`のモーダルガードとは独立に処理される）。
-#[test]
-fn mouse_scroll_works_even_while_permission_modal_is_pending() {
-    let mut app = pending_shell_approval("echo hi");
-    assert!(app.pending_permission.is_some());
-
-    app.on_mouse(MouseEventKind::ScrollUp);
-    assert_eq!(app.scroll_offset(), 3);
 }
 
 /// `TurnStarted`でUpstream概算・ライブ状態がセットされ、`TextDelta`/`ThinkingDelta`で
@@ -1356,6 +1347,11 @@ fn hunk_toggle_is_ignored_when_hunk_ops_are_blocked() {
 }
 
 /// PgUp/PgDnでdiffペインがスクロールし、上下ともクランプされる。
+///
+/// **下の止まり位置は描いて分かる**（最後の行が枠の一番下に来るところ。ペインの高さで決まる。BUG-204）。
+/// キーを受けた時点では上限を掛けずに進め、描いた後に切り詰める——先で押した分は溜まらず、`PgUp`1回で
+/// 10行戻る（BUG-076）。直す前は、キーの時点で「最後の行が枠の一番上」の位置（`diff_view().len() - 1`）で
+/// 止めていた。
 #[test]
 fn page_keys_scroll_the_diff_pane_and_clamp() {
     let mut app = AppState::new("mock".into(), "mock-model".into());
@@ -1365,17 +1361,38 @@ fn page_keys_scroll_the_diff_pane_and_clamp() {
     app.on_key(code(KeyCode::PageDown));
     assert_eq!(panel(&app).diff_scroll, 10);
 
-    // 何度押しても最終行を超えない。
     for _ in 0..20 {
         app.on_key(code(KeyCode::PageDown));
     }
-    let max = panel(&app).diff_view().len() as u16 - 1;
-    assert_eq!(panel(&app).diff_scroll, max);
+    // 差分がペインに入り切らない高さの端末で描く。
+    draw_app(&mut app, 120, 16);
+    let stopped = panel(&app).diff_scroll;
+    let last = panel(&app).diff_view().len() as u16 - 1;
+    assert!(
+        stopped > 0 && stopped < last,
+        "止まり位置{stopped}（最後の行の番号{last}）"
+    );
+    // 描き直しても動かない（切り詰めた値が上限そのもの）。
+    draw_app(&mut app, 120, 16);
+    assert_eq!(panel(&app).diff_scroll, stopped);
+
+    app.on_key(code(KeyCode::PageUp));
+    assert_eq!(panel(&app).diff_scroll, stopped.saturating_sub(10));
 
     for _ in 0..40 {
         app.on_key(code(KeyCode::PageUp));
     }
     assert_eq!(panel(&app).diff_scroll, 0);
+}
+
+/// 製品と同じ形で1フレーム描き、描いて分かったことを状態へ書き戻す（`crate::run`の描画ループと同じ順）。
+fn draw_app(app: &mut AppState, width: u16, height: u16) {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+        .expect("terminal");
+    let mut feedback = DrawFeedback::default();
+    term.draw(|f| feedback = crate::ui::render(f, app))
+        .expect("draw");
+    app.apply_draw_feedback(feedback);
 }
 
 /// diffペインは離れた変更をハンクとして分けて出し、間の共通行は省略表示にする

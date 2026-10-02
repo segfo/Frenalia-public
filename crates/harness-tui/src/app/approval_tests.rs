@@ -31,6 +31,16 @@ fn program(program: &str, args: &[&str]) -> PermissionSubject {
     ))
 }
 
+/// キー案内の文言を全部つないだもの（どの項目が出ているかを見る）。
+fn hint_labels(v: &PermissionView) -> String {
+    v.key_hints()
+        .concat()
+        .into_iter()
+        .map(|hint| hint.label)
+        .collect::<Vec<_>>()
+        .join("   ")
+}
+
 fn body_text(v: &PermissionView) -> String {
     v.body()
         .into_iter()
@@ -112,7 +122,7 @@ fn a_call_that_cannot_be_remembered_does_not_offer_permanent_approval() {
     unverifiable.unverifiable = true;
     let mut v = view(PermissionSubject::Command(unverifiable));
     assert!(!v.can_remember());
-    assert!(!v.key_hints().concat().contains("[a]"));
+    assert!(!hint_labels(&v).contains("[a]"));
     assert_eq!(v.on_key(key(KeyCode::Char('a'))), None);
     assert_eq!(v.stage, ApprovalStage::Choose);
     assert!(body_text(&v).contains("恒久的には承認できない"));
@@ -156,7 +166,7 @@ fn escape_closes_an_open_pane_before_it_denies() {
 fn the_diff_pane_needs_a_saved_copy_from_the_previous_approval() {
     let mut v = view(program("python", &["build.py"]));
     assert!(!v.has_diff());
-    assert!(!v.key_hints().concat().contains("[f]"));
+    assert!(!hint_labels(&v).contains("[f]"));
     assert_eq!(v.on_key(key(KeyCode::Char('f'))), None);
     assert_eq!(v.pane, ApprovalPane::None);
 
@@ -165,7 +175,7 @@ fn the_diff_pane_needs_a_saved_copy_from_the_previous_approval() {
         text: Ok("print('v1')".to_string()),
     }]);
     assert!(v.has_diff());
-    assert!(v.key_hints().concat().contains("[f]"));
+    assert!(hint_labels(&v).contains("[f]"));
     v.on_key(key(KeyCode::Char('f')));
     assert_eq!(v.pane, ApprovalPane::Diff);
 }
@@ -177,7 +187,7 @@ fn a_tool_without_a_ledger_entry_says_the_approval_is_session_scoped() {
     v.tool = "web_fetch".to_string();
     assert!(v.can_remember());
     assert!(!v.remember_is_recorded());
-    assert!(v.key_hints().concat().contains("このセッション中は許可"));
+    assert!(hint_labels(&v).contains("このセッション中は許可"));
     v.on_key(key(KeyCode::Char('a')));
     assert!(body_text(&v).contains("このセッション中だけ許可する"));
 }

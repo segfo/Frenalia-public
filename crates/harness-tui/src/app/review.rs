@@ -6,7 +6,7 @@
 //!
 //! | 面ごとに違うもの | どこに置くか |
 //! |---|---|
-//! | 一覧の見出し・キー説明 | [`ReviewPanelState::title`]・[`ReviewPanelState::key_hint`] |
+//! | 一覧の見出し・キー説明 | [`ReviewPanelState::title`]・[`ReviewPanelState::key_hints`] |
 //! | `x`（全破棄）を提供するか | [`ReviewPanelState::allow_discard_all`] |
 //! | `c`の結果を何のアクションへ写すか | [`ReviewTarget`]で分岐する[`commit_selection`] |
 //!
@@ -20,6 +20,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use harness_sandbox::textdiff::DiffKind;
 use harness_sandbox::FileReview;
+
+use super::pointer::KeyHint;
 
 /// `PgUp`/`PgDn`1回あたりのdiffペインのスクロール行数（端末の実高さはここでは分からないので
 /// 固定値で近似する。transcript側の`PAGE_SCROLL_LINES`と同じ考え方）。
@@ -80,10 +82,13 @@ pub enum ReviewCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewDiffLine {
     /// ハンク見出し（`[x] hunk 1/2  @@ -1,7 +1,7 @@`）。`selected`はハンクカーソルの位置。
+    /// 画面には`mark`（`[x]`/`[ ]`、ハンク単位の操作が使えない行では空白3桁）・空白1つ・`text`の順に出す。
+    /// 印を分けて持つのは、印だけを押せる場所にするため（`app::pointer`の`Click::HunkMark`）。
     Header {
         hunk: usize,
         accepted: bool,
         selected: bool,
+        mark: &'static str,
         text: String,
     },
     /// ハンク間で省略した共通行の件数。
@@ -99,8 +104,8 @@ pub struct ReviewPanelState {
     pub rows: Vec<ReviewRow>,
     /// 一覧ペインの見出し（面ごとの語彙）。
     pub title: String,
-    /// 見出しに添えるキー説明（面ごとの語彙）。
-    pub key_hint: String,
+    /// パネルの下に並べるキーの案内（面ごとの語彙）。押せる項目はクリックでそのキーを押せる（`app::pointer`）。
+    pub key_hints: Vec<KeyHint>,
     /// `x`（全破棄）を提供するか（面ごとの語彙）。
     pub allow_discard_all: bool,
     pub selected: usize,
@@ -111,7 +116,15 @@ pub struct ReviewPanelState {
     pub focus: ReviewFocus,
     /// diffフォーカス中のハンクカーソル（選択行のハンク番号）。
     pub hunk_cursor: usize,
+    /// diffペインの一番上に見せる行（[`Self::diff_view`]の何行目か。diffペインは折り返さないので表示行と同じ）。
+    ///
+    /// **上限はここでは掛けない**——「最後の行が枠の一番下に来る位置」はペインの高さで決まり、描くまで分からない。
+    /// 描画が返す上限で[`Self::clamp_diff_scroll`]が切り詰める（transcript・承認ダイアログと同じ形。
+    /// [BUG-204](../../../../docs/bugs/BUG-204.md)、BUG-076）。
     pub diff_scroll: u16,
+    /// 一覧の表示を始める位置（描画が書き戻す。ratatuiの`List`が選択を見せるために動かした結果を持ち越さないと、
+    /// カーソルが窓の中を動かず一覧の方が滑る）。
+    pub list_offset: usize,
 }
 
 impl ReviewPanelState {
@@ -128,9 +141,17 @@ impl ReviewPanelState {
         Self {
             rows,
             title,
-            key_hint: "↑↓ select, Enter/Space toggle, Tab diff, PgUp/PgDn scroll, c=commit, \
-                       x=discard-all, Esc=close"
-                .to_string(),
+            // `x`（全破棄）は確認なしにオーバーレイの変更を全部捨てるので、クリックでは押せない（キーでだけ押せる。
+            // `app::pointer`のモジュールdoc）。
+            key_hints: vec![
+                KeyHint::shown("↑↓ select"),
+                KeyHint::press("Enter/Space toggle", KeyCode::Enter),
+                KeyHint::press("Tab diff", KeyCode::Tab),
+                KeyHint::shown("PgUp/PgDn scroll"),
+                KeyHint::press("c=commit", KeyCode::Char('c')),
+                KeyHint::shown("x=discard-all"),
+                KeyHint::press("Esc=close", KeyCode::Esc),
+            ],
             allow_discard_all: true,
             selected: 0,
             rejected: HashSet::new(),
@@ -138,6 +159,7 @@ impl ReviewPanelState {
             focus: ReviewFocus::List,
             hunk_cursor: 0,
             diff_scroll: 0,
+            list_offset: 0,
         }
     }
 
@@ -227,7 +249,8 @@ impl ReviewPanelState {
                 hunk: i,
                 accepted,
                 selected: selectable && self.focus == ReviewFocus::Diff && self.hunk_cursor == i,
-                text: format!("{mark} hunk {}/{}  {}", i + 1, total, hunk.header()),
+                mark,
+                text: format!("hunk {}/{}  {}", i + 1, total, hunk.header()),
             });
             for line in &hunk.lines {
                 out.push(ReviewDiffLine::Line(line.kind, line.text.clone()));
@@ -252,24 +275,66 @@ impl ReviewPanelState {
             .collect()
     }
 
-    fn max_diff_scroll(&self) -> u16 {
-        (self.diff_view().len() as u16).saturating_sub(1)
-    }
-
+    /// diffペインを送る。上限は掛けない（[`Self::diff_scroll`]のdoc。描いた後に切り詰める）。
     fn scroll_diff(&mut self, delta: i32) {
-        let next = if delta >= 0 {
+        self.diff_scroll = if delta >= 0 {
             self.diff_scroll.saturating_add(delta as u16)
         } else {
             self.diff_scroll.saturating_sub((-delta) as u16)
         };
-        self.diff_scroll = next.min(self.max_diff_scroll());
     }
 
-    /// ハンクカーソルの位置がdiffペインの先頭に来るようスクロールを合わせる。
+    /// 直近の描画で分かった上限（最後の行が枠の一番下に来る位置）まで切り詰める。
+    pub fn clamp_diff_scroll(&mut self, max: u16) {
+        self.diff_scroll = self.diff_scroll.min(max);
+    }
+
+    /// ハンクカーソルの位置がdiffペインの先頭に来るようスクロールを合わせる（末尾近くのハンクは、
+    /// 描いた後に上限で切り詰められ、最後の行が枠の一番下に来る位置で止まる——見出しは見えたまま）。
     fn follow_hunk_cursor(&mut self) {
         if let Some(offset) = self.hunk_header_offsets().get(self.hunk_cursor) {
-            self.diff_scroll = (*offset).min(self.max_diff_scroll());
+            self.diff_scroll = *offset;
         }
+    }
+
+    /// 一覧の`row`行目を選ぶ（クリック。`↑↓`が呼ぶのと同じ`select_row`を行で呼ぶ）。**いまの行なら何もしない**
+    /// ——`select_row`は差分の位置とハンクのカーソルを先頭へ戻すので、選んでいる行を押しただけで読んでいた場所を失う。
+    pub(crate) fn pick_row(&mut self, row: usize) {
+        if row != self.selected {
+            self.select_row(row);
+        }
+    }
+
+    /// 差分の`hunk`番目のハンクを選ぶ（クリック）。フォーカスを差分へ移し、ハンクのカーソルをそこへ置く。
+    ///
+    /// **差分は送らない**（`↑↓`はカーソルの見出しを枠の一番上まで送るが、押せた見出しは見えている。送ると、
+    /// 押した場所の下にあるものが動き、同じ場所をもう一度押すと別のものに当たる）。ハンク単位の操作が使えない行
+    /// （`hunks_selectable`が偽）では何もしない（見出しも押せる場所にしていない）。
+    pub(crate) fn pick_hunk(&mut self, hunk: usize) {
+        if hunk < self.selectable_hunk_count() {
+            self.focus = ReviewFocus::Diff;
+            self.hunk_cursor = hunk;
+        }
+    }
+
+    /// 一覧の上でホイールを1刻み回した——選択を1行動かす（`↑↓`と同じ`select_row`。フォーカスは動かさない）。
+    ///
+    /// 一覧は選んだ行を必ず見せる（ratatuiの`List`）ので、窓だけを送ることはできない。1刻みで1行なのは、
+    /// 行が変わるたびに差分ペインがその行の差分に変わり、飛ばした行は差分を見ないまま通り過ぎるから。
+    /// 端で回し続けても差分の位置は失わない（[`Self::pick_row`]は同じ行では何もしない）。
+    pub(crate) fn wheel_list(&mut self, up: bool) {
+        let next = if up {
+            self.selected.saturating_sub(1)
+        } else {
+            (self.selected + 1).min(self.rows.len().saturating_sub(1))
+        };
+        self.pick_row(next);
+    }
+
+    /// 差分ペインの上でホイールを1刻み回した（送り量はtranscriptと同じ。`harness_term::scrollback`）。
+    pub(crate) fn wheel_diff(&mut self, up: bool) {
+        let rows = harness_term::scrollback::WHEEL_SCROLL_LINES;
+        self.scroll_diff(if up { -rows } else { rows });
     }
 
     fn select_row(&mut self, next: usize) {

@@ -24,6 +24,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 use harness_core::{escape_for_display, hole_accepts, PermissionSubject, RiskClass};
 use harness_sandbox::textdiff::{diff_hunks, DiffKind};
 
+use super::pointer::KeyHint;
+
 /// モーダルを出してからこの時間の入力は捨てる（D-106）。
 pub const MODAL_INPUT_GRACE: Duration = Duration::from_millis(300);
 
@@ -98,6 +100,9 @@ pub enum LineStyle {
 pub struct ApprovalLine {
     pub text: String,
     pub style: LineStyle,
+    /// 確認の段の「毎回変わってよい引数」の候補の行なら、何番目の候補か（押すとそこへ移って`Space`。
+    /// `app::pointer`）。どの行が候補かを描画の側で数え直さないよう、行を作るここで印を付ける。
+    pub candidate: Option<usize>,
 }
 
 impl ApprovalLine {
@@ -105,6 +110,7 @@ impl ApprovalLine {
         Self {
             text: text.into(),
             style,
+            candidate: None,
         }
     }
 }
@@ -347,6 +353,34 @@ impl PermissionView {
     /// 何行になるかは端末幅が決まるまで分からない。BUG-076 と同じ形）。
     pub fn clamp_scroll(&mut self, max: u16) {
         self.scroll = self.scroll.min(max);
+    }
+
+    /// ホイール1刻み（`up`が真なら先頭の向き）。送り量はtranscriptと同じ（`harness_term::scrollback`）。
+    ///
+    /// **開いた直後の窓（[`MODAL_INPUT_GRACE`]）でも捨てない**——送るだけで、何も決めないから（キーとクリックは
+    /// 決める操作になり得るので捨てる）。上限はここでは掛けず、描いた後に[`Self::clamp_scroll`]で切り詰める。
+    pub fn wheel(&mut self, up: bool) {
+        let rows = harness_term::scrollback::WHEEL_SCROLL_LINES as u16;
+        self.scroll = if up {
+            self.scroll.saturating_sub(rows)
+        } else {
+            self.scroll.saturating_add(rows)
+        };
+    }
+
+    /// 本文を送れる手段（枠の下辺の「N〜M/T行」の後ろに添える）。**効く手段だけを書く**（B-32）——
+    /// 確認の段で候補があるときの`↑↓`は候補を移るので、本文は送らない（[`Self::on_key`]）。
+    pub fn scroll_keys(&self) -> &'static str {
+        if self.stage == ApprovalStage::Confirm && !self.hole_candidates().is_empty() {
+            "PgUp/PgDn・ホイールで送る"
+        } else {
+            "↑↓ PgUp/PgDn・ホイールで送る"
+        }
+    }
+
+    /// 確認の段で選んでいる候補（穴の候補の何番目か）。
+    pub fn cursor(&self) -> usize {
+        self.cursor
     }
 
     /// 画面に描く本文。
@@ -652,51 +686,61 @@ impl PermissionView {
                     PermissionSubject::Program(p) => escape_for_display(&p.args[arg]),
                     _ => String::new(),
                 };
-                out.push(ApprovalLine::new(
-                    style,
-                    format!("  {mark} [{arg}] {value}"),
-                ));
+                out.push(ApprovalLine {
+                    candidate: Some(row),
+                    ..ApprovalLine::new(style, format!("  {mark} [{arg}] {value}"))
+                });
             }
         }
         out
     }
 
-    /// 枠の中の下に固定で出すキーの案内（**1要素が1行**）。
+    /// 枠の中の下に固定で出すキーの案内（**1要素が1つのまとまり**で、まとまりごとに行を改める）。
+    /// 各項目はクリックでそのキーを押せる（`app::pointer`。押せないのは1つのキーに決まらない案内だけ）。
     ///
     /// 決めるキーと見るキーを行で分けるのは、決める側が見る側に押し出されて切れないようにするため。
-    pub fn key_hints(&self) -> Vec<String> {
+    pub fn key_hints(&self) -> Vec<Vec<KeyHint>> {
         match self.stage {
             ApprovalStage::Confirm => {
-                let mut rows = vec!["Enter 確定   Esc 戻る".to_string()];
+                let mut rows = vec![vec![
+                    KeyHint::press("Enter 確定", KeyCode::Enter),
+                    KeyHint::press("Esc 戻る", KeyCode::Esc),
+                ]];
                 if !self.hole_candidates().is_empty() {
-                    rows.push("↑↓ 移動   Space 毎回変わってよい引数にする".to_string());
+                    rows.push(vec![
+                        KeyHint::shown("↑↓ 移動"),
+                        KeyHint::press("Space 毎回変わってよい引数にする", KeyCode::Char(' ')),
+                    ]);
                 }
                 rows
             }
             ApprovalStage::Choose => {
-                let mut decide = vec!["[y] 一度だけ許可".to_string()];
+                let mut decide = vec![KeyHint::press("[y] 一度だけ許可", KeyCode::Char('y'))];
                 if self.can_remember() {
-                    decide.push(
+                    decide.push(KeyHint::press(
                         match self.remember_is_recorded() {
                             true => "[a] 恒久的に承認（台帳へ）",
                             false => "[a] このセッション中は許可",
-                        }
-                        .to_string(),
-                    );
+                        },
+                        KeyCode::Char('a'),
+                    ));
                 }
-                decide.push("[n] 拒否".to_string());
-                decide.push("[d] このセッション中は拒否".to_string());
+                decide.push(KeyHint::press("[n] 拒否", KeyCode::Char('n')));
+                decide.push(KeyHint::press(
+                    "[d] このセッション中は拒否",
+                    KeyCode::Char('d'),
+                ));
 
                 let mut look = Vec::new();
                 if !self.previews().is_empty() {
-                    look.push("[v] 中身".to_string());
+                    look.push(KeyHint::press("[v] 中身", KeyCode::Char('v')));
                 }
                 if self.has_diff() {
-                    look.push("[f] 差分".to_string());
+                    look.push(KeyHint::press("[f] 差分", KeyCode::Char('f')));
                 }
-                look.push("PageUp/PageDown スクロール".to_string());
+                look.push(KeyHint::shown("PageUp/PageDown スクロール"));
 
-                vec![decide.join("   "), look.join("   ")]
+                vec![decide, look]
             }
         }
     }

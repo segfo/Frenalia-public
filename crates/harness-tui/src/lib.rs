@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{Event as CEvent, EventStream, KeyEventKind};
+use crossterm::event::EventStream;
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -42,7 +42,8 @@ pub fn render_approval_modal_for_example(
     area: ratatui::layout::Rect,
     pending: &PermissionView,
 ) -> u16 {
-    ui::render_permission_modal(f, area, pending)
+    // 押せる場所の登録は、描画ループの外では使わないので捨てる。
+    ui::render_permission_modal(f, area, pending, &mut app::Targets::default())
 }
 pub use engine::{spawn_engine, EngineHandle};
 pub use gate::InteractiveGate;
@@ -756,348 +757,337 @@ pub async fn run(
                 }
             }
             ev = term_events.next() => {
-                // Windowsのコンソールバックエンドはキー押下・離上の両方を`KeyEvent`として送るため、
-                // ここで`Press`のみに絞らないと1文字が2回入力されてしまう
-                // （離上も拾うと`Release`分だけ重複する）。
-                match ev {
-                    Some(Ok(CEvent::Key(key))) => {
-                        // Shift+Enter等の修飾キーが端末/ConPTY越しに実際どう届いているか
-                        // 切り分けるための生イベントログ（`init_file_logging`のログファイル参照）。
-                        tracing::debug!(code = ?key.code, modifiers = ?key.modifiers, kind = ?key.kind, "raw key event");
-                        // `HARNESS_KEY_DEBUG=1`時は画面にもecho（Press/Release両方を観測するため
-                        // Pressフィルタより前に呼ぶ）。無効時は`note_key_event`が即returnする。
-                        app.note_key_event(key);
-                        if key.kind != KeyEventKind::Press {
-                            continue;
+                // 端末のイベントは`AppState::handle_event`へ渡す（試験と同じ入口。キーは押下だけ——Windowsの
+                // コンソールは押下と離上の両方を送る——、マウスは左クリックとホイールだけを扱う）。
+                // 何も変えないイベント（キーを離した・ポインタが動いただけ）では描き直さない。
+                // `EnableMouseCapture`はポインタの移動もすべて報告するので、描き直すとマウスを動かすたびに
+                // 描くことになる。それ以外は1イベントごとに必ず描き直す——マウスの当たり判定は直前に描いた
+                // 画面の登録で引く（`app::pointer`）ので、描かずに次のイベントを読むと古い画面の場所で当たる。
+                let action = match ev {
+                    Some(Ok(event)) => match app.handle_event(event) {
+                        app::Step::Unchanged => continue,
+                        app::Step::Handled(action) => action,
+                    },
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    match action {
+                        Action::Submit(text) => engine.submit(text),
+                        Action::Respond(id, decision) => engine.gate.respond(&id, decision),
+                        Action::RespondRemember(id, holes) => {
+                            approvals::record_approval(
+                                &engine,
+                                &approval_store,
+                                &background_tx,
+                                &mut app,
+                                &id,
+                                &holes,
+                            );
                         }
-                        if let Some(action) = app.on_key(key) {
-                            match action {
-                                Action::Submit(text) => engine.submit(text),
-                                Action::Respond(id, decision) => engine.gate.respond(&id, decision),
-                                Action::RespondRemember(id, holes) => {
-                                    approvals::record_approval(
-                                        &engine,
-                                        &approval_store,
-                                        &background_tx,
-                                        &mut app,
-                                        &id,
-                                        &holes,
-                                    );
+                        Action::Cancel => engine.cancel_current(),
+                        Action::Slash(cmd) => match cmd {
+                            SlashCommand::Model(m) => engine.set_model(m),
+                            SlashCommand::Mode(mode) => {
+                                if let Err(reason) = engine.gate.set_mode(mode) {
+                                    app.transcript.push(app::TranscriptItem::Error(reason));
                                 }
-                                Action::Cancel => engine.cancel_current(),
-                                Action::Slash(cmd) => match cmd {
-                                    SlashCommand::Model(m) => engine.set_model(m),
-                                    SlashCommand::Mode(mode) => {
-                                        if let Err(reason) = engine.gate.set_mode(mode) {
-                                            app.transcript.push(app::TranscriptItem::Error(reason));
+                            }
+                            SlashCommand::Allow(rule) => {
+                                if let Err(reason) = engine.gate.add_allow(rule) {
+                                    app.transcript.push(app::TranscriptItem::Error(
+                                        format!("/allow: {reason}"),
+                                    ));
+                                }
+                            }
+                            // BUG-070: 要約はLLM呼び出しなので数秒〜数十秒かかる。
+                            // 進捗を出さないとユーザーは「効いていない」と思って
+                            // 連打し、**その回数だけ要約が直列に走る**。
+                            SlashCommand::Compact => {
+                                if app.begin_busy("Compacting context") {
+                                    engine.compact();
+                                } else {
+                                    app.transcript.push(app::TranscriptItem::Info(
+                                        "compaction is already running; ignoring this /compact".to_string(),
+                                    ));
+                                }
+                            }
+                            // BUG-072: engine側は会話状態を捨てて新しいセッションへ
+                            // 差し替えるので、画面も同時に空にする。片方だけ消すと
+                            // 「画面には残っているのにモデルは覚えていない」という
+                            // `/sessions`と同型のズレになる（engineは`/clear`で
+                            // イベントを返さないので、ここで1行だけ通知も出す）。
+                            SlashCommand::Clear => {
+                                engine.clear();
+                                app.clear_transcript();
+                                app.transcript.push(app::TranscriptItem::Info(
+                                    "cleared conversation (started a new session)".to_string(),
+                                ));
+                            }
+                            SlashCommand::Fork => engine.fork(),
+                            SlashCommand::Sessions => {
+                                // ピッカーの間は描画/入力ループを一時的に明け渡す
+                                // （`/clear`等と同じくengineタスクへコマンドを送るだけの
+                                // 他分岐と異なり、選択自体をここでブロッキング的に待つ）。
+                                match picker::run_picker(&mut term, &mut term_events, &sessions_dir).await {
+                                    // BUG-069: 切替後の会話も画面へ積む。ただし
+                                    // engineは`SessionSwitched`通知を**非同期で**返すので、
+                                    // ここで積むと見出し行が復元分の後ろに来てしまう。
+                                    // 通知を受け取った時点で積むよう予約しておく。
+                                    Ok(picker::PickerOutcome::Selected(s, msgs)) => {
+                                        // 会話とオーバーレイは1単位。置き場を用意
+                                        // できなければ**どちらも切り替えない**。
+                                        if let Some(next) = prepared_scope(&mut app, &workspace_root_for_panel, &scope_template, &s.id()) {
+                                            pending_restore = Some(msgs.clone());
+                                            pending_scope = Some(next.clone());
+                                            engine.switch_session(s, msgs, next);
                                         }
                                     }
-                                    SlashCommand::Allow(rule) => {
-                                        if let Err(reason) = engine.gate.add_allow(rule) {
-                                            app.transcript.push(app::TranscriptItem::Error(
-                                                format!("/allow: {reason}"),
-                                            ));
+                                    // ピッカーの`f`（fork）。**元セッションの未適用変更も
+                                    // 分岐先へ持っていく**（`/fork`・`--fork-session`と
+                                    // 同じ意味論、B-06）。
+                                    Ok(picker::PickerOutcome::Forked { source_id, session: s, messages }) => {
+                                        let next = scope_template.scope_for(&s.id());
+                                        let from = scope_template.scope_for(&source_id);
+                                        match harness_sandbox::session_scope::fork_overlay(&workspace_root_for_panel, &from, &next) {
+                                            Ok(_) => {
+                                                pending_restore = Some(messages.clone());
+                                                pending_scope = Some(next.clone());
+                                                engine.switch_session(s, messages, next);
+                                            }
+                                            Err(e) => app.transcript.push(app::TranscriptItem::Error(format!(
+                                                "{source_id} のオーバーレイを分岐先へ引き継げませんでした: {e} （会話も切り替えていません）"
+                                            ))),
                                         }
                                     }
-                                    // BUG-070: 要約はLLM呼び出しなので数秒〜数十秒かかる。
-                                    // 進捗を出さないとユーザーは「効いていない」と思って
-                                    // 連打し、**その回数だけ要約が直列に走る**。
-                                    SlashCommand::Compact => {
-                                        if app.begin_busy("Compacting context") {
-                                            engine.compact();
-                                        } else {
-                                            app.transcript.push(app::TranscriptItem::Info(
-                                                "compaction is already running; ignoring this /compact".to_string(),
-                                            ));
-                                        }
+                                    Ok(picker::PickerOutcome::Cancelled) => {}
+                                    Err(e) => {
+                                        app.apply(harness_core::AgentEvent::Error {
+                                            message: format!("session picker failed: {e}"),
+                                        });
                                     }
-                                    // BUG-072: engine側は会話状態を捨てて新しいセッションへ
-                                    // 差し替えるので、画面も同時に空にする。片方だけ消すと
-                                    // 「画面には残っているのにモデルは覚えていない」という
-                                    // `/sessions`と同型のズレになる（engineは`/clear`で
-                                    // イベントを返さないので、ここで1行だけ通知も出す）。
-                                    SlashCommand::Clear => {
-                                        engine.clear();
-                                        app.clear_transcript();
+                                }
+                            }
+                            // `AppState::submit_input`が`/fsstage`を`Action::Slash`ではなく
+                            // 専用の`Action`（`OpenChangesPanel`/`ListChanges`/`CommitChanges`/
+                            // `CommitAllChanges`/`DiscardChanges`）へ直接変換するため、ここには
+                            // 到達しない（engineアクターはSandboxFsへアクセスしないため）。
+                            SlashCommand::FsStage(_) => unreachable!(
+                                "AppState::submit_input converts /fsstage into a dedicated Action before it reaches Action::Slash"
+                            ),
+                            // `Recall`（`plans/PLAN-RECALL-MEMORY.md`）。`OpenChangesPanel`と
+                            // 同じく、この非対話ループ内で直接ファイルI/Oを行う
+                            // （記憶ディレクトリは小さいJSON/Markdownのみで、
+                            // `open_panel_fs`と同程度の軽さ）。
+                            // `/workspace`はプロセス内では移らない。ループを抜けて
+                            // `harness-cli`が既存のteardownを全部通した後に起動し直す
+                            // （`RunOutcome::Relaunch`のdoc）。
+                            SlashCommand::Workspace(raw) => {
+                                match resolve_workspace_arg(&raw, &workspace_root_for_panel) {
+                                    Ok(next) if next == workspace_root_for_panel => {
                                         app.transcript.push(app::TranscriptItem::Info(
-                                            "cleared conversation (started a new session)".to_string(),
+                                            "既にそのワークスペースを開いています".to_string(),
                                         ));
                                     }
-                                    SlashCommand::Fork => engine.fork(),
-                                    SlashCommand::Sessions => {
-                                        // ピッカーの間は描画/入力ループを一時的に明け渡す
-                                        // （`/clear`等と同じくengineタスクへコマンドを送るだけの
-                                        // 他分岐と異なり、選択自体をここでブロッキング的に待つ）。
-                                        match picker::run_picker(&mut term, &mut term_events, &sessions_dir).await {
-                                            // BUG-069: 切替後の会話も画面へ積む。ただし
-                                            // engineは`SessionSwitched`通知を**非同期で**返すので、
-                                            // ここで積むと見出し行が復元分の後ろに来てしまう。
-                                            // 通知を受け取った時点で積むよう予約しておく。
-                                            Ok(picker::PickerOutcome::Selected(s, msgs)) => {
-                                                // 会話とオーバーレイは1単位。置き場を用意
-                                                // できなければ**どちらも切り替えない**。
-                                                if let Some(next) = prepared_scope(&mut app, &workspace_root_for_panel, &scope_template, &s.id()) {
-                                                    pending_restore = Some(msgs.clone());
-                                                    pending_scope = Some(next.clone());
-                                                    engine.switch_session(s, msgs, next);
-                                                }
-                                            }
-                                            // ピッカーの`f`（fork）。**元セッションの未適用変更も
-                                            // 分岐先へ持っていく**（`/fork`・`--fork-session`と
-                                            // 同じ意味論、B-06）。
-                                            Ok(picker::PickerOutcome::Forked { source_id, session: s, messages }) => {
-                                                let next = scope_template.scope_for(&s.id());
-                                                let from = scope_template.scope_for(&source_id);
-                                                match harness_sandbox::session_scope::fork_overlay(&workspace_root_for_panel, &from, &next) {
-                                                    Ok(_) => {
-                                                        pending_restore = Some(messages.clone());
-                                                        pending_scope = Some(next.clone());
-                                                        engine.switch_session(s, messages, next);
-                                                    }
-                                                    Err(e) => app.transcript.push(app::TranscriptItem::Error(format!(
-                                                        "{source_id} のオーバーレイを分岐先へ引き継げませんでした: {e} （会話も切り替えていません）"
-                                                    ))),
-                                                }
-                                            }
-                                            Ok(picker::PickerOutcome::Cancelled) => {}
-                                            Err(e) => {
-                                                app.apply(harness_core::AgentEvent::Error {
-                                                    message: format!("session picker failed: {e}"),
-                                                });
-                                            }
-                                        }
+                                    Ok(next) => {
+                                        app.transcript.push(app::TranscriptItem::Info(format!(
+                                            "{} を開き直します（このセッションは終了し、移動先のセッション一覧が出ます）",
+                                            next.display()
+                                        )));
+                                        relaunch_into = Some(next);
+                                        app.should_quit = true;
                                     }
-                                    // `AppState::submit_input`が`/fsstage`を`Action::Slash`ではなく
-                                    // 専用の`Action`（`OpenChangesPanel`/`ListChanges`/`CommitChanges`/
-                                    // `CommitAllChanges`/`DiscardChanges`）へ直接変換するため、ここには
-                                    // 到達しない（engineアクターはSandboxFsへアクセスしないため）。
-                                    SlashCommand::FsStage(_) => unreachable!(
-                                        "AppState::submit_input converts /fsstage into a dedicated Action before it reaches Action::Slash"
-                                    ),
-                                    // `Recall`（`plans/PLAN-RECALL-MEMORY.md`）。`OpenChangesPanel`と
-                                    // 同じく、この非対話ループ内で直接ファイルI/Oを行う
-                                    // （記憶ディレクトリは小さいJSON/Markdownのみで、
-                                    // `open_panel_fs`と同程度の軽さ）。
-                                    // `/workspace`はプロセス内では移らない。ループを抜けて
-                                    // `harness-cli`が既存のteardownを全部通した後に起動し直す
-                                    // （`RunOutcome::Relaunch`のdoc）。
-                                    SlashCommand::Workspace(raw) => {
-                                        match resolve_workspace_arg(&raw, &workspace_root_for_panel) {
-                                            Ok(next) if next == workspace_root_for_panel => {
-                                                app.transcript.push(app::TranscriptItem::Info(
-                                                    "既にそのワークスペースを開いています".to_string(),
-                                                ));
-                                            }
-                                            Ok(next) => {
-                                                app.transcript.push(app::TranscriptItem::Info(format!(
-                                                    "{} を開き直します（このセッションは終了し、移動先のセッション一覧が出ます）",
-                                                    next.display()
-                                                )));
-                                                relaunch_into = Some(next);
-                                                app.should_quit = true;
-                                            }
-                                            Err(e) => app.transcript.push(app::TranscriptItem::Error(e)),
-                                        }
-                                    }
-                                    SlashCommand::Memory(cmd) => {
-                                        for line in run_memory_slash_command(&workspace_root_for_panel, cmd) {
-                                            app.transcript.push(app::TranscriptItem::Info(line));
-                                        }
-                                    }
-                                },
-                                Action::Quit => {}
-                                Action::OpenChangesPanel => {
-                                    match open_panel_fs(&workspace_root_for_panel, &review_scope) {
-                                        Ok(fs) => match fs.change_set() {
-                                            Ok(entries) => {
-                                                let rows = build_change_rows(&fs, entries);
-                                                app.open_changes_panel(rows);
-                                            }
-                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("failed to read changes: {e}"),
-                                            }),
-                                        },
-                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                            message: format!("failed to open sandbox: {e}"),
-                                        }),
-                                    }
+                                    Err(e) => app.transcript.push(app::TranscriptItem::Error(e)),
                                 }
-                                Action::ListChanges => {
-                                    match open_panel_fs(&workspace_root_for_panel, &review_scope) {
-                                        Ok(fs) => match fs.change_set() {
-                                            Ok(entries) if entries.is_empty() => {
-                                                app.transcript.push(app::TranscriptItem::Info(
-                                                    "(no changes)".to_string(),
-                                                ));
+                            }
+                            SlashCommand::Memory(cmd) => {
+                                for line in run_memory_slash_command(&workspace_root_for_panel, cmd) {
+                                    app.transcript.push(app::TranscriptItem::Info(line));
+                                }
+                            }
+                        },
+                        Action::Quit => {}
+                        Action::OpenChangesPanel => {
+                            match open_panel_fs(&workspace_root_for_panel, &review_scope) {
+                                Ok(fs) => match fs.change_set() {
+                                    Ok(entries) => {
+                                        let rows = build_change_rows(&fs, entries);
+                                        app.open_changes_panel(rows);
+                                    }
+                                    Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                        message: format!("failed to read changes: {e}"),
+                                    }),
+                                },
+                                Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                    message: format!("failed to open sandbox: {e}"),
+                                }),
+                            }
+                        }
+                        Action::ListChanges => {
+                            match open_panel_fs(&workspace_root_for_panel, &review_scope) {
+                                Ok(fs) => match fs.change_set() {
+                                    Ok(entries) if entries.is_empty() => {
+                                        app.transcript.push(app::TranscriptItem::Info(
+                                            "(no changes)".to_string(),
+                                        ));
+                                    }
+                                    Ok(entries) => {
+                                        // [D-110 (v)] `.git`配下は件数へ畳む（合格基準P1）。
+                                        // **この経路は`build_change_rows`を通らない**ので、
+                                        // 同じ畳みをここにも置く必要がある——片方だけ畳むと、
+                                        // パネルと`/fsstage list`が違うものを見せる。
+                                        let mut git_internal = 0usize;
+                                        for e in &entries {
+                                            if e.category
+                                                == harness_sandbox::ChangeCategory::GitInternal
+                                            {
+                                                git_internal += 1;
+                                                continue;
                                             }
-                                            Ok(entries) => {
-                                                // [D-110 (v)] `.git`配下は件数へ畳む（合格基準P1）。
-                                                // **この経路は`build_change_rows`を通らない**ので、
-                                                // 同じ畳みをここにも置く必要がある——片方だけ畳むと、
-                                                // パネルと`/fsstage list`が違うものを見せる。
-                                                let mut git_internal = 0usize;
-                                                for e in &entries {
-                                                    if e.category
-                                                        == harness_sandbox::ChangeCategory::GitInternal
-                                                    {
-                                                        git_internal += 1;
+                                            app.transcript.push(app::TranscriptItem::Info(format!(
+                                                "{:<7} {}",
+                                                format!("{:?}", e.op).to_lowercase(),
+                                                e.path
+                                            )));
+                                        }
+                                        if git_internal > 0 {
+                                            app.transcript.push(app::TranscriptItem::Info(format!(
+                                                "({git_internal} file(s) under `.git` are git internals -- \
+                                                 reviewed through git, not applied as files)"
+                                            )));
+                                        }
+                                    }
+                                    Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                        message: format!("failed to read changes: {e}"),
+                                    }),
+                                },
+                                Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                    message: format!("failed to open sandbox: {e}"),
+                                }),
+                            }
+                        }
+                        Action::CommitChanges(selection) => {
+                            match open_panel_fs(&workspace_root_for_panel, &review_scope) {
+                                Ok(fs) => match apply_commit_selection(&fs, &selection) {
+                                    Ok(report) => {
+                                        push_apply_report(&mut app, &report);
+                                        // 部分適用したファイルは**オーバーレイに残る**
+                                        // （rejectしたハンクは非破壊）。件数だけの報告では
+                                        // 「まだ残っている」ことが伝わらないのでパスを出す。
+                                        for partial in &selection.partial {
+                                            if report.applied.contains(&partial.path) {
+                                                app.transcript.push(app::TranscriptItem::Info(format!(
+                                                    "partially applied ({} hunk(s)); the rejected hunks stay in the overlay: {}",
+                                                    partial.accepted_hunks.len(),
+                                                    partial.path
+                                                )));
+                                            }
+                                        }
+                                    }
+                                    Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                        message: format!("apply failed: {e}"),
+                                    }),
+                                },
+                                Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                    message: format!("failed to open sandbox: {e}"),
+                                }),
+                            }
+                        }
+                        Action::CommitAllChanges => {
+                            match open_panel_fs(&workspace_root_for_panel, &review_scope) {
+                                Ok(fs) => match fs.apply(&ApplyOptions {
+                                    only_glob: None,
+                                    only_paths: None,
+                                    allow_ext: false,
+                                    adopt_unledgered: false,
+                                }) {
+                                    Ok(report) => push_apply_report(&mut app, &report),
+                                    Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                        message: format!("apply failed: {e}"),
+                                    }),
+                                },
+                                Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                    message: format!("failed to open sandbox: {e}"),
+                                }),
+                            }
+                        }
+                        Action::DiscardChanges => {
+                            match open_panel_fs(&workspace_root_for_panel, &review_scope) {
+                                Ok(fs) => match fs.discard() {
+                                    Ok(()) => app.transcript.push(app::TranscriptItem::Info(
+                                        "discarded changes".to_string(),
+                                    )),
+                                    Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                        message: format!("discard failed: {e}"),
+                                    }),
+                                },
+                                Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                    message: format!("failed to open sandbox: {e}"),
+                                }),
+                            }
+                        }
+                        Action::ResolveChanges(only_path) => {
+                            let fs_opt = match open_panel_fs(&workspace_root_for_panel, &review_scope) {
+                                Ok(fs) => Some(fs),
+                                Err(e) => {
+                                    app.apply(harness_core::AgentEvent::Error {
+                                        message: format!("failed to open sandbox: {e}"),
+                                    });
+                                    None
+                                }
+                            };
+                            if let Some(fs) = fs_opt {
+                                match harness_sandbox::resolve::prepare_resolve(&fs) {
+                                    Ok((report, prepared)) => {
+                                        for p in &report.applied {
+                                            app.transcript.push(app::TranscriptItem::Info(format!(
+                                                "applied (no conflict): {p}"
+                                            )));
+                                        }
+                                        if report.conflicts.is_empty() {
+                                            app.transcript.push(app::TranscriptItem::Info(
+                                                "no conflicts to resolve".to_string(),
+                                            ));
+                                        } else {
+                                            let mut resolved = 0usize;
+                                            let mut failed = 0usize;
+                                            for attempt in &prepared.attempts {
+                                                if let Some(want) = &only_path {
+                                                    if &attempt.path != want {
                                                         continue;
                                                     }
-                                                    app.transcript.push(app::TranscriptItem::Info(format!(
-                                                        "{:<7} {}",
-                                                        format!("{:?}", e.op).to_lowercase(),
-                                                        e.path
-                                                    )));
                                                 }
-                                                if git_internal > 0 {
-                                                    app.transcript.push(app::TranscriptItem::Info(format!(
-                                                        "({git_internal} file(s) under `.git` are git internals -- \
-                                                         reviewed through git, not applied as files)"
-                                                    )));
-                                                }
-                                            }
-                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("failed to read changes: {e}"),
-                                            }),
-                                        },
-                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                            message: format!("failed to open sandbox: {e}"),
-                                        }),
-                                    }
-                                }
-                                Action::CommitChanges(selection) => {
-                                    match open_panel_fs(&workspace_root_for_panel, &review_scope) {
-                                        Ok(fs) => match apply_commit_selection(&fs, &selection) {
-                                            Ok(report) => {
-                                                push_apply_report(&mut app, &report);
-                                                // 部分適用したファイルは**オーバーレイに残る**
-                                                // （rejectしたハンクは非破壊）。件数だけの報告では
-                                                // 「まだ残っている」ことが伝わらないのでパスを出す。
-                                                for partial in &selection.partial {
-                                                    if report.applied.contains(&partial.path) {
-                                                        app.transcript.push(app::TranscriptItem::Info(format!(
-                                                            "partially applied ({} hunk(s)); the rejected hunks stay in the overlay: {}",
-                                                            partial.accepted_hunks.len(),
-                                                            partial.path
-                                                        )));
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("apply failed: {e}"),
-                                            }),
-                                        },
-                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                            message: format!("failed to open sandbox: {e}"),
-                                        }),
-                                    }
-                                }
-                                Action::CommitAllChanges => {
-                                    match open_panel_fs(&workspace_root_for_panel, &review_scope) {
-                                        Ok(fs) => match fs.apply(&ApplyOptions {
-                                            only_glob: None,
-                                            only_paths: None,
-                                            allow_ext: false,
-                                            adopt_unledgered: false,
-                                        }) {
-                                            Ok(report) => push_apply_report(&mut app, &report),
-                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("apply failed: {e}"),
-                                            }),
-                                        },
-                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                            message: format!("failed to open sandbox: {e}"),
-                                        }),
-                                    }
-                                }
-                                Action::DiscardChanges => {
-                                    match open_panel_fs(&workspace_root_for_panel, &review_scope) {
-                                        Ok(fs) => match fs.discard() {
-                                            Ok(()) => app.transcript.push(app::TranscriptItem::Info(
-                                                "discarded changes".to_string(),
-                                            )),
-                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("discard failed: {e}"),
-                                            }),
-                                        },
-                                        Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                            message: format!("failed to open sandbox: {e}"),
-                                        }),
-                                    }
-                                }
-                                Action::ResolveChanges(only_path) => {
-                                    let fs_opt = match open_panel_fs(&workspace_root_for_panel, &review_scope) {
-                                        Ok(fs) => Some(fs),
-                                        Err(e) => {
-                                            app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("failed to open sandbox: {e}"),
-                                            });
-                                            None
-                                        }
-                                    };
-                                    if let Some(fs) = fs_opt {
-                                        match harness_sandbox::resolve::prepare_resolve(&fs) {
-                                            Ok((report, prepared)) => {
-                                                for p in &report.applied {
-                                                    app.transcript.push(app::TranscriptItem::Info(format!(
-                                                        "applied (no conflict): {p}"
-                                                    )));
-                                                }
-                                                if report.conflicts.is_empty() {
-                                                    app.transcript.push(app::TranscriptItem::Info(
-                                                        "no conflicts to resolve".to_string(),
-                                                    ));
-                                                } else {
-                                                    let mut resolved = 0usize;
-                                                    let mut failed = 0usize;
-                                                    for attempt in &prepared.attempts {
-                                                        if let Some(want) = &only_path {
-                                                            if &attempt.path != want {
+                                                if attempt.needs_edit {
+                                                    match harness_sandbox::resolve::editor_command() {
+                                                        Ok(mut cmd) => {
+                                                            // エディタは対話子プロセスなので、
+                                                            // 代替スクリーン・raw mode・マウスキャプチャを
+                                                            // 一時的に明け渡してから起動・待機する
+                                                            // （`TerminalGuard::suspend`/`resume`）。
+                                                            if let Err(e) = guard.suspend() {
+                                                                app.transcript.push(app::TranscriptItem::Error(format!(
+                                                                    "failed to suspend terminal: {e}"
+                                                                )));
+                                                                failed += 1;
                                                                 continue;
                                                             }
-                                                        }
-                                                        if attempt.needs_edit {
-                                                            match harness_sandbox::resolve::editor_command() {
-                                                                Ok(mut cmd) => {
-                                                                    // エディタは対話子プロセスなので、
-                                                                    // 代替スクリーン・raw mode・マウスキャプチャを
-                                                                    // 一時的に明け渡してから起動・待機する
-                                                                    // （`TerminalGuard::suspend`/`resume`）。
-                                                                    if let Err(e) = guard.suspend() {
-                                                                        app.transcript.push(app::TranscriptItem::Error(format!(
-                                                                            "failed to suspend terminal: {e}"
-                                                                        )));
-                                                                        failed += 1;
-                                                                        continue;
-                                                                    }
-                                                                    let status = cmd.arg(&attempt.merged_path).status();
-                                                                    let _ = guard.resume();
-                                                                    // エディタが残した画面内容を消し、
-                                                                    // TUIを再描画する。
-                                                                    term.clear()?;
-                                                                    match status {
-                                                                        Ok(s) if s.success() => {}
-                                                                        Ok(s) => {
-                                                                            app.transcript.push(app::TranscriptItem::Error(format!(
-                                                                                "{}: editor exited with {s}; skipping",
-                                                                                attempt.path
-                                                                            )));
-                                                                            failed += 1;
-                                                                            continue;
-                                                                        }
-                                                                        Err(e) => {
-                                                                            app.transcript.push(app::TranscriptItem::Error(format!(
-                                                                                "{}: failed to launch editor: {e}",
-                                                                                attempt.path
-                                                                            )));
-                                                                            failed += 1;
-                                                                            continue;
-                                                                        }
-                                                                    }
+                                                            let status = cmd.arg(&attempt.merged_path).status();
+                                                            let _ = guard.resume();
+                                                            // エディタが残した画面内容を消し、
+                                                            // TUIを再描画する。
+                                                            term.clear()?;
+                                                            match status {
+                                                                Ok(s) if s.success() => {}
+                                                                Ok(s) => {
+                                                                    app.transcript.push(app::TranscriptItem::Error(format!(
+                                                                        "{}: editor exited with {s}; skipping",
+                                                                        attempt.path
+                                                                    )));
+                                                                    failed += 1;
+                                                                    continue;
                                                                 }
                                                                 Err(e) => {
                                                                     app.transcript.push(app::TranscriptItem::Error(format!(
-                                                                        "{}: {e}",
+                                                                        "{}: failed to launch editor: {e}",
                                                                         attempt.path
                                                                     )));
                                                                     failed += 1;
@@ -1105,60 +1095,65 @@ pub async fn run(
                                                                 }
                                                             }
                                                         }
-                                                        match attempt.finalize(&fs) {
-                                                            // BUG-065: markerが残ったまま書いた場合は
-                                                            // 未解決として数える（内容は書く）。
-                                                            Ok(true) => {
-                                                                app.transcript.push(app::TranscriptItem::Error(format!(
-                                                                    "unresolved: {} (conflict markers remain)",
-                                                                    attempt.path
-                                                                )));
-                                                                failed += 1;
-                                                            }
-                                                            Ok(false) => {
-                                                                app.transcript.push(app::TranscriptItem::Info(format!(
-                                                                    "resolved: {}",
-                                                                    attempt.path
-                                                                )));
-                                                                resolved += 1;
-                                                            }
-                                                            Err(e) => {
-                                                                app.transcript.push(app::TranscriptItem::Error(format!(
-                                                                    "{}: failed to finalize: {e}",
-                                                                    attempt.path
-                                                                )));
-                                                                failed += 1;
-                                                            }
+                                                        Err(e) => {
+                                                            app.transcript.push(app::TranscriptItem::Error(format!(
+                                                                "{}: {e}",
+                                                                attempt.path
+                                                            )));
+                                                            failed += 1;
+                                                            continue;
                                                         }
                                                     }
-                                                    for s in &prepared.skipped {
-                                                        if let Some(want) = &only_path {
-                                                            if &s.path != want {
-                                                                continue;
-                                                            }
-                                                        }
-                                                        app.transcript.push(app::TranscriptItem::Info(format!(
-                                                            "skipped: {} ({})",
-                                                            s.path, s.reason
+                                                }
+                                                match attempt.finalize(&fs) {
+                                                    // BUG-065: markerが残ったまま書いた場合は
+                                                    // 未解決として数える（内容は書く）。
+                                                    Ok(true) => {
+                                                        app.transcript.push(app::TranscriptItem::Error(format!(
+                                                            "unresolved: {} (conflict markers remain)",
+                                                            attempt.path
                                                         )));
+                                                        failed += 1;
                                                     }
-                                                    app.transcript.push(app::TranscriptItem::Info(format!(
-                                                        "{resolved} resolved, {failed} skipped/failed"
-                                                    )));
+                                                    Ok(false) => {
+                                                        app.transcript.push(app::TranscriptItem::Info(format!(
+                                                            "resolved: {}",
+                                                            attempt.path
+                                                        )));
+                                                        resolved += 1;
+                                                    }
+                                                    Err(e) => {
+                                                        app.transcript.push(app::TranscriptItem::Error(format!(
+                                                            "{}: failed to finalize: {e}",
+                                                            attempt.path
+                                                        )));
+                                                        failed += 1;
+                                                    }
                                                 }
                                             }
-                                            Err(e) => app.apply(harness_core::AgentEvent::Error {
-                                                message: format!("resolve failed: {e}"),
-                                            }),
+                                            for s in &prepared.skipped {
+                                                if let Some(want) = &only_path {
+                                                    if &s.path != want {
+                                                        continue;
+                                                    }
+                                                }
+                                                app.transcript.push(app::TranscriptItem::Info(format!(
+                                                    "skipped: {} ({})",
+                                                    s.path, s.reason
+                                                )));
+                                            }
+                                            app.transcript.push(app::TranscriptItem::Info(format!(
+                                                "{resolved} resolved, {failed} skipped/failed"
+                                            )));
                                         }
                                     }
+                                    Err(e) => app.apply(harness_core::AgentEvent::Error {
+                                        message: format!("resolve failed: {e}"),
+                                    }),
                                 }
                             }
                         }
                     }
-                    // マウスホイールでのtranscriptスクロール（`AppState::on_mouse`）。
-                    Some(Ok(CEvent::Mouse(mouse))) => app.on_mouse(mouse.kind),
-                    _ => {}
                 }
             }
             Some(background) = background_rx.recv() => {
@@ -1173,18 +1168,16 @@ pub async fn run(
         // BUG-076: 遡れる上限は折り畳み状態と端末幅に依存し、描画時にしか決まらない。
         // 描いた直後に状態そのものを切り詰める——表示側だけで止めると、先頭に着いた後も
         // ホイールを回した分だけ`scroll_offset`が伸び、同じ回数下へ回すまで画面が動かない。
-        let mut ceilings = ui::Ceilings::default();
-        term.draw(|f| ceilings = ui::render(f, &app))?;
-        app.clamp_scroll(ceilings.transcript);
-        match app.pending_permission.as_mut() {
-            Some(pending) => pending.clamp_scroll(ceilings.modal),
-            // モーダルが閉じた（応答した・拒否した）。要約はもう誰も読まないので落とす（B-23）。
-            None => {
-                if let Some(token) = summary_cancel.take() {
-                    token.cancel();
-                }
-                summarized_id.clear();
+        // 押せる場所・送れる枠の登録と、一覧の表示を始める位置も同じく描いて初めて分かる（`app::DrawFeedback`）。
+        let mut feedback = app::DrawFeedback::default();
+        term.draw(|f| feedback = ui::render(f, &app))?;
+        app.apply_draw_feedback(feedback);
+        // モーダルが閉じた（応答した・拒否した）。要約はもう誰も読まないので落とす（B-23）。
+        if app.pending_permission.is_none() {
+            if let Some(token) = summary_cancel.take() {
+                token.cancel();
             }
+            summarized_id.clear();
         }
 
         if app.should_quit {

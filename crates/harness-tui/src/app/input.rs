@@ -146,6 +146,41 @@ impl AppState {
         }
     }
 
+    /// 入力欄の見出しに出すキーの案内（**押せば同じキーを押したのと同じ**。`app::pointer`）。
+    ///
+    /// 送信のキーは設定と端末で変わる（[`Self::enter_submits`]・[`Self::host_is_vscode`]）ので、案内もここで決める。
+    /// `PageUp/PageDown`は1つのキーに決まらないので押せない。`Ctrl-C=終了`は押せる——ポリシーエディタのキー案内も
+    /// 終了の項目を押せる（`plans/POLICY-EDITOR-TOMOYO-DIG.md`決定62の「マウスで操作できるようにした」の表の5）。
+    pub fn input_key_hints(&self) -> Vec<KeyHint> {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let mut hints = if self.enter_submits {
+            vec![KeyHint::press_key("Enter=送信", enter)]
+        } else if self.host_is_vscode {
+            vec![
+                KeyHint::press_key("Enter=改行", enter),
+                KeyHint::press_key(
+                    "Alt+Enter=送信",
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+                ),
+            ]
+        } else {
+            vec![
+                KeyHint::press_key("Enter=改行", enter),
+                KeyHint::press_key(
+                    "Shift+Enter=送信",
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+                ),
+            ]
+        };
+        hints.push(KeyHint::press("Esc=中断", KeyCode::Esc));
+        hints.push(KeyHint::shown("PageUp/PageDown=スクロール"));
+        hints.push(KeyHint::press_key(
+            "Ctrl-C=終了",
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ));
+        hints
+    }
+
     /// キー入力を処理し、engineアクター/InteractiveGateへ伝えるべきアクションを返す。
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         // 承認モーダルは自分でキーを解釈する（確認の一段・穴の選択・枠のスクロールがあるので、

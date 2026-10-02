@@ -1,27 +1,58 @@
 //! 承認モーダルの描画（D-106）。状態とキー処理は[`crate::app::approval`]が持つ。
 //!
 //! **枠に入りきらない中身は切り捨てずにスクロールさせる。** 承認は「見たものを許す」操作なので、
-//! 見えていないものが黙って切れている画面で決めさせてはいけない。折り返す（[`Wrap`]）ので
+//! 見えていないものが黙って切れている画面で決めさせてはいけない。折り返すので
 //! 実際に何行になるかは端末の幅が決まるまで分からず、上限は**描いた後に**呼び出し側が
 //! 状態へ反映する（transcript と同じ形。[BUG-076](../../../docs/bugs/BUG-076.md)）。
+//!
+//! # 本文の枠と、選択肢の枠
+//!
+//! ```text
+//! ┌承認が必要です──────────────────────┐
+//! │run_program（Exec）                  █   ← 本文。入り切らないときだけ右の枠線にスクロールバー
+//! │…                                    │
+//! ├──────── 1〜12/40行  ↑↓ PgUp/PgDn・ホイールで送る ┤   ← 本文の枠の下辺（位置の案内）＝仕切り
+//! │[y] 一度だけ許可   [a] …   [n] 拒否  │   ← 選択肢。本文と一緒には送らない
+//! │[v] 中身   PageUp/PageDown スクロール│
+//! └─────────────────────────────────────┘
+//! ```
+//!
+//! 本文はポリシーエディタの確認ダイアログ・ヘルプと同じ送れる枠の部品（`harness_term::scrollable`）で描く——
+//! 送る上限は「最後の行が枠の一番下」、入り切らないときだけスクロールバーと「N〜M/T行」を出す。
+//! 選択肢を本文の枠の外（仕切りの下）に置くのは、位置の案内を本文の枠の下辺に出し、選択肢を押し出させないため。
+//!
+//! 選択肢の各項目と、確認の段の「毎回変わってよい引数」の候補の行は、**描いたその場所で**押せる場所として登録する
+//! （`crate::app::pointer`）。枠の全体はホイールで本文を送る場所になる。
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
-use crate::app::{ApprovalStage, LineStyle, PermissionView};
+use crate::app::{ApprovalStage, Click, LineStyle, PermissionView, Targets, Wheel};
 use harness_sandbox::textdiff::DiffKind;
 
-/// 承認モーダルを描き、**この描画で判明したスクロールの上限**を返す。
-pub fn render_permission_modal(f: &mut Frame, area: Rect, pending: &PermissionView) -> u16 {
+/// 承認モーダルを描き、**この描画で判明したスクロールの上限**を返す。押せる場所と送れる枠を`targets`へ登録する
+/// （呼び出し側は、後ろの画面を先に覆っておく。`crate::ui::render`）。
+pub fn render_permission_modal(
+    f: &mut Frame,
+    area: Rect,
+    pending: &PermissionView,
+    targets: &mut Targets,
+) -> u16 {
     let rect = super::centered_rect(84, 70, area);
     // 後ろのtranscriptの全角文字が枠の左隣から始まっても左の枠線が欠けないよう、共有の部品で消す
     // （ポリシーエディタと同じ。`harness_term::overlay`）。
     harness_term::overlay::clear(f, rect);
+    // 枠の中は、どこで回しても本文を送る（ボタンの上でも。クリックとホイールは別々に引く）。
+    targets.cover(rect);
+    targets.wheel(rect, Wheel::Approval);
 
-    let mut lines: Vec<Line> = pending.body().into_iter().map(styled).collect();
+    let body = pending.body();
+    let candidates: Vec<Option<usize>> = body.iter().map(|line| line.candidate).collect();
+    let mut lines: Vec<Line> = body.into_iter().map(styled).collect();
     // `edit_file`の差分だけは材料（書込先パス）に写らないので、ここで足す。
     if pending.stage == ApprovalStage::Choose {
         if let Some(diff) = &pending.edit_diff {
@@ -40,40 +71,80 @@ pub fn render_permission_modal(f: &mut Frame, area: Rect, pending: &PermissionVi
         }
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title("承認が必要です")
-        .style(Style::default().fg(Color::White).bg(Color::Black));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    // **選択肢は枠の中に固定で置き、本文と一緒にスクロールさせない。** 枠の下辺の見出しに
-    // 入れると、選択肢そのものが端で切れる（日本語は1文字2桁なので、すぐ幅を超える）。
-    let hints: Vec<Line> = pending
-        .key_hints()
-        .into_iter()
-        .map(|h| Line::from(Span::styled(h, Style::default().fg(Color::DarkGray))))
-        .collect();
-    // **折り返してから高さを決める。** 日本語は1文字2桁なので、幅の狭い端末では
-    // 「[d] このセッション中は拒否」のような選択肢が黙って端で切れる。
+    let style = Style::default().fg(Color::White).bg(Color::Black);
+    // **選択肢は本文と一緒にスクロールさせない。** 枠の下辺の見出しに入れると、選択肢そのものが端で切れる
+    // （日本語は1文字2桁なので、すぐ幅を超える）。
     //
-    // 数える幅と描く幅は`harness_term::wrap`が揃える（行末の全角文字が右の枠線を覆わないよう、
-    // どちらも右端の1桁を空ける。BUG-200）。
-    let hint_height = harness_term::wrap::rows(hints.clone(), inner.width)
-        .min(inner.height.saturating_sub(1) as usize) as u16;
-    let parts = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(hint_height)])
-        .split(inner);
+    // **並べてから高さを決める。** 幅の狭い端末では、入り切らない選択肢を次の行へ送る（項目の途中では割らない。
+    // 「[d] このセッション中は拒否」が2行に割れると、どこまでが1つの押せる場所か分からない）。
+    let groups = pending.key_hints();
+    let hint_width = rect.width.saturating_sub(2);
+    let hint_rows: u16 = groups
+        .iter()
+        .map(|group| super::hint_rows(group, hint_width))
+        .sum();
+    // 本文の枠は少なくとも枠線2行＋本文1行を残す。選択肢の枠は選択肢の行＋下の枠線。
+    let hint_rows = hint_rows.min(rect.height.saturating_sub(4));
+    let body_area = Rect {
+        height: rect.height.saturating_sub(hint_rows + 1),
+        ..rect
+    };
+    let hint_area = Rect {
+        y: body_area.bottom(),
+        height: rect.height - body_area.height,
+        ..rect
+    };
 
-    let total =
-        u16::try_from(harness_term::wrap::rows(lines.clone(), parts[0].width)).unwrap_or(u16::MAX);
-    let max_scroll = total.saturating_sub(parts[0].height);
-    harness_term::wrap::Wrapped::new(lines)
-        .scroll(pending.scroll.min(max_scroll))
-        .render(f, parts[0]);
-    harness_term::wrap::Wrapped::new(hints).render(f, parts[1]);
-    max_scroll
+    // 本文の枠の下辺は、選択肢の枠との仕切りになる（左右の角を`├`/`┤`にして、1つの枠に見せる）。
+    let body_block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(symbols::border::Set {
+            bottom_left: symbols::line::VERTICAL_RIGHT,
+            bottom_right: symbols::line::VERTICAL_LEFT,
+            ..symbols::border::PLAIN
+        })
+        .title("承認が必要です")
+        .style(style);
+    let drawn = harness_term::scrollable::draw_with_buttons(
+        f,
+        body_area,
+        lines,
+        body_block,
+        pending.scroll,
+        harness_term::scrollable::Look {
+            how: pending.scroll_keys(),
+            notice: Style::default().fg(Color::DarkGray),
+            bar: Style::default().fg(Color::White),
+        },
+        &[],
+    );
+    for (line, candidate) in drawn.lines.iter().zip(&candidates) {
+        if let Some(row) = candidate {
+            targets.click(*line, Click::Candidate(*row));
+        }
+    }
+
+    let hint_block = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .style(style);
+    let mut hint_inner = hint_block.inner(hint_area);
+    f.render_widget(hint_block, hint_area);
+    for group in &groups {
+        let rows = super::hint_rows(group, hint_inner.width).min(hint_inner.height);
+        super::draw_hints(
+            f,
+            Rect {
+                height: rows,
+                ..hint_inner
+            },
+            group,
+            Style::default().fg(Color::DarkGray),
+            targets,
+        );
+        hint_inner.y += rows;
+        hint_inner.height -= rows;
+    }
+    drawn.max_top
 }
 
 fn styled(line: crate::app::ApprovalLine) -> Line<'static> {
@@ -117,7 +188,7 @@ mod tests {
     fn rendered(pending: &PermissionView) -> String {
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         term.draw(|f| {
-            super::render_permission_modal(f, f.area(), pending);
+            super::render_permission_modal(f, f.area(), pending, &mut Default::default());
         })
         .unwrap();
         let buffer = term.backend().buffer().clone();
@@ -153,8 +224,10 @@ mod tests {
 
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let mut ceiling = 0;
-        term.draw(|f| ceiling = super::render_permission_modal(f, f.area(), &pending))
-            .unwrap();
+        term.draw(|f| {
+            ceiling = super::render_permission_modal(f, f.area(), &pending, &mut Default::default())
+        })
+        .unwrap();
         assert!(
             ceiling > 0,
             "content taller than the box must be scrollable"
@@ -174,7 +247,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(70, 24)).unwrap();
         let pending = view(&["status"]);
         term.draw(|f| {
-            super::render_permission_modal(f, f.area(), &pending);
+            super::render_permission_modal(f, f.area(), &pending, &mut Default::default());
         })
         .unwrap();
         let buffer = term.backend().buffer().clone();

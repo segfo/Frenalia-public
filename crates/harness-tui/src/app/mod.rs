@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use harness_core::{AgentEvent, StopReason, ToolOutput, Usage};
 use harness_engine::{parse_allowlist_rule, AllowRule, Decision, PermissionMode};
@@ -55,6 +55,7 @@ mod approval;
 mod commands;
 mod events;
 mod input;
+mod pointer;
 mod review;
 
 #[cfg(test)]
@@ -65,6 +66,7 @@ pub use approval::{
 };
 use commands::parse_slash_command;
 pub use commands::{Action, FsStageCommand, MemoryCommand, SlashCommand};
+pub use pointer::{Click, DrawFeedback, KeyHint, ReviewDrawn, Step, Targets, Wheel};
 pub use review::{
     commit_selection, CommitSelection, PartialFile, ReviewCommand, ReviewDiffLine, ReviewFocus,
     ReviewPanelState, ReviewRow, ReviewTarget,
@@ -225,6 +227,9 @@ pub struct AppState {
     pub overlay_session_id: Option<String>,
     /// いま追記している会話のセッションID。
     pub conversation_session_id: String,
+    /// 直前に描いた画面の、押せる場所と送れる枠（`app::pointer`）。マウスのイベントはこれで引く。
+    /// 描くたびに[`Self::apply_draw_feedback`]が差し替える。
+    pub(crate) pointer: Targets,
 }
 
 // スクロール量（`PageUp`/`PageDown`とホイール1ノッチの行数）は
@@ -268,6 +273,7 @@ impl AppState {
             workspace_label: String::new(),
             overlay_session_id: None,
             conversation_session_id: String::new(),
+            pointer: Targets::default(),
         }
     }
 
@@ -460,16 +466,6 @@ impl AppState {
     pub fn toggle_fold(&mut self) {
         self.collapsed = !self.collapsed;
         self.scroll.reset();
-    }
-
-    /// マウスホイールイベントを処理する。過去ログの閲覧を妨げないよう、承認モーダル表示中でも
-    /// スクロール自体は許可する（`on_key`と異なり`pending_permission`をチェックしない）。
-    pub fn on_mouse(&mut self, kind: MouseEventKind) {
-        match kind {
-            MouseEventKind::ScrollUp => self.scroll.wheel(true),
-            MouseEventKind::ScrollDown => self.scroll.wheel(false),
-            _ => {}
-        }
     }
 
     pub fn push_user_prompt(&mut self, text: String) {

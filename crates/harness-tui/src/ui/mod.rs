@@ -2,6 +2,8 @@
 //!
 //! レビューパネル（1画面を占める自己完結した面）の描画だけは[`review`]へ分けている
 //! （`docs/CODE-STRUCTURE-RULES.md`規則3）。
+//!
+//! 描くついでに、押せる場所とホイールで送れる枠を**描いたその矩形で**登録して返す（`crate::app::pointer`）。
 
 mod approval;
 mod review;
@@ -15,18 +17,21 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{AppState, ToolCardStatus, TranscriptItem, SPINNER_FRAMES};
+use crate::app::{
+    AppState, Click, DrawFeedback, KeyHint, Targets, ToolCardStatus, TranscriptItem, Wheel,
+    SPINNER_FRAMES,
+};
 
 /// 入力欄が自動で伸びる最大行数。これを超えると内部スクロールする（カーソル行が
 /// 常に見えるよう毎フレーム再計算する。transcriptの`scroll_offset`のような永続的な
 /// スクロール状態は入力欄には持たせない）。
 const MAX_INPUT_VISIBLE_LINES: u16 = 6;
 
-/// 1フレーム描画し、**この描画で判明した`scroll_offset`の上限**を返す
+/// 1フレーム描画し、**この描画で判明したこと**（送れる上限・一覧の表示位置・押せる場所）を返す
 /// （[BUG-076](../../../docs/bugs/BUG-076.md)）。総行数は折り畳み状態と端末幅に依存するため
-/// 描画時にしか決まらない。呼び出し側は戻り値で`AppState::clamp_scroll`を呼び、状態そのものを
+/// 描画時にしか決まらない。呼び出し側は戻り値を`AppState::apply_draw_feedback`へ渡し、状態そのものを
 /// 切り詰める——ここで表示だけ止めても、状態は青天井に伸び続けてしまう。
-pub fn render(f: &mut Frame, app: &AppState) -> Ceilings {
+pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
     // 複数行入力（既定でEnterが改行を挿入するようになったため）にあわせ、入力欄の高さを
     // 行数に応じて`MAX_INPUT_VISIBLE_LINES`まで自動で伸ばす（それ以上は内部スクロール）。
     let input_line_count = app.input.split('\n').count() as u16;
@@ -40,15 +45,31 @@ pub fn render(f: &mut Frame, app: &AppState) -> Ceilings {
         ])
         .split(f.area());
 
-    let max_scroll = render_transcript(f, root[0], app);
+    // 押せる場所と送れる枠は描いた順に登録する（後から登録したものが上。重ねる枠は最後）。
+    let mut targets = Targets::default();
+    let mut feedback = DrawFeedback {
+        transcript: render_transcript(f, root[0], app, &mut targets),
+        ..DrawFeedback::default()
+    };
     render_status(f, root[1], app);
-    render_input(f, root[2], app);
+    render_input(f, root[2], app, &mut targets);
 
-    let mut modal_scroll = 0;
     if let Some(pending) = &app.pending_permission {
-        modal_scroll = approval::render_permission_modal(f, f.area(), pending);
+        behind_overlay(&mut targets, f.area(), root[0]);
+        feedback.approval = Some(approval::render_permission_modal(
+            f,
+            f.area(),
+            pending,
+            &mut targets,
+        ));
     } else if let Some(panel) = &app.review_panel {
-        review::render_review_panel(f, f.area(), panel);
+        behind_overlay(&mut targets, f.area(), root[0]);
+        feedback.review = Some(review::render_review_panel(
+            f,
+            f.area(),
+            panel,
+            &mut targets,
+        ));
     } else if app.selection_range().is_none() {
         // 端末の実カーソルを入力欄の入力末尾へ明示的に置く。ratatuiは`set_cursor_position`を
         // 呼ばない限りカーソルを隠したままにするため、これを怠るとOS/端末のIME（日本語等の
@@ -63,18 +84,55 @@ pub fn render(f: &mut Frame, app: &AppState) -> Ceilings {
         set_input_cursor(f, root[2], app);
     }
 
-    Ceilings {
-        transcript: max_scroll,
-        modal: modal_scroll,
-    }
+    feedback.targets = targets;
+    feedback
 }
 
-/// 1フレーム描いて初めて分かるスクロールの上限。**面ごとに別々に持つ**——1つの値にまとめると、
-/// モーダルを開いた瞬間に transcript の上限がモーダルのもので上書きされる。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Ceilings {
-    pub transcript: u16,
-    pub modal: u16,
+/// 承認ダイアログ・レビューパネルを重ねる前に呼ぶ。**後ろの画面は押せなくし、transcriptだけはホイールで
+/// 送れるまま残す**（承認待ちの間も前の会話を読み返せるように。`crate::app::pointer`のモジュールdoc）。
+/// 重ねる枠は、この後に自分の矩形を覆ってから（`Targets::cover`）自分の場所を登録する——覆わないと、
+/// 枠の中で何も登録していない場所（余白・案内の行）でホイールを回したときに、後ろのtranscriptが送られる。
+fn behind_overlay(targets: &mut Targets, screen: Rect, transcript: Rect) {
+    targets.cover(screen);
+    targets.wheel(transcript, Wheel::Transcript);
+}
+
+/// キー案内の項目の間の桁数（承認ダイアログとレビューパネルの案内の行）。
+pub(super) const HINT_GAP: u16 = 3;
+
+/// キー案内の項目を描く文字列（押せるかどうかで見た目は変えない。ポリシーエディタのキー案内と同じ）。
+pub(super) fn hint_spans(hints: &[KeyHint], style: Style) -> Vec<Span<'static>> {
+    hints
+        .iter()
+        .map(|hint| Span::styled(hint.label.clone(), style))
+        .collect()
+}
+
+/// キー案内の項目を`area`へ並べて描き（入り切らない項目は次の行の頭へ。`harness_term::row::draw_wrapped`）、
+/// 押せる項目をそのキーを押す場所として登録する。何行要るかは[`hint_rows`]が同じ置き方で数える。
+pub(super) fn draw_hints(
+    f: &mut Frame,
+    area: Rect,
+    hints: &[KeyHint],
+    style: Style,
+    targets: &mut Targets,
+) {
+    let drawn = harness_term::row::draw_wrapped(f, area, &hint_spans(hints, style), HINT_GAP);
+    register_hints(targets, hints, &drawn);
+}
+
+/// [`draw_hints`]が`width`桁で何行使うか。
+pub(super) fn hint_rows(hints: &[KeyHint], width: u16) -> u16 {
+    harness_term::row::wrapped_rows(&hint_spans(hints, Style::default()), HINT_GAP, width)
+}
+
+/// 描いた項目の矩形`drawn`（`hints`と同じ順）のうち、押せる項目をそのキーを押す場所として登録する。
+fn register_hints(targets: &mut Targets, hints: &[KeyHint], drawn: &[Rect]) {
+    for (hint, rect) in hints.iter().zip(drawn) {
+        if let Some(key) = hint.key {
+            targets.click(*rect, Click::Key(key));
+        }
+    }
 }
 
 /// Tier3サンドボックス準備中の待機画面（`sandbox_prep::run_prep_screen`から呼ばれる）。
@@ -382,23 +440,32 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
 }
 
 /// 戻り値は`scroll_offset`の上限（[`render`]がそのまま返す）。
-fn render_transcript(f: &mut Frame, area: Rect, app: &AppState) -> u16 {
+///
+/// 枠全体をホイールで送れる場所として登録する。さかのぼっている間だけ見出しに出る「さかのぼり中」の案内は、
+/// 押すと末尾へ戻る（見出しを`Block`に持たせず、上辺へ自分で描いて描いた場所を登録する）。
+fn render_transcript(f: &mut Frame, area: Rect, app: &AppState, targets: &mut Targets) -> u16 {
     // 末尾追従の描画と上限の算出は`harness_term::scrollback`が持つ
     // （ポリシーエディタの記録画面と共有。同局のdoc参照）。
-    // 戻り値の上限を`AppState::clamp_scroll`へ渡すのは呼び出し側の責務（BUG-076）。
+    // 戻り値の上限を`AppState::apply_draw_feedback`へ渡すのは呼び出し側の責務（BUG-076）。
     let lines = transcript_lines(app, app.collapsed);
-    let title = harness_term::scrollback::title_with_scroll(
-        "transcript ",
-        app.scroll,
-        "下へホイールで戻る",
-    );
-    harness_term::scrollback::render(
+    let max = harness_term::scrollback::render_with_bar(
         f,
         area,
         lines,
-        Block::default().borders(Borders::ALL).title(title),
+        Block::default().borders(Borders::ALL),
         app.scroll,
-    )
+        Style::default(),
+    );
+    targets.wheel(area, Wheel::Transcript);
+    let notice =
+        harness_term::scrollback::scrolled_notice(app.scroll, "下へホイールかここを押すと最新へ");
+    let title = [
+        Span::raw("transcript "),
+        Span::raw(notice.unwrap_or_default()),
+    ];
+    let drawn = harness_term::row::draw(f, harness_term::row::top_edge(area), &title);
+    targets.click(drawn[1], Click::ScrollToLatest);
+    max
 }
 
 /// ステータスバーに出すモデル名の上限文字数。超えた分は中間を省略する。
@@ -506,15 +573,22 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
     f.render_widget(paragraph, area);
 }
 
-fn render_input(f: &mut Frame, area: Rect, app: &AppState) {
-    let title = if app.enter_submits {
-        "input (Enter=送信, Esc=中断, PageUp/PageDown=スクロール, Ctrl-C=終了)"
-    } else if app.host_is_vscode {
-        "input (Enter=改行, Alt+Enter=送信, Esc=中断, PageUp/PageDown=スクロール, Ctrl-C=終了)"
-    } else {
-        "input (Enter=改行, Shift+Enter=送信, Esc=中断, PageUp/PageDown=スクロール, Ctrl-C=終了)"
-    };
-    let block = Block::default().borders(Borders::ALL).title(title);
+/// 入力欄を描く。見出しのキー案内（`input (Enter=送信, Esc=中断, …)`）は上辺へ自分で描き、押せる項目を
+/// そのキーを押す場所として登録する（`AppState::input_key_hints`）。
+fn render_input(f: &mut Frame, area: Rect, app: &AppState, targets: &mut Targets) {
+    let hints = app.input_key_hints();
+    // 見た目は見出しの文字列だった頃と同じ「input (項目, 項目, …)」。区切りと括弧は押せない。
+    let mut title = vec![Span::raw("input (")];
+    let mut at = Vec::with_capacity(hints.len());
+    for (i, hint) in hints.iter().enumerate() {
+        if i > 0 {
+            title.push(Span::raw(", "));
+        }
+        at.push(title.len());
+        title.push(Span::raw(hint.label.clone()));
+    }
+    title.push(Span::raw(")"));
+    let block = Block::default().borders(Borders::ALL);
 
     let visible = area.height.saturating_sub(2).max(1) as usize;
     let cursor_line = input_cursor_line(&app.input, app.input_cursor);
@@ -527,6 +601,9 @@ fn render_input(f: &mut Frame, area: Rect, app: &AppState) {
 
     let paragraph = Paragraph::new(visible_lines).block(block);
     f.render_widget(paragraph, area);
+    let drawn = harness_term::row::draw(f, harness_term::row::top_edge(area), &title);
+    let drawn: Vec<Rect> = at.into_iter().map(|i| drawn[i]).collect();
+    register_hints(targets, &hints, &drawn);
 }
 
 pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -831,6 +908,9 @@ mod border_tests {
     }
 
     /// 枠の右の枠線のうち、角を除いた行で欠けているもの。
+    ///
+    /// 枠線は`│`のほか、承認ダイアログの本文と選択肢の仕切りの右端（`┤`）でもよい。全角文字に覆われた桁は、
+    /// そのどちらでもない（全角文字の後半の空白になる）。
     fn broken_right_border(
         grid: &[Vec<String>],
         right: usize,
@@ -838,7 +918,7 @@ mod border_tests {
         bottom: usize,
     ) -> Vec<String> {
         (top + 1..bottom)
-            .filter(|&y| grid[y][right] != "│")
+            .filter(|&y| grid[y][right] != "│" && grid[y][right] != "┤")
             .map(|y| format!("{y}行目: 「{}」 / {}", grid[y][right], grid[y].concat()))
             .collect()
     }
@@ -864,16 +944,18 @@ mod border_tests {
         for width in [120u16, 119, 100] {
             let mut narrow = app_with_transcript("x");
             narrow.pending_permission = Some(approval(&["status".to_string()]));
-            let (left, _, top, bottom) = drawn_box(&screen(&narrow, width, 30), "承");
+            let reference = screen(&narrow, width, 30);
+            let (left, _, top, bottom) = drawn_box(&reference, "承");
             let mut wide = app_with_transcript("あ");
             wide.pending_permission = Some(approval(&["status".to_string()]));
             let grid = screen(&wide, width, 30);
             for (y, row) in grid.iter().enumerate().take(bottom + 1).skip(top) {
-                let want = match y {
-                    y if y == top => "┌",
-                    y if y == bottom => "└",
-                    _ => "│",
-                };
+                // 期待する左の枠線は、半角だけの画面で同じ桁に描かれたもの（角・縦線・本文と選択肢の仕切りの`├`）。
+                let want = reference[y][left].as_str();
+                assert!(
+                    ["┌", "│", "├", "└"].contains(&want),
+                    "{width}桁 {y}行目: 半角の画面で左の枠線が読めない: 「{want}」"
+                );
                 if row[left] != want {
                     failures.push(format!(
                         "{width}桁 {y}行目: 「{}」 / {}",
