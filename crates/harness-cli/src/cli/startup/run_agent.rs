@@ -1074,7 +1074,8 @@ async fn tui_branch(
     // 「どこへ移りたいか」だけを持ち帰らせる。
     relaunch_into: &mut Option<PathBuf>,
 ) -> ExitCode {
-    let log_dir = tool_ctx.workspace_root.join(".harness").join("logs");
+    // 置き場の綴りはTUIが持つ（同じ場所へ、TUIが動作中の標準エラーも預ける。BUG-206）。
+    let log_dir = harness_tui::log_dir(&tool_ctx.workspace_root);
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         eprintln!("failed to create log directory {}: {e}", log_dir.display());
         return ExitCode::FAILURE;

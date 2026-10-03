@@ -1403,7 +1403,9 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "ratatui",
+ "tempfile",
  "unicode-width",
+ "windows",
 ]
 
 [[package]]

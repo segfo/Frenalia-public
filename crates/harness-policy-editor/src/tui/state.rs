@@ -1014,7 +1014,8 @@ impl App {
     /// 端末へ直接書かれると画面が壊れるので預かっているだけで、内容は判断材料そのものである。
     /// 記録中は進行ログへ、待機中は[`App::notices`]へ入れて記録画面に出す。
     pub fn note_external(&mut self, line: String) {
-        self.notice(format!("[stderr] {line}"));
+        // 印の綴りは会話TUIと共有する（`harness_term::stderr_capture::shown`）。
+        self.notice(harness_term::stderr_capture::shown(&line));
     }
 
     /// 待機中に出す1行（記録中なら進行ログへ流す）。

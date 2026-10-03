@@ -92,6 +92,12 @@ fn poll_wait_state() -> Option<harness_core::tool::WaitState> {
 #[path = "review_flow_tests.rs"]
 mod review_flow_tests;
 
+/// 会話TUIがログを置くディレクトリ（`<workspace>/.harness/logs`）。[`init_file_logging`]へ渡す置き場と、
+/// [`run`]が標準エラーを預かる置き場（[BUG-206](../../../docs/bugs/BUG-206.md)）は同じで、綴りはここだけが持つ（B-05）。
+pub fn log_dir(workspace_root: &std::path::Path) -> PathBuf {
+    workspace_root.join(".harness").join("logs")
+}
+
 /// tracingの出力先をログファイルへ切り替える（stdoutを汚さない、§リッチTUI「端末復帰」）。
 /// 返り値の`WorkerGuard`はプロセス終了まで保持しないとバッファが破棄されるため、
 /// 呼び出し側（`harness-cli`）がライフタイムを保持する。
@@ -431,6 +437,13 @@ pub async fn run(
     // 承認画面の要約（D-100）。`None`なら作らない（設定で切った・プロバイダを作れなかった）。
     approval_summary: Option<ApprovalSummary>,
 ) -> io::Result<RunOutcome> {
+    // [BUG-206] 画面の動作中に、どの部品が標準エラーへ書いても画面を崩さないよう預かり、tickごとに
+    // transcriptへ出す（ポリシーエディタと同じ部品）。**端末を握るより先に作る**——宣言の逆順にdropするので、
+    // 読み残しの書き戻しが端末を返した後になり、panicの理由や撤収の警告が通常の画面に残る。
+    let mut stderr = harness_term::stderr_capture::StderrCapture::start(
+        &log_dir(&ctx.workspace_root),
+        "harness-tui-stderr",
+    );
     let guard = harness_term::TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend)?;
@@ -615,6 +628,9 @@ pub async fn run(
     app.note_scope(overlay_label(&review_scope), &new_session_id);
     if let Some(warning) = app_startup_scope_warning.take() {
         app.transcript.push(app::TranscriptItem::Error(warning));
+    }
+    if let Some(reason) = stderr.start_error() {
+        app.note_stderr_capture_failure(reason);
     }
     // Enter系キー化けの検証用: `HARNESS_KEY_DEBUG`（`0`/空以外）で受信キーイベントを画面へecho。
     if std::env::var("HARNESS_KEY_DEBUG")
@@ -1162,6 +1178,7 @@ pub async fn run(
             _ = tick.tick() => {
                 app.tick();
                 app.wait_state = poll_wait_state();
+                app.note_stderr_lines(stderr.poll());
             }
         }
 
@@ -1191,6 +1208,9 @@ pub async fn run(
     // （元は`main.rs`末尾にあった処理をTUI側で完結させる、`sandbox_prep`で開始した
     // ため対称的にここで終える）。
     drop(guard);
+    // [BUG-206] 端末を返した**後**に標準エラーを戻す（読み残しはここで通常の画面へ書き戻る）。
+    // 下のteardownの警告は戻した後なので、そのまま端末へ出る。
+    drop(stderr);
     #[cfg(windows)]
     if let Some(handle) = vm_sandbox_handle {
         if let Err(e) = handle.stop() {

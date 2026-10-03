@@ -57,6 +57,8 @@ mod events;
 mod input;
 mod pointer;
 mod review;
+/// [BUG-206] 預かった標準エラーの行を transcript へ出す。
+mod stderr;
 
 #[cfg(test)]
 pub use approval::MODAL_INPUT_GRACE;

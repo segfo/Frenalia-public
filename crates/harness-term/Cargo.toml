@@ -24,3 +24,13 @@ crossterm = "0.29"
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 # 送れる枠（`scrollable`）の下辺の「N〜M/T行」が下辺に入るかを、表示桁で数える。
 unicode-width = "0.2.2"
+
+[target.'cfg(windows)'.dependencies]
+# 画面を握っている間だけ標準エラー出力を預かる（`stderr_capture`。ライブラリの`eprintln!`が画面を壊すため）。
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

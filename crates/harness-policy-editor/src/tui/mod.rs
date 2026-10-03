@@ -73,7 +73,6 @@ mod proposal_tree;
 pub mod record_screen;
 /// 送れる枠（説明欄・ヘルプ・確認ダイアログ・記録画面の3枠）の位置と、ホイールで送ること（2026-10-02）。
 mod scroll;
-mod stderr_capture;
 mod text_input;
 /// [段階⑦] 承認待ち画面（`F2`）の遷移2タブの状態遷移。
 pub mod transition;
@@ -162,6 +161,17 @@ pub fn run(
     // そのプロファイルのpackage SIDを条件にしている）。ここで変えたのは`_guard`/`stderr`との
     // 相対順だけである。
     let _grants = crate::record_net::SessionGrants::hold();
+    // ライブラリが`eprintln!`で直接端末へ書くと、こちらのフレームの上に重なって表示が壊れる
+    // （`verify_elevation_target`のD-44警告が実際にそうなる）。TUIの間だけstderrを預かる
+    // （部品は会話TUIと共有する`harness_term::stderr_capture`）。
+    //
+    // **`_guard`より先に作る**（＝`_guard`より後にdropする）。`Drop`は読み残しを本物のstderrへ
+    // 書き戻すので、端末を返す前に戻すと書き戻しがオルタネートスクリーンの上に出て消える
+    // （`app`のdropで走るWFPの撤収の警告がそこに当たる）。`_grants`より後なのは上の理由のまま。
+    let mut stderr = harness_term::stderr_capture::StderrCapture::start(
+        &crate::session_dir::sandbox_root(&workspace_root),
+        "policy-editor-tui-stderr",
+    );
     // raw mode／オルタネートスクリーン／panic hookの復帰は`harness-term`が持つ（会話TUIと共有）。
     let _guard = harness_term::TerminalGuard::enter()?;
     let mut term = Terminal::new(CrosstermBackend::new(io::stdout()))?;
@@ -171,14 +181,15 @@ pub fn run(
     // セルには他人の描画が残り続ける。
     term.clear()?;
 
-    // ライブラリが`eprintln!`で直接端末へ書くと、こちらのフレームの上に重なって表示が壊れる
-    // （`verify_elevation_target`のD-44警告が実際にそうなる）。TUIの間だけstderrを預かる。
-    let mut stderr = stderr_capture::StderrCapture::start(&workspace_root);
     // **`_grants`より後**に作る。WFPの出口強制daemon（D-56）も同じくTUIを閉じるまで生かすが、
     // その`Teardown`はAppContainerプロファイルの削除（`SessionGrants`のDrop）より**先**に
     // 走らなければならない——フィルタはそのプロファイルのpackage SIDを条件にしているため。
     // Rustは宣言の逆順にdropするので、この順序がそのまま撤収順になる（`App`が`wfp`を持つ）。
     let mut app = App::new(workspace_root, require_sandbox);
+    // 預かれなかったことは黙らない（ライブラリの警告で画面が崩れることがある、と1度だけ言う）。
+    if let Some(reason) = stderr.start_error() {
+        app.notice(harness_term::stderr_capture::start_failure_notice(reason));
+    }
 
     // **昇格は起動直後に済ませる**（起動時前倒し）。遅延させると、UACが「準備が終わった
     // あと」＝無音が続いた後に出て見逃される——実測で1度そうなり、記録が丸ごと失敗した

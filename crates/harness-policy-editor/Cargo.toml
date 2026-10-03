@@ -56,8 +56,6 @@ windows = { version = "0.58", features = [
     # 記録セッションの同時実行を1本に絞るグローバル名前付きmutex（決定事項13）。
     "Win32_Foundation",
     "Win32_System_Threading",
-    # TUIの間だけ標準エラー出力を預かる（ライブラリの`eprintln!`が画面を壊すため）。
-    "Win32_System_Console",
 ] }
 
 [dev-dependencies]
