@@ -12,10 +12,13 @@
 //! │run_program（Exec）                  █   ← 本文。入り切らないときだけ右の枠線にスクロールバー
 //! │…                                    │
 //! ├──────── 1〜12/40行  ↑↓ PgUp/PgDn・ホイールで送る ┤   ← 本文の枠の下辺（位置の案内）＝仕切り
-//! │[y] 一度だけ許可   [a] …   [n] 拒否  │   ← 選択肢。本文と一緒には送らない
-//! │[v] 中身   PageUp/PageDown スクロール│
+//! │ [y] 一度だけ許可     [a] …     [n] 拒否  │   ← 選択肢。本文と一緒には送らない。押せるものはボタン
+//! │ [v] 中身    PageUp/PageDown スクロール   │   ← 押せない案内（1つのキーに決まらない）は文字のまま
 //! └─────────────────────────────────────┘
 //! ```
+//!
+//! 選択肢のボタンは入力欄の「送信」「中断」と同じ見た目（`super::button`。2026-10-03、括弧書きの選択肢が押せる場所に
+//! 見えないとユーザーが実機で指摘した）。並べ方は変えていない——入り切らない項目は次の行の頭へ送り、項目の途中では割らない。
 //!
 //! 本文はポリシーエディタの確認ダイアログ・ヘルプと同じ送れる枠の部品（`harness_term::scrollable`）で描く——
 //! 送る上限は「最後の行が枠の一番下」、入り切らないときだけスクロールバーと「N〜M/T行」を出す。
@@ -77,11 +80,13 @@ pub fn render_permission_modal(
     //
     // **並べてから高さを決める。** 幅の狭い端末では、入り切らない選択肢を次の行へ送る（項目の途中では割らない。
     // 「[d] このセッション中は拒否」が2行に割れると、どこまでが1つの押せる場所か分からない）。
+    //
+    // **押せる選択肢はボタンとして描く**（入力欄の「送信」「中断」と同じ部品。`super::HintLook::Buttons`）。
     let groups = pending.key_hints();
     let hint_width = rect.width.saturating_sub(2);
     let hint_rows: u16 = groups
         .iter()
-        .map(|group| super::hint_rows(group, hint_width))
+        .map(|group| super::hint_rows(group, super::HintLook::Buttons, hint_width))
         .sum();
     // 本文の枠は少なくとも枠線2行＋本文1行を残す。選択肢の枠は選択肢の行＋下の枠線。
     let hint_rows = hint_rows.min(rect.height.saturating_sub(4));
@@ -130,7 +135,8 @@ pub fn render_permission_modal(
     let mut hint_inner = hint_block.inner(hint_area);
     f.render_widget(hint_block, hint_area);
     for group in &groups {
-        let rows = super::hint_rows(group, hint_inner.width).min(hint_inner.height);
+        let rows = super::hint_rows(group, super::HintLook::Buttons, hint_inner.width)
+            .min(hint_inner.height);
         super::draw_hints(
             f,
             Rect {
@@ -138,7 +144,7 @@ pub fn render_permission_modal(
                 ..hint_inner
             },
             group,
-            Style::default().fg(Color::DarkGray),
+            super::HintLook::Buttons,
             targets,
         );
         hint_inner.y += rows;

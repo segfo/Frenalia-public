@@ -50,7 +50,9 @@ pub(super) fn render_review_panel(
     targets.cover(rect);
 
     // キーの案内はパネルの一番下の枠（案内の行＋下の枠線）。2つのペインには少なくとも枠線2行＋1行を残す。
-    let hint_rows = super::hint_rows(&panel.key_hints, rect.width.saturating_sub(2))
+    // 案内は文字のまま描く（承認ダイアログの選択肢のようなボタンにはしていない。`super::HintLook`）。
+    let look = super::HintLook::Text(Style::default().fg(Color::DarkGray));
+    let hint_rows = super::hint_rows(&panel.key_hints, look, rect.width.saturating_sub(2))
         .min(rect.height.saturating_sub(4));
     let hint_height = if hint_rows == 0 { 0 } else { hint_rows + 1 };
     let [panes, hints] =
@@ -67,13 +69,7 @@ pub(super) fn render_review_panel(
         let block = Block::default().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM);
         let inner = block.inner(hints);
         f.render_widget(block, hints);
-        super::draw_hints(
-            f,
-            inner,
-            &panel.key_hints,
-            Style::default().fg(Color::DarkGray),
-            targets,
-        );
+        super::draw_hints(f, inner, &panel.key_hints, look, targets);
     }
     ReviewDrawn {
         diff_max,

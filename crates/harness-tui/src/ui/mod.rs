@@ -18,8 +18,8 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    AppState, Click, DrawFeedback, KeyHint, Targets, ToolCardStatus, TranscriptItem, Wheel,
-    SPINNER_FRAMES,
+    AppState, Click, DrawFeedback, InputButton, KeyHint, Targets, ToolCardStatus, TranscriptItem,
+    Wheel, SPINNER_FRAMES,
 };
 
 /// 入力欄が自動で伸びる最大行数。これを超えると内部スクロールする（カーソル行が
@@ -100,30 +100,63 @@ fn behind_overlay(targets: &mut Targets, screen: Rect, transcript: Rect) {
 /// キー案内の項目の間の桁数（承認ダイアログとレビューパネルの案内の行）。
 pub(super) const HINT_GAP: u16 = 3;
 
-/// キー案内の項目を描く文字列（押せるかどうかで見た目は変えない。ポリシーエディタのキー案内と同じ）。
-pub(super) fn hint_spans(hints: &[KeyHint], style: Style) -> Vec<Span<'static>> {
+/// 会話画面のボタンの色。入力欄の「送信」「中断」と承認ダイアログの選択肢で同じにする（見た目を揃える）。
+const BUTTON_COLOR: Color = Color::Cyan;
+
+/// 会話画面のボタン1つ（`harness_term::button`の見た目。ポリシーエディタの確認ダイアログのボタンと同じ部品）。
+/// 押せないもの（キーを押しても何も起きない間）は薄く描く。
+pub(super) fn button(label: &str, pressable: bool) -> Span<'static> {
+    if pressable {
+        harness_term::button::active(label, BUTTON_COLOR)
+    } else {
+        harness_term::button::inactive(label)
+    }
+}
+
+/// キー案内の項目の見せ方。
+#[derive(Debug, Clone, Copy)]
+pub(super) enum HintLook {
+    /// どの項目も案内の文字として描く（押せるかどうかで見た目を変えない。レビューパネルの案内。
+    /// ポリシーエディタのキー案内と同じ）。
+    Text(Style),
+    /// **押せる項目はボタン**（[`button`]）として描く（承認ダイアログの選択肢。2026-10-03、ユーザーが実機で
+    /// 括弧書きの`[y] 一度だけ許可`を押せる場所に見えないと指摘した）。押せない項目（`PageUp/PageDown スクロール`・
+    /// `↑↓ 移動`）は暗い文字のまま——1つのキーに決まらない案内で、ボタンの形にすると押せそうに見える。
+    Buttons,
+}
+
+/// キー案内の項目を描く文字列（`look`の見せ方で）。**描く[`draw_hints`]と数える[`hint_rows`]が同じこれを通る**
+/// ——ボタンは文言の左右に余白を持つので、別々に組むと数えた行数と描いた行数がずれる。
+fn hint_spans(hints: &[KeyHint], look: HintLook) -> Vec<Span<'static>> {
     hints
         .iter()
-        .map(|hint| Span::styled(hint.label.clone(), style))
+        .map(|hint| match look {
+            HintLook::Text(style) => Span::styled(hint.label.clone(), style),
+            HintLook::Buttons => match hint.key {
+                Some(_) => button(&hint.label, true),
+                None => Span::styled(hint.label.clone(), Style::default().fg(Color::DarkGray)),
+            },
+        })
         .collect()
 }
 
-/// キー案内の項目を`area`へ並べて描き（入り切らない項目は次の行の頭へ。`harness_term::row::draw_wrapped`）、
-/// 押せる項目をそのキーを押す場所として登録する。何行要るかは[`hint_rows`]が同じ置き方で数える。
+/// キー案内の項目を`area`へ並べて描き（入り切らない項目は次の行の頭へ。項目の途中では割らない。
+/// `harness_term::row::draw_wrapped`）、押せる項目をそのキーを押す場所として登録する。
+/// 何行要るかは[`hint_rows`]が同じ置き方で数える。
 pub(super) fn draw_hints(
     f: &mut Frame,
     area: Rect,
     hints: &[KeyHint],
-    style: Style,
+    look: HintLook,
     targets: &mut Targets,
 ) {
-    let drawn = harness_term::row::draw_wrapped(f, area, &hint_spans(hints, style), HINT_GAP);
+    let drawn = harness_term::row::draw_wrapped(f, area, &hint_spans(hints, look), HINT_GAP);
     register_hints(targets, hints, &drawn);
 }
 
 /// [`draw_hints`]が`width`桁で何行使うか。
-pub(super) fn hint_rows(hints: &[KeyHint], width: u16) -> u16 {
-    harness_term::row::wrapped_rows(&hint_spans(hints, Style::default()), HINT_GAP, width)
+pub(super) fn hint_rows(hints: &[KeyHint], look: HintLook, width: u16) -> u16 {
+    harness_term::row::wrapped_rows(&hint_spans(hints, look), HINT_GAP, width)
 }
 
 /// 描いた項目の矩形`drawn`（`hints`と同じ順）のうち、押せる項目をそのキーを押す場所として登録する。
@@ -573,21 +606,27 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
     f.render_widget(paragraph, area);
 }
 
-/// 入力欄を描く。見出しのキー案内（`input (Enter=送信, Esc=中断, …)`）は上辺へ自分で描き、押せる項目を
-/// そのキーを押す場所として登録する（`AppState::input_key_hints`）。
+/// 入力欄を描く。
+///
+/// ```text
+/// ┌input (Enter=改行, PageUp/PageDown=スクロール, Ctrl-C=終了)────────────────┐
+/// │こんにちは                                                                  │
+/// └──────────────────────────────────────────── Esc=中断 ─ Shift+Enter=送信 ┘
+/// ```
+///
+/// - **下辺の右に「中断」「送信」のボタン**（`AppState::input_buttons`。2026-10-03、ユーザーが実機で「入力欄の右下に
+///   送信ボタンが独立してあると思っている。括弧の中の注釈では押せると分からない」と指摘した）。見た目は承認ダイアログの
+///   選択肢・ポリシーエディタの確認ダイアログのボタンと同じ部品（[`button`]）。
+/// - **上辺の見出しは、キーボードの人のための案内**（`AppState::input_key_hints`）。押せる項目はそのキーを押す場所として
+///   登録する（9064b30から。区切りと括弧は押せない）。送信と中断はボタンへ移したので見出しから外した
+///   ——同じ操作を2か所に並べない（ポリシーエディタの確認ダイアログが`y=書く`を見出しからボタンへ移したのと同じ）。
+///
+/// 見出しとボタンは別の行（上辺と下辺）なので、狭い端末でも重ならない。どちらも項目の途中では切らない
+/// （[`input_title`]・[`draw_input_buttons`]）。
 fn render_input(f: &mut Frame, area: Rect, app: &AppState, targets: &mut Targets) {
     let hints = app.input_key_hints();
-    // 見た目は見出しの文字列だった頃と同じ「input (項目, 項目, …)」。区切りと括弧は押せない。
-    let mut title = vec![Span::raw("input (")];
-    let mut at = Vec::with_capacity(hints.len());
-    for (i, hint) in hints.iter().enumerate() {
-        if i > 0 {
-            title.push(Span::raw(", "));
-        }
-        at.push(title.len());
-        title.push(Span::raw(hint.label.clone()));
-    }
-    title.push(Span::raw(")"));
+    let top = harness_term::row::top_edge(area);
+    let (title, at) = input_title(&hints, top.width);
     let block = Block::default().borders(Borders::ALL);
 
     let visible = area.height.saturating_sub(2).max(1) as usize;
@@ -601,9 +640,71 @@ fn render_input(f: &mut Frame, area: Rect, app: &AppState, targets: &mut Targets
 
     let paragraph = Paragraph::new(visible_lines).block(block);
     f.render_widget(paragraph, area);
-    let drawn = harness_term::row::draw(f, harness_term::row::top_edge(area), &title);
-    let drawn: Vec<Rect> = at.into_iter().map(|i| drawn[i]).collect();
+    let drawn = harness_term::row::draw(f, top, &title);
+    // 落とした項目は幅0（押せない。`Targets::click`は幅0を登録しない）。
+    let drawn: Vec<Rect> = at
+        .into_iter()
+        .map(|i| i.map_or_else(Rect::default, |i| drawn[i]))
+        .collect();
     register_hints(targets, &hints, &drawn);
+    draw_input_buttons(f, area, &app.input_buttons(), targets);
+}
+
+/// 入力欄の見出し`input (項目, 項目, …)`を、上辺の幅`width`に収まる形で組む。戻り値は見出しのspanと、
+/// 各項目（`hints`と同じ順）がそのspanの何番目か（落とした項目は`None`）。
+///
+/// 入り切らなければ**後ろの項目から丸ごと落とし**、落とした数を`… 他N件`で出す（ポリシーエディタのキー案内の
+/// `fit_key_hints`と同じ規則——項目の途中で切ると残った文字が別のキーに読め、黙って落とすと省略が見えない。B-09）。
+/// 並びの頭ほど残る。先頭は`Enter=改行`（`AppState::input_key_hints`）——Enterで送れると思って押すと改行になるので、
+/// いちばん知らせたい。
+/// 項目を全部落としても入らない幅では、そのまま描いて右で切れる（描画が落ちないことだけを保つ）。
+fn input_title(hints: &[KeyHint], width: u16) -> (Vec<Span<'static>>, Vec<Option<usize>>) {
+    let compose = |kept: usize| {
+        let mut title = vec![Span::raw("input (")];
+        let mut at = vec![None; hints.len()];
+        for (i, hint) in hints[..kept].iter().enumerate() {
+            if i > 0 {
+                title.push(Span::raw(", "));
+            }
+            at[i] = Some(title.len());
+            title.push(Span::raw(hint.label.clone()));
+        }
+        if kept < hints.len() {
+            if kept > 0 {
+                title.push(Span::raw(", "));
+            }
+            title.push(Span::raw(format!("… 他{}件", hints.len() - kept)));
+        }
+        title.push(Span::raw(")"));
+        (title, at)
+    };
+    (0..=hints.len())
+        .rev()
+        .map(compose)
+        .find(|(title, _)| harness_term::row::width(title) <= width)
+        .unwrap_or_else(|| compose(0))
+}
+
+/// 入力欄の下辺の右に「中断」「送信」のボタンを描き、押せるものをそのキーを押す場所として登録する。
+///
+/// 幅が足りなければキーを落とした短い文言（`中断`・`送信`）で、それも入らなければ1つも描かない（途中で切らない。
+/// `harness_term::button::draw_right`）。押せないボタン（空の入力欄の「送信」）は薄く描き、登録しない。
+fn draw_input_buttons(f: &mut Frame, area: Rect, buttons: &[InputButton], targets: &mut Targets) {
+    let full: Vec<Span> = buttons
+        .iter()
+        .map(|b| button(&b.hint.label, b.hint.key.is_some()))
+        .collect();
+    let short: Vec<Span> = buttons
+        .iter()
+        .map(|b| button(b.short, b.hint.key.is_some()))
+        .collect();
+    let edge = harness_term::row::bottom_edge(area);
+    let drawn = harness_term::button::draw_right(f, edge, &[&full, &short]);
+    for (b, rect) in buttons.iter().zip(drawn) {
+        if let Some(key) = b.hint.key {
+            targets.click(rect, Click::Key(key));
+        }
+    }
 }
 
 pub(super) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

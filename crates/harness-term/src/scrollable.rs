@@ -22,8 +22,9 @@
 //!
 //! 確認ダイアログは「何を押せば書くか」を枠の下辺に固定で置く（本文の最後に置くと、本文が長いときに
 //! 枠の外へ消えるため）。それを押せるようにするため、ボタンを下辺の左に描いて**描いた位置を返す**
-//! （[`crate::pointer`]へ登録する）。下辺の右の「N〜M/T行」はボタンの残りの幅に収まる形を選ぶので、
-//! **ボタンには重ならない**（押すべきものが案内に覆われない）。
+//! （[`crate::pointer`]へ登録する）。ボタンの間は[`crate::button::GAP`]桁空けて枠線を見せ、入り切らない
+//! ボタンは途中で切らずに描かない（[`crate::button::draw_left`]）。下辺の右の「N〜M/T行」はボタンの残りの幅に
+//! 収まる形を選ぶので、**ボタンには重ならない**（押すべきものが案内に覆われない）。
 //!
 //! # 本文の行が描かれた場所も返す（[`Drawn::lines`]）
 //!
@@ -95,8 +96,8 @@ pub fn draw<'a>(
     draw_with_buttons(frame, area, text, block, top, look, &[]).max_top
 }
 
-/// [`draw`]に加えて、下辺の左に`buttons`を描き、それぞれが描かれた矩形を返す（モジュールdoc）。
-/// 本文の各行が描かれた矩形も返す（[`Drawn::lines`]）。
+/// [`draw`]に加えて、下辺の左に`buttons`（[`crate::button::active`]で作ったもの）を間を空けて描き、
+/// それぞれが描かれた矩形を返す（モジュールdoc）。本文の各行が描かれた矩形も返す（[`Drawn::lines`]）。
 pub fn draw_with_buttons<'a>(
     frame: &mut Frame,
     area: Rect,
@@ -149,7 +150,7 @@ fn draw_text<'a>(
     let taken = if buttons.is_empty() {
         0
     } else {
-        crate::row::width(buttons).saturating_add(1)
+        crate::button::row_width(buttons).saturating_add(1)
     };
     let room = area.width.saturating_sub(2).saturating_sub(taken);
     let block = match window.notice(look.how, room) {
@@ -169,7 +170,7 @@ fn draw_text<'a>(
     let buttons = if buttons.is_empty() || area.height == 0 {
         vec![Rect::default(); buttons.len()]
     } else {
-        crate::row::draw(frame, crate::row::bottom_edge(area), buttons)
+        crate::button::draw_left(frame, crate::row::bottom_edge(area), buttons)
     };
     Drawn {
         max_top: u16::try_from(window.max_top()).unwrap_or(u16::MAX),
@@ -359,19 +360,23 @@ mod tests {
 
     fn buttons() -> Vec<Span<'static>> {
         vec![
-            Span::raw(" y=書く "),
-            Span::raw(" "),
-            Span::raw(" n / Esc=やめる "),
+            crate::button::active("y=書く", ratatui::style::Color::Yellow),
+            crate::button::active("n / Esc=やめる", ratatui::style::Color::Yellow),
         ]
     }
 
-    /// **ボタンは下辺の左（角の隣）に描かれ、返した矩形にその文字がある。**
+    /// **ボタンは下辺の左（角の隣）に1桁空けて描かれ、返した矩形にその文字がある。** 間の1桁は枠線のまま。
     #[test]
     fn the_buttons_are_drawn_on_the_bottom_edge_where_they_are_returned() {
         let buttons = buttons();
         let (drawn, buffer) = paint(80, 20, &buttons);
-        assert_eq!(drawn.buttons.len(), 3);
+        assert_eq!(drawn.buttons.len(), 2);
         assert_eq!(drawn.buttons[0].x, 1, "左の角の隣から");
+        assert_eq!(
+            buffer[(drawn.buttons[0].right(), 7)].symbol(),
+            "─",
+            "ボタンの間は枠線"
+        );
         for (span, rect) in buttons.iter().zip(&drawn.buttons) {
             assert_eq!(rect.y, 7, "下辺");
             let text: String = (rect.x..rect.right())
@@ -389,10 +394,12 @@ mod tests {
         for width in [80u16, 50, 40, 30, 20] {
             let (drawn, buffer) = paint(width, 20, &buttons);
             let row = bottom_row(&buffer, Rect::new(0, 0, width, 8)).replace(' ', "");
+            // 間の1桁は枠線（`─`）として見える。
             let wanted: String = buttons
                 .iter()
                 .map(|b| b.content.replace(' ', ""))
-                .collect::<String>();
+                .collect::<Vec<_>>()
+                .join("─");
             let fits = drawn
                 .buttons
                 .iter()

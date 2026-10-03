@@ -724,21 +724,17 @@ fn a_field_click_enters_it_like_tab_and_typing_goes_there() {
 // 4. キー案内と確認ダイアログのボタン
 // ---------------------------------------------------------------------------
 
-/// **キー案内の項目を押すと、そのキーを押したのと同じになる**（代表: 画面ごとの項目・ヘルプ・終了・記録の開始）。
+/// **キー案内の項目を押すと、そのキーを押したのと同じになる**（代表: 画面ごとの項目・ヘルプ・終了）。
+/// 記録の開始・停止はキー案内から「記録」の枠のボタンへ移した（[`the_record_buttons_do_what_their_keys_do`]）。
 #[test]
 fn a_key_hint_does_what_its_key_does() {
     type Make = fn(&std::path::Path) -> App;
-    let with_command: Make = |ws| {
-        let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
-        app.command.set_text("cargo build");
-        app
-    };
     let reserved_transition: Make = |ws| {
         let mut app = transition_tab_with_three_candidates(ws);
         press(&mut app, KeyCode::Char(' '));
         app
     };
-    let cases: [(&str, Make, &str, Vec<KeyEvent>); 9] = [
+    let cases: [(&str, Make, &str, Vec<KeyEvent>); 8] = [
         (
             "承認待ち・t",
             edit_screen_with_a_tree,
@@ -770,12 +766,6 @@ fn a_key_hint_does_what_its_key_does() {
             vec![k(KeyCode::Char(' '))],
         ),
         (
-            "記録・Enter",
-            with_command,
-            "Enter 記録を開始",
-            vec![k(KeyCode::Enter)],
-        ),
-        (
             "共通・F4",
             edit_screen_with_a_tree,
             "F4 ヘルプ",
@@ -802,6 +792,87 @@ fn a_key_hint_does_what_its_key_does() {
             &keys,
         );
     }
+}
+
+/// 「記録」の枠の下辺（枠線の行）。
+fn record_box_bottom(grid: &[Vec<String>]) -> Rect {
+    let area = boxed(grid, " 記録 ");
+    Rect::new(area.x, area.bottom() - 1, area.width, 1)
+}
+
+/// **「記録」の枠の右下のボタンは、そのキーを押したのと同じ**（2026-10-03、会話画面の入力欄の「送信」「中断」と
+/// 同じ形）。実行前は`Enter 記録を開始`（コマンドが空でも押せて、キーと同じく理由が出る）、記録中は`Esc 停止`。
+/// どちらもキー案内の行には無い（同じ操作を2か所に並べない）。ボタンは枠の右下の角のすぐ左で終わる。
+#[test]
+fn the_record_buttons_do_what_their_keys_do() {
+    type Make = fn(&std::path::Path) -> App;
+    let with_command: Make = |ws| {
+        let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+        app.command.set_text("cargo build");
+        app
+    };
+    let empty: Make = |ws| App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+    let cases: [(&str, Make, &str, KeyCode); 3] = [
+        ("開始", with_command, "Enter 記録を開始", KeyCode::Enter),
+        ("コマンドが空", empty, "Enter 記録を開始", KeyCode::Enter),
+        (
+            "記録中の停止",
+            running_record_screen,
+            "Esc 停止",
+            KeyCode::Esc,
+        ),
+    ];
+    for (case, make, button, key) in cases {
+        assert_click_is_keys(
+            case,
+            &make,
+            &|grid, _| cell_of(grid, Some(record_box_bottom(grid)), button, None),
+            &[k(key)],
+        );
+
+        let ws = workspace();
+        let mut app = make(ws.path());
+        let grid = frame(&mut app, SIZE.0, SIZE.1);
+        let keys = squash(&grid[usize::from(key_row(&grid).y)].concat());
+        assert!(
+            !keys.contains(&squash(button)),
+            "{case}: キー案内の行にも「{button}」がある: {keys}"
+        );
+        let bottom = record_box_bottom(&grid);
+        let edge = squash(&grid[usize::from(bottom.y)][..usize::from(bottom.right())].concat());
+        assert!(
+            edge.ends_with(&format!("{}┘", squash(button))),
+            "{case}: ボタンが枠の右下の角の手前に無い: {edge}"
+        );
+    }
+    // 空のコマンドで押すと、キーと同じく開始できない理由が出る（無反応にしない）。
+    let ws = workspace();
+    let mut app = empty(ws.path());
+    let grid = frame(&mut app, SIZE.0, SIZE.1);
+    let action = click(
+        &mut app,
+        cell_of(
+            &grid,
+            Some(record_box_bottom(&grid)),
+            "Enter 記録を開始",
+            None,
+        ),
+    );
+    assert_eq!(action_kind(&action), "なし");
+    assert!(app.status.contains("コマンドを入力"), "{}", app.status);
+    // 押せば始まる（許可側）。
+    let mut app = with_command(ws.path());
+    let grid = frame(&mut app, SIZE.0, SIZE.1);
+    let action = click(
+        &mut app,
+        cell_of(
+            &grid,
+            Some(record_box_bottom(&grid)),
+            "Enter 記録を開始",
+            None,
+        ),
+    );
+    assert_eq!(action_kind(&action), "パス1を開始");
 }
 
 /// 終了の項目は、押すと終了の操作を返す（キーと同じ。上の試験は種類が一致することしか見ないので、ここで値を見る）。

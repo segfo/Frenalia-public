@@ -8,8 +8,9 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
-use harness_core::{FilePreview, PermissionSubject, ProgramSubject, RiskClass};
+use harness_core::{AgentEvent, FilePreview, PermissionSubject, ProgramSubject, RiskClass};
 use ratatui::backend::TestBackend;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::Terminal;
 
 use super::*;
@@ -21,8 +22,8 @@ use crate::app::{
 const WIDTH: u16 = 100;
 const HEIGHT: u16 = 30;
 
-/// 描いた画面。行ごとに、各セルの記号。
-struct Screen(Vec<Vec<String>>);
+/// 描いた画面。行ごとに、各セルの記号と見た目（背景・太字などの`Style`）。
+struct Screen(Vec<Vec<String>>, Vec<Vec<Style>>);
 
 impl Screen {
     /// `text`が描かれている最初の場所（その最初の文字のセル）。全角文字は2セルを占めるので、
@@ -33,21 +34,8 @@ impl Screen {
     }
 
     fn try_find(&self, text: &str) -> Option<(u16, u16)> {
-        for (y, row) in self.0.iter().enumerate() {
-            // 文字ごとに、それが描かれたセルの桁を持つ。全角文字の後ろのセル（2桁目）は読まない。
-            let mut line = String::new();
-            let mut columns = Vec::new();
-            let mut second_half = false;
-            for (x, symbol) in row.iter().enumerate() {
-                if std::mem::take(&mut second_half) {
-                    continue;
-                }
-                for c in symbol.chars() {
-                    line.push(c);
-                    columns.push(x);
-                }
-                second_half = unicode_width::UnicodeWidthStr::width(symbol.as_str()) == 2;
-            }
+        for y in 0..self.0.len() {
+            let (line, columns) = self.line(y);
             if let Some(byte) = line.find(text) {
                 let index = line[..byte].chars().count();
                 return Some((columns[index] as u16, y as u16));
@@ -56,8 +44,36 @@ impl Screen {
         None
     }
 
+    /// `y`行目の文字と、文字ごとにそれが描かれたセルの桁。全角文字の後ろのセル（2桁目）は読まない。
+    fn line(&self, y: usize) -> (String, Vec<usize>) {
+        let mut line = String::new();
+        let mut columns = Vec::new();
+        let mut second_half = false;
+        for (x, symbol) in self.0[y].iter().enumerate() {
+            if std::mem::take(&mut second_half) {
+                continue;
+            }
+            for c in symbol.chars() {
+                line.push(c);
+                columns.push(x);
+            }
+            second_half = unicode_width::UnicodeWidthStr::width(symbol.as_str()) == 2;
+        }
+        (line, columns)
+    }
+
     fn cell(&self, (x, y): (u16, u16)) -> &str {
         &self.0[usize::from(y)][usize::from(x)]
+    }
+
+    /// そのセルの見た目。
+    fn style(&self, (x, y): (u16, u16)) -> Style {
+        self.1[usize::from(y)][usize::from(x)]
+    }
+
+    /// `y`行目の文字（[`Self::line`]と同じ読み方）。
+    fn row(&self, y: u16) -> String {
+        self.line(usize::from(y)).0
     }
 
     fn text(&self) -> String {
@@ -84,21 +100,27 @@ impl Screen {
 
 /// 製品と同じ形で1フレーム描き、描いて分かったことを状態へ書き戻す（`crate::run`の描画ループと同じ順）。
 fn draw(app: &mut AppState) -> Screen {
-    let mut term = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("test terminal");
+    draw_sized(app, WIDTH, HEIGHT)
+}
+
+/// [`draw`]を`width`×`height`の端末で。
+fn draw_sized(app: &mut AppState, width: u16, height: u16) -> Screen {
+    let mut term = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
     let mut feedback = DrawFeedback::default();
     term.draw(|f| feedback = crate::ui::render(f, app))
         .expect("draw");
     app.apply_draw_feedback(feedback);
     let buffer = term.backend().buffer();
     Screen(
-        (0..HEIGHT)
-            .map(|y| {
-                (0..WIDTH)
-                    .map(|x| buffer[(x, y)].symbol().to_string())
-                    .collect()
-            })
-            .collect(),
+        grid(width, height, |x, y| buffer[(x, y)].symbol().to_string()),
+        grid(width, height, |x, y| buffer[(x, y)].style()),
     )
+}
+
+fn grid<T>(width: u16, height: u16, cell: impl Fn(u16, u16) -> T) -> Vec<Vec<T>> {
+    (0..height)
+        .map(|y| (0..width).map(|x| cell(x, y)).collect())
+        .collect()
 }
 
 fn mouse(app: &mut AppState, kind: MouseEventKind, (column, row): (u16, u16)) -> Step {
@@ -239,6 +261,93 @@ fn clicking_each_approval_button_does_what_its_key_does() {
     );
 }
 
+/// `screen`に描かれた`label`の各文字のセルの見た目（同じものは1つにまとめる。全部同じなら1要素）。
+/// 全角文字の後ろのセル（2桁目）は読まない——ratatuiはそこを既定の見た目へ戻し、端末は前のセルの文字で覆う。
+fn label_looks(screen: &Screen, label: &str) -> Vec<Style> {
+    let (_, y) = screen.find(label);
+    let (line, columns) = screen.line(usize::from(y));
+    let start = line[..line.find(label).expect("同じ行にある")]
+        .chars()
+        .count();
+    let mut looks: Vec<Style> = columns[start..start + label.chars().count()]
+        .iter()
+        .map(|&x| screen.style((x as u16, y)))
+        .collect();
+    looks.dedup();
+    looks
+}
+
+/// ボタンの見た目（`harness_term::button::active`。会話画面のボタンの色はシアン）か。
+fn is_button(look: &Style) -> bool {
+    look.bg == Some(Color::Cyan)
+        && look.fg == Some(Color::Black)
+        && look.add_modifier.contains(Modifier::BOLD)
+}
+
+/// **承認ダイアログの押せる選択肢はボタンとして描かれ、押せない案内は文字のまま**（2026-10-03、括弧書きの選択肢が
+/// 押せる場所に見えないとユーザーが実機で指摘した）。選ぶ段と確認の段の両方。見た目は描いたセルの背景と太字で見る。
+#[test]
+fn the_approval_choices_are_buttons_and_the_plain_hints_are_text() {
+    let mut app = pending_app(5);
+    let screen = draw(&mut app);
+    for label in [
+        "[y] 一度だけ許可",
+        "[a] 恒久的に承認",
+        "[n] 拒否",
+        "[d] このセッション中は拒否",
+        "[v] 中身",
+        "[f] 差分",
+    ] {
+        let looks = label_looks(&screen, label);
+        assert!(
+            looks.len() == 1 && is_button(&looks[0]),
+            "選ぶ段の「{label}」がボタンでない: {looks:?}"
+        );
+    }
+    let scroll = label_looks(&screen, "PageUp/PageDown スクロール");
+    assert!(
+        scroll.iter().all(|look| !is_button(look)),
+        "押せない案内がボタンに見える: {scroll:?}"
+    );
+
+    press(&mut app, KeyCode::Char('a'));
+    let screen = draw(&mut app);
+    for label in ["Enter 確定", "Esc 戻る", "Space 毎回変わってよい引数にする"] {
+        let looks = label_looks(&screen, label);
+        assert!(
+            looks.len() == 1 && is_button(&looks[0]),
+            "確認の段の「{label}」がボタンでない: {looks:?}"
+        );
+    }
+    assert!(
+        label_looks(&screen, "↑↓ 移動")
+            .iter()
+            .all(|l| !is_button(l)),
+        "押せない「↑↓ 移動」がボタンに見える"
+    );
+}
+
+/// **入力欄の「送信」「中断」と承認ダイアログの選択肢は、同じ1つの見た目を通る**（共通にした部品が、後から片方だけ
+/// 触って別の見た目へ戻らないように。`docs/CODE-STRUCTURE-RULES.md`§5.1の「共通性そのものを固定する」）。
+#[test]
+fn the_input_buttons_and_the_approval_choices_share_one_look() {
+    let mut app = pending_app(5);
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    app.input = "hi".to_string();
+    let screen = draw(&mut app);
+    let send = label_looks(&screen, "Shift+Enter=送信");
+    let cancel = label_looks(&screen, "Esc=中断");
+    let allow = label_looks(&screen, "[y] 一度だけ許可");
+    assert_eq!(send, allow);
+    assert_eq!(cancel, allow);
+    // ボタンの左右の余白（1桁）も同じ見た目で、ボタンの外（枠線）は違う。
+    let (x, y) = screen.find("Shift+Enter=送信");
+    assert_eq!(screen.style((x - 1, y)), allow[0], "左の余白");
+    assert!(!is_button(&screen.style((x - 2, y))), "ボタンの間の1桁");
+}
+
 /// **開いてから300ms未満のクリックは、キーと同じく捨てる**（D-106）。窓を過ぎれば同じクリックが効く（対）。
 #[test]
 fn a_click_within_the_grace_window_is_discarded_like_a_key() {
@@ -357,15 +466,21 @@ fn mouse_scroll_works_even_while_permission_modal_is_pending() {
     assert_eq!(app.pending_permission.as_ref().map(|v| v.scroll), Some(6));
 }
 
-/// **承認待ちの間、後ろの画面は押せない**——入力欄の`Esc=中断`を押しても、承認ダイアログの`Esc`（拒否）には
-/// ならない。transcriptの本文・ダイアログの中の何も無い所も、何も変えない。
+/// **承認待ちの間、後ろの画面は押せない**——入力欄の「中断」ボタンを押しても、承認ダイアログの`Esc`（拒否）には
+/// ならない。「送信」ボタンも送らない。transcriptの本文・ダイアログの中の何も無い所も、何も変えない。
 #[test]
 fn nothing_behind_the_approval_dialog_or_off_its_buttons_can_be_clicked() {
     let mut app = pending_app(100);
+    // 承認を求められるのはターンの途中なので、後ろの入力欄には「中断」が出ている。入力があれば「送信」も押せる形。
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    app.input = "hi".to_string();
     let screen = draw(&mut app);
     let before = approval_state(&app);
     for place in [
         screen.find("Esc=中断"),
+        screen.find("Shift+Enter=送信"),
         screen.find("Ctrl-C"),
         (1, 2),
         screen.find("program: git"),
@@ -374,6 +489,7 @@ fn nothing_behind_the_approval_dialog_or_off_its_buttons_can_be_clicked() {
         assert!(click(&mut app, place).is_none(), "{place:?}");
         assert_eq!(approval_state(&app), before, "{place:?}");
         assert!(!app.should_quit);
+        assert_eq!(app.input, "hi", "{place:?}: 後ろの送信が効いた");
     }
 }
 
@@ -430,37 +546,64 @@ fn the_transcript_scrollbar_appears_only_when_it_overflows() {
         .any(|c| c == "█"));
 }
 
-/// **入力欄の見出しのキー案内は、そのキーを押したのと同じ**（`Esc=中断`・送信・`Ctrl-C=終了`）。
-/// `PageUp/PageDown=スクロール`は1つのキーに決まらないので押せない。
+/// 入力欄の枠の上辺と下辺の行（上辺は見出しの`input`がある行。ごく狭い端末では括弧から先が切れる）。
+fn input_edges(screen: &Screen) -> (u16, u16) {
+    let top = screen.find("input").1;
+    let bottom = (top + 1..)
+        .take_while(|&y| usize::from(y) < screen.0.len())
+        .find(|&y| screen.cell((0, y)) == "└")
+        .expect("入力欄の左下の角");
+    (top, bottom)
+}
+
+/// 入力の状態（送った後に何が残るか）。
+fn input_state(app: &AppState) -> String {
+    format!(
+        "{:?} {} {}",
+        app.input,
+        app.input_cursor,
+        app.transcript.len()
+    )
+}
+
+fn type_text(app: &mut AppState, text: &str) {
+    for c in text.chars() {
+        press(app, KeyCode::Char(c));
+    }
+}
+
+/// **入力欄の見出しに残ったキー案内は、そのキーを押したのと同じ**（`Enter=改行`・`Ctrl-C=終了`）。
+/// `PageUp/PageDown=スクロール`は1つのキーに決まらないので押せない。**送信と中断は見出しから外れて**、
+/// 下辺のボタンにだけある（同じ操作を2か所に並べない）。
 #[test]
 fn the_input_title_hints_press_their_keys() {
     let mut app = app_with_transcript(3);
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    type_text(&mut app, "hi");
     let screen = draw(&mut app);
-    assert!(matches!(
-        click(&mut app, screen.find("Esc=中断")),
-        Some(Action::Cancel)
-    ));
+    let (top, _) = input_edges(&screen);
+    let title = screen.row(top);
+    assert!(
+        !title.contains("送") && !title.contains("中") && !title.contains("Esc"),
+        "見出しに送信・中断が残っている: {title}"
+    );
+
+    // `Enter=改行`を押すと、Enterを押したのと同じく改行が入る。
+    let mut by_key = app_with_transcript(3);
+    by_key.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    type_text(&mut by_key, "hi");
+    assert!(click(&mut app, screen.find("Enter=改行")).is_none());
+    assert!(press(&mut by_key, KeyCode::Enter).is_none());
+    assert_eq!(input_state(&app), input_state(&by_key));
+    assert_eq!(app.input, "hi\n");
+
+    let screen = draw(&mut app);
     assert!(click(&mut app, screen.find("PageUp/PageDown=")).is_none());
     assert_eq!(app.scroll_offset(), 0);
-
-    for c in "hi".chars() {
-        press(&mut app, KeyCode::Char(c));
-    }
-    let mut by_key = app_with_transcript(3);
-    for c in "hi".chars() {
-        press(&mut by_key, KeyCode::Char(c));
-    }
-    let screen = draw(&mut app);
-    let sent = click(&mut app, screen.find("Shift+Enter=送信"));
-    let expected = press_key(
-        &mut by_key,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
-    );
-    assert_eq!(shown(&sent), shown(&expected));
-    assert!(
-        matches!(sent, Some(Action::Submit(ref text)) if text == "hi"),
-        "{sent:?}"
-    );
 
     let screen = draw(&mut app);
     assert!(matches!(
@@ -468,6 +611,237 @@ fn the_input_title_hints_press_their_keys() {
         Some(Action::Quit)
     ));
     assert!(app.should_quit);
+}
+
+/// **入力欄の下辺の右に「中断」「送信」のボタンがあり、送信は右下の角のすぐ左で終わる**（ユーザーが指した場所）。
+/// 見出しの行には無い。
+#[test]
+fn the_send_and_cancel_buttons_sit_on_the_bottom_right_of_the_input_box() {
+    let mut app = app_with_transcript(3);
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    type_text(&mut app, "hi");
+    let screen = draw(&mut app);
+    let (_, bottom) = input_edges(&screen);
+    let (send_x, send_y) = screen.find("Shift+Enter=送信");
+    let (cancel_x, cancel_y) = screen.find("Esc=中断");
+    assert_eq!((send_y, cancel_y), (bottom, bottom), "下辺に無い");
+    assert!(cancel_x < send_x, "中断が送信の左に無い");
+    // 送信の文言の後ろは、余白の1桁、そして右下の角。
+    let edge = screen.row(bottom);
+    assert!(
+        edge.ends_with("Shift+Enter=送信 ┘"),
+        "送信が右下の角の手前で終わっていない: {edge}"
+    );
+    assert_eq!(screen.cell((WIDTH - 1, bottom)), "┘");
+}
+
+/// **「送信」ボタンは、送信キーを押したのと同じ**——送るキーは端末と設定で変わり（VS Codeの統合ターミナルは
+/// `Alt+Enter`、`enter_submits`なら素の`Enter`）、ボタンの文言とキーはそれに合わせて変わる。返る操作と、送った後の
+/// 入力欄・transcriptの両方を、キーで送った別の`AppState`と比べる。
+#[test]
+fn the_send_button_sends_like_the_send_key() {
+    type Setup = fn(&mut AppState);
+    let cases: [(&str, Setup, &str, KeyEvent); 3] = [
+        (
+            "既定",
+            |_| {},
+            "Shift+Enter=送信",
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        ),
+        (
+            "VS Code",
+            |app| app.host_is_vscode = true,
+            "Alt+Enter=送信",
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+        ),
+        (
+            "enter_submits",
+            |app| app.enter_submits = true,
+            "Enter=送信",
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ),
+    ];
+    for (case, setup, label, key) in cases {
+        let mut clicked = app_with_transcript(3);
+        setup(&mut clicked);
+        type_text(&mut clicked, "hi");
+        let screen = draw(&mut clicked);
+        let sent = click(&mut clicked, screen.find(label));
+
+        let mut pressed = app_with_transcript(3);
+        setup(&mut pressed);
+        type_text(&mut pressed, "hi");
+        let expected = press_key(&mut pressed, key);
+
+        assert_eq!(shown(&sent), shown(&expected), "{case}");
+        assert!(
+            matches!(sent, Some(Action::Submit(ref text)) if text == "hi"),
+            "{case}: {sent:?}"
+        );
+        assert_eq!(input_state(&clicked), input_state(&pressed), "{case}");
+        assert_eq!(clicked.input, "", "{case}: 送った後に入力が残った");
+    }
+    // `enter_submits`では、素のEnterは送信なので見出しに`Enter=改行`を出さない。
+    let mut app = app_with_transcript(3);
+    app.enter_submits = true;
+    let screen = draw(&mut app);
+    assert!(screen.try_find("Enter=改行").is_none(), "{}", screen.text());
+}
+
+/// **入力が空白だけの間、「送信」は薄く描かれ、押しても何も起きない**（送信キーも何もしない）。
+/// 打てば同じ場所で押せる見た目に変わり、押すと送る（対）。押せないことは、描いたセルの背景で見る。
+#[test]
+fn the_send_button_is_dim_and_does_nothing_while_the_input_is_blank() {
+    for blank in ["", "   ", "\n"] {
+        let mut app = app_with_transcript(3);
+        app.input = blank.to_string();
+        app.input_cursor = blank.chars().count();
+        let screen = draw(&mut app);
+        let at = screen.find("Shift+Enter=送信");
+        let look = screen.style(at);
+        assert_eq!(
+            look.bg,
+            Some(Color::DarkGray),
+            "{blank:?}: 薄く描かれていない"
+        );
+        assert!(!look.add_modifier.contains(Modifier::BOLD), "{blank:?}");
+        let before = input_state(&app);
+        assert!(click(&mut app, at).is_none(), "{blank:?}");
+        assert_eq!(
+            input_state(&app),
+            before,
+            "{blank:?}: 押せないはずの送信で何か変わった"
+        );
+    }
+
+    let mut app = app_with_transcript(3);
+    let blank_at = draw(&mut app).find("Shift+Enter=送信");
+    type_text(&mut app, "hi");
+    let screen = draw(&mut app);
+    let at = screen.find("Shift+Enter=送信");
+    assert_eq!(at, blank_at, "打つと送信の場所が動いた");
+    assert_eq!(
+        screen.style(at).bg,
+        Some(Color::Cyan),
+        "押せる見た目になっていない"
+    );
+    assert!(screen.style(at).add_modifier.contains(Modifier::BOLD));
+    assert!(matches!(click(&mut app, at), Some(Action::Submit(_))));
+}
+
+/// **「中断」は止めるものが走っている間だけ出る**——応答中のターン（`TurnStarted`〜`TurnCompleted`）と、
+/// 走り始めた`/compact`の要約。キューで待っているだけの要約では出ない（`Esc`がまだそれに届かない）。
+/// 押すと`Esc`を押したのと同じ。出たり消えたりしても「送信」の場所は動かない。
+#[test]
+fn the_cancel_button_appears_only_while_something_can_be_cancelled() {
+    let mut app = app_with_transcript(3);
+    let idle = draw(&mut app);
+    assert!(
+        idle.try_find("中断").is_none(),
+        "走っていないのに中断が出た"
+    );
+    let send_at = idle.find("Shift+Enter=送信");
+
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    let running = draw(&mut app);
+    assert_eq!(
+        running.find("Shift+Enter=送信"),
+        send_at,
+        "送信の場所が動いた"
+    );
+    let cancel_at = running.find("Esc=中断");
+    assert_eq!(running.style(cancel_at).bg, Some(Color::Cyan));
+
+    let mut by_key = app_with_transcript(3);
+    by_key.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    let clicked = click(&mut app, cancel_at);
+    let pressed = press(&mut by_key, KeyCode::Esc);
+    assert_eq!(shown(&clicked), shown(&pressed));
+    assert!(matches!(clicked, Some(Action::Cancel)), "{clicked:?}");
+
+    // ターンが終われば消える。
+    app.apply(AgentEvent::Cancelled);
+    assert!(draw(&mut app).try_find("中断").is_none());
+
+    // `/compact`: キューで待っている間は出ず、走り始めたら出る。
+    let mut compacting = app_with_transcript(3);
+    assert!(compacting.begin_busy("Compacting context"));
+    assert!(
+        draw(&mut compacting).try_find("中断").is_none(),
+        "キュー待ちで出た"
+    );
+    compacting.apply(AgentEvent::ContextCompactionStarted);
+    let screen = draw(&mut compacting);
+    assert!(matches!(
+        click(&mut compacting, screen.find("Esc=中断")),
+        Some(Action::Cancel)
+    ));
+}
+
+/// **狭い端末でも、見出しの項目とボタンは途中で切れない。** 見出しは後ろの項目から丸ごと落として`… 他N件`と数を出し、
+/// ボタンはキーを落とした短い文言（`中断`・`送信`）にし、それも入らなければ出さない。見出し（上辺）とボタン（下辺）は
+/// 別の行なので重ならない。短い文言になっても押せば送る。
+#[test]
+fn a_narrow_terminal_never_cuts_a_title_item_or_a_button() {
+    let titles = ["Enter=改行", "PageUp/PageDown=スクロール", "Ctrl-C=終了"];
+    for width in [100u16, 60, 45, 30, 20, 14, 8] {
+        let mut app = app_with_transcript(3);
+        app.apply(AgentEvent::TurnStarted {
+            estimated_input_tokens: 0,
+        });
+        type_text(&mut app, "hi");
+        let screen = draw_sized(&mut app, width, 12);
+        let (top, bottom) = input_edges(&screen);
+
+        // 見出し: 各項目は丸ごと出るか、まったく出ないか。落とした数を`他N件`で言う。
+        let title = screen.row(top);
+        let shown_titles = titles.iter().filter(|t| title.contains(*t)).count();
+        for t in titles {
+            let head: String = t.chars().take(3).collect();
+            assert!(
+                title.contains(t) || !title.contains(&head),
+                "{width}桁: 見出しの「{t}」が途中で切れた: {title}"
+            );
+        }
+        let dropped = titles.len() - shown_titles;
+        if dropped > 0 && title.contains(')') {
+            assert!(
+                title.contains(&format!("他{dropped}件")),
+                "{width}桁: 落とした数を言っていない: {title}"
+            );
+        }
+
+        // ボタン: 長い文言の2つ・短い文言の2つ・無し、のどれか。中途半端な文言は無い。
+        let edge = screen.row(bottom);
+        let long = edge.contains("Esc=中断") && edge.contains("Shift+Enter=送信");
+        let short = !long && edge.contains("中断") && edge.contains("送信");
+        let none = !edge.contains('断') && !edge.contains('信') && !edge.contains("Esc");
+        assert!(long || short || none, "{width}桁: ボタンが切れた: {edge}");
+        assert!(
+            !title.contains('信') && !title.contains('断'),
+            "{width}桁: {title}"
+        );
+        match width {
+            100 | 60 | 45 => assert!(long, "{width}桁: 長い文言が入るはず: {edge}"),
+            30 | 20 => assert!(short, "{width}桁: 短い文言が入るはず: {edge}"),
+            _ => assert!(none, "{width}桁: 入らないボタンを描いた: {edge}"),
+        }
+        if short {
+            assert!(
+                matches!(
+                    click(&mut app, screen.find("送信")),
+                    Some(Action::Submit(_))
+                ),
+                "{width}桁: 短い文言の送信が押せない"
+            );
+        }
+    }
 }
 
 /// **ポインタが動いただけ・キーを離しただけのイベントは描き直さない**（`Step::Unchanged`）。押下とホイールは
@@ -735,6 +1109,10 @@ fn the_wheel_under_the_review_panel_moves_what_is_under_the_pointer() {
         "外に見えているtranscriptが送られない"
     );
 
+    // 後ろの入力欄の「中断」ボタン（ターンの途中にパネルを開いた形）。
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
     let screen = draw(&mut app);
     let before = panel_state(&app);
     assert!(click(&mut app, screen.find("Esc=中断")).is_none());
