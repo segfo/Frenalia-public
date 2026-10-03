@@ -1,7 +1,9 @@
 //! ボタン——押せる項目を、注釈ではなく**押せるもの**として見せる見た目と置き方
-//! （会話TUIとポリシーエディタが共有する）。形は2つある。
+//! （会話TUIとポリシーエディタが共有する）。**押すと1回だけ動作が起きる**部品で、並んだ中から1つを選んで選んだ見た目が
+//! 残るタブ（[`crate::tab`]）とは別の部品である（2026-10-03、ユーザーの指示「『タブ』と『ボタン』はUX的な意味合いは
+//! 別」。違いの表は`tab`のモジュールdoc）。形は2つある。
 //!
-//! - **辺に載せるボタン**（[`active`]・[`draw_left`]）——枠の辺や案内の行に並べる、背景色付きの1行。
+//! - **辺に載せるボタン**（[`span`]・[`draw_left`]）——枠の辺や案内の行に並べる、背景色付きの1行。
 //!   ダイアログの選択肢（会話TUIの承認ダイアログ・ポリシーエディタの確認ダイアログ）に使う。ダイアログの中には
 //!   枠で囲む高さが無い。
 //! - **枠付きのボタン**（[`Framed`]・[`place_framed`]）——欄の右隣に置く、枠で囲んだ3行の独立したボタン。
@@ -19,12 +21,40 @@
 //! 同じ日に入力欄の下辺の右へその形の「送信」を載せたところ、ユーザーが実機を見て図を描き、「ボタンと分かるように
 //! 枠で囲んだものを入力欄の右に置いてほしい」と希望した。それが枠付きのボタンである（下の節）。
 //!
-//! # いまは押せないボタンは薄く描く（[`Framed::pressable`]）
+//! # 見た目は3つ（[`Look`]）——普通・押されている・押せない
+//!
+//! どちらの形も、同じ3つの見た目を持つ。呼び出し側はボタンごとに[`Press::look`]で選んで渡す。
+//!
+//! | 見た目 | 辺に載せるボタン（[`span`]） | 枠付きのボタン（[`Framed`]） |
+//! |---|---|---|
+//! | 普通 | ボタンの色の背景に黒の太字 | 枠と文言をボタンの色で、文言は太字 |
+//! | 押されている | 普通の形の文字色と背景色を入れ替える（塗りが抜ける） | 普通の形の文字色と背景色を入れ替える（枠の中までボタンの色で塗る） |
+//! | 押せない | 暗い灰色の文字（太字にしない） | 枠・文言・キーを暗い灰色で（太字にしない） |
+//!
+//! # 押した瞬間の見た目（[`Press`]）
+//!
+//! ボタンを押した瞬間（マウスの左ボタンを押した瞬間。クリックはそこで効く——[`crate::pointer`]）に、そのボタンを
+//! **押されている形**で描く（2026-10-03、ユーザー「クリックしたらそのクリックした瞬間に色変えられたりします？」）。
+//! 押されている形は普通の形の文字色と背景色を入れ替えたもの（`Modifier::REVERSED`。端末の既定の背景色が何色でも、
+//! そのまま入れ替わる）なので、普通の形とも押せない形とも見分けが付く。
+//!
+//! - **動作は今までどおり押した瞬間に起きる**（離した瞬間に変えない）。見た目だけが、離すまで残る。
+//! - **最低でも[`PRESSED_AT_LEAST`]は残す。** 押した瞬間に動作して画面が変わる（「送信」を押すと入力欄が空になる、
+//!   「記録を開始」を押すと「停止を予約」に変わる）ので、離した瞬間に戻すと、素早いクリックでは押した色が描かれる前に
+//!   消える。離していて、押してからこの長さが過ぎたら戻す（[`Press::up`]・[`Press::tick`]）——呼び出し側は、時間が
+//!   進んだら`tick`を呼んで描き直す（会話画面は33msごとの描画の合図、ポリシーエディタはイベントを待つ100msの区切りで）。
+//! - **押されている見た目は、ボタンの名前に付く**（`Press<K>`の`K`。何を同じボタンとみなすかは呼び出し側が決める）。
+//!   押した後でボタンの位置が動いても押したボタンに付いて動き、その場所へ来た別のボタンには付かない（会話画面の
+//!   「送信」は、応答が始まると現れる「中断」に押されて左へずれる）。押した結果ボタンが消えたら（閉じた確認ダイアログ）、
+//!   それ自体が押した反応なので何も付かない。
+//! - 押せないボタンは押されている形にならない（[`Press::look`]は押せないボタンに[`Look::Disabled`]を返す）。
+//! - タブには付けない（[`crate::tab`]）。押したタブが選ばれた見た目に変わり、それが残ること自体が押した反応である。
+//!
+//! # いまは押せないボタンは薄く描く（[`Look::Disabled`]）
 //!
 //! 押しても何も起きない間だけ押せないボタンは、枠も文字も暗い灰色にして太字をやめる。押す場所も登録しない
 //! （呼び出し側の責務）。消さずに残すのは、**ボタンの置き場所そのものを見せておく**ため——押せない間にボタンが
 //! 消えると、最初に画面を見たときに何を押せばよいのか分からない。
-//! 辺に載せるボタンには押せない形が無い。
 //!
 //! **いまこの形を使う画面は無い。** 2026-10-03までは会話画面の「送信」が、入力欄が空白だけの間この形だった。
 //! ユーザーがポリシーエディタと見比べて「ボタンの色が違う。ポリシーエディタに合わせられる？」と言い（灰色の「送信」と
@@ -55,17 +85,23 @@
 //!   入力欄は上へ伸びるので、下端にそろえれば送信の位置が行数で変わらない。
 //! - **狭いときは、隣の欄に`keep`桁を残せる形を選ぶ**: キーを添える形 → キーを落とした短い形（文言の左右に1桁）
 //!   → 置かない、の順（辺に載せるボタンの長い文言→短い文言→描かない、と同じ並び）。途中で切れたボタンは描かない。
-//! - 押せる形は枠と文言をボタンの色で描き、文言を太字にする。押せない形は枠・文言・キーを暗い灰色で、太字にしない。
+//! - 見た目は上の表のとおり（普通・押されている・押せない）。
 //!
 //! # 限界
 //!
 //! - 色は呼び出し側が選ぶ。押せるかどうかは色と太字で見せる——色を持たない端末では、押せるボタンと押せない
-//!   ボタンの違いは太字だけになる。
-//! - 押したときの見た目の変化（押下中の反転など）は無い。クリックは押した瞬間に効く（`crate::pointer`）。
+//!   ボタンの違いは太字だけになる（押されている形は文字色と背景色の入れ替えなので、色を持たない端末でも見える）。
+//! - 押してから外へずらしても取り消せない（動作は押した瞬間に済んでいる）。押されている形は、離すか、ボタンを押さずに
+//!   ポインタが動くか、別の場所を押すまで残る——**離したことを報告しない端末では、ポインタが次に動くまで残る**。
+//! - 押されている形を戻すのは、呼び出し側が時間の進みを伝えたとき（[`Press::tick`]）か、離したとき（[`Press::up`]）。
+//!   最低時間が過ぎてから戻るまでは、呼び出し側が次に描くまで（会話画面で最大33ms、ポリシーエディタで最大100ms）遅れる。
 //! - 枠付きのボタンは、ボタンの数が変わると列の幅が変わり、ボタンの位置が動く（ユーザーの図では「中断」が「送信」の
 //!   右に並ぶので、出入りすると「送信」が動く）。動いた直後の押し間違いを捨てるかは呼び出し側が決める
 //!   （会話TUIの`app::pointer`）。
 
+use std::time::{Duration, Instant};
+
+use crossterm::event::{MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
@@ -76,15 +112,131 @@ use unicode_width::UnicodeWidthStr;
 /// ボタンの間の桁数（何も描かない）。
 pub const GAP: u16 = 1;
 
-/// 押せるボタン（`color`の背景に黒の太字。文言の左右に1桁ずつ余白を付ける）。
-pub fn active(label: &str, color: Color) -> Span<'static> {
-    Span::styled(
-        format!(" {label} "),
-        Style::default()
-            .fg(Color::Black)
-            .bg(color)
-            .add_modifier(Modifier::BOLD),
-    )
+/// ボタンの見た目（モジュールdocの表）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Look {
+    /// 押せる。
+    Normal,
+    /// いま押されている（[`Press`]）。
+    Pressed,
+    /// いまは押せない（薄く描く。押す場所も登録しない）。
+    Disabled,
+}
+
+impl Look {
+    /// 普通の形を`base`とした、この見た目の文字の色と修飾（押されている形は`base`の文字色と背景色を入れ替える）。
+    fn style(self, base: Style) -> Style {
+        match self {
+            Look::Normal => base,
+            Look::Pressed => base.add_modifier(Modifier::REVERSED),
+            Look::Disabled => Style::default().fg(Color::DarkGray),
+        }
+    }
+}
+
+/// 辺に載せるボタン1つ（文言の左右に1桁ずつ余白を付ける）。普通の形は`color`の背景に黒の太字（モジュールdocの表）。
+pub fn span(label: &str, color: Color, look: Look) -> Span<'static> {
+    let normal = Style::default()
+        .fg(Color::Black)
+        .bg(color)
+        .add_modifier(Modifier::BOLD);
+    Span::styled(format!(" {label} "), look.style(normal))
+}
+
+/// 押されている形を、離してからも残す長さの下限（押した瞬間から数える。モジュールdoc「押した瞬間の見た目」）。
+///
+/// 前例の無い値で、150msに決めた——素早いクリックは押してから離すまで100ms前後で、押した瞬間に動作して画面が変わる
+/// ボタンでは、離した瞬間に戻すと押した色が描かれる前に消える。会話画面は33msごと、ポリシーエディタは100msごとに描き直す
+/// ので、どちらでも少なくとも1回は押した形が描かれる長さにした（それより長いと、連打したときに前の押下の色が残って見える）。
+pub const PRESSED_AT_LEAST: Duration = Duration::from_millis(150);
+
+/// いま押されているボタン（多くても1つ）。`K`はボタンの名前で、何を同じボタンとみなすかは呼び出し側が決める
+/// （会話画面はクリックで起こす動き`Click`の値、ポリシーエディタは押すと文言の変わる「記録を開始」⇄「停止」を
+/// 1つのボタンとみなす名前）。
+///
+/// 時刻は外から渡す（`now`）。呼び出し側はイベントを受けた時刻・描き直しの合図の時刻を渡し、試験は時刻を作って渡す
+/// （実時間で待たない。ポリシーエディタの`state::is_double_esc`と同じ形）。
+#[derive(Debug, Clone)]
+pub struct Press<K> {
+    held: Option<Held<K>>,
+}
+
+#[derive(Debug, Clone)]
+struct Held<K> {
+    button: K,
+    /// 押した時刻。
+    at: Instant,
+    /// 離したか（離していなければ、最低時間が過ぎても戻さない）。
+    released: bool,
+}
+
+impl<K> Default for Press<K> {
+    fn default() -> Self {
+        Self { held: None }
+    }
+}
+
+impl<K: PartialEq> Press<K> {
+    /// `button`を押した。前に押していたボタンは離したことになる（押せるのは1つだけ）。
+    /// **呼び出し側は、押して動作が起きるときだけ呼ぶ**——押しても捨てるクリック（動いた直後のボタン・開いた直後の
+    /// ダイアログ）に押した色を付けると、何かが起きたように見える。
+    pub fn down(&mut self, button: K, now: Instant) {
+        self.held = Some(Held {
+            button,
+            at: now,
+            released: false,
+        });
+    }
+
+    /// マウスのボタンを離した。押してから[`PRESSED_AT_LEAST`]が過ぎていれば押されている形を戻して真を返す
+    /// （描き直しが要る）。過ぎていなければ離したことだけを覚え、過ぎたときに[`Self::tick`]が戻す。
+    pub fn up(&mut self, now: Instant) -> bool {
+        if let Some(held) = self.held.as_mut() {
+            held.released = true;
+        }
+        self.tick(now)
+    }
+
+    /// マウスのイベントの種類を渡す。左ボタンの押下・離上と、どのボタンも押さずに動いたことは、どれも「前に押していた
+    /// ボタンはもう離されている」ことを表すので[`Self::up`]を呼ぶ（離したことを報告しない端末でも、次に動かすか押せば
+    /// 戻る）。戻して描き直しが要るなら真。押下でボタンを押したなら、この後で[`Self::down`]を呼ぶ。
+    pub fn pointer(&mut self, kind: MouseEventKind, now: Instant) -> bool {
+        match kind {
+            MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)
+            | MouseEventKind::Moved => self.up(now),
+            _ => false,
+        }
+    }
+
+    /// 時間が進んだ。離していて、押してから[`PRESSED_AT_LEAST`]が過ぎていれば押されている形を戻して真を返す
+    /// （描き直しが要る）。
+    pub fn tick(&mut self, now: Instant) -> bool {
+        let done = self.held.as_ref().is_some_and(|held| {
+            held.released && now.saturating_duration_since(held.at) >= PRESSED_AT_LEAST
+        });
+        if done {
+            self.held = None;
+        }
+        done
+    }
+
+    /// ボタン`button`の見た目。`None`はいま押せないボタンで[`Look::Disabled`]（押されていても押されている形にしない）。
+    /// いま押されているボタンなら[`Look::Pressed`]、ほかは[`Look::Normal`]。
+    pub fn look(&self, button: Option<&K>) -> Look {
+        match button {
+            None => Look::Disabled,
+            Some(button)
+                if self
+                    .held
+                    .as_ref()
+                    .is_some_and(|held| held.button == *button) =>
+            {
+                Look::Pressed
+            }
+            Some(_) => Look::Normal,
+        }
+    }
 }
 
 /// `buttons`を[`GAP`]桁ずつ空けて並べたときの幅（ボタンが無ければ0）。
@@ -112,8 +264,9 @@ pub struct Framed<'a> {
     pub label: &'a str,
     /// 下辺の中央に添えるキー（`Alt+Enter`）。幅が足りないときは添えない（[`place_framed`]）。
     pub key: &'a str,
-    /// いま押せるか。押せないものは枠も文字も暗い灰色で描く（押す場所を登録しないのは呼び出し側）。
-    pub pressable: bool,
+    /// 見た目（[`Press::look`]で選ぶ）。押せない形（[`Look::Disabled`]）は枠も文字も暗い灰色で描く（押す場所を
+    /// 登録しないのは呼び出し側）。
+    pub look: Look,
 }
 
 /// 枠付きのボタンの高さ（上辺・文言・下辺）。
@@ -238,15 +391,15 @@ impl FramedRow<'_> {
 
 /// 枠付きのボタン1つを`rect`（高さ[`FRAMED_HEIGHT`]、幅は文言とキーが入る幅）へ描く。
 fn draw_framed(frame: &mut Frame, rect: Rect, button: &Framed, with_keys: bool, color: Color) {
-    let (border, label) = if button.pressable {
-        (
-            Style::default().fg(color),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )
-    } else {
-        let dim = Style::default().fg(Color::DarkGray);
-        (dim, dim)
+    let border = button.look.style(Style::default().fg(color));
+    let label = match button.look {
+        Look::Disabled => border,
+        _ => border.add_modifier(Modifier::BOLD),
     };
+    // 押されている形は枠の中（文言の左右の余白）まで入れ替える（ボタン全体が塗られて見える）。
+    if button.look == Look::Pressed {
+        frame.buffer_mut().set_style(rect, border);
+    }
     frame.render_widget(
         Block::default().borders(Borders::ALL).border_style(border),
         rect,
@@ -289,8 +442,8 @@ mod tests {
 
     fn long() -> Vec<Span<'static>> {
         vec![
-            active("Esc=中断", Color::Cyan),
-            active("Alt+Enter=送信", Color::Cyan),
+            span("Esc=中断", Color::Cyan, Look::Normal),
+            span("Alt+Enter=送信", Color::Cyan, Look::Normal),
         ]
     }
 
@@ -313,11 +466,11 @@ mod tests {
 
     // --- 枠付きのボタン ---
 
-    fn send(pressable: bool) -> Framed<'static> {
+    fn send(look: Look) -> Framed<'static> {
         Framed {
             label: "送信",
             key: "Alt+Enter",
-            pressable,
+            look,
         }
     }
 
@@ -325,7 +478,7 @@ mod tests {
         Framed {
             label: "中断",
             key: "Esc",
-            pressable: true,
+            look: Look::Normal,
         }
     }
 
@@ -361,7 +514,7 @@ mod tests {
     /// 期待値はユーザーが描いた図の文字そのもの（幅の計算から作らない）。
     #[test]
     fn framed_buttons_look_like_the_users_drawing() {
-        let (rest, row, drawn, buffer) = framed(&[send(true)], 60, 3, 0);
+        let (rest, row, drawn, buffer) = framed(&[send(Look::Normal)], 60, 3, 0);
         let (row, with_keys) = row.expect("置けるはず");
         assert!(with_keys);
         assert_eq!(
@@ -376,7 +529,7 @@ mod tests {
             "残りがボタンの左隣で終わっていない"
         );
 
-        let (_, row, drawn, buffer) = framed(&[send(true), cancel()], 60, 3, 0);
+        let (_, row, drawn, buffer) = framed(&[send(Look::Normal), cancel()], 60, 3, 0);
         let (row, _) = row.expect("置けるはず");
         assert_eq!(
             rows(&buffer, row),
@@ -405,7 +558,7 @@ mod tests {
     fn buttons_in_one_row_share_the_widest_width() {
         let shift = Framed {
             key: "Shift+Enter",
-            ..send(true)
+            ..send(Look::Normal)
         };
         let (_, row, drawn, buffer) = framed(&[shift, cancel()], 60, 3, 0);
         let (row, _) = row.expect("置けるはず");
@@ -421,12 +574,18 @@ mod tests {
         assert_eq!(drawn[0].width, drawn[1].width);
     }
 
-    /// 押せるボタンは枠と文言がボタンの色で、文言が太字。押せないボタンは枠・文言・キーが暗い灰色で、太字でない。
+    /// **枠付きのボタンの3つの見た目**——普通は枠と文言がボタンの色で文言が太字。押されている形は同じ色に文字色と背景色の
+    /// 入れ替え（`REVERSED`）が枠・文言・キー・**文言の左右の余白まで**付く（ボタン全体が塗られて見える）。押せない形は
+    /// 枠・文言・キーが暗い灰色で、太字も入れ替えも無い。3つとも文字と位置は同じ（見た目だけが変わる）。
     #[test]
-    fn a_framed_button_that_cannot_be_pressed_is_dim() {
-        for (pressable, color, bold) in [(true, Color::Cyan, true), (false, Color::DarkGray, false)]
-        {
-            let (_, _, drawn, buffer) = framed(&[send(pressable)], 30, 3, 0);
+    fn a_framed_button_has_three_looks() {
+        let mut texts = Vec::new();
+        for (look, color, bold, reversed) in [
+            (Look::Normal, Color::Cyan, true, false),
+            (Look::Pressed, Color::Cyan, true, true),
+            (Look::Disabled, Color::DarkGray, false, false),
+        ] {
+            let (_, row, drawn, buffer) = framed(&[send(look)], 30, 3, 0);
             let rect = drawn[0];
             let corner = &buffer[(rect.x, rect.y)];
             let label = (rect.x..rect.right())
@@ -437,24 +596,139 @@ mod tests {
                 .map(|x| &buffer[(x, rect.bottom() - 1)])
                 .find(|cell| cell.symbol() == "A")
                 .expect("キー");
+            // 文言の左の余白（枠線の右隣）。
+            let padding = &buffer[(rect.x + 1, rect.y + 1)];
+            assert_eq!(padding.symbol(), " ");
             assert_eq!(
                 (corner.fg, label.fg, key.fg),
                 (color, color, color),
-                "押せる={pressable}"
+                "{look:?}"
             );
-            assert_eq!(
-                label.modifier.contains(Modifier::BOLD),
-                bold,
-                "押せる={pressable}"
-            );
+            assert_eq!(label.modifier.contains(Modifier::BOLD), bold, "{look:?}");
+            for (what, cell) in [
+                ("枠", corner),
+                ("文言", label),
+                ("キー", key),
+                ("余白", padding),
+            ] {
+                assert_eq!(
+                    cell.modifier.contains(Modifier::REVERSED),
+                    reversed,
+                    "{look:?}: {what}"
+                );
+            }
+            texts.push(rows(&buffer, row.expect("置けるはず").0));
         }
+        assert!(texts.windows(2).all(|pair| pair[0] == pair[1]), "{texts:?}");
+    }
+
+    /// **辺に載せるボタンの3つの見た目**——普通はボタンの色の背景に黒の太字、押されている形はそれに入れ替え（`REVERSED`）、
+    /// 押せない形は暗い灰色の文字。文字と幅はどれも同じ（並べた行の幅・折り返しが見た目で変わらない）。
+    #[test]
+    fn an_edge_button_has_three_looks() {
+        let normal = span("y=書く", Color::Yellow, Look::Normal);
+        let pressed = span("y=書く", Color::Yellow, Look::Pressed);
+        let disabled = span("y=書く", Color::Yellow, Look::Disabled);
+        assert_eq!(
+            (normal.style.fg, normal.style.bg),
+            (Some(Color::Black), Some(Color::Yellow))
+        );
+        assert!(normal.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!normal.style.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(
+            pressed.style,
+            normal.style.add_modifier(Modifier::REVERSED),
+            "押されている形は普通の形の入れ替え"
+        );
+        assert_eq!(disabled.style, Style::default().fg(Color::DarkGray));
+        for button in [&normal, &pressed, &disabled] {
+            assert_eq!(button.content, " y=書く ");
+        }
+    }
+
+    // --- 押した瞬間の見た目 ---
+
+    /// **押した瞬間に押されている形になり、離していても[`PRESSED_AT_LEAST`]が過ぎるまでは戻らず、過ぎたら戻る。**
+    /// 押していないボタンは普通の形のまま、押せないボタン（`None`）は押されていても押せない形。時刻は作って渡す。
+    #[test]
+    fn a_press_shows_until_released_and_at_least_the_minimum_time() {
+        let t0 = Instant::now();
+        let mut press: Press<&str> = Press::default();
+        assert_eq!(press.look(Some(&"送信")), Look::Normal);
+        press.down("送信", t0);
+        assert_eq!(press.look(Some(&"送信")), Look::Pressed);
+        assert_eq!(
+            press.look(Some(&"中断")),
+            Look::Normal,
+            "押していないボタン"
+        );
+        assert_eq!(press.look(None), Look::Disabled, "押せないボタン");
+
+        // 最低時間の前に離した: 離したことだけ覚えて、まだ戻さない。
+        let early = t0 + PRESSED_AT_LEAST - Duration::from_millis(1);
+        assert!(!press.up(t0 + Duration::from_millis(80)));
+        assert!(!press.tick(early));
+        assert_eq!(press.look(Some(&"送信")), Look::Pressed);
+        // 過ぎたら戻る。
+        assert!(press.tick(t0 + PRESSED_AT_LEAST));
+        assert_eq!(press.look(Some(&"送信")), Look::Normal);
+        assert!(!press.tick(t0 + PRESSED_AT_LEAST), "戻した後は何も変えない");
+    }
+
+    /// **離していなければ、最低時間が過ぎても戻さない**（押している間は押されている形）。過ぎてから離すと、その場で
+    /// 戻して真を返す（描き直しが要る）。
+    #[test]
+    fn a_held_press_stays_until_it_is_released() {
+        let t0 = Instant::now();
+        let mut press: Press<&str> = Press::default();
+        press.down("記録", t0);
+        assert!(!press.tick(t0 + Duration::from_secs(5)));
+        assert_eq!(press.look(Some(&"記録")), Look::Pressed);
+        assert!(press.up(t0 + Duration::from_secs(5)));
+        assert_eq!(press.look(Some(&"記録")), Look::Normal);
+    }
+
+    /// **左ボタンを離す・ボタンを押さずに動く・別の場所を押すは、どれも離したことになる**（離したことが報告されない端末
+    /// でも戻る）。ドラッグ（押したまま動く）・右ボタン・ホイールは離したことにならない。別のボタンを押せば、押されて
+    /// いるのはそちらだけになる。
+    #[test]
+    fn the_pointer_events_that_mean_released() {
+        let t0 = Instant::now();
+        let later = t0 + PRESSED_AT_LEAST;
+        for kind in [
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+        ] {
+            let mut press: Press<&str> = Press::default();
+            press.down("送信", t0);
+            assert!(press.pointer(kind, later), "{kind:?}");
+            assert_eq!(press.look(Some(&"送信")), Look::Normal, "{kind:?}");
+        }
+        for kind in [
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::ScrollDown,
+        ] {
+            let mut press: Press<&str> = Press::default();
+            press.down("送信", t0);
+            assert!(!press.pointer(kind, later), "{kind:?}");
+            assert!(!press.tick(later), "{kind:?}: 離したことになった");
+            assert_eq!(press.look(Some(&"送信")), Look::Pressed, "{kind:?}");
+        }
+        let mut press: Press<&str> = Press::default();
+        press.down("送信", t0);
+        press.down("中断", t0 + Duration::from_millis(10));
+        assert_eq!(press.look(Some(&"送信")), Look::Normal);
+        assert_eq!(press.look(Some(&"中断")), Look::Pressed);
     }
 
     /// **狭いときは、キーを添える形 → キーを落とした短い形 → 置かない**。どの形でも左に`keep`桁が残り、ボタンは途中で
     /// 切れない。置かないときは全体を返す。
     #[test]
     fn a_narrow_area_falls_back_to_short_buttons_and_then_to_none() {
-        let buttons = [send(true), cancel()];
+        let buttons = [send(Look::Normal), cancel()];
         // キーを添える形は12桁×2、短い形は8桁×2。残す桁は10。
         for (width, want) in [
             (34u16, Some(true)),
@@ -493,7 +767,7 @@ mod tests {
     /// **高い場所では下端にそろえる**（残りは全体の高さのまま）。3行に満たない場所・ボタンが無いときは置かない。
     #[test]
     fn framed_buttons_sit_at_the_bottom_and_need_three_rows() {
-        let (rest, row, drawn, buffer) = framed(&[send(true)], 40, 7, 0);
+        let (rest, row, drawn, buffer) = framed(&[send(Look::Normal)], 40, 7, 0);
         let (row, _) = row.expect("置けるはず");
         assert_eq!((row.y, row.height), (4, 3), "下端にそろっていない");
         assert_eq!(rest.height, 7);
@@ -504,7 +778,7 @@ mod tests {
             "ボタンの上に何か描いた"
         );
 
-        let (rest, row, _, _) = framed(&[send(true)], 40, 2, 0);
+        let (rest, row, _, _) = framed(&[send(Look::Normal)], 40, 2, 0);
         assert!(row.is_none());
         assert_eq!(rest, Rect::new(0, 0, 40, 2));
         let (rest, row, _, _) = framed(&[], 40, 3, 0);

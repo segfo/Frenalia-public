@@ -10,6 +10,8 @@ mod review;
 
 pub(crate) use approval::render_permission_modal;
 
+use crossterm::event::KeyEvent;
+use harness_term::button::Press;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -60,6 +62,7 @@ pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
             f,
             f.area(),
             pending,
+            &app.press,
             &mut targets,
         ));
     } else if let Some(panel) = &app.review_panel {
@@ -110,28 +113,43 @@ const MIN_INPUT_WIDTH: u16 = harness_term::button::KEEP_TEXT_WIDTH + 2;
 
 /// キー案内の項目の見せ方。
 #[derive(Debug, Clone, Copy)]
-pub(super) enum HintLook {
+pub(super) enum HintLook<'a> {
     /// どの項目も案内の文字として描く（押せるかどうかで見た目を変えない。レビューパネルの案内。
-    /// ポリシーエディタのキー案内と同じ）。
+    /// ポリシーエディタのキー案内と同じ）。ボタンの形ではないので、押されている形も無い。
     Text(Style),
-    /// **押せる項目はボタン**（`harness_term::button::active`。ポリシーエディタの確認ダイアログのボタンと同じ部品）
+    /// **押せる項目はボタン**（`harness_term::button::span`。ポリシーエディタの確認ダイアログのボタンと同じ部品）
     /// として描く（承認ダイアログの選択肢。2026-10-03、ユーザーが実機で
     /// 括弧書きの`[y] 一度だけ許可`を押せる場所に見えないと指摘した）。押せない項目（`PageUp/PageDown スクロール`・
     /// `↑↓ 移動`）は暗い文字のまま——1つのキーに決まらない案内で、ボタンの形にすると押せそうに見える。
-    Buttons,
+    /// 押した瞬間からは押されている形で描く（`AppState::press`。`app::pointer`のモジュールdoc）。
+    Buttons(&'a Press<Click>),
+}
+
+/// キー案内の項目を押したときの動き。ボタンとして描く項目は[`Click::Button`]（その値がボタンの名前になり、押されている
+/// 形が付く）、文字のままの項目は[`Click::Key`]。**見た目を選ぶ[`hint_spans`]と登録する[`draw_hints`]が同じこれを通る**
+/// ——別々に組むと、押されている形が登録した値と違う名前に付く。
+fn hint_click(look: HintLook, key: KeyEvent) -> Click {
+    match look {
+        HintLook::Text(_) => Click::Key(key),
+        HintLook::Buttons(_) => Click::Button(key),
+    }
 }
 
 /// キー案内の項目を描く文字列（`look`の見せ方で）。**描く[`draw_hints`]と数える[`hint_rows`]が同じこれを通る**
-/// ——ボタンは文言の左右に余白を持つので、別々に組むと数えた行数と描いた行数がずれる。
+/// ——ボタンは文言の左右に余白を持つので、別々に組むと数えた行数と描いた行数がずれる（押されている形は幅を変えない）。
 fn hint_spans(hints: &[KeyHint], look: HintLook) -> Vec<Span<'static>> {
     hints
         .iter()
-        .map(|hint| match look {
-            HintLook::Text(style) => Span::styled(hint.label.clone(), style),
-            HintLook::Buttons => match hint.key {
-                Some(_) => harness_term::button::active(&hint.label, BUTTON_COLOR),
-                None => Span::styled(hint.label.clone(), Style::default().fg(Color::DarkGray)),
-            },
+        .map(|hint| match (look, hint.key) {
+            (HintLook::Text(style), _) => Span::styled(hint.label.clone(), style),
+            (HintLook::Buttons(press), Some(key)) => harness_term::button::span(
+                &hint.label,
+                BUTTON_COLOR,
+                press.look(Some(&hint_click(look, key))),
+            ),
+            (HintLook::Buttons(_), None) => {
+                Span::styled(hint.label.clone(), Style::default().fg(Color::DarkGray))
+            }
         })
         .collect()
 }
@@ -147,7 +165,7 @@ pub(super) fn draw_hints(
     targets: &mut Targets,
 ) {
     let drawn = harness_term::row::draw_wrapped(f, area, &hint_spans(hints, look), HINT_GAP);
-    register_hints(targets, hints, &drawn);
+    register_hints(targets, hints, &drawn, |key| hint_click(look, key));
 }
 
 /// [`draw_hints`]が`width`桁で何行使うか。
@@ -155,11 +173,16 @@ pub(super) fn hint_rows(hints: &[KeyHint], look: HintLook, width: u16) -> u16 {
     harness_term::row::wrapped_rows(&hint_spans(hints, look), HINT_GAP, width)
 }
 
-/// 描いた項目の矩形`drawn`（`hints`と同じ順）のうち、押せる項目をそのキーを押す場所として登録する。
-fn register_hints(targets: &mut Targets, hints: &[KeyHint], drawn: &[Rect]) {
+/// 描いた項目の矩形`drawn`（`hints`と同じ順）のうち、押せる項目を、押すと`click`（キー→動き）になる場所として登録する。
+fn register_hints(
+    targets: &mut Targets,
+    hints: &[KeyHint],
+    drawn: &[Rect],
+    click: impl Fn(KeyEvent) -> Click,
+) {
     for (hint, rect) in hints.iter().zip(drawn) {
         if let Some(key) = hint.key {
-            targets.click(*rect, Click::Key(key));
+            targets.click(*rect, click(key));
         }
     }
 }
@@ -629,20 +652,27 @@ fn render_input_row(
     drawn: &mut Vec<(&'static str, Rect)>,
 ) -> Rect {
     let buttons = app.input_buttons();
+    // 押したときの動き（押せないボタンは`None`）。**見た目を選ぶ名前と登録する値を同じこれから取る**——別々に組むと、
+    // 押されている形が登録した値と違う名前に付く（`app::pointer`のモジュールdoc）。
+    let clicks: Vec<Option<Click>> = buttons
+        .iter()
+        .map(|b| b.key.map(Click::InputButton))
+        .collect();
     let framed: Vec<harness_term::button::Framed> = buttons
         .iter()
-        .map(|b| harness_term::button::Framed {
+        .zip(&clicks)
+        .map(|(b, click)| harness_term::button::Framed {
             label: b.label,
             key: b.key_label,
-            pressable: b.key.is_some(),
+            look: app.press.look(click.as_ref()),
         })
         .collect();
     let (input, row) = harness_term::button::place_framed(area, &framed, MIN_INPUT_WIDTH);
     render_input(f, input, app, targets);
     if let Some(row) = row {
-        for (button, rect) in buttons.iter().zip(row.draw(f, BUTTON_COLOR)) {
-            if let Some(key) = button.key {
-                targets.click(rect, Click::InputButton(key));
+        for ((button, click), rect) in buttons.iter().zip(clicks).zip(row.draw(f, BUTTON_COLOR)) {
+            if let Some(click) = click {
+                targets.click(rect, click);
             }
             drawn.push((button.label, rect));
         }
@@ -679,7 +709,7 @@ fn render_input(f: &mut Frame, area: Rect, app: &AppState, targets: &mut Targets
         .into_iter()
         .map(|i| i.map_or_else(Rect::default, |i| drawn[i]))
         .collect();
-    register_hints(targets, &hints, &drawn);
+    register_hints(targets, &hints, &drawn, Click::Key);
 }
 
 /// 入力欄の見出し`input (項目, 項目, …)`を、上辺の幅`width`に収まる形で組む。戻り値は見出しのspanと、

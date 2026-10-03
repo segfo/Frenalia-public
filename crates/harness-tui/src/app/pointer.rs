@@ -58,6 +58,24 @@
 //! 開いた直後の窓（D-106。現れたものへ、別のものを狙った手の入力が流れ込む）と同じ。**キーは捨てない**——
 //! `Esc`や送信キーは押す場所を狙わないので、ボタンが動いても押し間違いにならない。
 //!
+//! # 押したボタンは、押した瞬間に色を変える
+//!
+//! 入力欄の右の「送信」「中断」と承認ダイアログの選択肢（どちらもボタンの部品`harness_term::button`で描く）は、
+//! 押した瞬間から押されている形（色の入れ替え）で描く（2026-10-03、ユーザー「クリックしたらそのクリックした瞬間に色
+//! 変えられたりします？」）。離していて、押してから`harness_term::button::PRESSED_AT_LEAST`（150ms）が過ぎたら戻す
+//! （[`AppState::tick`]か、離したとき）。動作は今までどおり押した瞬間に起きる。
+//!
+//! - **押されている形はボタンの名前に付く**——名前はクリックで起こす動き（[`Click::InputButton`]・[`Click::Button`]の値）。
+//!   「送信」を押して応答が始まると、「中断」が送信の居た右端に現れて送信は左へずれるが、押されている形は左へずれた送信に
+//!   付いて動き、右端に来た中断には付かない。
+//! - **押しても捨てるクリックには付けない**（何も起きないのに押したように見える）——ボタンが動いた直後の300ms
+//!   （下の節）と、承認ダイアログを開いた直後の300ms（D-106。`PermissionView::accepts_input`）。
+//! - **キー案内の項目（入力欄の見出し・レビューパネルの案内）には付けない**——ボタンの形ではなく案内の文字のまま描いて
+//!   いる（`crate::ui`の`HintLook::Text`）ので、押されている形が無い。押せる項目の押し方は今までどおり。
+//! - 離したこと（`Up`）とボタンを押さない移動（`Moved`）は、押されている形を戻すかもしれないので見る。それで画面が
+//!   変わるときだけ描き直し（[`Step::Handled`]）、変わらないなら今までどおり描き直さない（[`Step::Unchanged`]）。
+//!   最低時間の前に離したときは、33msごとの描画の合図（[`AppState::tick`]）が戻して描き直す。
+//!
 //! # 限界
 //!
 //! - クリックは左ボタンを押した瞬間に効く（離したときではない。`harness_term::pointer`）。
@@ -82,11 +100,14 @@ pub type Targets = harness_term::pointer::Targets<Click, Wheel>;
 /// 承認ダイアログを開いた直後の窓（D-106）と同じ長さにする。
 pub(crate) const BUTTON_SHIFT_GRACE: Duration = super::approval::MODAL_INPUT_GRACE;
 
-/// クリックで起こすこと。どれもキーの処理を呼ぶ（モジュールdoc）。
+/// クリックで起こすこと。どれもキーの処理を呼ぶ（モジュールdoc）。ボタンを押すもの（[`Self::InputButton`]・
+/// [`Self::Button`]）は、その値がボタンの名前になり、押されている形がそれに付く（`AppState::press`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Click {
-    /// キーを押す（入力欄の見出し・承認ダイアログ・レビューパネルの案内の項目）。
+    /// キーを押す（入力欄の見出し・レビューパネルの案内の項目。ボタンの形ではないので押されている形は無い）。
     Key(KeyEvent),
+    /// キーを押すボタン（承認ダイアログの選択肢）。開いた直後の窓（D-106）の間はキーと同じく捨てる。
+    Button(KeyEvent),
     /// 入力欄の右のボタン（「送信」「中断」）。キーを押すが、ボタンが動いた直後は捨てる（モジュールdoc）。
     InputButton(KeyEvent),
     /// transcriptの「さかのぼり中」の案内。末尾へ戻る。
@@ -196,7 +217,8 @@ pub struct ReviewDrawn {
 /// 端末のイベント1つを渡した結果。
 #[derive(Debug)]
 pub enum Step {
-    /// 画面に出るものは何も変わっていない（キーを離した・ポインタが動いただけ）。描き直さなくてよい。
+    /// 画面に出るものは何も変わっていない（キーを離した・ポインタが動いただけ・マウスのボタンを離したが押されている形は
+    /// まだ残る）。描き直さなくてよい。
     Unchanged,
     /// 状態へ渡した（描き直す）。呼び出し側の処理が要るときは[`Action`]が返る。
     Handled(Option<Action>),
@@ -207,8 +229,14 @@ impl AppState {
     ///
     /// キーは[`Self::on_key`]（押下だけ。Windowsのコンソールは押下と離上の両方を送るので、離上も渡すと
     /// 1文字が2回入る）、マウスは[`Self::on_mouse`]（左クリックとホイールだけ。`harness_term::pointer::acts`）。
-    /// リサイズは何もしないが描き直す（次の描画で反映される）。
+    /// マウスのボタンを離した・ボタンを押さずに動いたことは、押されている形のボタンを戻すかを見るためにだけ使う
+    /// （モジュールdoc「押したボタンは、押した瞬間に色を変える」）。リサイズは何もしないが描き直す（次の描画で反映される）。
     pub fn handle_event(&mut self, event: Event) -> Step {
+        self.handle_event_at(event, Instant::now())
+    }
+
+    /// [`Self::handle_event`]の本体。`now`はイベントを受けた時刻（押されている形の時間を数える。試験は時刻を作って渡す）。
+    pub(crate) fn handle_event_at(&mut self, event: Event, now: Instant) -> Step {
         match event {
             Event::Key(key) => {
                 // Shift+Enter等の修飾キーが端末/ConPTY越しに実際どう届いているか
@@ -222,23 +250,34 @@ impl AppState {
                 }
                 Step::Handled(self.on_key(key))
             }
-            // ポインタの移動だけのイベントは何にも当たらない（`EnableMouseCapture`は移動もすべて報告する）。
-            // 描き直すと、マウスを動かしている間ずっと描き続ける。
-            Event::Mouse(mouse) if !harness_term::pointer::acts(mouse.kind) => Step::Unchanged,
-            Event::Mouse(mouse) => Step::Handled(self.on_mouse(mouse)),
+            Event::Mouse(mouse) => {
+                // 左ボタンの押下・離上・ボタンを押さない移動は、前に押したボタンを離したことを表す（押されている形を
+                // 戻すかもしれない）。押下でボタンを押したなら、この後の`on_click`が押されている形にする。
+                let released = self.press.pointer(mouse.kind, now);
+                if harness_term::pointer::acts(mouse.kind) {
+                    return Step::Handled(self.on_mouse(mouse, now));
+                }
+                // それ以外（離上・移動・ドラッグ・右ボタン）は何にも当たらない（`EnableMouseCapture`は移動もすべて
+                // 報告する）。押されている形が戻ったときだけ描き直す——いつも描き直すと、マウスを動かしている間ずっと描き続ける。
+                if released {
+                    Step::Handled(None)
+                } else {
+                    Step::Unchanged
+                }
+            }
             _ => Step::Handled(None),
         }
     }
 
     /// マウスのイベント（左クリックとホイール）。直前に描いた画面の登録で引く。押せる場所・送れる枠の外では
-    /// **何もしない**——外した位置で別のものが動くほうが混乱する。
-    pub fn on_mouse(&mut self, event: MouseEvent) -> Option<Action> {
+    /// **何もしない**——外した位置で別のものが動くほうが混乱する。`now`は押したボタンを押されている形にした時刻。
+    pub fn on_mouse(&mut self, event: MouseEvent, now: Instant) -> Option<Action> {
         match self.pointer.resolve(&event)? {
             Pointer::Wheel { target, up } => {
                 self.on_wheel(target, up);
                 None
             }
-            Pointer::Click(click) => self.on_click(click),
+            Pointer::Click(click) => self.on_click(click, now),
         }
     }
 
@@ -264,9 +303,20 @@ impl AppState {
         }
     }
 
-    fn on_click(&mut self, click: Click) -> Option<Action> {
+    fn on_click(&mut self, click: Click, now: Instant) -> Option<Action> {
         match click {
             Click::Key(pressed) => self.on_key(pressed),
+            Click::Button(pressed) => {
+                // 開いた直後の窓（D-106）の間は、キーと同じく`on_key`が捨てる。捨てるクリックに押した色を付けない。
+                if self
+                    .pending_permission
+                    .as_ref()
+                    .is_some_and(|pending| pending.accepts_input())
+                {
+                    self.press.down(click, now);
+                }
+                self.on_key(pressed)
+            }
             Click::InputButton(_)
                 if self
                     .input_buttons_moved_at
@@ -274,7 +324,10 @@ impl AppState {
             {
                 None
             }
-            Click::InputButton(pressed) => self.on_key(pressed),
+            Click::InputButton(pressed) => {
+                self.press.down(click, now);
+                self.on_key(pressed)
+            }
             Click::ScrollToLatest => {
                 self.scroll.reset();
                 None

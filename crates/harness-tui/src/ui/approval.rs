@@ -36,13 +36,16 @@ use ratatui::Frame;
 
 use crate::app::{ApprovalStage, Click, LineStyle, PermissionView, Targets, Wheel};
 use harness_sandbox::textdiff::DiffKind;
+use harness_term::button::Press;
 
 /// 承認モーダルを描き、**この描画で判明したスクロールの上限**を返す。押せる場所と送れる枠を`targets`へ登録する
-/// （呼び出し側は、後ろの画面を先に覆っておく。`crate::ui::render`）。
+/// （呼び出し側は、後ろの画面を先に覆っておく。`crate::ui::render`）。選択肢のボタンのうち、いま押されているもの
+/// （`press`。`AppState::press`）は押されている形で描く。
 pub fn render_permission_modal(
     f: &mut Frame,
     area: Rect,
     pending: &PermissionView,
+    press: &Press<Click>,
     targets: &mut Targets,
 ) -> u16 {
     let rect = super::centered_rect(84, 70, area);
@@ -86,7 +89,7 @@ pub fn render_permission_modal(
     let hint_width = rect.width.saturating_sub(2);
     let hint_rows: u16 = groups
         .iter()
-        .map(|group| super::hint_rows(group, super::HintLook::Buttons, hint_width))
+        .map(|group| super::hint_rows(group, super::HintLook::Buttons(press), hint_width))
         .sum();
     // 本文の枠は少なくとも枠線2行＋本文1行を残す。選択肢の枠は選択肢の行＋下の枠線。
     let hint_rows = hint_rows.min(rect.height.saturating_sub(4));
@@ -135,7 +138,7 @@ pub fn render_permission_modal(
     let mut hint_inner = hint_block.inner(hint_area);
     f.render_widget(hint_block, hint_area);
     for group in &groups {
-        let rows = super::hint_rows(group, super::HintLook::Buttons, hint_inner.width)
+        let rows = super::hint_rows(group, super::HintLook::Buttons(press), hint_inner.width)
             .min(hint_inner.height);
         super::draw_hints(
             f,
@@ -144,7 +147,7 @@ pub fn render_permission_modal(
                 ..hint_inner
             },
             group,
-            super::HintLook::Buttons,
+            super::HintLook::Buttons(press),
             targets,
         );
         hint_inner.y += rows;
@@ -194,7 +197,13 @@ mod tests {
     fn rendered(pending: &PermissionView) -> String {
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         term.draw(|f| {
-            super::render_permission_modal(f, f.area(), pending, &mut Default::default());
+            super::render_permission_modal(
+                f,
+                f.area(),
+                pending,
+                &Default::default(),
+                &mut Default::default(),
+            );
         })
         .unwrap();
         let buffer = term.backend().buffer().clone();
@@ -231,7 +240,13 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let mut ceiling = 0;
         term.draw(|f| {
-            ceiling = super::render_permission_modal(f, f.area(), &pending, &mut Default::default())
+            ceiling = super::render_permission_modal(
+                f,
+                f.area(),
+                &pending,
+                &Default::default(),
+                &mut Default::default(),
+            )
         })
         .unwrap();
         assert!(
@@ -253,7 +268,13 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(70, 24)).unwrap();
         let pending = view(&["status"]);
         term.draw(|f| {
-            super::render_permission_modal(f, f.area(), &pending, &mut Default::default());
+            super::render_permission_modal(
+                f,
+                f.area(),
+                &pending,
+                &Default::default(),
+                &mut Default::default(),
+            );
         })
         .unwrap();
         let buffer = term.backend().buffer().clone();

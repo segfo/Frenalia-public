@@ -237,6 +237,10 @@ pub struct AppState {
     /// 入力欄の右のボタンが、別のボタンの居た場所へ最後に動いた時刻。そこから`pointer::BUTTON_SHIFT_GRACE`の間は
     /// そのボタンのクリックを捨てる。
     input_buttons_moved_at: Option<Instant>,
+    /// いま押されている形で描くボタン（入力欄の右の「送信」「中断」・承認ダイアログの選択肢。名前はクリックで起こす
+    /// 動き[`Click`]の値）。押した瞬間に入り（`app::pointer`）、離していて最低時間が過ぎたら[`Self::tick`]が戻す
+    /// （`harness_term::button::Press`）。
+    pub(crate) press: harness_term::button::Press<Click>,
 }
 
 // スクロール量（`PageUp`/`PageDown`とホイール1ノッチの行数）は
@@ -283,6 +287,7 @@ impl AppState {
             pointer: Targets::default(),
             input_buttons_drawn: Vec::new(),
             input_buttons_moved_at: None,
+            press: Default::default(),
         }
     }
 
@@ -328,9 +333,16 @@ impl AppState {
         )));
     }
 
-    /// 描画tick（33ms間隔）ごとに呼ぶ。スピナーのフレームを送るだけ。
+    /// 描画tick（33ms間隔）ごとに呼ぶ。スピナーのフレームを送り、押されている形のボタンを、離していて最低時間が
+    /// 過ぎていれば戻す（`harness_term::button::Press::tick`。呼び出し側はこの後で必ず描き直す）。
     pub fn tick(&mut self) {
+        self.tick_at(Instant::now());
+    }
+
+    /// [`Self::tick`]の本体。`now`は合図を受けた時刻（試験は時刻を作って渡す。実時間で待たない）。
+    pub(crate) fn tick_at(&mut self, now: Instant) {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        self.press.tick(now);
     }
 
     /// ターン以外のバックグラウンド処理（`/compact`の要約など）を**キューへ入れた**ことを

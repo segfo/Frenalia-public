@@ -724,6 +724,8 @@ pub struct App {
     pub panels: crate::tui::scroll::PanelScroll,
     /// 直前に描いた画面の、押せる場所とホイールで送れる枠（`tui::pointer`）。描くたびに入れ替わる。
     pub pointer: crate::tui::pointer::Targets,
+    /// いま押されている形で描くボタン（`tui::pointer`の「押したボタンは、押した瞬間に色を変える」）。
+    pub press: harness_term::button::Press<crate::tui::pointer::ButtonId>,
 
     // 記録画面
     pub pass: Pass,
@@ -892,6 +894,7 @@ impl App {
             modal_scroll: 0,
             panels: Default::default(),
             pointer: Default::default(),
+            press: Default::default(),
             pass: Pass::One,
             net_mode: NetMode::RecordAll,
             command: TextInput::default(),

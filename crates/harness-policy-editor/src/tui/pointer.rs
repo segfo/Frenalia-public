@@ -17,7 +17,7 @@
 //! クリック用の処理は書かない（同じ操作を2か所に持つと、片方だけ直る）。[`Click`]はどれも、
 //! 次のどちらかで終わる。
 //!
-//! - **キーを押す**（`App::on_key`）——キー案内の項目・記録の枠のボタン（記録の開始・停止）・確認ダイアログのボタン・`[x]`（`Space`）・
+//! - **キーを押す**（`App::on_key`）——キー案内の項目・記録の枠のボタン（記録の開始・停止。[`Click::Button`]）・確認ダイアログのボタン・`[x]`（`Space`）・
 //!   `▾`/`▸`（`←`/`→`）・入力欄（`Tab`で入るのと同じ）・一番上のタブ（`F1`〜`F3`）。
 //! - **キーが呼ぶのと同じ関数を、行の差だけ動かして呼ぶ**——一覧の行を選ぶとき。`↓`をN回押す形にしないのは、
 //!   記録セッションの一覧では選択が動くたびにその記録を開き直す（`move_selection`）ので、途中の記録を全部
@@ -47,11 +47,29 @@
 //! 名前に`a`が入るのは押した意図と違うので、**文字キーを押す項目は、先に欄から出る**（`Enter`。
 //! 欄から一覧へ戻る既存のキー）。一覧の行を押したときも同じく欄から出る。
 //!
+//! # 押したボタンは、押した瞬間に色を変える
+//!
+//! 「記録」の枠の右のボタンと確認ダイアログのボタン（どちらもボタンの部品`harness_term::button`で描く）は、押した瞬間から
+//! 押されている形（色の入れ替え）で描く（2026-10-03、ユーザー「クリックしたらそのクリックした瞬間に色変えられたりします？」。
+//! 会話画面の「送信」「中断」・承認ダイアログの選択肢と同じ部品・同じ規則）。離していて、押してから
+//! `harness_term::button::PRESSED_AT_LEAST`（150ms）が過ぎたら戻す。動作は今までどおり押した瞬間に起きる。
+//!
+//! - 押されている形は**ボタンの名前**（[`ButtonId`]）に付く。「記録を開始」を押すと同じ場所が「停止を予約」に変わるが、
+//!   同じボタンなので押されている形のまま描く。確認ダイアログのボタンは押すとダイアログが閉じるので、閉じたこと自体が
+//!   押した反応になる（閉じた後ろに見える「記録を開始」は、同じキー`Enter`を押すボタンでも名前が違うので押されている形に
+//!   ならない）。
+//! - 時間で戻すのはイベントループ（`tui::run`）が1周ごとに呼ぶ`tui::tick`。ループはイベントを待つ間も100msごとに
+//!   1周して描き直すので、戻すための描き直しの仕組みを新しく足していない。
+//! - **キー案内の項目・タブ・一覧の行には付けない**——キー案内は案内の文字のまま描いている（ボタンの形ではない）。
+//!   タブは押すと選ばれた見た目が残る部品（`harness_term::tab`）なので、それが押した反応になる。
+//!
 //! # 限界
 //!
 //! - クリックは左ボタンを押した瞬間に効く（離したときではない）。押してから外へずらして取り消すことはできない。
 //! - 入力欄を押しても、押した桁へカーソルは移らない（`Tab`で入ったときと同じく、カーソルはそのまま）。
 //! - キーボードの`Esc`の後にクリックを挟むと、`Esc`の二度押し（終了）の続きは切れる（キーと同じ規則）。
+
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use harness_term::pointer::Pointer;
@@ -85,10 +103,24 @@ pub enum Click {
     },
     /// 入力欄（`Tab`で入るのと同じ状態にする）。
     Field(Field),
-    /// キーを順に押す（キー案内の項目・記録の枠のボタン・確認ダイアログのボタン）。
+    /// キーを順に押す（キー案内の項目。案内の文字のまま描いているので、押されている形は無い）。
     Keys(Vec<KeyEvent>),
+    /// ボタン（記録の枠のボタン・確認ダイアログのボタン）。`key`を押し（[`Self::Keys`]と同じ処理）、押した瞬間から
+    /// そのボタンを押されている形で描く（`App::press`。モジュールdoc「押したボタンは、押した瞬間に色を変える」）。
+    Button { id: ButtonId, key: KeyEvent },
     /// ヘルプを閉じる（何でもないキーを押す）。
     CloseHelp,
+}
+
+/// ボタンの名前（押されている形をどのボタンに付けるか。`harness_term::button::Press`）。**押した結果、同じ場所で文言が
+/// 変わるボタンは同じ名前**にする——「記録」の枠の右のボタンは「記録を開始」を押すと「停止を予約」「停止」に変わるが、
+/// 押した手が見ているのは同じボタンで、文言が変わった瞬間に押した色が消えると、押した色が一度も見えない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonId {
+    /// 「記録」の枠の右のボタン（「記録を開始」⇄「停止を予約」「停止」。いつも1つ——`key_hints::record_buttons`）。
+    Record,
+    /// 確認ダイアログの下辺のボタン（文言で見分ける。押すとダイアログが閉じるものは、閉じたこと自体が押した反応になる）。
+    Modal(&'static str),
 }
 
 /// 押せる行を持つ一覧。
@@ -176,26 +208,30 @@ pub(crate) fn register_rows(
 impl App {
     /// マウスのイベント（左クリックとホイール）。直前に描いた画面の登録（`self.pointer`）で引く。
     /// 押せる場所・送れる枠の外では**何もしない**——外した位置で別のものが動くほうが混乱する。
-    pub fn on_mouse(&mut self, event: MouseEvent) -> Option<Action> {
+    ///
+    /// 左ボタンの押下・離上とボタンを押さない移動は、前に押したボタンを離したことを表すので、まず押されている形を
+    /// 戻すかを見る（`harness_term::button::Press::pointer`）。`now`はイベントを受けた時刻。
+    pub fn on_mouse(&mut self, event: MouseEvent, now: Instant) -> Option<Action> {
+        self.press.pointer(event.kind, now);
         match self.pointer.resolve(&event)? {
             Pointer::Wheel { target, up } => {
                 self.on_wheel(target, up);
                 None
             }
-            Pointer::Click(click) => self.on_click(click),
+            Pointer::Click(click) => self.on_click(click, now),
         }
     }
 
-    fn on_click(&mut self, click: Click) -> Option<Action> {
+    fn on_click(&mut self, click: Click, now: Instant) -> Option<Action> {
         // クリックは`Esc`ではない。`Esc`の二度押し（終了）の途中に挟まったら続きを切る
         // （`on_key`が`Esc`以外のキーで切るのと同じ規則。キーを押すクリックは`on_key`がもう一度判定する）。
         self.last_esc = None;
         match click {
-            Click::Keys(keys) => {
-                if keys.iter().any(types_text) {
-                    self.leave_text_field();
-                }
-                self.press_all(&keys)
+            Click::Keys(keys) => self.press_keys(&keys),
+            // このエディタには押しても捨てるクリックが無いので、押したボタンはいつも押されている形にする。
+            Click::Button { id, key } => {
+                self.press.down(id, now);
+                self.press_keys(&[key])
             }
             Click::Screen(screen) => {
                 if self.screen == screen {
@@ -232,6 +268,14 @@ impl App {
             // ヘルプは「何かキーを押すと閉じる」（`on_key`）。閉じ方を2か所に持たないよう、何でもないキーを押す。
             Click::CloseHelp => self.on_key(key(KeyCode::Null)),
         }
+    }
+
+    /// キー案内の項目・ボタンが押すキーを押す。文字キーを押すなら先に入力欄から出る（モジュールdoc）。
+    fn press_keys(&mut self, keys: &[KeyEvent]) -> Option<Action> {
+        if keys.iter().any(types_text) {
+            self.leave_text_field();
+        }
+        self.press_all(keys)
     }
 
     /// キーを順に押す。途中で操作（記録の開始・終了）が返ったら、そこで止めて返す。

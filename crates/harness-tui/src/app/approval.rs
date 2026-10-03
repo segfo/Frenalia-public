@@ -253,10 +253,16 @@ impl PermissionView {
             .is_some_and(|p| p.iter().any(|c| c.text.is_ok()))
     }
 
+    /// いまキー（とキーを押すクリック）を受けるか。開いてから[`MODAL_INPUT_GRACE`]の間は受けない（D-106: モーダルを
+    /// 出した直後の打鍵は、次の依頼を打っていた手が流れ込んだものかもしれない）。**キーを捨てる判定と、ボタンに押した
+    /// 色を付けるかの判定（`app::pointer`）が同じこれを通る**——押しても捨てるボタンに押した色を付けない。
+    pub fn accepts_input(&self) -> bool {
+        self.opened_at.elapsed() >= MODAL_INPUT_GRACE
+    }
+
     /// キー入力。返した`Some`が応答で、`None`は「この画面の中で処理した」。
     pub fn on_key(&mut self, key: KeyEvent) -> Option<ApprovalCommand> {
-        // D-106: モーダルを出した直後の打鍵は、次の依頼を打っていた手が流れ込んだものかもしれない。
-        if self.opened_at.elapsed() < MODAL_INPUT_GRACE {
+        if !self.accepts_input() {
             return None;
         }
         match self.stage {

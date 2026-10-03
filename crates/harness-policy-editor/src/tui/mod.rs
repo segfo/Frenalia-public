@@ -215,6 +215,9 @@ pub fn run(
         if app.should_exit() {
             break;
         }
+        // 押されている形のボタンを、離していて最低時間が過ぎていれば戻す（直後に描き直す）。イベントを待つのは
+        // 最長`TICK`なので、待っている間もこのループは100msごとに回る——時間で描き直す仕組みを別に足さない。
+        tick(&mut app, std::time::Instant::now());
         // **描画で判明した上限を状態へ戻す。** これを怠ると、先頭まで遡った後も
         // 回した分だけ内部の値が伸び続け、下へ戻すときに同じ回数だけ空回りする（BUG-076）。
         term.draw(|frame| feedback = draw(frame, &app))?;
@@ -267,15 +270,31 @@ pub fn run(
 
 /// イベント1つを状態へ渡す。**イベントループ（[`run`]）と試験が同じこれを通る**（製品の入口）。
 ///
-/// キーは`App::on_key`、マウスは`App::on_mouse`（クリックとホイール。当たり判定は直前に描いた画面の登録）。
+/// キーは`App::on_key`、マウスは`App::on_mouse`（クリックとホイール。当たり判定は直前に描いた画面の登録。マウスの
+/// ボタンを離したことは、押されている形のボタンを戻すかを見るためにだけ使う）。
 /// クリックで起きる操作（記録の開始・終了）もキーと同じ[`Action`]で返る。リサイズ・貼り付けは何もしない
 /// （リサイズは次の描画で反映される）。
 pub(crate) fn handle_event(app: &mut App, event: Event) -> Option<Action> {
+    handle_event_at(app, event, std::time::Instant::now())
+}
+
+/// [`handle_event`]の本体。`now`はイベントを受けた時刻（押されている形の時間を数える。試験は時刻を作って渡す）。
+pub(crate) fn handle_event_at(
+    app: &mut App,
+    event: Event,
+    now: std::time::Instant,
+) -> Option<Action> {
     match event {
         Event::Key(key) => app.on_key(key),
-        Event::Mouse(mouse) => app.on_mouse(mouse),
+        Event::Mouse(mouse) => app.on_mouse(mouse, now),
         _ => None,
     }
+}
+
+/// 時間が進んだ（イベントループ[`run`]が1周ごとに、描く直前に呼ぶ）。押されている形のボタンを、離していて
+/// 最低時間（`harness_term::button::PRESSED_AT_LEAST`）が過ぎていれば戻す。`now`は試験が作って渡せる。
+pub(crate) fn tick(app: &mut App, now: std::time::Instant) {
+    app.press.tick(now);
 }
 
 /// 画面全体の縦割り（タブ1行・本体・知らせ・キー案内1行）。
@@ -350,6 +369,7 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
             area,
             modal,
             app.modal_scroll,
+            &app.press,
             &mut feedback.targets,
         ));
     }
@@ -652,6 +672,7 @@ fn draw_modal(
     area: Rect,
     modal: &state::Modal,
     scroll: u16,
+    press: &harness_term::button::Press<pointer::ButtonId>,
     targets: &mut Targets,
 ) -> u16 {
     let written = modal
@@ -689,9 +710,16 @@ fn draw_modal(
     } else {
         Color::Red
     };
+    // 押されている形はボタンの文言を名前にして付ける（`pointer::ButtonId::Modal`）。
     let spans: Vec<Span> = buttons
         .iter()
-        .map(|(label, _)| harness_term::button::active(label, color))
+        .map(|(label, _)| {
+            harness_term::button::span(
+                label,
+                color,
+                press.look(Some(&pointer::ButtonId::Modal(label))),
+            )
+        })
         .collect();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -710,8 +738,14 @@ fn draw_modal(
         },
         &spans,
     );
-    for ((_, code), rect) in buttons.iter().zip(drawn.buttons) {
-        targets.click(rect, Click::Keys(vec![pointer::key(*code)]));
+    for ((label, code), rect) in buttons.iter().zip(drawn.buttons) {
+        targets.click(
+            rect,
+            Click::Button {
+                id: pointer::ButtonId::Modal(label),
+                key: pointer::key(*code),
+            },
+        );
     }
     drawn.max_top
 }

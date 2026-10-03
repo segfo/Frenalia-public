@@ -96,7 +96,7 @@ pub fn draw<'a>(
     draw_with_buttons(frame, area, text, block, top, look, &[]).max_top
 }
 
-/// [`draw`]に加えて、下辺の左に`buttons`（[`crate::button::active`]で作ったもの）を間を空けて描き、
+/// [`draw`]に加えて、下辺の左に`buttons`（[`crate::button::span`]で作ったもの）を間を空けて描き、
 /// それぞれが描かれた矩形を返す（モジュールdoc）。本文の各行が描かれた矩形も返す（[`Drawn::lines`]）。
 pub fn draw_with_buttons<'a>(
     frame: &mut Frame,
@@ -360,8 +360,16 @@ mod tests {
 
     fn buttons() -> Vec<Span<'static>> {
         vec![
-            crate::button::active("y=書く", ratatui::style::Color::Yellow),
-            crate::button::active("n / Esc=やめる", ratatui::style::Color::Yellow),
+            crate::button::span(
+                "y=書く",
+                ratatui::style::Color::Yellow,
+                crate::button::Look::Normal,
+            ),
+            crate::button::span(
+                "n / Esc=やめる",
+                ratatui::style::Color::Yellow,
+                crate::button::Look::Normal,
+            ),
         ]
     }
 

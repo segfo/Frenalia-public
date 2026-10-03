@@ -1251,6 +1251,224 @@ fn the_confirmation_buttons_do_what_their_keys_do() {
 }
 
 // ---------------------------------------------------------------------------
+// 押した瞬間の見た目（ボタンだけ）
+// ---------------------------------------------------------------------------
+
+/// 製品と同じ形で1フレーム描き（描いて分かったことを状態へ書き戻す）、セルの文字と見た目の格子を返す。
+fn frame_with_looks(app: &mut App) -> (Vec<Vec<String>>, Vec<Vec<ratatui::style::Style>>) {
+    let mut terminal = Terminal::new(TestBackend::new(SIZE.0, SIZE.1)).expect("test terminal");
+    let mut feedback = DrawFeedback::default();
+    terminal
+        .draw(|f| feedback = draw(f, app))
+        .expect("描画は落ちてはいけない");
+    app.apply_draw_feedback(feedback);
+    let buffer = terminal.backend().buffer();
+    (
+        (0..SIZE.1)
+            .map(|y| {
+                (0..SIZE.0)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect(),
+        (0..SIZE.1)
+            .map(|y| (0..SIZE.0).map(|x| buffer[(x, y)].style()).collect())
+            .collect(),
+    )
+}
+
+/// 押されている形（`harness_term::button`の押されている見た目＝文字色と背景色の入れ替え）か。
+fn is_pressed(look: ratatui::style::Style) -> bool {
+    look.add_modifier
+        .contains(ratatui::style::Modifier::REVERSED)
+}
+
+/// `inside`の外にある、押されている形のセルの数（`inside`を空にすれば画面全体）。
+fn pressed_cells_outside(looks: &[Vec<ratatui::style::Style>], inside: Rect) -> usize {
+    let mut count = 0;
+    for (y, row) in looks.iter().enumerate() {
+        for (x, look) in row.iter().enumerate() {
+            let at = ratatui::layout::Position::new(x as u16, y as u16);
+            if is_pressed(*look) && !inside.contains(at) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// マウスのイベントを、製品の入口（`handle_event`の本体）へ時刻`now`で入れる。
+fn mouse_at(
+    app: &mut App,
+    kind: MouseEventKind,
+    (column, row): (u16, u16),
+    now: std::time::Instant,
+) -> Option<Action> {
+    handle_event_at(
+        app,
+        crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+        now,
+    )
+}
+
+/// **「記録を開始」を押した瞬間に記録が始まり（動作は押した瞬間）、同じ場所に変わった「停止を予約」は押されている形**
+/// （枠・文言・文言の左の余白まで色が入れ替わる）——押すと文言が変わるが同じボタン（`ButtonId::Record`）。ボタンの外
+/// （タブ・キー案内・ほかの枠）は変わらない。最低時間（150ms）の前に離しても押されている形のままで、最低時間が過ぎた
+/// 周回（`tui::tick`）で戻る。押す位置は描いたセルから取り、時刻は作って渡す（実時間で待たない）。
+#[test]
+fn a_pressed_record_button_is_reversed_until_released_and_the_minimum_time_passes() {
+    let at_least = harness_term::button::PRESSED_AT_LEAST;
+    let ws = workspace();
+    let mut app = record_screen_with_command(ws.path());
+    let (grid, looks) = frame_with_looks(&mut app);
+    let start = record_button(&grid, "記録を開始");
+    assert_eq!(
+        pressed_cells_outside(&looks, Rect::default()),
+        0,
+        "押す前から押されている形がある"
+    );
+    let at = cell_of(&grid, Some(right_of_record_box(&grid)), "記録を開始", None);
+
+    let t0 = std::time::Instant::now();
+    let action = mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), at, t0);
+    assert_eq!(
+        action_kind(&action),
+        "パス1を開始",
+        "押した瞬間に始まっていない"
+    );
+    let pressed_look = |app: &mut App| {
+        let (grid, looks) = frame_with_looks(app);
+        let button = record_button(&grid, "停止を予約");
+        let label = cell_of(&grid, Some(button), "停止を予約", None);
+        let cells = [(button.x, button.y), label, (button.x + 1, button.y + 1)]
+            .map(|(x, y)| is_pressed(looks[usize::from(y)][usize::from(x)]));
+        assert!(
+            cells.iter().all(|p| *p == cells[0]),
+            "一部だけが押されている形: {cells:?}"
+        );
+        (button, cells[0], pressed_cells_outside(&looks, button))
+    };
+    let (stop, pressed, outside) = pressed_look(&mut app);
+    assert_eq!(stop, start, "試験の前提: 同じ場所に変わっていない");
+    assert!(pressed, "押した直後のボタンが押されている形でない");
+    assert_eq!(outside, 0, "ボタンの外に押されている形がある");
+
+    // 最低時間の前に離す: まだ押されている形。
+    assert!(mouse_at(
+        &mut app,
+        MouseEventKind::Up(MouseButton::Left),
+        at,
+        t0 + std::time::Duration::from_millis(60)
+    )
+    .is_none());
+    tick(
+        &mut app,
+        t0 + at_least - std::time::Duration::from_millis(1),
+    );
+    assert!(pressed_look(&mut app).1, "最低時間の前に戻った");
+    tick(&mut app, t0 + at_least);
+    let (_, pressed, outside) = pressed_look(&mut app);
+    assert!(!pressed, "最低時間が過ぎても戻らない");
+    assert_eq!(outside, 0);
+}
+
+/// **確認ダイアログのボタンを押すと（押した瞬間に）ダイアログが閉じ、閉じた後ろに見える「記録を開始」は押されている形に
+/// ならない**——どちらも同じキー（`Enter`）を押すボタンだが、押されている形を付ける名前（`ButtonId`）が違う。
+#[test]
+fn closing_a_dialog_by_its_button_does_not_press_the_button_behind_it() {
+    let ws = workspace();
+    let mut app = record_screen_with_content(ws.path());
+    app.modal = Some(state::Modal {
+        title: "報告".to_string(),
+        lines: vec!["読むだけ".to_string()],
+        confirm: Confirm::ReadOnly,
+    });
+    let (grid, _) = frame_with_looks(&mut app);
+    let area = modal_box(&grid, &app);
+    let bottom = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+    let at = cell_of(&grid, Some(bottom), "Enter / Esc=閉じる", None);
+    mouse_at(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        at,
+        std::time::Instant::now(),
+    );
+    assert!(app.modal.is_none(), "押した瞬間に閉じていない");
+    let (grid, looks) = frame_with_looks(&mut app);
+    record_button(&grid, "記録を開始");
+    assert_eq!(
+        pressed_cells_outside(&looks, Rect::default()),
+        0,
+        "後ろの「記録を開始」に押されている形が付いた"
+    );
+}
+
+/// 描いた画面の、セルごとの「押されている形か」（一覧の選択の強調など、画面がもともと持つ入れ替えも含む）。
+fn pressed_map(looks: &[Vec<ratatui::style::Style>]) -> Vec<Vec<bool>> {
+    looks
+        .iter()
+        .map(|row| row.iter().map(|look| is_pressed(*look)).collect())
+        .collect()
+}
+
+/// **ボタンの形ではない押せる項目（タブ・キー案内の項目）には押されている形を付けない**——タブは選ばれた見た目が残ること
+/// 自体が押した反応（`harness_term::tab`）、キー案内は案内の文字のまま描いている。押した画面と、同じ操作をキーで行った
+/// 画面で、色の入れ替わったセルが1つも違わないことを見る（承認待ちの画面は一覧の選択の強調にもともと入れ替えを使うので、
+/// 数ではなくキーで行った画面と比べる）。押せば今までどおり、そのタブを選び・そのキーを押す。
+#[test]
+fn tabs_and_key_hints_get_no_pressed_look() {
+    let (ws_click, ws_keys) = (workspace(), workspace());
+    let mut clicked = record_screen_with_content(ws_click.path());
+    let mut keyed = record_screen_with_content(ws_keys.path());
+    let (grid, _) = frame_with_looks(&mut clicked);
+    let t0 = std::time::Instant::now();
+    mouse_at(
+        &mut clicked,
+        MouseEventKind::Down(MouseButton::Left),
+        cell_of(&grid, Some(top_row()), " F2 承認待ち ", None),
+        t0,
+    );
+    press(&mut keyed, KeyCode::F(2));
+    assert_eq!(
+        clicked.screen,
+        Screen::Edit,
+        "試験の前提: タブが押せていない"
+    );
+    let (grid, clicked_looks) = frame_with_looks(&mut clicked);
+    let (_, keyed_looks) = frame_with_looks(&mut keyed);
+    assert_eq!(
+        pressed_map(&clicked_looks),
+        pressed_map(&keyed_looks),
+        "タブに押されている形が付いた"
+    );
+
+    let tree = clicked.show_tree;
+    mouse_at(
+        &mut clicked,
+        MouseEventKind::Down(MouseButton::Left),
+        cell_of(&grid, Some(key_row(&grid)), "t プロセスツリー", None),
+        t0,
+    );
+    press(&mut keyed, KeyCode::Char('t'));
+    assert_ne!(
+        clicked.show_tree, tree,
+        "試験の前提: キー案内が押せていない"
+    );
+    let (_, clicked_looks) = frame_with_looks(&mut clicked);
+    let (_, keyed_looks) = frame_with_looks(&mut keyed);
+    assert_eq!(
+        pressed_map(&clicked_looks),
+        pressed_map(&keyed_looks),
+        "キー案内に押されている形が付いた"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 許可側: 押せない場所・重ねた枠の後ろ・左クリック以外
 // ---------------------------------------------------------------------------
 

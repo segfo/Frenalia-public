@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::tui::pointer::{Click, Field, Targets};
+use crate::tui::pointer::{ButtonId, Click, Field, Targets};
 use crate::tui::scroll::{Panel, PanelLimits, PanelScroll, Wheel};
 use crate::tui::state::{
     format_elapsed, progress_bar, spinner_frame, App, Pass, RecordField, RunState,
@@ -157,21 +157,28 @@ const FORM_MIN_WIDTH: u16 = LABEL_WIDTH + harness_term::button::KEEP_TEXT_WIDTH 
 /// 「中断」と同じ部品・同じ置き方（`harness_term::button::place_framed`）——枠の下端にそろえ、下辺にキーを添え、
 /// 狭ければキーを落とした短い形、それも入らなければ置かない（枠が幅いっぱい。キーは今までどおり効く）。
 /// 枠の中の右下に置かないのは、記録中の段階の1行（スピナー・経過・ゲージ・観測件数）が右へ長く伸びて重なるため。
-/// 押すとそのキーを押したのと同じ。
+/// 押すとそのキーを押したのと同じで、押した瞬間から押されている形で描く（`tui::pointer`のモジュールdoc）。
 fn draw_form(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
     let buttons = super::key_hints::record_buttons(app);
+    // 押されている形は「記録」の枠の右のボタンという名前に付く（押すと文言が変わっても同じボタン。`ButtonId::Record`）。
     let framed: Vec<harness_term::button::Framed> = buttons
         .iter()
         .map(|button| harness_term::button::Framed {
             label: button.label,
             key: button.key_label,
-            pressable: true,
+            look: app.press.look(Some(&ButtonId::Record)),
         })
         .collect();
     let (area, row) = harness_term::button::place_framed(area, &framed, FORM_MIN_WIDTH);
     if let Some(row) = row {
         for (button, rect) in buttons.iter().zip(row.draw(frame, Color::Cyan)) {
-            targets.click(rect, Click::Keys(vec![button.key]));
+            targets.click(
+                rect,
+                Click::Button {
+                    id: ButtonId::Record,
+                    key: button.key,
+                },
+            );
         }
     }
     let block = Block::default().borders(Borders::ALL).title(" 記録 ");

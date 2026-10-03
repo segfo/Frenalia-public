@@ -617,6 +617,21 @@ fn settle(app: &mut AppState) {
     app.input_buttons_moved_at = None;
 }
 
+/// マウスのボタンを離し、押されている形の最低時間が過ぎた時刻で渡す（押した見た目が戻る）。押した直後の見た目と
+/// 比べたくない試験が、人が画面を見比べるときと同じ状態へ戻すのに使う。
+fn release(app: &mut AppState) {
+    let later = Instant::now() + harness_term::button::PRESSED_AT_LEAST;
+    app.handle_event_at(
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }),
+        later,
+    );
+}
+
 /// 入力の状態（送った後に何が残るか）。
 fn input_state(app: &AppState) -> String {
     format!(
@@ -850,7 +865,8 @@ fn the_send_button_stays_pressable_and_explains_when_the_input_is_blank() {
     assert!(click(&mut app, screen.find_last("送信")).is_none());
     assert_eq!(empty_notices(&app), 1, "キーとボタンで知らせが2行になった");
 
-    // 対: 打てば同じ場所・同じ見た目のボタンが送る。
+    // 対: 打てば同じ場所・同じ見た目のボタンが送る（押した直後の押されている形は、離して戻してから見比べる）。
+    release(&mut app);
     type_text(&mut app, "hi");
     let screen = draw(&mut app);
     let at = screen.find_last("送信");
@@ -1113,6 +1129,268 @@ fn a_narrow_terminal_never_overlaps_or_cuts_the_input_and_its_buttons() {
             "{width}桁: 送信が押せない"
         );
     }
+}
+
+// --- 押した瞬間の見た目 ---
+
+/// 押されている形（`harness_term::button`の押されている見た目＝文字色と背景色の入れ替え）か。
+fn is_pressed(look: Style) -> bool {
+    look.add_modifier.contains(Modifier::REVERSED)
+}
+
+/// 枠付きのボタン`label`が押されている形か。枠の角・文言の頭・文言の左の余白（枠線の右隣）の3つを見て、そろって
+/// いなければ落ちる（一部だけ入れ替わった形を見逃さない）。
+fn framed_is_pressed(screen: &Screen, label: &str) -> bool {
+    let frame = framed_button(screen, label);
+    let looks = [
+        screen.style((frame.x, frame.y)),
+        screen.style(screen.find_last(label)),
+        screen.style((frame.x + 1, frame.y + 1)),
+    ];
+    let pressed = looks.map(is_pressed);
+    assert!(
+        pressed.iter().all(|p| *p == pressed[0]),
+        "「{label}」の一部だけが押されている形: {looks:?}"
+    );
+    pressed[0]
+}
+
+/// `inside`の外にある、押されている形のセルの数（`inside`を空にすれば画面全体）。
+fn pressed_cells_outside(screen: &Screen, inside: Rect) -> usize {
+    let mut count = 0;
+    for (y, row) in screen.1.iter().enumerate() {
+        for (x, look) in row.iter().enumerate() {
+            let at = ratatui::layout::Position::new(x as u16, y as u16);
+            if is_pressed(*look) && !inside.contains(at) {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// マウスのイベントを、製品の入口（`handle_event`の本体）へ時刻`now`で入れる。
+fn mouse_at(
+    app: &mut AppState,
+    kind: MouseEventKind,
+    (column, row): (u16, u16),
+    now: Instant,
+) -> Step {
+    app.handle_event_at(
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+        now,
+    )
+}
+
+/// **「送信」を押した瞬間に送り（動作は押した瞬間）、その次の描画から「送信」は押されている形**（枠・文言・文言の左右の
+/// 余白まで色が入れ替わる）。押していない「中断」と、ボタンの外は変わらない。最低時間（150ms）の前に離しても押されている
+/// 形のまま（画面は変わらないので描き直さない）で、最低時間が過ぎた描画の合図で戻る。押したまま最低時間が過ぎても戻らず、
+/// その後で離すとその場で戻して描き直す。押す位置は描いたセルから取り、時刻は作って渡す（実時間で待たない）。
+#[test]
+fn a_pressed_input_button_is_reversed_until_released_and_the_minimum_time_passes() {
+    let at_least = harness_term::button::PRESSED_AT_LEAST;
+    let mut app = running_app();
+    type_text(&mut app, "hi");
+    let screen = draw(&mut app);
+    assert!(!framed_is_pressed(&screen, "送信"));
+    assert_eq!(
+        pressed_cells_outside(&screen, Rect::default()),
+        0,
+        "押す前から押されている形がある"
+    );
+    let at = screen.find_last("送信");
+
+    let t0 = Instant::now();
+    let step = mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), at, t0);
+    assert!(
+        matches!(step, Step::Handled(Some(Action::Submit(ref text))) if text == "hi"),
+        "押した瞬間に送っていない: {step:?}"
+    );
+    let screen = draw(&mut app);
+    assert!(
+        framed_is_pressed(&screen, "送信"),
+        "押した直後の送信が押されている形でない:\n{}",
+        screen.text()
+    );
+    assert!(
+        !framed_is_pressed(&screen, "中断"),
+        "押していない中断まで押されている形"
+    );
+    let send = framed_button(&screen, "送信");
+    assert_eq!(
+        pressed_cells_outside(&screen, send),
+        0,
+        "送信の枠の外に押されている形がある"
+    );
+
+    // 最低時間の前に離す: まだ押されている形。画面は変わらないので描き直さない。
+    let step = mouse_at(
+        &mut app,
+        MouseEventKind::Up(MouseButton::Left),
+        at,
+        t0 + Duration::from_millis(60),
+    );
+    assert!(matches!(step, Step::Unchanged), "{step:?}");
+    app.tick_at(t0 + at_least - Duration::from_millis(1));
+    assert!(
+        framed_is_pressed(&draw(&mut app), "送信"),
+        "最低時間の前に戻った"
+    );
+    app.tick_at(t0 + at_least);
+    let screen = draw(&mut app);
+    assert!(
+        !framed_is_pressed(&screen, "送信"),
+        "最低時間が過ぎても戻らない"
+    );
+    assert_eq!(pressed_cells_outside(&screen, Rect::default()), 0);
+
+    // 押したまま最低時間が過ぎても戻らない。その後で離すと、その場で戻して描き直す。
+    let t1 = t0 + Duration::from_secs(1);
+    mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), at, t1);
+    app.tick_at(t1 + Duration::from_secs(1));
+    assert!(
+        framed_is_pressed(&draw(&mut app), "送信"),
+        "押している間に戻った"
+    );
+    let step = mouse_at(
+        &mut app,
+        MouseEventKind::Up(MouseButton::Left),
+        at,
+        t1 + Duration::from_secs(1),
+    );
+    assert!(matches!(step, Step::Handled(None)), "{step:?}");
+    assert!(!framed_is_pressed(&draw(&mut app), "送信"));
+}
+
+/// **押されている形は、押したボタンに付いて動く**——「送信」を押して応答が始まると、「中断」が送信の居た右端に現れて
+/// 送信は左へずれる。押されている形は左へずれた送信に付き、右端に来た中断（押していない）には付かない。
+#[test]
+fn the_pressed_look_follows_the_button_that_was_pressed() {
+    let mut app = app_with_transcript(3);
+    type_text(&mut app, "hi");
+    let right_end = draw(&mut app).find_last("送信");
+    let t0 = Instant::now();
+    assert!(matches!(
+        mouse_at(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            right_end,
+            t0
+        ),
+        Step::Handled(Some(Action::Submit(_)))
+    ));
+    draw(&mut app);
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    let screen = draw(&mut app);
+    let send = framed_button(&screen, "送信");
+    let cancel = framed_button(&screen, "中断");
+    assert!(
+        cancel.contains(right_end.into()) && !send.contains(right_end.into()),
+        "試験の前提: 送信の居た場所に中断が来ていない:\n{}",
+        screen.text()
+    );
+    assert!(
+        framed_is_pressed(&screen, "送信"),
+        "ずれた送信が押されている形でない"
+    );
+    assert!(
+        !framed_is_pressed(&screen, "中断"),
+        "送信の居た場所へ来た中断が押されている形"
+    );
+    assert_eq!(pressed_cells_outside(&screen, send), 0);
+}
+
+/// **押しても捨てるクリックと、ボタンの形ではない押せる項目には、押されている形を付けない**——
+/// (1) ボタンが別のボタンの居た場所へ動いた直後（300ms）の「中断」、(2) 承認ダイアログを開いた直後（D-106）の選択肢、
+/// (3) 入力欄の見出しのキー案内（`Enter=改行`。案内の文字のまま描いている）、(4) 承認ダイアログの押せない案内
+/// （`PageUp/PageDown スクロール`）。窓を過ぎた選択肢（`[v] 中身`。押してもダイアログは開いたまま）は押されている形に
+/// なり、ほかの選択肢は普通の形のまま（対）。
+#[test]
+fn discarded_clicks_and_plain_hints_get_no_pressed_look() {
+    // (1) 動いた直後のボタン。
+    let mut app = app_with_transcript(3);
+    type_text(&mut app, "hi");
+    let right_end = draw(&mut app).find_last("送信");
+    assert!(matches!(
+        click(&mut app, right_end),
+        Some(Action::Submit(_))
+    ));
+    release(&mut app);
+    draw(&mut app);
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    draw(&mut app);
+    assert!(
+        app.input_buttons_moved_at.is_some(),
+        "試験の前提: 窓が開いていない"
+    );
+    assert!(
+        click(&mut app, right_end).is_none(),
+        "動いた直後の中断が効いた"
+    );
+    assert_eq!(
+        pressed_cells_outside(&draw(&mut app), Rect::default()),
+        0,
+        "捨てたクリックに押されている形が付いた"
+    );
+
+    // (2) 開いた直後の承認ダイアログ。窓を過ぎれば付く（対）。
+    let mut app = pending_app(5);
+    app.pending_permission.as_mut().expect("承認待ち").opened_at = Instant::now();
+    let screen = draw(&mut app);
+    assert!(click(&mut app, screen.find("[v]")).is_none());
+    assert_eq!(
+        pressed_cells_outside(&draw(&mut app), Rect::default()),
+        0,
+        "開いた直後に押した選択肢に押されている形が付いた"
+    );
+    app.pending_permission.as_mut().expect("承認待ち").opened_at =
+        Instant::now() - MODAL_INPUT_GRACE - Duration::from_millis(1);
+    let screen = draw(&mut app);
+    assert!(click(&mut app, screen.find("[v]")).is_none());
+    let screen = draw(&mut app);
+    let pressed = label_looks(&screen, "[v] 中身");
+    assert!(
+        pressed.iter().all(|look| is_pressed(*look)),
+        "窓を過ぎて押した[v]が押されている形でない: {pressed:?}"
+    );
+    for label in ["[y] 一度だけ許可", "[n] 拒否", "[f] 差分"] {
+        assert!(
+            label_looks(&screen, label)
+                .iter()
+                .all(|look| !is_pressed(*look)),
+            "押していない「{label}」まで押されている形"
+        );
+    }
+
+    // (3) 見出しのキー案内（押すとキーは押されるが、ボタンの形ではない）。
+    let mut app = running_app();
+    let screen = draw(&mut app);
+    assert!(click(&mut app, screen.find("Enter=改行")).is_none());
+    assert_eq!(app.input, "\n", "試験の前提: 案内が押せていない");
+    assert_eq!(
+        pressed_cells_outside(&draw(&mut app), Rect::default()),
+        0,
+        "見出しのキー案内に押されている形が付いた"
+    );
+
+    // (4) 承認ダイアログの押せない案内。
+    let mut app = pending_app(5);
+    let screen = draw(&mut app);
+    assert!(click(&mut app, screen.find("PageUp/PageDown ス")).is_none());
+    assert_eq!(
+        pressed_cells_outside(&draw(&mut app), Rect::default()),
+        0,
+        "押せない案内に押されている形が付いた"
+    );
 }
 
 /// 製品と同じ形で1フレーム描き、端末のカーソルの位置（IMEの変換候補が出る場所）を返す。隠していれば`None`。

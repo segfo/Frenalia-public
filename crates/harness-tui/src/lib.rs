@@ -42,8 +42,14 @@ pub fn render_approval_modal_for_example(
     area: ratatui::layout::Rect,
     pending: &PermissionView,
 ) -> u16 {
-    // 押せる場所の登録は、描画ループの外では使わないので捨てる。
-    ui::render_permission_modal(f, area, pending, &mut app::Targets::default())
+    // 押せる場所の登録は、描画ループの外では使わないので捨てる（押されている形のボタンも無い）。
+    ui::render_permission_modal(
+        f,
+        area,
+        pending,
+        &Default::default(),
+        &mut app::Targets::default(),
+    )
 }
 pub use engine::{spawn_engine, EngineHandle};
 pub use gate::InteractiveGate;

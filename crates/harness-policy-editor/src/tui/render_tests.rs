@@ -700,7 +700,14 @@ fn the_last_line_of_a_confirmation_is_never_cut_off_silently() {
             .into_iter()
             .filter_map(|(width, height)| {
                 let rows = paint_rows(width, height, |f| {
-                    draw_modal(f, f.area(), modal, 0, &mut Targets::default());
+                    draw_modal(
+                        f,
+                        f.area(),
+                        modal,
+                        0,
+                        &Default::default(),
+                        &mut Targets::default(),
+                    );
                 });
                 let screen = flatten(&rows);
                 (!screen.contains(&last) && !screen.contains(MODAL_SCROLL_HINT))
@@ -762,7 +769,14 @@ fn a_confirmation_that_fits_is_drawn_as_before_and_does_not_offer_scrolling() {
         confirm: Confirm::Approval,
     };
     let rows = paint_rows(120, 40, |f| {
-        draw_modal(f, f.area(), &modal, 0, &mut Targets::default());
+        draw_modal(
+            f,
+            f.area(),
+            &modal,
+            0,
+            &Default::default(),
+            &mut Targets::default(),
+        );
     });
     assert_eq!(
         box_height(&rows),
@@ -792,7 +806,14 @@ fn a_wrapped_confirmation_that_fits_shows_every_line_without_a_scroll_hint() {
     for (name, app) in [("遷移", &transition), ("付け替え", &reassign)] {
         let modal = app.modal.as_ref().expect("確認ダイアログ");
         let screen = flatten(&paint_rows(120, 60, |f| {
-            draw_modal(f, f.area(), modal, 0, &mut Targets::default());
+            draw_modal(
+                f,
+                f.area(),
+                modal,
+                0,
+                &Default::default(),
+                &mut Targets::default(),
+            );
         }));
         for line in &modal.lines {
             assert!(
@@ -1162,7 +1183,14 @@ fn paint_short_modal(frame: &mut Frame) {
         lines: (0..5).map(|i| format!("  + fs.read = C:/x/{i}")).collect(),
         confirm: Confirm::Approval,
     };
-    draw_modal(frame, frame.area(), &modal, 0, &mut Targets::default());
+    draw_modal(
+        frame,
+        frame.area(),
+        &modal,
+        0,
+        &Default::default(),
+        &mut Targets::default(),
+    );
 }
 
 fn paint_help(frame: &mut Frame) {
@@ -1379,7 +1407,14 @@ fn a_wrapped_box_keeps_its_right_border_when_a_line_ends_with_a_wide_character()
             lines: vec![spilling_line(86), "最後の行".to_string()],
             confirm: Confirm::Approval,
         };
-        draw_modal(frame, frame.area(), &modal, 0, &mut Targets::default());
+        draw_modal(
+            frame,
+            frame.area(),
+            &modal,
+            0,
+            &Default::default(),
+            &mut Targets::default(),
+        );
     };
     let boxes: [(&str, &str, Paint); 3] = [
         ("ヘルプ", "ヘルプ", paint_help),
