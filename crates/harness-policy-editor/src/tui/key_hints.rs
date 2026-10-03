@@ -178,6 +178,8 @@ pub(super) struct RecordButton {
 /// - 実行前は「記録を開始」（下辺に`Enter`）。コマンドが空でも押せる——押すと開始できない理由が出る
 ///   （`App::start_recording`。押しても無反応にしない、B-23(c)）。
 /// - 実行中は、止められるときだけ「停止」／「停止を予約」（下辺に`Esc`。効かない操作を案内しない。B-32）。
+/// - 同じ場所で働きが入れ替わるので、入れ替わった直後の300msのクリックは捨てる（ここが返すキーを`tui::tick`が毎周見る。
+///   `tui::pointer`のモジュールdoc、[BUG-210](../../../../docs/bugs/BUG-210.md)）。
 ///
 /// キー案内の行（[`screen_keys`]）には出さない——同じ操作を2か所に並べない（会話画面の見出しから送信・中断を外したのと同じ）。
 pub(super) fn record_buttons(app: &App) -> Vec<RecordButton> {

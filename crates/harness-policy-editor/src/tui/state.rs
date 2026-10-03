@@ -726,6 +726,8 @@ pub struct App {
     pub pointer: crate::tui::pointer::Targets,
     /// いま押されている形で描くボタン（`tui::pointer`の「押したボタンは、押した瞬間に色を変える」）。
     pub press: harness_term::button::Press<crate::tui::pointer::ButtonId>,
+    /// 「記録」の枠の右のボタンの働きが変わった時刻（直後のクリックを捨てる。`tui::pointer`、BUG-210）。
+    pub record_shift: crate::tui::pointer::ButtonShift,
 
     // 記録画面
     pub pass: Pass,
@@ -895,6 +897,7 @@ impl App {
             panels: Default::default(),
             pointer: Default::default(),
             press: Default::default(),
+            record_shift: Default::default(),
             pass: Pass::One,
             net_mode: NetMode::RecordAll,
             command: TextInput::default(),

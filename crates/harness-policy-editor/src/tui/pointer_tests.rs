@@ -1408,6 +1408,233 @@ fn closing_a_dialog_by_its_button_does_not_press_the_button_behind_it() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 働きが入れ替わった直後の「記録」の枠の右のボタン（BUG-210）
+//
+// 時刻はイベントループ（`tui::run`）の順で作って渡す——1周は「workerの知らせを引き取る → `tui::tick` → 描く →
+// イベントを1つ処理する」。`loop_turn`がその前半（`tick`と描く）を、`click_at`が後半を行う。
+// ---------------------------------------------------------------------------
+
+/// `n`ミリ秒。
+fn ms(n: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(n)
+}
+
+/// イベントループの1周の前半（`tui::run`と同じ順）: 時刻`now`で`tui::tick`を呼んでから1フレーム描き、描いて分かったことを
+/// 状態へ書き戻す。セルの文字と見た目の格子を返す。
+fn loop_turn(
+    app: &mut App,
+    now: std::time::Instant,
+) -> (Vec<Vec<String>>, Vec<Vec<ratatui::style::Style>>) {
+    tick(app, now);
+    frame_with_looks(app)
+}
+
+/// 左クリックを製品の入口へ入れる（押下を`now`、離上を同じ位置で`now`の10ms後）。押下の戻り値を返す。
+fn click_at(app: &mut App, at: (u16, u16), now: std::time::Instant) -> Option<Action> {
+    let action = mouse_at(app, MouseEventKind::Down(MouseButton::Left), at, now);
+    assert!(
+        mouse_at(app, MouseEventKind::Up(MouseButton::Left), at, now + ms(10)).is_none(),
+        "離したときに操作が返った"
+    );
+    action
+}
+
+/// 記録中で、停止を予約したか（記録していなければ偽）。
+fn stop_requested(app: &App) -> bool {
+    app.run.as_ref().is_some_and(|run| run.stop_requested)
+}
+
+/// `rect`の中に`at`があるか。
+fn holds(rect: Rect, at: (u16, u16)) -> bool {
+    rect.contains(ratatui::layout::Position::new(at.0, at.1))
+}
+
+/// **「記録を開始」をダブルクリックしても、2回目は同じ場所に変わった「停止を予約」に当たらない**（BUG-210）——働きが
+/// 変わってから300ms（`BUTTON_SHIFT_GRACE`）の間のクリックは捨てる。状態は1つも変わらず（`Esc`を押したのと同じにならず、
+/// 記録は続く）、捨てたクリックには押されている形を新しく付けない。窓を過ぎれば同じ位置で停止を予約できる（捨てすぎて
+/// いない）。窓の境目は会話画面と同じく、ちょうど300msで受ける。
+#[test]
+fn a_double_click_on_start_recording_does_not_queue_a_stop() {
+    let grace = crate::tui::pointer::BUTTON_SHIFT_GRACE;
+    let ws = workspace();
+    let mut app = record_screen_with_command(ws.path());
+    let t0 = std::time::Instant::now();
+    let (grid, _) = loop_turn(&mut app, t0);
+    let at = cell_of(&grid, Some(right_of_record_box(&grid)), "記録を開始", None);
+    assert_eq!(
+        action_kind(&click_at(&mut app, at, t0 + ms(1))),
+        "パス1を開始"
+    );
+
+    // 次の周回の`tick`が、働きが変わった（`Enter`→`Esc`）ことを見る。
+    let changed = t0 + ms(2);
+    let (grid, _) = loop_turn(&mut app, changed);
+    assert!(
+        holds(record_button(&grid, "停止を予約"), at),
+        "試験の前提: 押した場所が「停止を予約」に変わっていない"
+    );
+    let before = snapshot(&app);
+
+    // ダブルクリックの2回目（1回目の押されている形がまだ残っている間）。
+    assert_eq!(
+        action_kind(&click_at(&mut app, at, changed + ms(50))),
+        "なし"
+    );
+    assert!(
+        !stop_requested(&app),
+        "ダブルクリックの2回目で、始めたばかりの記録の停止を予約した"
+    );
+    assert_eq!(snapshot(&app), before, "捨てたクリックで状態が変わった");
+    assert!(app.is_running(), "記録が続いていない");
+
+    // 1回目の押されている形が戻った後でも、窓の中なら捨て、押されている形を新しく付けない。境目の1ms前まで見る。
+    let (_, looks) = loop_turn(&mut app, changed + harness_term::button::PRESSED_AT_LEAST);
+    assert_eq!(
+        pressed_cells_outside(&looks, Rect::default()),
+        0,
+        "試験の前提: 1回目の押されている形が戻っていない"
+    );
+    for late in [
+        changed + harness_term::button::PRESSED_AT_LEAST + ms(1),
+        changed + grace - ms(1),
+    ] {
+        assert_eq!(
+            action_kind(&click_at(&mut app, at, late)),
+            "なし",
+            "{late:?}"
+        );
+        let (_, looks) = loop_turn(&mut app, late + ms(11));
+        assert!(!stop_requested(&app), "窓の中のクリックで停止を予約した");
+        assert_eq!(snapshot(&app), before, "捨てたクリックで状態が変わった");
+        assert_eq!(
+            pressed_cells_outside(&looks, Rect::default()),
+            0,
+            "捨てたクリックに押されている形が付いた"
+        );
+    }
+
+    // 窓を過ぎたら（ちょうど300ms）、同じ位置で停止を予約できる。押されている形も付く。
+    assert_eq!(
+        action_kind(&click_at(&mut app, at, changed + grace)),
+        "なし"
+    );
+    assert!(stop_requested(&app), "窓を過ぎても停止を予約できない");
+    let (grid, looks) = frame_with_looks(&mut app);
+    let button = record_button(&grid, "停止を予約");
+    assert!(
+        is_pressed(looks[usize::from(at.1)][usize::from(at.0)]),
+        "受けたクリックに押されている形が付いていない"
+    );
+    assert_eq!(pressed_cells_outside(&looks, button), 0);
+}
+
+/// **記録が終わった瞬間に「停止」を押しても、同じ場所へ戻った「記録を開始」に当たって次の記録を始めない**（BUG-210）——
+/// 記録の終わり（workerの知らせ）で働きが変わったことも、ループが知らせを引き取った後に呼ぶ`tui::tick`が見る。終わりの
+/// 知らせが同じ周回に届く場合（「停止」→「記録を開始」）と、コマンドの終了とドレインを挟んで別の周回に届く場合（「停止」→
+/// ボタン無し→「記録を開始」）の両方。窓を過ぎれば同じ位置で次の記録を始められる（捨てすぎていない）。
+#[test]
+fn a_click_on_stop_as_the_recording_ends_does_not_start_another() {
+    let grace = crate::tui::pointer::BUTTON_SHIFT_GRACE;
+    for through_draining in [false, true] {
+        let case = if through_draining {
+            "ドレインを挟む"
+        } else {
+            "同じ周回"
+        };
+        let ws = workspace();
+        let mut app = running_record_screen(ws.path());
+        let t0 = std::time::Instant::now();
+        let (grid, _) = loop_turn(&mut app, t0);
+        let stop = record_button(&grid, "停止");
+        let at = cell_of(&grid, Some(stop), "停止", None);
+
+        let mut now = t0;
+        if through_draining {
+            app.on_worker(WorkerMsg::Pass1(RecordEvent::Exited(0)));
+            now += ms(100);
+            loop_turn(&mut app, now);
+            assert!(
+                crate::tui::key_hints::record_buttons(&app).is_empty(),
+                "{case}: 試験の前提: ドレイン中にボタンが残っている"
+            );
+        }
+        app.on_worker(WorkerMsg::Pass1Done(Box::new(Err(
+            crate::record::RecordError::NoShell,
+        ))));
+        let ended = now + ms(100);
+        let (grid, _) = loop_turn(&mut app, ended);
+        assert!(
+            app.has_finished_run(),
+            "{case}: 試験の前提: 記録が終わっていない"
+        );
+        assert!(
+            holds(record_button(&grid, "記録を開始"), at),
+            "{case}: 試験の前提: 「停止」の場所に「記録を開始」が戻っていない"
+        );
+
+        let before = snapshot(&app);
+        assert_eq!(
+            action_kind(&click_at(&mut app, at, ended + ms(50))),
+            "なし",
+            "{case}: 「停止」のつもりのクリックで次の記録が始まった"
+        );
+        assert_eq!(
+            snapshot(&app),
+            before,
+            "{case}: 捨てたクリックで状態が変わった"
+        );
+        assert!(app.has_finished_run(), "{case}: 終わった記録の結果が消えた");
+
+        loop_turn(&mut app, ended + ms(60));
+        assert_eq!(
+            action_kind(&click_at(&mut app, at, ended + grace)),
+            "パス1を開始",
+            "{case}: 窓を過ぎても次の記録を始められない"
+        );
+    }
+}
+
+/// **キーは窓の間でも捨てない**（BUG-210）——`Esc`は押す場所を狙わないので、ボタンが「停止を予約」へ入れ替わった直後でも、
+/// 押せば停止を予約する（同じ時刻のクリックは捨てる）。
+#[test]
+fn keys_still_work_right_after_the_record_button_changes() {
+    let ws = workspace();
+    let mut app = record_screen_with_command(ws.path());
+    let t0 = std::time::Instant::now();
+    let (grid, _) = loop_turn(&mut app, t0);
+    let at = cell_of(&grid, Some(right_of_record_box(&grid)), "記録を開始", None);
+    click_at(&mut app, at, t0 + ms(1));
+    let changed = t0 + ms(2);
+    loop_turn(&mut app, changed);
+    click_at(&mut app, at, changed + ms(20));
+    assert!(
+        !stop_requested(&app),
+        "試験の前提: 窓の中のクリックが効いた"
+    );
+    handle_event_at(
+        &mut app,
+        crossterm::event::Event::Key(k(KeyCode::Esc)),
+        changed + ms(40),
+    );
+    assert!(stop_requested(&app), "窓の中の`Esc`が捨てられた");
+}
+
+/// **起動直後の最初の働きは「変わった」と数えない**（BUG-210）——起動して最初の周回のすぐ後に押しても、記録が始まる。
+#[test]
+fn a_click_right_after_launch_is_not_dropped() {
+    let ws = workspace();
+    let mut app = record_screen_with_command(ws.path());
+    let t0 = std::time::Instant::now();
+    let (grid, _) = loop_turn(&mut app, t0);
+    let at = cell_of(&grid, Some(right_of_record_box(&grid)), "記録を開始", None);
+    assert_eq!(
+        action_kind(&click_at(&mut app, at, t0)),
+        "パス1を開始",
+        "起動直後のクリックを捨てた"
+    );
+}
+
 /// 描いた画面の、セルごとの「押されている形か」（一覧の選択の強調など、画面がもともと持つ入れ替えも含む）。
 fn pressed_map(looks: &[Vec<ratatui::style::Style>]) -> Vec<Vec<bool>> {
     looks
