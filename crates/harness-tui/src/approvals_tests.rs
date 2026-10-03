@@ -114,8 +114,46 @@ fn the_reuse_key_changes_with_the_material() {
         label: "a".into(),
         text: "three".into(),
     }];
-    assert_ne!(summary_key(&a), summary_key(&b));
-    assert_eq!(summary_key(&a), summary_key(&a.clone()));
+    assert_ne!(summary_key(&a, None), summary_key(&b, None));
+    assert_eq!(summary_key(&a, None), summary_key(&a.clone(), None));
+}
+
+/// **長さが同じでも、中身が違えば鍵は違う**（[BUG-220](../../../docs/bugs/BUG-220.md)）。以前の鍵は
+/// 見出しと**中身の長さ**だけで作っており、同じ長さの別の行・別の中身に、前に作った要約がそのまま出た。
+/// 変わったことにハッシュが気づいて聞き直したまさにその場面で、変わる前の説明を見せることになる。
+#[test]
+fn material_of_the_same_length_does_not_share_a_key() {
+    let line = |text: &str| {
+        vec![SummaryPiece {
+            label: "the shell line".into(),
+            text: text.into(),
+        }]
+    };
+    let listed = line("ls -la /tmp/x");
+    let removed = line("rm -rf /tmp/x");
+    assert_eq!(
+        listed[0].text.len(),
+        removed[0].text.len(),
+        "前提: 長さが同じ"
+    );
+    assert_ne!(summary_key(&listed, None), summary_key(&removed, None));
+
+    // 区切りの文字を中身に混ぜても、別の組と同じ鍵にはならない（見出しと中身の境目を偽れない）。
+    let one = vec![SummaryPiece {
+        label: "a".into(),
+        text: "x\u{2}b\u{1}y".into(),
+    }];
+    let two = vec![
+        SummaryPiece {
+            label: "a".into(),
+            text: "x".into(),
+        },
+        SummaryPiece {
+            label: "b".into(),
+            text: "y".into(),
+        },
+    ];
+    assert_ne!(summary_key(&one, None), summary_key(&two, None));
 }
 
 /// **別の承認要求へ移っていたら、遅れて届いた要約は捨てる。** 前の中身の説明を、
@@ -206,16 +244,25 @@ async fn a_summary_is_not_started_twice_for_the_same_material() {
 
     // 回すものが無い（書込先パスの承認）。
     let mut app = app_with(PermissionSubject::WritePath("a.txt".into()));
-    assert!(start_summary(&summary, &tx, &mut app, &SummaryCache::new(), &scope, false).is_none());
+    assert!(start_summary(
+        &summary,
+        &tx,
+        &mut app,
+        &SummaryCache::new(),
+        &scope,
+        false,
+        None
+    )
+    .is_none());
 
     // 同じ中身は使い回す。
     let mut c = CommandSubject::line_only("cargo test");
     c.previews = vec![];
     let mut app = app_with(PermissionSubject::Command(c));
-    let key = summary_key(&summary_pieces(&app, &scope));
+    let key = summary_key(&summary_pieces(&app, &scope), None);
     let mut cache = SummaryCache::new();
     cache.insert(key, "前に作った要約".into());
-    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false).is_none());
+    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false, None).is_none());
     assert_eq!(
         app.pending_permission.as_ref().unwrap().summary,
         crate::app::SummaryState::Done("前に作った要約".into())
@@ -274,7 +321,7 @@ async fn a_summary_cut_off_while_thinking_says_so_on_screen() {
     )));
     let mut cache = SummaryCache::new();
 
-    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false).is_some());
+    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false, None).is_some());
     let event = rx.recv().await.expect("要約の結果が届かない");
     on_background(event, &mut app, &mut cache);
 
@@ -295,4 +342,206 @@ async fn a_summary_cut_off_while_thinking_says_so_on_screen() {
         "考える過程に触れていない: {reason}"
     );
     assert!(cache.is_empty(), "失敗を使い回しの表へ入れない");
+}
+
+/// 送られた要求を控え、本文1行を返すプロバイダ（何が要約の呼び出しへ渡ったかを見る）。
+#[derive(Default)]
+struct Capturing {
+    seen: std::sync::Mutex<Vec<harness_core::CompletionRequest>>,
+}
+
+#[async_trait::async_trait]
+impl harness_core::LlmProvider for Capturing {
+    fn id(&self) -> &str {
+        "capturing"
+    }
+    async fn stream(
+        &self,
+        req: harness_core::CompletionRequest,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<harness_core::StreamEvent, harness_core::ProviderError>,
+        >,
+        harness_core::ProviderError,
+    > {
+        self.seen.lock().unwrap().push(req);
+        let events = vec![
+            harness_core::StreamEvent::TextDelta {
+                index: 0,
+                text: "ファイルを消す。".to_string(),
+            },
+            harness_core::StreamEvent::Done {
+                stop_reason: harness_core::StopReason::EndTurn,
+                usage: Default::default(),
+            },
+        ];
+        Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+    }
+}
+
+/// 製品の入口`start_summary`から要約を1本起こし、結果を画面へ反映するまで待つ。送った要求を返す。
+async fn summarize_through_the_screen(
+    app: &mut AppState,
+    display_language: Option<SummaryLanguage>,
+) -> harness_core::CompletionRequest {
+    let provider = Arc::new(Capturing::default());
+    let summary = ApprovalSummary {
+        provider: provider.clone(),
+        model: "m".into(),
+        label: "mock / ".into(),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let scope = open_scope(ReadScopeConfig::default());
+    let mut cache = SummaryCache::new();
+    assert!(
+        start_summary(&summary, &tx, app, &cache, &scope, false, display_language).is_some(),
+        "要約が起きなかった"
+    );
+    let event = rx.recv().await.expect("要約の結果が届かない");
+    on_background(event, app, &mut cache);
+    let seen = provider.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    seen[0].clone()
+}
+
+/// **ユーザーが日本語で書いていれば、要約を日本語で書かせる。ユーザーの文そのものは要求のどこにも載らない**
+/// （D-100「要約の言語」）。要約は会話と別のプロバイダへ送れるので、渡すのは言語の名前だけである。
+#[tokio::test]
+async fn the_summary_is_asked_for_in_the_users_language_without_sending_the_users_words() {
+    let mut app = app_with(PermissionSubject::Command(CommandSubject::line_only(
+        "rm -rf build",
+    )));
+    let words = "ビルドの成果物を消しておいて（秘密の合言葉 ZEBRA-42）";
+    app.push_user_prompt(words.to_string());
+
+    // 表示言語は英語にしておく（文から決まったことを見るため）。
+    let req = summarize_through_the_screen(&mut app, Some(SummaryLanguage::English)).await;
+
+    assert!(
+        req.system[0]
+            .text
+            .ends_with("\n- Write the summary in Japanese."),
+        "{}",
+        req.system[0].text
+    );
+    let everything = format!("{req:?}");
+    assert!(
+        !everything.contains("ZEBRA-42"),
+        "ユーザーの文が要求に載っている"
+    );
+    assert!(
+        !everything.contains("成果物"),
+        "ユーザーの文が要求に載っている"
+    );
+    assert_eq!(
+        app.pending_permission.as_ref().unwrap().summary,
+        crate::app::SummaryState::Done("ファイルを消す。".into())
+    );
+}
+
+/// **ラテン文字だけの入力・入力がまだ無いときは表示言語、それも無ければ言語を足さない**（今までの要求）。
+#[tokio::test]
+async fn without_a_deciding_script_the_display_language_is_used() {
+    let mut app = app_with(PermissionSubject::Command(CommandSubject::line_only("ls")));
+    app.push_user_prompt("list the files".to_string());
+    let req = summarize_through_the_screen(&mut app, Some(SummaryLanguage::German)).await;
+    assert!(req.system[0]
+        .text
+        .ends_with("\n- Write the summary in German."));
+
+    let mut app = app_with(PermissionSubject::Command(CommandSubject::line_only("ls")));
+    let req = summarize_through_the_screen(&mut app, Some(SummaryLanguage::Japanese)).await;
+    assert!(req.system[0]
+        .text
+        .ends_with("\n- Write the summary in Japanese."));
+
+    let mut app = app_with(PermissionSubject::Command(CommandSubject::line_only("ls")));
+    let req = summarize_through_the_screen(&mut app, None).await;
+    assert!(
+        !req.system[0].text.contains("Write the summary in"),
+        "言語が決まらないのに言語を足した"
+    );
+}
+
+/// **言語が違えば鍵も違う。** 含めないと、言語が変わっても前の言語の要約が使い回される。
+#[test]
+fn the_reuse_key_changes_with_the_language() {
+    let pieces = vec![SummaryPiece {
+        label: "the shell line".into(),
+        text: "ls".into(),
+    }];
+    let none = summary_key(&pieces, None);
+    let ja = summary_key(&pieces, Some(SummaryLanguage::Japanese));
+    let en = summary_key(&pieces, Some(SummaryLanguage::English));
+    assert_ne!(none, ja);
+    assert_ne!(ja, en);
+    assert_eq!(
+        ja,
+        summary_key(&pieces.clone(), Some(SummaryLanguage::Japanese))
+    );
+}
+
+/// **使い回すのは、中身も言語も同じときだけ**（製品の入口から）。[BUG-220] 以前は同じ長さの別の行に、
+/// 前の行の要約がそのまま出た。言語が変わったときも前の言語の要約を出さない。
+#[tokio::test]
+async fn a_cached_summary_is_reused_only_for_the_same_material_and_language() {
+    let summary = ApprovalSummary {
+        provider: Arc::new(Capturing::default()),
+        model: "m".into(),
+        label: "mock / ".into(),
+    };
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let scope = open_scope(ReadScopeConfig::default());
+    let ja = Some(SummaryLanguage::Japanese);
+
+    // `ls -la /tmp/x`の要約を日本語で作ってあるとする。
+    let listed = || {
+        app_with(PermissionSubject::Command(CommandSubject::line_only(
+            "ls -la /tmp/x",
+        )))
+    };
+    let mut cache = SummaryCache::new();
+    cache.insert(
+        summary_key(&summary_pieces(&listed(), &scope), ja),
+        "一覧を出すだけ。".into(),
+    );
+
+    // 同じ中身・同じ言語なら使い回す（対照）。
+    let mut again = listed();
+    assert!(start_summary(&summary, &tx, &mut again, &cache, &scope, false, ja).is_none());
+    assert_eq!(
+        again.pending_permission.as_ref().unwrap().summary,
+        crate::app::SummaryState::Done("一覧を出すだけ。".into())
+    );
+
+    // 長さが同じ別の行には使い回さない。
+    let mut removed = app_with(PermissionSubject::Command(CommandSubject::line_only(
+        "rm -rf /tmp/x",
+    )));
+    let token = start_summary(&summary, &tx, &mut removed, &cache, &scope, false, ja)
+        .expect("別の中身なのに要約を起こさなかった");
+    token.cancel();
+    assert_eq!(
+        removed.pending_permission.as_ref().unwrap().summary,
+        crate::app::SummaryState::Running
+    );
+
+    // 同じ行でも、言語が違えば使い回さない。
+    let mut english = listed();
+    let token = start_summary(
+        &summary,
+        &tx,
+        &mut english,
+        &cache,
+        &scope,
+        false,
+        Some(SummaryLanguage::English),
+    )
+    .expect("言語が違うのに前の要約を使い回した");
+    token.cancel();
+    assert_eq!(
+        english.pending_permission.as_ref().unwrap().summary,
+        crate::app::SummaryState::Running
+    );
 }

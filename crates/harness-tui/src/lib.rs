@@ -526,6 +526,9 @@ pub async fn run(
     let read_scope_for_summary = harness_sandbox::ReadScope::open(&ctx.read_scope);
     // Tier3ではホストの絶対パスをモデルへ見せない（`harness_engine::sanitize`と同じ扱い）。
     let redact_host_paths_in_summary = ctx.shell_tier.tier == harness_core::ShellTier::Tier3;
+    // 要約の言語の倒し先（ユーザーの文から決まらないとき。`SummaryLanguage::for_user`）。
+    let display_language = harness_term::ui_language_id()
+        .and_then(harness_engine::approval_summary::SummaryLanguage::from_windows_langid);
     // このプロセスのオーバーレイ機構（`--live`/`--staged`/`--sandbox tier2a-cow`）。
     // **セッションを切り替えても変わらない**——workspaceツリーのアクセス形状は起動時の
     // `preflight`が確定し、capability・ACE・モードmutexがそれに紐付いているため（D-54）。
@@ -743,6 +746,7 @@ pub async fn run(
                                     &summary_cache,
                                     &read_scope_for_summary,
                                     redact_host_paths_in_summary,
+                                    display_language,
                                 );
                             }
                         }

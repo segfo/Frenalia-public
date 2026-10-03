@@ -63,6 +63,14 @@ impl LlmProvider for Capturing {
     }
 }
 
+/// 1行の中身を、既定の引数（伏字化なし・言語なし）で1回要約する。
+async fn summarize(
+    provider: &Capturing,
+    cancel: &CancellationToken,
+) -> Result<Option<String>, SummaryError> {
+    summarize_for_approval(provider, "m", &[piece("a", "x")], false, None, cancel).await
+}
+
 fn piece(label: &str, text: &str) -> SummaryPiece {
     SummaryPiece {
         label: label.to_string(),
@@ -81,6 +89,7 @@ async fn the_call_carries_no_tools_and_a_system_of_its_own() {
         "m",
         &[piece("build.py", "print('hi')")],
         false,
+        None,
         &cancel,
     )
     .await
@@ -102,6 +111,57 @@ async fn the_call_carries_no_tools_and_a_system_of_its_own() {
     );
 }
 
+/// 送った要求の system と、区切りを伏せた中身（区切りは呼ぶたびに変わるので比べられない）。
+fn sent(provider: &Capturing, i: usize) -> (String, String) {
+    let seen = provider.seen.lock().unwrap();
+    let ContentBlock::Text(text) = &seen[i].messages[0].content[0] else {
+        panic!("expected text");
+    };
+    let fence = &text[text.find("<<<").unwrap()..text.find(">>>").unwrap() + 3];
+    (
+        seen[i].system[0].text.clone(),
+        text.replace(fence, "<<<FENCE>>>"),
+    )
+}
+
+/// **言語を渡せば、固定文の最後に1行だけ足す**（D-100「要約の言語」）。足すのは区切りの外（system）で、
+/// 中身の側は何も変わらない。**言語が無ければ、今までと1文字も違わない要求**になる。
+#[tokio::test]
+async fn the_language_is_one_line_appended_to_the_fixed_system() {
+    let provider = Arc::new(Capturing::default());
+    let cancel = CancellationToken::new();
+    for language in [None, Some(SummaryLanguage::Japanese)] {
+        summarize_for_approval(
+            provider.as_ref(),
+            "m",
+            &[piece("build.py", "print('hi')")],
+            false,
+            language,
+            &cancel,
+        )
+        .await
+        .unwrap();
+    }
+    let (plain_system, plain_body) = sent(&provider, 0);
+    let (ja_system, ja_body) = sent(&provider, 1);
+
+    assert_eq!(plain_system, SYSTEM, "言語が無いのに固定文が変わった");
+    assert!(!plain_system.contains("Write the summary in"));
+    assert_eq!(
+        ja_system,
+        format!("{SYSTEM}\n- Write the summary in Japanese."),
+        "固定文の最後に1行だけ足す"
+    );
+    assert_eq!(
+        plain_body, ja_body,
+        "中身の側（区切りの内外）は言語で変わらない"
+    );
+    assert!(
+        !ja_body.contains("Japanese"),
+        "言語を区切りの内側へ書いていない"
+    );
+}
+
 /// **出力の上限は、考える過程を挟んでも本文まで届く値である**（BUG-214）。
 ///
 /// 2026-10-03の実測（LMStudio・Qwen3.6 35B系・中身1行）で、考える過程だけで約500トークン要り、
@@ -111,9 +171,7 @@ async fn the_call_carries_no_tools_and_a_system_of_its_own() {
 async fn the_output_limit_leaves_room_for_thinking_before_the_body() {
     let provider = Arc::new(Capturing::default());
     let cancel = CancellationToken::new();
-    summarize_for_approval(provider.as_ref(), "m", &[piece("a", "x")], false, &cancel)
-        .await
-        .unwrap();
+    summarize(provider.as_ref(), &cancel).await.unwrap();
     let sent = provider.seen.lock().unwrap()[0].max_tokens;
     assert!(
         sent >= 4_096,
@@ -129,7 +187,7 @@ async fn a_body_cut_off_by_the_output_limit_while_thinking_says_so() {
         &"The user wants me to summarize (ls).name. ".repeat(40),
     )));
     let cancel = CancellationToken::new();
-    let err = summarize_for_approval(provider.as_ref(), "m", &[piece("a", "x")], false, &cancel)
+    let err = summarize(provider.as_ref(), &cancel)
         .await
         .expect_err("本文が空なのに要約として返った");
 
@@ -164,9 +222,7 @@ async fn thinking_followed_by_a_body_still_yields_the_body() {
     ]);
     let provider = Arc::new(Capturing::replying(reply));
     let cancel = CancellationToken::new();
-    let out = summarize_for_approval(provider.as_ref(), "m", &[piece("a", "x")], false, &cancel)
-        .await
-        .unwrap();
+    let out = summarize(provider.as_ref(), &cancel).await.unwrap();
     assert_eq!(
         out.as_deref(),
         Some("Lists the names of files in the current folder.")
@@ -181,7 +237,7 @@ async fn an_empty_body_that_did_not_hit_the_limit_is_not_blamed_on_it() {
         usage: Default::default(),
     }]));
     let cancel = CancellationToken::new();
-    let err = summarize_for_approval(provider.as_ref(), "m", &[piece("a", "x")], false, &cancel)
+    let err = summarize(provider.as_ref(), &cancel)
         .await
         .expect_err("本文が空なのに要約として返った");
     let message = err.to_string();
@@ -196,9 +252,7 @@ async fn the_fence_is_different_on_every_call() {
     let provider = Arc::new(Capturing::default());
     let cancel = CancellationToken::new();
     for _ in 0..2 {
-        summarize_for_approval(provider.as_ref(), "m", &[piece("a", "x")], false, &cancel)
-            .await
-            .unwrap();
+        summarize(provider.as_ref(), &cancel).await.unwrap();
     }
     let seen = provider.seen.lock().unwrap();
     let text = |i: usize| match &seen[i].messages[0].content[0] {
@@ -231,9 +285,7 @@ async fn an_already_cancelled_call_never_reaches_the_provider() {
     let provider = Arc::new(Capturing::default());
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let out = summarize_for_approval(provider.as_ref(), "m", &[piece("a", "x")], false, &cancel)
-        .await
-        .unwrap();
+    let out = summarize(provider.as_ref(), &cancel).await.unwrap();
     assert_eq!(out, None);
     assert!(provider.seen.lock().unwrap().is_empty());
 }
@@ -260,6 +312,7 @@ async fn host_paths_are_redacted_when_asked() {
         "m",
         &[piece("a", r"open(r'C:\Users\me\secret.txt')")],
         true,
+        None,
         &cancel,
     )
     .await

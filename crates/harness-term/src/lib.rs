@@ -64,6 +64,24 @@ pub fn host_is_vscode() -> bool {
         .unwrap_or(false)
 }
 
+/// Windows の表示言語（`GetUserDefaultUILanguage`の LANGID）。取れなければ`None`。Windows 以外では常に`None`。
+///
+/// 会話画面が承認ダイアログの要約の言語を決めるのに使う（ユーザーの文から言語が決まらないときの倒し先。
+/// `harness_engine::approval_summary::SummaryLanguage`）。**判定には使わない**——表示の言語を選ぶだけで、
+/// 外れても要約が別の言語で出るだけに留まる。
+pub fn ui_language_id() -> Option<u16> {
+    #[cfg(windows)]
+    {
+        // SAFETY: 引数を取らず、呼び出し元の状態を読み書きしない（ユーザーの設定を返すだけ）。
+        let id = unsafe { windows::Win32::Globalization::GetUserDefaultUILanguage() };
+        (id != 0).then_some(id)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// `Ctrl`か`Alt`を押しながらの文字キーか（[BUG-212]）。
 ///
 /// 重ねた枠（承認ダイアログ・レビューパネル・確認ダイアログ）は文字のキーで決める（`y`=許可・`c`=commit等）。

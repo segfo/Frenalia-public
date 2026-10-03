@@ -28,8 +28,10 @@ unicode-width = "0.2.2"
 [target.'cfg(windows)'.dependencies]
 # 画面を握っている間だけ標準エラー出力を預かる（`stderr_capture`。ライブラリの`eprintln!`が画面を壊すため）。
 # 選んだ文章をクリップボードへ書く（`clipboard`。`DataExchange`がクリップボード、`Memory`が渡すメモリ）。
+# 表示言語を読む（`ui_language_id`。`Globalization`）。
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_Memory",

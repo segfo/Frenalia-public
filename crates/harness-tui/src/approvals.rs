@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use harness_core::{LlmProvider, PermissionSubject, ProgramRule, ShellRule};
 use harness_engine::approval_ledger::{ApprovalStore, RecordedRule};
-use harness_engine::approval_summary::{summarize_for_approval, SummaryPiece};
+use harness_engine::approval_summary::{summarize_for_approval, SummaryLanguage, SummaryPiece};
 use harness_engine::Remembered;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
@@ -30,7 +30,7 @@ pub struct ApprovalSummary {
     pub label: String,
 }
 
-/// 同じ中身を2回要約しない（セッション中だけ覚える）。鍵は縛ったファイルのハッシュと行そのもの。
+/// 同じ中身を2回要約しない（セッション中だけ覚える）。鍵は送った中身そのものと要約の言語（[`summary_key`]）。
 pub(crate) type SummaryCache = HashMap<String, String>;
 
 /// 描画ループの外でやった仕事の結果。
@@ -214,17 +214,39 @@ fn file_pieces(
         .collect()
 }
 
-/// 同じ中身を2回要約しないための鍵。
-pub(crate) fn summary_key(pieces: &[SummaryPiece]) -> String {
-    pieces
-        .iter()
-        .map(|p| format!("{}\u{1}{}", p.label, p.text.len()))
-        .collect::<Vec<_>>()
-        .join("\u{2}")
+/// 同じ中身を2回要約しないための鍵。**送る中身そのもの**（見出しと本文）と要約の言語で作る。
+///
+/// [BUG-220] 以前は見出しと**本文の長さ**だけで作っており、同じ長さの別の中身（`ls -la /tmp/x`と
+/// `rm -rf /tmp/x`）に前の要約が出た。各欄は長さを前に付けて並べる——区切りの文字だけで並べると、
+/// 中身に区切りの文字を書けば別の組と同じ鍵を作れる。言語を含めないと、言語が変わっても前の言語の要約が出る。
+pub(crate) fn summary_key(pieces: &[SummaryPiece], language: Option<SummaryLanguage>) -> String {
+    let mut key = format!("{};", language.map_or("", SummaryLanguage::english_name));
+    for p in pieces {
+        key.push_str(&format!(
+            "{}:{}{}:{}",
+            p.label.len(),
+            p.label,
+            p.text.len(),
+            p.text
+        ));
+    }
+    key
+}
+
+/// ユーザーが最後に入力した文（画面の transcript の最後の`User`）。要約の言語を決めるのに使う
+/// （**文そのものは要約の呼び出しへ渡さない**。渡るのは[`SummaryLanguage`]の名前だけ）。
+fn last_user_input(app: &AppState) -> Option<&str> {
+    app.transcript.iter().rev().find_map(|item| match item {
+        TranscriptItem::User(text) => Some(text.as_str()),
+        _ => None,
+    })
 }
 
 /// 承認要求1件につき1本だけ要約を起こす（B-23 の二重起動の防止）。
 /// 返り値は**この要求のためのキャンセルトークン**で、モーダルが差し替わったら落とす。
+///
+/// `display_language`は Windows の表示言語（起動時に1回読む。試験は作って渡す）。要約の言語は、
+/// ユーザーが最後に入力した文とこれから決める（[`SummaryLanguage::for_user`]）。
 pub(crate) fn start_summary(
     summary: &ApprovalSummary,
     background: &UnboundedSender<BackgroundEvent>,
@@ -232,12 +254,14 @@ pub(crate) fn start_summary(
     cache: &SummaryCache,
     read_scope: &harness_sandbox::ReadScope,
     redact_host_paths: bool,
+    display_language: Option<SummaryLanguage>,
 ) -> Option<CancellationToken> {
     let pieces = summary_pieces(app, read_scope);
     if pieces.is_empty() {
         return None;
     }
-    let key = summary_key(&pieces);
+    let language = SummaryLanguage::for_user(last_user_input(app), display_language);
+    let key = summary_key(&pieces, language);
     let view = app.pending_permission.as_mut()?;
     if let Some(done) = cache.get(&key) {
         view.summary_source = Some(format!("{} / {}", summary.label, summary.model));
@@ -261,6 +285,7 @@ pub(crate) fn start_summary(
             &model,
             &pieces,
             redact_host_paths,
+            language,
             &token,
         )
         .await

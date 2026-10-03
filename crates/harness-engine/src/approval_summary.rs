@@ -15,6 +15,12 @@
 //! 中身は**呼ぶたびに作り直す区切り**（nonce）で囲う。固定の区切りだと、中身の側に同じ綴りを
 //! 書いておけば「ここで中身は終わり」と言い張れる。
 //!
+//! # 要約の言語
+//!
+//! 要約はユーザーの言語で書かせる。会話から渡すのは**固定の表から選んだ言語の名前1つ**だけで、
+//! ユーザーの文そのものは渡さない（[`SummaryLanguage`]のモジュールdoc）。名前は固定文の側（区切りの外）に
+//! 「Write the summary in Japanese.」の1行として足す。
+//!
 //! # ここが守らないもの
 //!
 //! - **要約が正しいことは保証しない。** モデルは間違えるし、誘導もされる
@@ -31,6 +37,9 @@ use harness_core::{
 };
 
 use crate::side_call::{self, EmptyBody};
+
+mod language;
+pub use language::SummaryLanguage;
 
 /// 要約の出力の上限。
 ///
@@ -104,16 +113,20 @@ impl std::error::Error for SummaryError {}
 /// リクエストを1本も出さずに降りる）。
 ///
 /// `redact_host_paths`が真なら、Tier3の伏字化（ホストの絶対パスを`/workspace`へ潰す）を通す。
+///
+/// `language`が`Some`なら、固定文の後ろに「Write the summary in {言語}.」の1行を足す。`None`なら
+/// 言語を足さない（今までどおりの要求）。
 pub async fn summarize_for_approval(
     provider: &dyn LlmProvider,
     model: &str,
     pieces: &[SummaryPiece],
     redact_host_paths: bool,
+    language: Option<SummaryLanguage>,
     cancel: &CancellationToken,
 ) -> Result<Option<String>, SummaryError> {
     let mut req = CompletionRequest {
         system: vec![SystemBlock {
-            text: SYSTEM.to_string(),
+            text: system_text(language),
             cache: false,
         }],
         messages: vec![Message {
@@ -139,6 +152,17 @@ pub async fn summarize_for_approval(
             let body = result?.into_body()?;
             Ok(Some(body.trim().to_string()))
         }
+    }
+}
+
+/// 固定文。言語が決まっていれば、規則の最後に1行足す（**綴りは表のものだけ**。自由な文字列を混ぜない）。
+fn system_text(language: Option<SummaryLanguage>) -> String {
+    match language {
+        Some(language) => format!(
+            "{SYSTEM}\n- Write the summary in {}.",
+            language.english_name()
+        ),
+        None => SYSTEM.to_string(),
     }
 }
 
