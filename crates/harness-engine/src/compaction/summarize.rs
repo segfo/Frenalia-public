@@ -3,17 +3,22 @@
 //! **providerに触る唯一の縮約モジュール**。①の切詰め（[`super::shrink`]）で目標に届かなかった
 //! ときだけ呼ばれる。不可逆かつprompt cacheを全ミスさせるので、常に最後の手段。
 
-use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use harness_core::{
     CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError, Role, Sampling,
-    StreamEvent, ToolChoice,
+    ToolChoice,
 };
 
+use crate::side_call::{self, EmptyBody};
 use crate::ConversationState;
 
-const COMPACTION_MAX_TOKENS: u32 = 1024;
+/// 要約コールの出力の上限。見える要約の長さは[`COMPACTION_INSTRUCTION`]の「concisely」が決める。
+///
+/// 以前は1024だった。考える過程を出すモデルでは上限は考える過程にも数えられ、チャンクが大きいほど
+/// 考える過程も長くなるので、本文が始まる前に上限で止まり得た（[BUG-216](../../../../docs/bugs/BUG-216.md)）。
+/// 会話の外の呼び出しが共有する値を使う（[`side_call`]のモジュールdoc）。
+const COMPACTION_MAX_TOKENS: u32 = side_call::SIDE_CALL_MAX_TOKENS;
 const COMPACTION_INSTRUCTION: &str = "Summarize the conversation so far concisely, \
 preserving all facts, decisions, file paths, and open tasks that would be needed to continue \
 the work. Output only the summary text.";
@@ -34,6 +39,11 @@ pub const FOLD_SUMMARY_PREFIX: &str = "[compacted summary of ";
 /// 1/4にするのは、チャンク本体に加えて「ここまでの要約」「指示文」「出力`max_tokens`」が
 /// 同じウィンドウへ載るため。**要約コール自体が超過しては本末転倒**であり、リアクティブ経路が
 /// 最も必要とする場面で最も壊れやすかった従来実装の欠陥がここにあった。
+///
+/// **出力の上限を1024から4096へ上げた**（[BUG-216](../../../../docs/bugs/BUG-216.md)）ので、窓が
+/// 8,192なら チャンク2,048＋上限4,096 で窓の3/4を使い、systemと「ここまでの要約」には残り2,048しか
+/// 無い。会話の本体も同じ4096を窓から取っており、同じ構成で同じ扱いになる（ここでは窓に合わせて
+/// 上限を縮めていない。[`side_call`]のモジュールdoc「ここが守らないもの」）。
 pub fn chunk_tokens_for(context_window: u32) -> u64 {
     (u64::from(context_window) / 4).max(MIN_CHUNK_TOKENS)
 }
@@ -64,6 +74,12 @@ pub fn chunk_tokens_for(context_window: u32) -> u64 {
 /// 「失敗したことは戻り値に出す」と書いているが、呼び出し元を触らないという同文書の要求と両立しない
 /// ため、**部分要約であることは要約テキスト自身に印字**し、戻り値では「全滅か否か」だけを区別する。
 ///
+/// **本文が空で返ったチャンクも失敗として数える**（[BUG-216](../../../../docs/bugs/BUG-216.md)）。
+/// 以前は空の本文を要約として受け取っていたので、1つ目のチャンクが空なら履歴の先頭が
+/// `(summary unavailable)`の1行に置き換わり（畳んだ件数は成功として報告された）、途中のチャンクが
+/// 空ならそれまでの要約が空で上書きされていた。考える過程を出すモデルで、考える過程だけで出力の
+/// 上限に達すると起きる。1つ目が空なら`Err`の文に「なぜ空か」（[`EmptyBody`]）を入れて返す。
+///
 /// # キャンセル（[BUG-074](../../../../docs/bugs/BUG-074.md)）
 ///
 /// `cancel`が発火したらチャンク境界とストリーム受信の両方で降り、[`Compacted::Cancelled`]を返す。
@@ -93,10 +109,12 @@ pub async fn compact(
             Ok(Some(next)) => summary = next,
             // キャンセルは失敗ではないので、取れた分で畳まずそのまま降りる。
             Ok(None) => return Ok(Compacted::Cancelled),
+            // 本文が空のチャンクもプロバイダの失敗と同じに扱う（BUG-216）。`summary`は
+            // 上書きしない——空で上書きすると、それまでのチャンクの要約が消える。
             Err(e) => {
                 if summary.trim().is_empty() {
                     // 1つも取れていないなら縮約は成立していない。履歴は一切触らず失敗を返す。
-                    return Err(e);
+                    return Err(e.into_provider_error());
                 }
                 truncated_at = Some(i);
                 break;
@@ -104,9 +122,10 @@ pub async fn compact(
         }
     }
 
-    if summary.trim().is_empty() {
-        summary = "(summary unavailable)".to_string();
-    }
+    // ここへ来たなら`summary`は空でない——空の本文は上で失敗として扱い、1つ目が失敗すれば
+    // 戻っている（`foldable_cut`が`Some`ならチャンクは1つ以上ある）。以前はここで空を
+    // `(summary unavailable)`へ置き換えて畳んでおり、履歴が何も残らずに消えた（BUG-216）。
+    debug_assert!(!summary.trim().is_empty());
     if let Some(i) = truncated_at {
         summary.push_str(&format!(
             "\n[partial: summarization stopped after {i} of {chunk_count} chunks]"
@@ -223,11 +242,36 @@ fn chunk_ranges(messages: &[Message], chunk_tokens: u64) -> Vec<std::ops::Range<
     chunks
 }
 
+/// 1チャンクの要約コールが要約を返せなかった理由。
+#[derive(Debug)]
+enum ChunkError {
+    Provider(ProviderError),
+    /// 返事は来たが本文が空だった（BUG-216）。
+    Empty(EmptyBody),
+}
+
+impl ChunkError {
+    /// [`compact`]の戻り値（`ProviderError`）へ写す。
+    ///
+    /// 空の本文はプロバイダの失敗ではないが、`compact`の呼び出し元（`run_agent_loop`・`/compact`）が
+    /// 受け取るのは`ProviderError`だけなので、`InvalidRequest`の文に理由を入れて運ぶ。
+    /// `run_agent_loop`が`max_turns`の超過（これもプロバイダの失敗ではない）を同じ形で
+    /// 返しているのに倣った。文は画面の`AgentEvent::Error`にそのまま出る。
+    fn into_provider_error(self) -> ProviderError {
+        match self {
+            ChunkError::Provider(e) => e,
+            ChunkError::Empty(empty) => ProviderError::InvalidRequest {
+                msg: format!("会話の要約が空で返ったので、履歴は畳んでいない（{empty}）"),
+            },
+        }
+    }
+}
+
 /// 1チャンク分の要約コール。`prev`が空でなければ「ここまでの要約」を先頭に載せて畳み込む。
 ///
 /// `cancel`が発火したら`Ok(None)`。**受信途中でも降りられる**ようにストリームの読み出し全体を
 /// レースの対象にしてある——要約は数十秒かかることがあり、「コールの切れ目でしか止まらない」
-/// では実用的なキャンセルにならない。
+/// では実用的なキャンセルにならない。`Ok(Some(s))`の`s`は空でない（空なら[`ChunkError::Empty`]）。
 async fn summarize_chunk(
     provider: &dyn LlmProvider,
     state: &ConversationState,
@@ -235,7 +279,7 @@ async fn summarize_chunk(
     prev: &str,
     chunk: &[Message],
     cancel: Option<&CancellationToken>,
-) -> Result<Option<String>, ProviderError> {
+) -> Result<Option<String>, ChunkError> {
     let mut messages: Vec<Message> = Vec::with_capacity(chunk.len() + 2);
     if !prev.trim().is_empty() {
         messages.push(Message {
@@ -271,14 +315,11 @@ async fn summarize_chunk(
     }
 
     let work = async {
-        let mut stream = provider.stream(req).await?;
-        let mut out = String::new();
-        while let Some(event) = stream.next().await {
-            if let StreamEvent::TextDelta { text, .. } = event? {
-                out.push_str(&text);
-            }
-        }
-        Ok::<String, ProviderError>(out)
+        side_call::collect(provider, req)
+            .await
+            .map_err(ChunkError::Provider)?
+            .into_body()
+            .map_err(ChunkError::Empty)
     };
 
     match cancel {
@@ -457,6 +498,87 @@ mod tests {
 
         assert!(matches!(err, ProviderError::Overloaded));
         assert_eq!(state.messages, before, "失敗時に履歴を壊さない");
+    }
+
+    // --- BUG-216: 考える過程だけで上限に達し、本文が空で返ったチャンク ---
+
+    /// **1つ目のチャンクの本文が空なら、履歴を一切触らず、なぜ空かを言って失敗する。**
+    /// 以前は空の本文を要約として受け取り、履歴の先頭が`(summary unavailable)`の1行に置き換わって
+    /// `removed`が成功として返った（畳んだメッセージの中身はどこにも残らない）。
+    #[tokio::test]
+    async fn an_empty_first_chunk_leaves_the_history_untouched_and_says_why() {
+        let mut state = ConversationState::new(Vec::new());
+        for i in 0..3 {
+            state.messages.push(user_turn(&format!("turn{i}")));
+            state.messages.push(assistant_text("reply"));
+        }
+        let before = state.messages.clone();
+
+        let provider = MockProvider::new(vec![side_call::thinking_then_cut_off(
+            &"Let me think about what to keep. ".repeat(100),
+        )]);
+        let err = compact(&provider, &mut state, "mock-model", 1, 1_000_000, None)
+            .await
+            .expect_err("本文が空なのに畳んだ");
+
+        assert_eq!(state.messages, before, "空の要約で履歴を置き換えない");
+        let ProviderError::InvalidRequest { msg } = &err else {
+            panic!("理由を運ばない失敗になった: {err:?}");
+        };
+        assert!(msg.contains("出力の上限"), "{msg}");
+        assert!(msg.contains("考える過程"), "{msg}");
+    }
+
+    /// **途中のチャンクの本文が空なら、それまでの要約を残して部分要約として畳む。**
+    /// 以前は空の本文で`summary`を上書きし、1つ目のチャンクの要約が消えていた。
+    #[tokio::test]
+    async fn an_empty_later_chunk_keeps_the_summary_so_far() {
+        let mut state = ConversationState::new(Vec::new());
+        for i in 0..4 {
+            state.messages.push(user_turn(&format!("turn{i}")));
+            state.messages.push(assistant_text(&"x".repeat(400)));
+        }
+        state.messages.push(user_turn("recent"));
+
+        let provider = MockProvider::new(vec![
+            summary_turn("s1"),
+            side_call::thinking_then_cut_off("hmm"),
+            summary_turn("s3"),
+            summary_turn("s4"),
+        ]);
+        let removed = compact(&provider, &mut state, "mock-model", 1, 120, None)
+            .await
+            .unwrap()
+            .removed()
+            .expect("キャンセルしていない");
+
+        assert_eq!(removed, 8, "履歴は畳まれる");
+        assert_eq!(provider.calls_made(), 2, "空が返ったところで止める");
+        match &state.messages[0].content[0] {
+            ContentBlock::Text(t) => {
+                assert!(t.contains("s1"), "1つ目のチャンクの要約が残る: {t}");
+                assert!(t.contains("[partial:"), "部分要約であることを明示する: {t}");
+            }
+            other => panic!("expected summary text, got {other:?}"),
+        }
+    }
+
+    /// 要約コールの出力の上限は、考える過程を挟んでも本文まで届く値（会話の外の呼び出しが
+    /// 共有する値）である。以前は1024。
+    #[tokio::test]
+    async fn the_summary_call_leaves_room_for_thinking() {
+        let mut state = ConversationState::new(Vec::new());
+        for i in 0..3 {
+            state.messages.push(user_turn(&format!("turn{i}")));
+            state.messages.push(assistant_text("reply"));
+        }
+        let provider = MockProvider::new(vec![summary_turn("s")]);
+        compact(&provider, &mut state, "mock-model", 1, 1_000_000, None)
+            .await
+            .unwrap();
+        let seen = provider.max_tokens_seen();
+        assert_eq!(seen, vec![side_call::SIDE_CALL_MAX_TOKENS]);
+        assert!(seen[0] >= 4_096, "以前の1024へ戻っている: {seen:?}");
     }
 
     // --- BUG-074: 要約中のEscで降りられる ---

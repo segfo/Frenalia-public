@@ -221,3 +221,78 @@ async fn a_summary_is_not_started_twice_for_the_same_material() {
         crate::app::SummaryState::Done("前に作った要約".into())
     );
 }
+
+/// **考える過程だけで出力の上限に達し、本文が空のまま止まったら、そう画面に出す**（BUG-214）。
+/// 以前は「モデルが空の要約を返した」という固定の文しか出ず、原因（上限で止まった・考える過程で
+/// 使い切った）が画面から読めなかった。実機で見た形（`reasoning_content`だけで
+/// `finish_reason: "length"`）を、製品の入口`start_summary`から流して確かめる。
+#[tokio::test]
+async fn a_summary_cut_off_while_thinking_says_so_on_screen() {
+    use harness_core::{BlockKind, StopReason, StreamEvent, Usage};
+
+    struct ThinksPastTheLimit;
+    #[async_trait::async_trait]
+    impl harness_core::LlmProvider for ThinksPastTheLimit {
+        fn id(&self) -> &str {
+            "thinks-past-the-limit"
+        }
+        async fn stream(
+            &self,
+            _req: harness_core::CompletionRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<StreamEvent, harness_core::ProviderError>>,
+            harness_core::ProviderError,
+        > {
+            let events = vec![
+                StreamEvent::BlockStart {
+                    index: usize::MAX,
+                    kind: BlockKind::Thinking,
+                },
+                StreamEvent::ThinkingDelta {
+                    index: usize::MAX,
+                    text: "The user wants a summary of (ls).name. ".repeat(40),
+                },
+                StreamEvent::BlockStop { index: usize::MAX },
+                StreamEvent::Done {
+                    stop_reason: StopReason::MaxTokens,
+                    usage: Usage::default(),
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    let summary = ApprovalSummary {
+        provider: Arc::new(ThinksPastTheLimit),
+        model: "m".into(),
+        label: "mock / ".into(),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let scope = open_scope(ReadScopeConfig::default());
+    let mut app = app_with(PermissionSubject::Command(CommandSubject::line_only(
+        "powershell.exe -Command (ls).name",
+    )));
+    let mut cache = SummaryCache::new();
+
+    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false).is_some());
+    let event = rx.recv().await.expect("要約の結果が届かない");
+    on_background(event, &mut app, &mut cache);
+
+    let crate::app::SummaryState::Failed(reason) =
+        &app.pending_permission.as_ref().unwrap().summary
+    else {
+        panic!(
+            "失敗として出ていない: {:?}",
+            app.pending_permission.as_ref().unwrap().summary
+        );
+    };
+    assert!(
+        reason.contains("出力の上限"),
+        "上限で止まったと言っていない: {reason}"
+    );
+    assert!(
+        reason.contains("考える過程"),
+        "考える過程に触れていない: {reason}"
+    );
+    assert!(cache.is_empty(), "失敗を使い回しの表へ入れない");
+}

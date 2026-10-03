@@ -35,15 +35,15 @@
 //! - 省略した旨と「正確な本文が要るならツールを再実行せよ」を本文へ書く。パスは`tool_use`側に
 //!   残っているので**回復経路がある**。
 
-use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use harness_core::text::truncate_head_tail;
 use harness_core::{
     AgentEvent, CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError, Role,
-    Sampling, StreamEvent, ToolChoice,
+    Sampling, ToolChoice,
 };
 
+use crate::side_call;
 use crate::{ConversationState, EventSink};
 
 /// digest済みブロックのマーカー。書く側と「これは既にdigestしたか」を見る側が共有する。
@@ -65,8 +65,13 @@ pub const DIGEST_MIN_CHARS: usize = 2_000;
 /// 基準で、小さな`grep`を何十回やってもコールは増えない。
 pub const DIGEST_MIN_BATCH_CHARS: usize = 12_000;
 
-/// digestの出力上限。ローカルモデルでも1本で収まる長さ。
-const DIGEST_MAX_TOKENS: u32 = 1_024;
+/// digestの出力の上限。見えるdigestの長さは[`DIGEST_INSTRUCTION`]の「Be terse」が決める。
+///
+/// 以前は「ローカルモデルでも1本で収まる長さ」として1024だった。考える過程を出すモデルでは
+/// 上限は考える過程にも数えられ、本文が始まる前に止まるとdigestは空になる
+/// （[BUG-216](../../../../docs/bugs/BUG-216.md)）。会話の外の呼び出しが共有する値を使う
+/// （[`side_call`]のモジュールdoc）。
+const DIGEST_MAX_TOKENS: u32 = side_call::SIDE_CALL_MAX_TOKENS;
 
 /// 1回のdigestコールへ載せる入力の**絶対上限**（トークン）。
 ///
@@ -345,18 +350,9 @@ async fn call_digest(
         crate::sanitize::completion_request(&mut req);
     }
 
-    let work = async {
-        let mut stream = provider.stream(req).await?;
-        let mut out = String::new();
-        while let Some(event) = stream.next().await {
-            if let StreamEvent::TextDelta { text, .. } = event? {
-                out.push_str(&text);
-            }
-        }
-        Ok::<String, ProviderError>(out)
-    };
+    let work = side_call::collect(provider, req);
 
-    let text = match cancel {
+    let collected = match cancel {
         // `biased`で先にキャンセルを見る。既に発火していればリクエストを1本も出さない。
         Some(token) => tokio::select! {
             biased;
@@ -365,11 +361,27 @@ async fn call_digest(
         },
         None => work.await?,
     };
-    if text.trim().is_empty() {
+    match collected.into_body() {
+        Ok(text) => Ok(Some(text)),
         // 空のdigestで置き換えると本文を捨てるだけになる。触らない方がまし。
-        return Ok(Some(String::new()));
+        //
+        // **ターンは止めない**——この段は予防で、推定だけを根拠に送信を止めない
+        // （`relieve_pressure`のdoc）。ただし理由は捨てずに残す（BUG-216）。画面へ出す
+        // イベントはまだ無い（`harness-core`の`AgentEvent`に、ターンを終わらせない警告の
+        // 変種が無い）ので、`HARNESS_WIRE_LOG`へ1行置く。縮約の他の判断と同じ置き場である。
+        Err(empty) => {
+            harness_core::wire_log::record(|| {
+                serde_json::json!({
+                    "kind": "digest_empty_body",
+                    "reason": empty.to_string(),
+                    "hit_output_limit": empty.hit_output_limit(),
+                    "max_tokens": empty.max_tokens,
+                    "thinking_chars": empty.thinking_chars,
+                })
+            });
+            Ok(Some(String::new()))
+        }
     }
-    Ok(Some(text))
 }
 
 /// いまのターンのユーザプロンプト本文（digestに「何のために読んだか」を教えるため）。
@@ -575,6 +587,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(out.digested_blocks, 2, "予算ぶんだけ");
+    }
+
+    /// **考える過程だけで上限に達し、digestの本文が空で返ったら、履歴は無傷のまま降りる**
+    /// （BUG-216。空のdigestで置き換えると本文を捨てるだけになる）。ターンは止めない。
+    /// あわせて、digestコールの出力の上限が会話の外の呼び出しが共有する値であることを見る。
+    #[tokio::test]
+    async fn an_empty_digest_leaves_the_history_untouched() {
+        let mut state = turn_with_reads(5, 8_000);
+        let before = state.messages.clone();
+        let scope = digest_scope(&state);
+        let provider = MockProvider::new(vec![crate::side_call::thinking_then_cut_off(
+            &"Which facts matter here? ".repeat(200),
+        )]);
+
+        let out = digest_tool_results(&provider, &mut state, "mock", scope, 1_000_000, None, None)
+            .await
+            .expect("空のdigestでターンを止めない");
+
+        assert!(out.is_noop());
+        assert!(!out.cancelled);
+        assert_eq!(state.messages, before, "空のdigestで置き換えない");
+        assert_eq!(
+            provider.max_tokens_seen(),
+            vec![crate::side_call::SIDE_CALL_MAX_TOKENS]
+        );
     }
 
     /// キャンセルなら**履歴は無傷**（BUG-074の規則）。

@@ -8,14 +8,38 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
-use harness_core::{ProviderCapabilities, StopReason};
+use harness_core::{ProviderCapabilities, StopReason, StreamEvent};
 
 use super::*;
 
-/// 送られたリクエストを控えるだけのプロバイダ。
-#[derive(Default)]
+/// 送られたリクエストを控え、用意した返事を返すプロバイダ。既定の返事は本文1行。
 struct Capturing {
     seen: Mutex<Vec<CompletionRequest>>,
+    reply: Vec<StreamEvent>,
+}
+
+impl Default for Capturing {
+    fn default() -> Self {
+        Self::replying(vec![
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "ネットワークへ出る。".to_string(),
+            },
+            StreamEvent::Done {
+                stop_reason: StopReason::EndTurn,
+                usage: Default::default(),
+            },
+        ])
+    }
+}
+
+impl Capturing {
+    fn replying(reply: Vec<StreamEvent>) -> Self {
+        Self {
+            seen: Mutex::new(Vec::new()),
+            reply,
+        }
+    }
 }
 
 #[async_trait]
@@ -29,17 +53,9 @@ impl LlmProvider for Capturing {
         req: CompletionRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
         self.seen.lock().unwrap().push(req);
-        let events = vec![
-            Ok(StreamEvent::TextDelta {
-                index: 0,
-                text: "ネットワークへ出る。".to_string(),
-            }),
-            Ok(StreamEvent::Done {
-                stop_reason: StopReason::EndTurn,
-                usage: Default::default(),
-            }),
-        ];
-        Ok(Box::pin(stream::iter(events)))
+        Ok(Box::pin(stream::iter(
+            self.reply.clone().into_iter().map(Ok),
+        )))
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -80,6 +96,97 @@ async fn the_call_carries_no_tools_and_a_system_of_its_own() {
     assert!(req.system[0].text.starts_with("You summarize code"));
     assert!(req.system[0].text.contains("UNTRUSTED"));
     assert_eq!(req.messages.len(), 1, "会話の履歴を混ぜない");
+    assert_eq!(
+        req.max_tokens, SUMMARY_MAX_TOKENS,
+        "上限が要求に載っていない"
+    );
+}
+
+/// **出力の上限は、考える過程を挟んでも本文まで届く値である**（BUG-214）。
+///
+/// 2026-10-03の実測（LMStudio・Qwen3.6 35B系・中身1行）で、考える過程だけで約500トークン要り、
+/// 上限512では本文0文字で止まった。見える長さは SYSTEM の「8行まで」が決めるので、上限を
+/// 本文の長さに合わせて絞る理由は無い。会話の本体の既定（4096）と同じ値を要求に載せる。
+#[tokio::test]
+async fn the_output_limit_leaves_room_for_thinking_before_the_body() {
+    let provider = Arc::new(Capturing::default());
+    let cancel = CancellationToken::new();
+    summarize_for_approval(provider.as_ref(), "m", &[piece("a", "x")], false, &cancel)
+        .await
+        .unwrap();
+    let sent = provider.seen.lock().unwrap()[0].max_tokens;
+    assert!(
+        sent >= 4_096,
+        "上限{sent}は、実測で考える過程だけに要った約500トークン＋本文を収めるには小さい"
+    );
+}
+
+/// **考える過程だけで上限に達し、本文が空のまま止まったら、そう言う**（BUG-214）。
+/// 以前は空の文字列が`Ok`で返り、画面は「モデルが空の要約を返した」としか出せなかった。
+#[tokio::test]
+async fn a_body_cut_off_by_the_output_limit_while_thinking_says_so() {
+    let provider = Arc::new(Capturing::replying(side_call::thinking_then_cut_off(
+        &"The user wants me to summarize (ls).name. ".repeat(40),
+    )));
+    let cancel = CancellationToken::new();
+    let err = summarize_for_approval(provider.as_ref(), "m", &[piece("a", "x")], false, &cancel)
+        .await
+        .expect_err("本文が空なのに要約として返った");
+
+    let SummaryError::Empty(empty) = &err else {
+        panic!("プロバイダの失敗として返った: {err:?}");
+    };
+    assert!(empty.hit_output_limit());
+    assert_eq!(empty.max_tokens, SUMMARY_MAX_TOKENS);
+    assert!(empty.thinking_chars > 0);
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("出力の上限（{SUMMARY_MAX_TOKENS} トークン）")),
+        "{message}"
+    );
+    assert!(message.contains("考える過程"), "{message}");
+}
+
+/// 考える過程の後に本文があれば、今までどおり本文だけが要約になる（考える過程を混ぜない）。
+#[tokio::test]
+async fn thinking_followed_by_a_body_still_yields_the_body() {
+    let mut reply = side_call::thinking_then_cut_off("let me look at the script first");
+    reply.pop(); // 上限で止まる`Done`を外し、本文と`EndTurn`を足す。
+    reply.extend([
+        StreamEvent::TextDelta {
+            index: 0,
+            text: "\nLists the names of files in the current folder.\n".to_string(),
+        },
+        StreamEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: Default::default(),
+        },
+    ]);
+    let provider = Arc::new(Capturing::replying(reply));
+    let cancel = CancellationToken::new();
+    let out = summarize_for_approval(provider.as_ref(), "m", &[piece("a", "x")], false, &cancel)
+        .await
+        .unwrap();
+    assert_eq!(
+        out.as_deref(),
+        Some("Lists the names of files in the current folder.")
+    );
+}
+
+/// 上限ではない理由で本文が空だったときは「上限」と言わない（原因を取り違えさせない）。
+#[tokio::test]
+async fn an_empty_body_that_did_not_hit_the_limit_is_not_blamed_on_it() {
+    let provider = Arc::new(Capturing::replying(vec![StreamEvent::Done {
+        stop_reason: StopReason::EndTurn,
+        usage: Default::default(),
+    }]));
+    let cancel = CancellationToken::new();
+    let err = summarize_for_approval(provider.as_ref(), "m", &[piece("a", "x")], false, &cancel)
+        .await
+        .expect_err("本文が空なのに要約として返った");
+    let message = err.to_string();
+    assert!(!message.contains("上限"), "{message}");
+    assert!(message.contains("end_turn"), "{message}");
 }
 
 /// 区切りは呼ぶたびに変える。固定だと、中身の側に同じ行を書くだけで「ここで終わり」と

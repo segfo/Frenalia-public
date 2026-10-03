@@ -21,16 +21,26 @@
 //! - **中身はプロバイダへ出る。** 止めたいときは設定で切る（`approval.summarize`）
 //! - 読取スコープで拒否される中身を落とすのは**呼び出し側**である（ここは渡されたものを送る）
 
-use futures::StreamExt;
+use std::fmt;
+
 use tokio_util::sync::CancellationToken;
 
 use harness_core::{
     CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError, Role, Sampling,
-    StreamEvent, SystemBlock, ToolChoice,
+    SystemBlock, ToolChoice,
 };
 
-/// 要約の出力上限。1画面に収まる長さで十分で、長い要約は読まれない。
-const SUMMARY_MAX_TOKENS: u32 = 512;
+use crate::side_call::{self, EmptyBody};
+
+/// 要約の出力の上限。
+///
+/// **見える要約の長さを決めているのは[`SYSTEM`]の「8行まで」で、この値ではない。** 以前は
+/// 「1画面に収まる長さで十分」という理由で512にしていたが、その理由付けは**上限が本文だけに
+/// 掛かる**ことを前提にしていた。考える過程を出すモデルでは上限は考える過程にも数えられ、512では
+/// 本文が始まる前に止まって要約が空になった（[BUG-214](../../../docs/bugs/BUG-214.md)。中身が
+/// 1行でも考える過程が約500トークン要った）。会話の外の呼び出しが共有する値を使う
+/// （[`side_call`]のモジュールdoc）。
+const SUMMARY_MAX_TOKENS: u32 = side_call::SIDE_CALL_MAX_TOKENS;
 
 /// 送る中身の合計上限（文字）。超えたぶんは真ん中を落とし、落としたことを本文に書く。
 pub const MAX_SUMMARY_INPUT_CHARS: usize = 24_000;
@@ -53,11 +63,45 @@ pub struct SummaryPiece {
     pub text: String,
 }
 
-/// 要約を作る。`Ok(None)`はキャンセル（エラーではない）。
+/// 要約を作れなかった理由。画面は`to_string()`をそのまま「要約を作れなかった: …」へ入れる。
+#[derive(Debug)]
+pub enum SummaryError {
+    /// プロバイダが失敗を返した（接続・認証・レート制限など）。
+    Provider(ProviderError),
+    /// 返事は来たが本文が空だった。**出力の上限で止まったのか、別の理由かを区別して持つ**
+    /// （[BUG-214](../../../docs/bugs/BUG-214.md)）。
+    Empty(EmptyBody),
+}
+
+impl From<ProviderError> for SummaryError {
+    fn from(e: ProviderError) -> Self {
+        SummaryError::Provider(e)
+    }
+}
+
+impl From<EmptyBody> for SummaryError {
+    fn from(e: EmptyBody) -> Self {
+        SummaryError::Empty(e)
+    }
+}
+
+impl fmt::Display for SummaryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SummaryError::Provider(e) => e.fmt(f),
+            SummaryError::Empty(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for SummaryError {}
+
+/// 要約を作る。`Ok(None)`はキャンセル（エラーではない）。**`Ok(Some(s))`の`s`は空でない**——
+/// 本文が空なら[`SummaryError::Empty`]で、なぜ空なのか（上限で止まった・考える過程の量）を返す。
 ///
-/// [`summarize_chunk`](crate::compaction::summarize)と同じ形——providerのストリームを直接読み、
-/// 道具は渡さず、`biased`の`select!`でキャンセルを先に見る（既に発火していればリクエストを
-/// 1本も出さずに降りる）。
+/// [`summarize_chunk`](crate::compaction::summarize)と同じ形——道具は渡さず、ストリームは
+/// `side_call::collect`で読み、`biased`の`select!`でキャンセルを先に見る（既に発火していれば
+/// リクエストを1本も出さずに降りる）。
 ///
 /// `redact_host_paths`が真なら、Tier3の伏字化（ホストの絶対パスを`/workspace`へ潰す）を通す。
 pub async fn summarize_for_approval(
@@ -66,7 +110,7 @@ pub async fn summarize_for_approval(
     pieces: &[SummaryPiece],
     redact_host_paths: bool,
     cancel: &CancellationToken,
-) -> Result<Option<String>, ProviderError> {
+) -> Result<Option<String>, SummaryError> {
     let mut req = CompletionRequest {
         system: vec![SystemBlock {
             text: SYSTEM.to_string(),
@@ -88,20 +132,13 @@ pub async fn summarize_for_approval(
         crate::sanitize::completion_request(&mut req);
     }
 
-    let work = async {
-        let mut stream = provider.stream(req).await?;
-        let mut out = String::new();
-        while let Some(event) = stream.next().await {
-            if let StreamEvent::TextDelta { text, .. } = event? {
-                out.push_str(&text);
-            }
-        }
-        Ok::<String, ProviderError>(out)
-    };
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Ok(None),
-        result = work => result.map(|s| Some(s.trim().to_string())),
+        result = side_call::collect(provider, req) => {
+            let body = result?.into_body()?;
+            Ok(Some(body.trim().to_string()))
+        }
     }
 }
 
