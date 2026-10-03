@@ -68,7 +68,16 @@ async fn summarize(
     provider: &Capturing,
     cancel: &CancellationToken,
 ) -> Result<Option<String>, SummaryError> {
-    summarize_for_approval(provider, "m", &[piece("a", "x")], false, None, cancel).await
+    summarize_for_approval(
+        provider,
+        "m",
+        &[piece("a", "x")],
+        false,
+        None,
+        cancel,
+        &mut |_| {},
+    )
+    .await
 }
 
 fn piece(label: &str, text: &str) -> SummaryPiece {
@@ -91,6 +100,7 @@ async fn the_call_carries_no_tools_and_a_system_of_its_own() {
         false,
         None,
         &cancel,
+        &mut |_| {},
     )
     .await
     .unwrap();
@@ -138,6 +148,7 @@ async fn the_language_is_one_line_appended_to_the_fixed_system() {
             false,
             language,
             &cancel,
+            &mut |_| {},
         )
         .await
         .unwrap();
@@ -229,6 +240,44 @@ async fn thinking_followed_by_a_body_still_yields_the_body() {
     );
 }
 
+/// **出力が届くたびに、それまでの累計文字数を知らせる**（承認ダイアログの待ちの表示の「考えた量」）。
+/// 考える過程も本文も数える——会話の「Thinking…」の行と同じ量。中身は渡さず、数だけ。
+#[tokio::test]
+async fn the_amount_of_output_is_reported_as_it_arrives() {
+    let mut reply = side_call::thinking_then_cut_off("let me look"); // 考える過程 11 文字
+    reply.pop();
+    reply.extend([
+        StreamEvent::TextDelta {
+            index: 0,
+            text: "一覧を出す".to_string(), // 本文 5 文字
+        },
+        StreamEvent::TextDelta {
+            index: 0,
+            text: "。".to_string(), // 本文 1 文字
+        },
+        StreamEvent::Done {
+            stop_reason: StopReason::EndTurn,
+            usage: Default::default(),
+        },
+    ]);
+    let provider = Arc::new(Capturing::replying(reply));
+    let cancel = CancellationToken::new();
+    let mut seen = Vec::new();
+    let out = summarize_for_approval(
+        provider.as_ref(),
+        "m",
+        &[piece("a", "x")],
+        false,
+        None,
+        &cancel,
+        &mut |chars| seen.push(chars),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.as_deref(), Some("一覧を出す。"));
+    assert_eq!(seen, vec![11, 16, 17], "累計の文字数を、届くたびに知らせる");
+}
+
 /// 上限ではない理由で本文が空だったときは「上限」と言わない（原因を取り違えさせない）。
 #[tokio::test]
 async fn an_empty_body_that_did_not_hit_the_limit_is_not_blamed_on_it() {
@@ -314,6 +363,7 @@ async fn host_paths_are_redacted_when_asked() {
         true,
         None,
         &cancel,
+        &mut |_| {},
     )
     .await
     .unwrap();

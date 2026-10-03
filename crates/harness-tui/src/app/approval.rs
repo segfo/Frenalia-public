@@ -67,15 +67,52 @@ pub enum ApprovalCommand {
     DenySession,
 }
 
-/// 要約（D-100）の状態。作るのは段7で、ここは器だけを持つ。
+/// 要約（D-100）の状態。作るのは`crate::approvals`で、ここは器だけを持つ。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SummaryState {
     /// 作らない構成（設定で切った・要約する中身が無い）。
     #[default]
     Off,
-    Running,
-    Done(String),
-    Failed(String),
+    /// 作っている。待ちの行に、会話の「Thinking…」と同じ回る記号・経過秒・考えた量を出す。
+    Running(SummaryWait),
+    /// できた。`took`は待った時間で、見出しに残す（会話の「(thought for Ns)」と同じ）。前に作った要約を
+    /// 使い回したときは待っていないので`None`。
+    Done {
+        text: String,
+        took: Option<Duration>,
+    },
+    /// 作れなかった。`took`は`Done`と同じ。
+    Failed {
+        reason: String,
+        took: Option<Duration>,
+    },
+}
+
+/// 要約を待っている間の状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummaryWait {
+    /// 要約を起こした時刻。経過秒と、終わった後の「待った時間」はここから測る。
+    pub started: Instant,
+    /// これまでに受けた出力（考える過程と本文）の文字数の累計。背景の要約から途中経過として届く
+    /// （`crate::approvals::BackgroundEvent::SummaryProgress`）。
+    pub output_chars: usize,
+}
+
+impl SummaryWait {
+    pub fn new(started: Instant) -> Self {
+        Self {
+            started,
+            output_chars: 0,
+        }
+    }
+}
+
+/// 待ちの行を描くときの、回る記号の位置といまの時刻。**回る記号は`AppState::spinner_frame`を渡す**——会話の
+/// 「Thinking…」の行と同じ数で回す（2つが別々に回らないように）。時刻は外から渡す（試験は時刻を作って渡す）。
+#[derive(Debug, Clone, Copy)]
+pub struct WaitClock {
+    pub spinner_frame: usize,
+    pub now: Instant,
 }
 
 /// 行の意味。色はここで決めない。
@@ -390,15 +427,15 @@ impl PermissionView {
         self.cursor
     }
 
-    /// 画面に描く本文。
-    pub fn body(&self) -> Vec<ApprovalLine> {
+    /// 画面に描く本文。`clock`は要約の待ちの行（回る記号と経過秒）にだけ使う。
+    pub fn body(&self, clock: WaitClock) -> Vec<ApprovalLine> {
         match self.stage {
-            ApprovalStage::Choose => self.body_choose(),
+            ApprovalStage::Choose => self.body_choose(clock),
             ApprovalStage::Confirm => self.body_confirm(),
         }
     }
 
-    fn body_choose(&self) -> Vec<ApprovalLine> {
+    fn body_choose(&self, clock: WaitClock) -> Vec<ApprovalLine> {
         let mut out = vec![ApprovalLine::new(
             LineStyle::Heading,
             format!("{}（{:?}）", self.tool, self.risk),
@@ -471,7 +508,7 @@ impl PermissionView {
             }
         }
         out.extend(self.bound_file_lines());
-        out.extend(self.summary_lines());
+        out.extend(self.summary_lines(clock));
         out.extend(self.pane_lines());
         out
     }
@@ -502,26 +539,51 @@ impl PermissionView {
         out
     }
 
-    fn summary_lines(&self) -> Vec<ApprovalLine> {
+    fn summary_lines(&self, clock: WaitClock) -> Vec<ApprovalLine> {
         match &self.summary {
             SummaryState::Off => Vec::new(),
-            SummaryState::Running => vec![ApprovalLine::new(
-                LineStyle::Dim,
-                match &self.summary_source {
-                    Some(src) => format!("要約を作成中…（{src}へ中身を送っている）"),
-                    None => "要約を作成中…".to_string(),
+            SummaryState::Running(wait) => {
+                // 会話の「Thinking…」の行と同じ形（回る記号・考えた量・経過秒。`super::wait_figures`）。
+                let glyph = super::spinner_glyph(clock.spinner_frame);
+                let figures = super::wait_figures(
+                    wait.output_chars as u64,
+                    clock.now.saturating_duration_since(wait.started),
+                );
+                vec![ApprovalLine::new(
+                    LineStyle::Dim,
+                    match &self.summary_source {
+                        Some(src) => {
+                            format!("{glyph} 要約を作成中… {figures}（{src}へ中身を送っている）")
+                        }
+                        None => format!("{glyph} 要約を作成中… {figures}"),
+                    },
+                )]
+            }
+            SummaryState::Failed { reason, took } => vec![ApprovalLine::new(
+                LineStyle::Warn,
+                match took {
+                    Some(took) => {
+                        format!("要約を作れなかった（{:.1}s）: {reason}", took.as_secs_f32())
+                    }
+                    None => format!("要約を作れなかった: {reason}"),
                 },
             )],
-            SummaryState::Failed(reason) => vec![ApprovalLine::new(
-                LineStyle::Warn,
-                format!("要約を作れなかった: {reason}"),
-            )],
-            SummaryState::Done(text) => {
+            SummaryState::Done { text, took } => {
+                // 出どころと待った時間を見出しの括弧に並べる（どちらも無ければ括弧ごと出さない）。
+                let tags: Vec<String> = self
+                    .summary_source
+                    .iter()
+                    .cloned()
+                    .chain(took.map(|t| format!("{:.1}s", t.as_secs_f32())))
+                    .collect();
                 let mut out = vec![ApprovalLine::new(
                     LineStyle::Heading,
-                    match &self.summary_source {
-                        Some(src) => format!("要約（補助。中身と差分を必ず確認すること）［{src}］"),
-                        None => "要約（補助。中身と差分を必ず確認すること）".to_string(),
+                    match tags.is_empty() {
+                        true => "要約（補助。中身と差分を必ず確認すること）".to_string(),
+                        false => format!(
+                            "要約（補助。中身と差分を必ず確認すること）［{}］",
+                            tags.join("・")
+                        ),
                     },
                 )];
                 out.extend(text.lines().map(|l| {

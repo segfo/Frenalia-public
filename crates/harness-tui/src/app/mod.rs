@@ -15,6 +15,22 @@ use events::{pretty, MAX_OUTPUT_PREVIEW};
 /// `AppState::spinner_frame`でインデックスし、`lib.rs`の描画tick（33ms間隔）ごとに送る。
 pub const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// `frame`番目の回る記号（[`SPINNER_FRAMES`]を一周ごとに繰り返す）。
+pub fn spinner_glyph(frame: usize) -> char {
+    SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
+}
+
+/// 待っている間の行に添える「(~N tokens, X.Xs)」。**会話の「Thinking…」の行と、承認ダイアログの要約の待ちの行が
+/// 同じこれを通る**——同じ量を同じ形で見せ、片方だけ形が変わらないようにする。トークン数は受けた出力の文字数
+/// （考える過程と本文）の1/4の概算。
+pub fn wait_figures(output_chars: u64, elapsed: std::time::Duration) -> String {
+    format!(
+        "(~{} tokens, {:.1}s)",
+        output_chars / 4,
+        elapsed.as_secs_f32()
+    )
+}
+
 #[derive(Debug, Clone)]
 pub enum ToolCardStatus {
     Running {
@@ -68,7 +84,7 @@ mod stderr;
 pub use approval::MODAL_INPUT_GRACE;
 pub use approval::{
     ApprovalCommand, ApprovalLine, ApprovalStage, LineStyle, PermissionView, PreviousCopy,
-    SummaryState,
+    SummaryState, SummaryWait, WaitClock,
 };
 use commands::parse_slash_command;
 pub use commands::{Action, FsStageCommand, MemoryCommand, SlashCommand};

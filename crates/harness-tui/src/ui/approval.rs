@@ -35,14 +35,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
-use crate::app::{ApprovalStage, Click, LineStyle, PermissionView, Targets, Wheel};
+use crate::app::{ApprovalStage, Click, LineStyle, PermissionView, Targets, WaitClock, Wheel};
 use harness_sandbox::textdiff::DiffKind;
 use harness_term::button::Press;
 use harness_term::select::{Selectable, Selection};
 
 /// 承認モーダルを描き、**この描画で判明したスクロールの上限**を返す。押せる場所と送れる枠を`targets`へ登録する
 /// （呼び出し側は、後ろの画面を先に覆っておく。`crate::ui::render`）。選択肢のボタンのうち、いま押されているもの
-/// （`press`。`AppState::press`）は押されている形で描く。
+/// （`press`。`AppState::press`）は押されている形で描く。`clock`は要約の待ちの行（回る記号と経過秒）に使う。
 pub fn render_permission_modal(
     f: &mut Frame,
     area: Rect,
@@ -50,6 +50,7 @@ pub fn render_permission_modal(
     press: &Press<Click>,
     targets: &mut Targets,
     selection: &Selection<Wheel>,
+    clock: WaitClock,
 ) -> u16 {
     let rect = super::centered_rect(84, 70, area);
     // 後ろのtranscriptの全角文字が枠の左隣から始まっても左の枠線が欠けないよう、共有の部品で消す
@@ -59,7 +60,7 @@ pub fn render_permission_modal(
     targets.cover(rect);
     targets.wheel(rect, Wheel::Approval);
 
-    let body = pending.body();
+    let body = pending.body(clock);
     let candidates: Vec<Option<usize>> = body.iter().map(|line| line.candidate).collect();
     let mut lines: Vec<Line> = body.into_iter().map(styled).collect();
     // `edit_file`の差分だけは材料（書込先パス）に写らないので、ここで足す。
@@ -198,6 +199,14 @@ mod tests {
         )
     }
 
+    /// 待ちの行を描く時刻（要約を待っていない画面では使われない）。
+    fn clock() -> crate::app::WaitClock {
+        crate::app::WaitClock {
+            spinner_frame: 0,
+            now: std::time::Instant::now(),
+        }
+    }
+
     fn rendered(pending: &PermissionView) -> String {
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         term.draw(|f| {
@@ -208,6 +217,7 @@ mod tests {
                 &Default::default(),
                 &mut Default::default(),
                 &Default::default(),
+                clock(),
             );
         })
         .unwrap();
@@ -252,6 +262,7 @@ mod tests {
                 &Default::default(),
                 &mut Default::default(),
                 &Default::default(),
+                clock(),
             )
         })
         .unwrap();
@@ -281,6 +292,7 @@ mod tests {
                 &Default::default(),
                 &mut Default::default(),
                 &Default::default(),
+                clock(),
             );
         })
         .unwrap();

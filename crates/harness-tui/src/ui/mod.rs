@@ -20,8 +20,8 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    AppState, Click, DrawFeedback, KeyHint, NoticeTone, Targets, ToolCardStatus, TranscriptItem,
-    Wheel, SPINNER_FRAMES,
+    spinner_glyph, wait_figures, AppState, Click, DrawFeedback, KeyHint, NoticeTone, Targets,
+    ToolCardStatus, TranscriptItem, WaitClock, Wheel, SPINNER_FRAMES,
 };
 
 /// 入力欄が自動で伸びる最大行数。これを超えると内部スクロールする（カーソル行が
@@ -65,6 +65,11 @@ pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
             &app.press,
             &mut targets,
             &app.selection,
+            // 要約の待ちの行は「Thinking…」の行と同じ回る記号を使う（2つが別々に回らないように）。
+            WaitClock {
+                spinner_frame: app.spinner_frame,
+                now: std::time::Instant::now(),
+            },
         ));
     } else if let Some(panel) = &app.review_panel {
         behind_overlay(&mut targets, f.area(), root[0]);
@@ -468,11 +473,10 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
     // 本文/ツール呼び出しが届いた時点で`app.thinking_progress`が`None`に戻るため、
     // 次フレームからは自然に消え、実際の応答（既に上のループで描画済み）に置き換わって見える。
     if let Some(started) = app.thinking_progress {
-        let glyph = SPINNER_FRAMES[app.spinner_frame % SPINNER_FRAMES.len()];
-        let tokens = app.current_turn_downstream_chars / 4;
-        let elapsed = started.elapsed().as_secs_f32();
+        let glyph = spinner_glyph(app.spinner_frame);
+        let figures = wait_figures(app.current_turn_downstream_chars, started.elapsed());
         lines.push(Line::from(Span::styled(
-            format!("{glyph} Thinking… (~{tokens} tokens, {elapsed:.1}s)"),
+            format!("{glyph} Thinking… {figures}"),
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::ITALIC),
@@ -488,7 +492,7 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
     // ここで区別しないと、上の`Thinking…`と並んで2本のスピナーが回り、**同時に処理されて
     // いるように見えてしまう**。
     if let Some(busy) = &app.busy_progress {
-        let glyph = SPINNER_FRAMES[app.spinner_frame % SPINNER_FRAMES.len()];
+        let glyph = spinner_glyph(app.spinner_frame);
         let elapsed = busy.elapsed().as_secs_f32();
         let queued = if busy.is_running() { "" } else { " (queued)" };
         lines.push(Line::from(Span::styled(

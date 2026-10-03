@@ -86,6 +86,7 @@ async fn the_summary_comes_back_and_does_not_obey_the_material() {
         false,
         None,
         &cancel,
+        &mut |_| {},
     )
     .await
     // 本文が空のときも`Err`で来る（BUG-214）。文に「上限で止まった・考える過程の量」が入る。
@@ -133,6 +134,9 @@ async fn the_summary_comes_back_and_does_not_obey_the_material() {
 /// 測れない——モデルがそれに従うかは実物でしか分からない。従う保証は無い（要約は補助）ので、ここで見るのは
 /// 「この開発機のモデルで日本語が返るか」である。
 ///
+/// あわせて、**待っている間に出力の量が届くか**を見る（承認ダイアログの待ちの行に出す「考えた量」）。
+/// 捕捉用のプロバイダは用意した差分を一度に流すので、実物のストリームで途中に届くことはここでしか測れない。
+///
 /// **観測（2026-10-03、`qwen3.6-35b-a3b-uncensored-genesis-mtp-apex`）**: 結果は
 /// `plans/DESIGN-RUNSHELL-ALLOWLIST.md` D-100 の「要約の言語」の追記にある。
 #[tokio::test]
@@ -143,6 +147,8 @@ async fn the_summary_comes_back_in_the_requested_language() {
     let cancel = CancellationToken::new();
 
     let started = std::time::Instant::now();
+    // 待ちの表示へ送る「考えた量」（出力の文字数の累計）と、それが届いた時刻。
+    let mut reports: Vec<(std::time::Duration, usize)> = Vec::new();
     let summary = summarize_for_approval(
         provider.as_ref(),
         &model,
@@ -153,6 +159,7 @@ async fn the_summary_comes_back_in_the_requested_language() {
         false,
         Some(SummaryLanguage::Japanese),
         &cancel,
+        &mut |chars| reports.push((started.elapsed(), chars)),
     )
     .await
     .unwrap_or_else(|e| panic!("要約を作れなかった: {e}"))
@@ -161,6 +168,26 @@ async fn the_summary_comes_back_in_the_requested_language() {
     println!(
         "--- model: {model}, language: Japanese ({:.1}s) ---\n{summary}\n--- end ---",
         elapsed.as_secs_f64()
+    );
+    let (first_at, _) = reports.first().copied().unwrap_or_default();
+    let (_, total) = reports.last().copied().unwrap_or_default();
+    println!(
+        "--- output reports: {} (first at {:.1}s, last total {total} chars = ~{} tokens) ---",
+        reports.len(),
+        first_at.as_secs_f64(),
+        total / 4
+    );
+
+    // **待っている間に量が届く**（承認ダイアログの待ちの行が動く）。累計なので減らない。
+    assert!(!reports.is_empty(), "出力の量が一度も届かなかった");
+    assert!(
+        reports.windows(2).all(|w| w[0].1 <= w[1].1),
+        "累計が減った: {reports:?}"
+    );
+    assert!(
+        total >= summary.chars().count(),
+        "本文より少ない量しか数えていない（{total} < {}）",
+        summary.chars().count()
     );
 
     // 平仮名か片仮名が入っていれば日本語で書いている（漢字だけなら中国語の可能性が残る）。
@@ -194,6 +221,7 @@ async fn a_cancelled_call_does_not_reach_the_real_provider() {
         false,
         None,
         &cancel,
+        &mut |_| {},
     )
     .await
     .expect("cancellation must not be reported as an error");

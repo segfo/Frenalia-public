@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use harness_core::{LlmProvider, PermissionSubject, ProgramRule, ShellRule};
 use harness_engine::approval_ledger::{ApprovalStore, RecordedRule};
@@ -18,7 +19,7 @@ use harness_engine::Remembered;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{AppState, PreviousCopy, SummaryState, TranscriptItem};
+use crate::app::{AppState, PreviousCopy, SummaryState, SummaryWait, TranscriptItem};
 use crate::engine::EngineHandle;
 
 /// 承認画面の要約（D-100）をどこで作るか。`harness-cli`が起動時に決める。
@@ -38,6 +39,12 @@ pub(crate) type SummaryCache = HashMap<String, String>;
 pub(crate) enum BackgroundEvent {
     /// 台帳への書込が終わった。`Ok`は記録した内容、`Err`は理由。
     ApprovalRecorded(Result<String, String>),
+    /// 要約の途中経過。`output_chars`はそれまでに受けた出力（考える過程と本文）の文字数の累計。
+    /// 待ちの行の「考えた量」に使う。
+    SummaryProgress {
+        request: String,
+        output_chars: usize,
+    },
     /// 要約ができた。`request`は承認要求のid、`key`は使い回しの鍵。
     SummaryReady {
         request: String,
@@ -46,14 +53,29 @@ pub(crate) enum BackgroundEvent {
     },
 }
 
-/// 背景の結果を画面へ反映する。
-pub(crate) fn on_background(event: BackgroundEvent, app: &mut AppState, cache: &mut SummaryCache) {
+/// 背景の結果を画面へ反映する。`now`は受け取った時刻（要約を待った時間を測る。試験は作って渡す）。
+pub(crate) fn on_background(
+    event: BackgroundEvent,
+    app: &mut AppState,
+    cache: &mut SummaryCache,
+    now: Instant,
+) {
     match event {
         BackgroundEvent::ApprovalRecorded(Ok(what)) => app
             .transcript
             .push(TranscriptItem::Info(format!("承認を記録した: {what}"))),
         BackgroundEvent::ApprovalRecorded(Err(reason)) => {
             app.transcript.push(TranscriptItem::Error(reason))
+        }
+        BackgroundEvent::SummaryProgress {
+            request,
+            output_chars,
+        } => {
+            // **いま待っている要約のものだけを入れる。** 別の承認要求へ移った後・できた後に遅れて届いたもの
+            // （キャンセルの前に送られて溝に残っていたもの）は捨てる。累計なので小さい値では戻さない。
+            if let Some(SummaryState::Running(wait)) = waiting_summary_for(app, &request) {
+                wait.output_chars = wait.output_chars.max(output_chars);
+            }
         }
         BackgroundEvent::SummaryReady {
             request,
@@ -65,18 +87,28 @@ pub(crate) fn on_background(event: BackgroundEvent, app: &mut AppState, cache: &
             }
             // **別の承認要求へ移っていたら捨てる。** 前の中身の要約を、いま聞かれている
             // 呼び出しの説明として出さない。
-            let Some(view) = app.pending_permission.as_mut() else {
+            let Some(summary) = waiting_summary_for(app, &request) else {
                 return;
             };
-            if view.id != request {
-                return;
-            }
-            view.summary = match result {
-                Ok(text) => SummaryState::Done(text),
-                Err(reason) => SummaryState::Failed(reason),
+            // 待った時間を残す（会話の「(thought for Ns)」と同じ）。待っていなかったなら残さない。
+            let took = match summary {
+                SummaryState::Running(wait) => Some(now.saturating_duration_since(wait.started)),
+                _ => None,
+            };
+            *summary = match result {
+                Ok(text) => SummaryState::Done { text, took },
+                Err(reason) => SummaryState::Failed { reason, took },
             };
         }
     }
+}
+
+/// いま開いている承認ダイアログが`request`のものなら、その要約の状態。別の要求・閉じていれば`None`。
+fn waiting_summary_for<'a>(app: &'a mut AppState, request: &str) -> Option<&'a mut SummaryState> {
+    app.pending_permission
+        .as_mut()
+        .filter(|view| view.id == request)
+        .map(|view| &mut view.summary)
 }
 
 /// 「恒久的に承認」を確定する。判定器への登録はゲートが同期で終えているので、ここは
@@ -265,13 +297,16 @@ pub(crate) fn start_summary(
     let view = app.pending_permission.as_mut()?;
     if let Some(done) = cache.get(&key) {
         view.summary_source = Some(format!("{} / {}", summary.label, summary.model));
-        view.summary = SummaryState::Done(done.clone());
+        view.summary = SummaryState::Done {
+            text: done.clone(),
+            took: None,
+        };
         return None;
     }
     // **開始を即座に画面へ出す**（B-23）。無言で待たせない。
     // 出どころも一緒に出す——中身がどこへ出たのかを後から見て分かるようにする（D-100）。
     view.summary_source = Some(format!("{} / {}", summary.label, summary.model));
-    view.summary = SummaryState::Running;
+    view.summary = SummaryState::Running(SummaryWait::new(Instant::now()));
     let request = view.id.clone();
 
     let cancel = CancellationToken::new();
@@ -279,6 +314,15 @@ pub(crate) fn start_summary(
     let provider = summary.provider.clone();
     let model = summary.model.clone();
     let background = background.clone();
+    // 途中経過（考えた量）を描画ループへ送る。届いた先で、いま待っている要求のものかを照合する（`on_background`）。
+    let progress = background.clone();
+    let progress_request = request.clone();
+    let mut report = move |output_chars| {
+        let _ = progress.send(BackgroundEvent::SummaryProgress {
+            request: progress_request.clone(),
+            output_chars,
+        });
+    };
     tokio::spawn(async move {
         let result = match summarize_for_approval(
             provider.as_ref(),
@@ -287,6 +331,7 @@ pub(crate) fn start_summary(
             redact_host_paths,
             language,
             &token,
+            &mut report,
         )
         .await
         {

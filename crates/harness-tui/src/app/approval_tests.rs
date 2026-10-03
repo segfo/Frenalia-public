@@ -1,6 +1,7 @@
 //! 承認モーダルの回帰テスト（D-106・D-107）。内部の状態（段・穴・カーソル）へ触れるため
 //! `#[cfg(test)]`のまま別ファイルへ分けている（`docs/CODE-STRUCTURE-RULES.md`規則2）。
 
+use super::super::SPINNER_FRAMES;
 use super::SummaryState;
 use super::*;
 use harness_core::{CommandSubject, ProgramSubject};
@@ -41,8 +42,20 @@ fn hint_labels(v: &PermissionView) -> String {
         .join("   ")
 }
 
+/// 待ちの行を描く時刻（要約を待っていない画面では使われない）。
+fn clock() -> WaitClock {
+    WaitClock {
+        spinner_frame: 0,
+        now: Instant::now(),
+    }
+}
+
 fn body_text(v: &PermissionView) -> String {
-    v.body()
+    body_text_at(v, clock())
+}
+
+fn body_text_at(v: &PermissionView, clock: WaitClock) -> String {
+    v.body(clock)
         .into_iter()
         .map(|l| l.text)
         .collect::<Vec<_>>()
@@ -143,7 +156,7 @@ fn invisible_characters_are_visible_in_the_modal() {
 #[test]
 fn arguments_are_one_per_line_with_their_position() {
     let v = view(program("git", &["commit", "-m", "a b c"]));
-    let lines: Vec<String> = v.body().into_iter().map(|l| l.text).collect();
+    let lines: Vec<String> = v.body(clock()).into_iter().map(|l| l.text).collect();
     assert!(lines.iter().any(|l| l == "  [0] commit"), "{lines:?}");
     assert!(lines.iter().any(|l| l == "  [1] -m"), "{lines:?}");
     assert!(lines.iter().any(|l| l == "  [2] a b c"), "{lines:?}");
@@ -198,21 +211,105 @@ fn a_tool_without_a_ledger_entry_says_the_approval_is_session_scoped() {
 fn the_summary_says_where_it_came_from_and_that_it_is_only_an_aid() {
     let mut v = view(program("python", &["build.py"]));
     v.summary_source = Some("lmstudio / qwen3-8b".to_string());
-    v.summary = SummaryState::Running;
+    v.summary = SummaryState::Running(SummaryWait::new(Instant::now()));
     assert!(
-        body_text(&v).contains("要約を作成中…（lmstudio / qwen3-8b へ中身を送っている）")
-            || body_text(&v).contains("lmstudio / qwen3-8b")
+        body_text(&v).contains("（lmstudio / qwen3-8bへ中身を送っている）"),
+        "{}",
+        body_text(&v)
     );
 
-    v.summary = SummaryState::Done("ネットワークへ出る。".to_string());
+    v.summary = SummaryState::Done {
+        text: "ネットワークへ出る。".to_string(),
+        took: None,
+    };
     let text = body_text(&v);
     assert!(
         text.contains("補助。中身と差分を必ず確認すること"),
         "{text}"
     );
-    assert!(text.contains("lmstudio / qwen3-8b"), "{text}");
+    assert!(text.contains("［lmstudio / qwen3-8b］"), "{text}");
     assert!(text.contains("ネットワークへ出る。"), "{text}");
 
-    v.summary = SummaryState::Failed("接続できない".to_string());
+    v.summary = SummaryState::Failed {
+        reason: "接続できない".to_string(),
+        took: None,
+    };
     assert!(body_text(&v).contains("要約を作れなかった: 接続できない"));
+}
+
+/// **要約を待っている間は、会話の「Thinking…」と同じ形で進む**——回る記号・考えた量・経過秒。時刻と記号の位置は
+/// 外から与える（実時間で待たない）。描くたびに経過秒が進み、記号が回る。
+#[test]
+fn the_waiting_line_spins_and_counts_like_thinking() {
+    let mut v = view(program("python", &["build.py"]));
+    v.summary_source = Some("lmstudio / m".to_string());
+    let started = Instant::now();
+    v.summary = SummaryState::Running(SummaryWait {
+        started,
+        output_chars: 480,
+    });
+
+    let at = |v: &PermissionView, frame: usize, millis: u64| {
+        body_text_at(
+            v,
+            WaitClock {
+                spinner_frame: frame,
+                now: started + Duration::from_millis(millis),
+            },
+        )
+    };
+    let first = at(&v, 0, 3_400);
+    assert!(
+        first.contains(&format!(
+            "{} 要約を作成中… (~120 tokens, 3.4s)（lmstudio / mへ中身を送っている）",
+            SPINNER_FRAMES[0]
+        )),
+        "{first}"
+    );
+    // 会話の「Thinking…」の行と同じ部品で数字を組む（同じ量・同じ形）。
+    assert!(first.contains(&super::super::wait_figures(
+        480,
+        Duration::from_millis(3_400)
+    )));
+
+    let later = at(&v, 1, 5_000);
+    assert!(
+        later.contains(SPINNER_FRAMES[1]),
+        "記号が回っていない: {later}"
+    );
+    assert!(later.contains("5.0s"), "経過秒が進んでいない: {later}");
+
+    // 出どころが無い構成でも同じ形。
+    v.summary_source = None;
+    assert!(at(&v, 2, 0).contains(&format!(
+        "{} 要約を作成中… (~120 tokens, 0.0s)",
+        SPINNER_FRAMES[2]
+    )));
+}
+
+/// **終わった後は、待った時間を残す**（会話の「(thought for Ns)」・`/compact`の「finished in Ns」と同じ）。
+/// 前に作った要約を使い回したときは待っていないので出さない。作れなかったときも何秒で諦めたかを出す。
+#[test]
+fn the_time_it_took_stays_after_the_summary_is_done() {
+    let mut v = view(program("python", &["build.py"]));
+    v.summary_source = Some("lmstudio / m".to_string());
+    v.summary = SummaryState::Done {
+        text: "ネットワークへ出る。".to_string(),
+        took: Some(Duration::from_millis(9_100)),
+    };
+    let text = body_text(&v);
+    assert!(text.contains("［lmstudio / m・9.1s］"), "{text}");
+    assert!(
+        !text.contains("要約を作成中"),
+        "待ちの行が残っている: {text}"
+    );
+
+    v.summary_source = None;
+    assert!(body_text(&v).contains("［9.1s］"));
+
+    v.summary = SummaryState::Failed {
+        reason: "接続できない".to_string(),
+        took: Some(Duration::from_millis(2_000)),
+    };
+    assert!(body_text(&v).contains("要約を作れなかった（2.0s）: 接続できない"));
 }

@@ -6,6 +6,7 @@ use super::*;
 use harness_core::ReadScopeConfig;
 use harness_core::{CommandSubject, FilePreview, ProgramSubject, RiskClass};
 use harness_sandbox::ReadScope;
+use std::time::{Duration, Instant};
 
 fn preview(rel: &str, text: &str) -> FilePreview {
     FilePreview {
@@ -171,6 +172,7 @@ fn a_summary_that_arrives_after_the_modal_changed_is_discarded() {
         },
         &mut app,
         &mut cache,
+        Instant::now(),
     );
     assert_eq!(
         app.pending_permission.as_ref().unwrap().summary,
@@ -187,10 +189,14 @@ fn a_summary_that_arrives_after_the_modal_changed_is_discarded() {
         },
         &mut app,
         &mut cache,
+        Instant::now(),
     );
     assert_eq!(
         app.pending_permission.as_ref().unwrap().summary,
-        crate::app::SummaryState::Done("いまの要約".into())
+        crate::app::SummaryState::Done {
+            text: "いまの要約".into(),
+            took: None
+        }
     );
 }
 
@@ -203,6 +209,7 @@ fn the_ledger_write_result_is_visible() {
         BackgroundEvent::ApprovalRecorded(Err("書けなかった".into())),
         &mut app,
         &mut cache,
+        Instant::now(),
     );
     assert!(matches!(
         app.transcript.last(),
@@ -265,7 +272,10 @@ async fn a_summary_is_not_started_twice_for_the_same_material() {
     assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false, None).is_none());
     assert_eq!(
         app.pending_permission.as_ref().unwrap().summary,
-        crate::app::SummaryState::Done("前に作った要約".into())
+        crate::app::SummaryState::Done {
+            text: "前に作った要約".into(),
+            took: None
+        }
     );
 }
 
@@ -322,10 +332,9 @@ async fn a_summary_cut_off_while_thinking_says_so_on_screen() {
     let mut cache = SummaryCache::new();
 
     assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false, None).is_some());
-    let event = rx.recv().await.expect("要約の結果が届かない");
-    on_background(event, &mut app, &mut cache);
+    apply_until_ready(&mut rx, &mut app, &mut cache).await;
 
-    let crate::app::SummaryState::Failed(reason) =
+    let crate::app::SummaryState::Failed { reason, .. } =
         &app.pending_permission.as_ref().unwrap().summary
     else {
         panic!(
@@ -342,6 +351,22 @@ async fn a_summary_cut_off_while_thinking_says_so_on_screen() {
         "考える過程に触れていない: {reason}"
     );
     assert!(cache.is_empty(), "失敗を使い回しの表へ入れない");
+}
+
+/// 背景から届くもの（途中経過と結果）を、結果が届くまで画面へ反映する。
+async fn apply_until_ready(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<BackgroundEvent>,
+    app: &mut AppState,
+    cache: &mut SummaryCache,
+) {
+    loop {
+        let event = rx.recv().await.expect("要約の結果が届かない");
+        let ready = matches!(event, BackgroundEvent::SummaryReady { .. });
+        on_background(event, app, cache, Instant::now());
+        if ready {
+            return;
+        }
+    }
 }
 
 /// 送られた要求を控え、本文1行を返すプロバイダ（何が要約の呼び出しへ渡ったかを見る）。
@@ -398,8 +423,7 @@ async fn summarize_through_the_screen(
         start_summary(&summary, &tx, app, &cache, &scope, false, display_language).is_some(),
         "要約が起きなかった"
     );
-    let event = rx.recv().await.expect("要約の結果が届かない");
-    on_background(event, app, &mut cache);
+    apply_until_ready(&mut rx, app, &mut cache).await;
     let seen = provider.seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
     seen[0].clone()
@@ -434,9 +458,13 @@ async fn the_summary_is_asked_for_in_the_users_language_without_sending_the_user
         !everything.contains("成果物"),
         "ユーザーの文が要求に載っている"
     );
-    assert_eq!(
-        app.pending_permission.as_ref().unwrap().summary,
-        crate::app::SummaryState::Done("ファイルを消す。".into())
+    assert!(
+        matches!(
+            &app.pending_permission.as_ref().unwrap().summary,
+            crate::app::SummaryState::Done { text, .. } if text == "ファイルを消す。"
+        ),
+        "{:?}",
+        app.pending_permission.as_ref().unwrap().summary
     );
 }
 
@@ -512,7 +540,10 @@ async fn a_cached_summary_is_reused_only_for_the_same_material_and_language() {
     assert!(start_summary(&summary, &tx, &mut again, &cache, &scope, false, ja).is_none());
     assert_eq!(
         again.pending_permission.as_ref().unwrap().summary,
-        crate::app::SummaryState::Done("一覧を出すだけ。".into())
+        crate::app::SummaryState::Done {
+            text: "一覧を出すだけ。".into(),
+            took: None
+        }
     );
 
     // 長さが同じ別の行には使い回さない。
@@ -522,10 +553,10 @@ async fn a_cached_summary_is_reused_only_for_the_same_material_and_language() {
     let token = start_summary(&summary, &tx, &mut removed, &cache, &scope, false, ja)
         .expect("別の中身なのに要約を起こさなかった");
     token.cancel();
-    assert_eq!(
+    assert!(matches!(
         removed.pending_permission.as_ref().unwrap().summary,
-        crate::app::SummaryState::Running
-    );
+        crate::app::SummaryState::Running(_)
+    ));
 
     // 同じ行でも、言語が違えば使い回さない。
     let mut english = listed();
@@ -540,8 +571,210 @@ async fn a_cached_summary_is_reused_only_for_the_same_material_and_language() {
     )
     .expect("言語が違うのに前の要約を使い回した");
     token.cancel();
-    assert_eq!(
+    assert!(matches!(
         english.pending_permission.as_ref().unwrap().summary,
-        crate::app::SummaryState::Running
+        crate::app::SummaryState::Running(_)
+    ));
+}
+
+/// 待っている承認ダイアログ（`perm-0`）。要約は`started`に起こした。
+fn waiting_app(started: Instant) -> AppState {
+    let mut app = app_with(PermissionSubject::Command(CommandSubject::line_only("ls")));
+    app.pending_permission.as_mut().unwrap().summary =
+        crate::app::SummaryState::Running(crate::app::SummaryWait::new(started));
+    app
+}
+
+fn output_chars(app: &AppState) -> Option<usize> {
+    match &app.pending_permission.as_ref()?.summary {
+        crate::app::SummaryState::Running(wait) => Some(wait.output_chars),
+        _ => None,
+    }
+}
+
+fn progress(request: &str, output_chars: usize) -> BackgroundEvent {
+    BackgroundEvent::SummaryProgress {
+        request: request.into(),
+        output_chars,
+    }
+}
+
+/// **途中経過が届くと、待ちの行の「考えた量」が増える。** 累計なので、小さい値では戻さない。
+#[test]
+fn progress_raises_the_amount_on_the_waiting_line() {
+    let now = Instant::now();
+    let mut app = waiting_app(now);
+    let mut cache = SummaryCache::new();
+    assert_eq!(output_chars(&app), Some(0));
+
+    on_background(progress("perm-0", 40), &mut app, &mut cache, now);
+    assert_eq!(output_chars(&app), Some(40));
+    on_background(progress("perm-0", 100), &mut app, &mut cache, now);
+    assert_eq!(output_chars(&app), Some(100));
+    on_background(progress("perm-0", 60), &mut app, &mut cache, now);
+    assert_eq!(output_chars(&app), Some(100), "累計が戻った");
+}
+
+/// **別の承認要求の途中経過・終わった後に遅れて届いた途中経過は捨てる。** キャンセルの前に送られて溝に残って
+/// いたものが、いま聞かれている呼び出しの待ちの行や、出来上がった要約を書き換えない。
+#[test]
+fn progress_for_another_request_or_after_the_end_is_discarded() {
+    let now = Instant::now();
+    let mut app = waiting_app(now);
+    let mut cache = SummaryCache::new();
+
+    on_background(progress("perm-9", 400), &mut app, &mut cache, now);
+    assert_eq!(output_chars(&app), Some(0), "別の要求の量が入った");
+
+    on_background(
+        BackgroundEvent::SummaryReady {
+            request: "perm-0".into(),
+            key: "k".into(),
+            result: Ok("一覧を出す。".into()),
+        },
+        &mut app,
+        &mut cache,
+        now,
+    );
+    let done = app.pending_permission.as_ref().unwrap().summary.clone();
+    on_background(progress("perm-0", 999), &mut app, &mut cache, now);
+    assert_eq!(
+        app.pending_permission.as_ref().unwrap().summary,
+        done,
+        "終わった後の途中経過で状態が変わった"
+    );
+
+    // ダイアログが閉じた後に届いても何も起きない。
+    app.pending_permission = None;
+    on_background(progress("perm-0", 1), &mut app, &mut cache, now);
+    assert!(app.pending_permission.is_none());
+}
+
+/// **終わったら待ちの行は消え、待った時間が残る**（会話の「(thought for Ns)」と同じ）。作れなかったときも同じ。
+#[test]
+fn the_wait_ends_with_the_time_it_took() {
+    let started = Instant::now();
+    let finished = started + Duration::from_millis(9_100);
+    let mut cache = SummaryCache::new();
+
+    let mut app = waiting_app(started);
+    on_background(
+        BackgroundEvent::SummaryReady {
+            request: "perm-0".into(),
+            key: "k".into(),
+            result: Ok("一覧を出す。".into()),
+        },
+        &mut app,
+        &mut cache,
+        finished,
+    );
+    assert_eq!(
+        app.pending_permission.as_ref().unwrap().summary,
+        crate::app::SummaryState::Done {
+            text: "一覧を出す。".into(),
+            took: Some(Duration::from_millis(9_100)),
+        }
+    );
+
+    let mut app = waiting_app(started);
+    on_background(
+        BackgroundEvent::SummaryReady {
+            request: "perm-0".into(),
+            key: "k2".into(),
+            result: Err("接続できない".into()),
+        },
+        &mut app,
+        &mut cache,
+        finished,
+    );
+    assert_eq!(
+        app.pending_permission.as_ref().unwrap().summary,
+        crate::app::SummaryState::Failed {
+            reason: "接続できない".into(),
+            took: Some(Duration::from_millis(9_100)),
+        }
+    );
+}
+
+/// **製品の入口から**: 要約が考える過程と本文を流す間、背景から途中経過が届き、待ちの行の量が増えてから
+/// 要約に置き換わる。
+#[tokio::test]
+async fn progress_flows_from_the_summary_to_the_waiting_line() {
+    use harness_core::{BlockKind, StopReason, StreamEvent, Usage};
+
+    struct ThinksThenAnswers;
+    #[async_trait::async_trait]
+    impl harness_core::LlmProvider for ThinksThenAnswers {
+        fn id(&self) -> &str {
+            "thinks-then-answers"
+        }
+        async fn stream(
+            &self,
+            _req: harness_core::CompletionRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<StreamEvent, harness_core::ProviderError>>,
+            harness_core::ProviderError,
+        > {
+            let events = vec![
+                StreamEvent::BlockStart {
+                    index: usize::MAX,
+                    kind: BlockKind::Thinking,
+                },
+                StreamEvent::ThinkingDelta {
+                    index: usize::MAX,
+                    text: "let me look".to_string(), // 11 文字
+                },
+                StreamEvent::BlockStop { index: usize::MAX },
+                StreamEvent::TextDelta {
+                    index: 0,
+                    text: "一覧を出す。".to_string(), // 6 文字
+                },
+                StreamEvent::Done {
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+    }
+
+    let summary = ApprovalSummary {
+        provider: Arc::new(ThinksThenAnswers),
+        model: "m".into(),
+        label: "mock / ".into(),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let scope = open_scope(ReadScopeConfig::default());
+    let mut app = app_with(PermissionSubject::Command(CommandSubject::line_only("ls")));
+    let mut cache = SummaryCache::new();
+    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false, None).is_some());
+    assert_eq!(
+        output_chars(&app),
+        Some(0),
+        "起こした直後は待ちの行が出ている"
+    );
+
+    let mut seen = Vec::new();
+    loop {
+        let event = rx.recv().await.expect("要約の結果が届かない");
+        let ready = matches!(event, BackgroundEvent::SummaryReady { .. });
+        on_background(event, &mut app, &mut cache, Instant::now());
+        if ready {
+            break;
+        }
+        seen.push(output_chars(&app));
+    }
+    assert_eq!(
+        seen,
+        vec![Some(11), Some(17)],
+        "途中経過が待ちの行に入っていない"
+    );
+    assert!(
+        matches!(
+            &app.pending_permission.as_ref().unwrap().summary,
+            crate::app::SummaryState::Done { text, took: Some(_) } if text == "一覧を出す。"
+        ),
+        "{:?}",
+        app.pending_permission.as_ref().unwrap().summary
     );
 }

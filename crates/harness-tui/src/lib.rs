@@ -30,7 +30,7 @@ pub use app::{
     Action, AppState, BusyEnd, BusyProgress, CommitSelection, MemoryCommand, PartialFile,
     ReviewPanelState, ReviewRow, ReviewTarget, SlashCommand,
 };
-pub use app::{ApprovalStage, PermissionView, PreviousCopy, SummaryState};
+pub use app::{ApprovalStage, PermissionView, PreviousCopy, SummaryState, SummaryWait};
 pub use approvals::ApprovalSummary;
 
 /// 承認画面を1枚描く（`examples/approval-frames.rs`のための入口）。
@@ -50,6 +50,10 @@ pub fn render_approval_modal_for_example(
         &Default::default(),
         &mut app::Targets::default(),
         &Default::default(),
+        app::WaitClock {
+            spinner_frame: 0,
+            now: std::time::Instant::now(),
+        },
     )
 }
 pub use engine::{spawn_engine, EngineHandle};
@@ -1195,7 +1199,8 @@ pub async fn run(
                 }
             }
             Some(background) = background_rx.recv() => {
-                approvals::on_background(background, &mut app, &mut summary_cache);
+                let now = std::time::Instant::now();
+                approvals::on_background(background, &mut app, &mut summary_cache, now);
             }
             _ = tick.tick() => {
                 app.tick();

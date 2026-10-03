@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use harness_core::{
     BoundFile, CommandSubject, FilePreview, PermissionSubject, ProgramSubject, RiskClass,
 };
-use harness_tui::{ApprovalStage, PermissionView, PreviousCopy, SummaryState};
+use harness_tui::{ApprovalStage, PermissionView, PreviousCopy, SummaryState, SummaryWait};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
@@ -164,11 +164,24 @@ fn scenes() -> Vec<(&'static str, PermissionView)> {
         text: Ok("import subprocess\nsubprocess.run(['cargo', 'build'])\n".to_string()),
     }]);
     with_diff.summary_source = Some("lmstudio / qwen3-8b".to_string());
-    with_diff.summary = SummaryState::Done(
-        "cargo build を --release で実行します。ネットワークへは出ません。".to_string(),
-    );
+    with_diff.summary = SummaryState::Done {
+        text: "cargo build を --release で実行します。ネットワークへは出ません。".to_string(),
+        took: Some(Duration::from_millis(9_100)),
+    };
     with_diff.on_key(key('f'));
     out.push(("6. 差分の枠（[f]）と要約", with_diff));
+
+    // 要約を待っている間（会話の「Thinking…」と同じ回る記号・考えた量・経過秒）。
+    let mut waiting = view(
+        "run_shell",
+        PermissionSubject::Command(CommandSubject::line_only("python build.py")),
+    );
+    waiting.summary_source = Some("lmstudio / qwen3-8b".to_string());
+    waiting.summary = SummaryState::Running(SummaryWait {
+        started: Instant::now() - Duration::from_millis(3_400),
+        output_chars: 480,
+    });
+    out.push(("7. 要約を待っている間", waiting));
 
     out
 }

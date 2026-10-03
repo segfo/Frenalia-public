@@ -109,13 +109,16 @@ impl std::error::Error for SummaryError {}
 /// 本文が空なら[`SummaryError::Empty`]で、なぜ空なのか（上限で止まった・考える過程の量）を返す。
 ///
 /// [`summarize_chunk`](crate::compaction::summarize)と同じ形——道具は渡さず、ストリームは
-/// `side_call::collect`で読み、`biased`の`select!`でキャンセルを先に見る（既に発火していれば
+/// `side_call::collect_reporting`で読み、`biased`の`select!`でキャンセルを先に見る（既に発火していれば
 /// リクエストを1本も出さずに降りる）。
 ///
 /// `redact_host_paths`が真なら、Tier3の伏字化（ホストの絶対パスを`/workspace`へ潰す）を通す。
 ///
 /// `language`が`Some`なら、固定文の後ろに「Write the summary in {言語}.」の1行を足す。`None`なら
 /// 言語を足さない（今までどおりの要求）。
+///
+/// `on_output`は、出力（考える過程と本文）が届くたびに、それまでに受けた文字数の累計を受ける。
+/// 画面が待っている間に「考えた量」を出すのに使う（中身は渡さない。数だけ）。
 pub async fn summarize_for_approval(
     provider: &dyn LlmProvider,
     model: &str,
@@ -123,6 +126,7 @@ pub async fn summarize_for_approval(
     redact_host_paths: bool,
     language: Option<SummaryLanguage>,
     cancel: &CancellationToken,
+    on_output: &mut (dyn FnMut(usize) + Send),
 ) -> Result<Option<String>, SummaryError> {
     let mut req = CompletionRequest {
         system: vec![SystemBlock {
@@ -148,7 +152,7 @@ pub async fn summarize_for_approval(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Ok(None),
-        result = side_call::collect(provider, req) => {
+        result = side_call::collect_reporting(provider, req, on_output) => {
             let body = result?.into_body()?;
             Ok(Some(body.trim().to_string()))
         }

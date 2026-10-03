@@ -69,6 +69,17 @@ pub(crate) async fn collect(
     provider: &dyn LlmProvider,
     req: CompletionRequest,
 ) -> Result<Collected, ProviderError> {
+    collect_reporting(provider, req, &mut |_| {}).await
+}
+
+/// [`collect`]と同じ読み方で、**出力が届くたびに、それまでに受けた出力の文字数の累計**を`on_output`へ渡す。
+/// 数えるのは考える過程と本文の両方（会話の「Thinking…」の行が数える量と同じ。`harness-tui`の
+/// `current_turn_downstream_chars`）。承認画面の要約の待ちの表示が使う。
+pub(crate) async fn collect_reporting(
+    provider: &dyn LlmProvider,
+    req: CompletionRequest,
+    on_output: &mut (dyn FnMut(usize) + Send),
+) -> Result<Collected, ProviderError> {
     let max_tokens = req.max_tokens;
     let mut stream = provider.stream(req).await?;
     let mut out = Collected {
@@ -77,11 +88,19 @@ pub(crate) async fn collect(
         stop_reason: None,
         max_tokens,
     };
+    let mut output_chars = 0usize;
     while let Some(event) = stream.next().await {
         match event? {
-            StreamEvent::TextDelta { text, .. } => out.text.push_str(&text),
+            StreamEvent::TextDelta { text, .. } => {
+                output_chars += text.chars().count();
+                out.text.push_str(&text);
+                on_output(output_chars);
+            }
             StreamEvent::ThinkingDelta { text, .. } => {
-                out.thinking_chars += text.chars().count();
+                let chars = text.chars().count();
+                out.thinking_chars += chars;
+                output_chars += chars;
+                on_output(output_chars);
             }
             StreamEvent::Done { stop_reason, .. } => out.stop_reason = Some(stop_reason),
             _ => {}
