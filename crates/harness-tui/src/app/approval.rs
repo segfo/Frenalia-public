@@ -262,7 +262,8 @@ impl PermissionView {
 
     /// キー入力。返した`Some`が応答で、`None`は「この画面の中で処理した」。
     pub fn on_key(&mut self, key: KeyEvent) -> Option<ApprovalCommand> {
-        if !self.accepts_input() {
+        // [BUG-212] `Ctrl`・`Alt`付きの文字キーは選択肢のキーではない（`Ctrl+Y`が`y`=一度だけ許可として効いていた）。
+        if !self.accepts_input() || harness_term::is_chorded_char(&key) {
             return None;
         }
         match self.stage {

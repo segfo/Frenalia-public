@@ -1753,6 +1753,10 @@ impl App {
     }
 
     fn on_modal_key(&mut self, key: KeyEvent) -> Option<Action> {
+        // [BUG-212] `Ctrl`・`Alt`付きの文字キーは`y`=書く・`n`=やめるではない（`Ctrl+Y`で書いていた）。
+        if harness_term::is_chorded_char(&key) {
+            return None;
+        }
         let kind = self.modal.as_ref().map(|m| m.confirm);
         let confirm = kind.is_some_and(Confirm::asks);
         // 差分が長いと画面に収まらない。**最後まで読めないと確認にならない**ので送れるようにする。

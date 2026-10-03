@@ -348,6 +348,11 @@ impl ReviewPanelState {
     /// パネル表示中のキー入力。パネルが消費したら`None`、呼び出し側の処理が要るときだけ
     /// [`ReviewCommand`]を返す。
     pub fn on_key(&mut self, key: KeyEvent) -> Option<ReviewCommand> {
+        // [BUG-212] `Ctrl`・`Alt`付きの文字キーはパネルの文字のキーではない（`Ctrl+C`が`c`=commit、
+        // `Ctrl+X`が`x`=discard-allとして効いていた）。
+        if harness_term::is_chorded_char(&key) {
+            return None;
+        }
         match key.code {
             KeyCode::Esc => Some(ReviewCommand::Close),
             KeyCode::Tab | KeyCode::BackTab => {

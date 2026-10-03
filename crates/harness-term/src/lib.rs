@@ -37,8 +37,8 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableMouseCapture, EnableMouseCapture, KeyCode, KeyEvent, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -60,6 +60,21 @@ pub fn host_is_vscode() -> bool {
     std::env::var("TERM_PROGRAM")
         .map(|v| v.eq_ignore_ascii_case("vscode"))
         .unwrap_or(false)
+}
+
+/// `Ctrl`か`Alt`を押しながらの文字キーか（[BUG-212]）。
+///
+/// 重ねた枠（承認ダイアログ・レビューパネル・確認ダイアログ）は文字のキーで決める（`y`=許可・`c`=commit等）。
+/// キーの種類（`KeyCode::Char`）だけを見ると、`Ctrl+C`（終了・コピーのつもり）が`c`=commitとして、`Ctrl+Y`が`y`=許可として
+/// 効く。**押した人が狙ったのは別の操作**なので、そうした枠は先頭でこれが真のキーを捨てる。`Shift`は数えない
+/// （大文字は別の文字として届く）。
+///
+/// [BUG-212]: ../../../docs/bugs/BUG-212.md
+pub fn is_chorded_char(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
 pub struct TerminalGuard;

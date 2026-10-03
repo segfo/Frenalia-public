@@ -465,3 +465,45 @@ fn selected_characters_look_selected_not_reversed() {
         "選んでいない文字まで色が付いた"
     );
 }
+
+/// [BUG-212] **レビューパネルで選んでいないときの`Ctrl+C`は、`c=commit`にならない**（`Ctrl+X`も`x=discard-all`に
+/// ならない）。修飾キー付きの文字キーは、パネルの文字のキーとして扱わない。素の`c`は今までどおりcommit（許可側）。
+#[test]
+fn ctrl_c_in_the_review_panel_never_commits() {
+    let mut app = review_app(three_rows());
+    draw(&mut app);
+    let (copied, other) = ctrl_c(&mut app);
+    assert_eq!(copied, None);
+    assert_eq!(other, shown(&None), "Ctrl+Cで何かが起きた");
+    assert!(app.review_panel.is_some(), "Ctrl+Cでパネルが閉じた");
+    assert!(!app.should_quit);
+    let ctrl_x = press_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(shown(&ctrl_x), shown(&None));
+    assert!(app.review_panel.is_some());
+    assert!(matches!(
+        press(&mut app, KeyCode::Char('c')),
+        Some(Action::CommitChanges(_))
+    ));
+}
+
+/// [BUG-212] **承認ダイアログでも、修飾キー付きの文字キーは選択肢を押さない**（`Ctrl+Y`で一度だけ許可にならない）。
+#[test]
+fn a_ctrl_chord_does_not_answer_the_approval_dialog() {
+    for code in ['y', 'n', 'd', 'a'] {
+        let mut app = pending_app(3);
+        draw(&mut app);
+        let action = press_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(code), KeyModifiers::CONTROL),
+        );
+        assert_eq!(shown(&action), shown(&None), "Ctrl+{code}");
+        assert_eq!(
+            approval_state(&app),
+            approval_state(&pending_app(3)),
+            "Ctrl+{code}で承認ダイアログが変わった"
+        );
+    }
+}

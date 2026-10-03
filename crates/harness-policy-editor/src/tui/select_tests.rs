@@ -270,3 +270,15 @@ fn the_result_and_the_hint_follow_what_can_be_copied() {
     let keys: String = grid[usize::from(SIZE.1 - 1)].concat();
     assert!(squash(&keys).contains("Ctrl+Cコピー"), "{keys}");
 }
+
+/// [BUG-212] **確認ダイアログの`y`=書くは、`Ctrl+Y`では押されない**（修飾キー付きの文字キーは`y`ではない）。
+#[test]
+fn a_ctrl_chord_does_not_confirm_the_write() {
+    let ws = workspace();
+    let mut app = with_modal(ws.path(), vec!["alpha".into()]);
+    frame(&mut app, SIZE.0, SIZE.1);
+    app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+    assert!(app.modal.is_some(), "Ctrl+Yで書き込みの確認が通った");
+    app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::ALT));
+    assert!(app.modal.is_some(), "Alt+Nで確認ダイアログが閉じた");
+}
