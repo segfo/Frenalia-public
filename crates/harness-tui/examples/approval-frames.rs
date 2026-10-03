@@ -157,6 +157,7 @@ fn scenes() -> Vec<(&'static str, PermissionView)> {
                     .to_string(),
                 truncated: false,
             }],
+            decoded: Vec::new(),
         }),
     );
     with_diff.previous = Some(vec![PreviousCopy {
@@ -182,6 +183,24 @@ fn scenes() -> Vec<(&'static str, PermissionView)> {
         output_chars: 480,
     });
     out.push(("7. 要約を待っている間", waiting));
+
+    // [BUG-224] 符号化された中身を、段ごとに解読して見せる（`run_shell`の行から）。
+    let line = "pwsh --enc cwB5AHMAdABlAG0AaQBuAGYAbwA=";
+    let mut decoded = CommandSubject::line_only(line);
+    decoded.decoded = harness_tools::encoded_command::decode_shell_line(line);
+    out.push((
+        "8. 符号化された中身を解読して見せる",
+        view("run_shell", PermissionSubject::Command(decoded)),
+    ));
+
+    // 解読できなかったこと・上限で止めたことも段として出す（黙って落とさない）。
+    let line = "pwsh -enc $payload; [Convert]::FromBase64String($b)";
+    let mut undecodable = CommandSubject::line_only(line);
+    undecodable.decoded = harness_tools::encoded_command::decode_shell_line(line);
+    out.push((
+        "9. 解読できなかった符号化",
+        view("run_shell", PermissionSubject::Command(undecodable)),
+    ));
 
     out
 }

@@ -275,9 +275,9 @@ fn program_subject(
     let mut subject = ProgramSubject {
         resolved: resolved.as_ref().map(|r| r.to_string_lossy().into_owned()),
         runs_code,
-        decoded_inline: is_powershell(&program)
-            .then(|| approval_binding::decode_encoded_command(&args))
-            .flatten(),
+        // 符号化された中身は、ハーネスが機械的に解読して承認画面と要約へ渡す（§4.4）。
+        // **照合には使わない**——`same_for_approval`も記録もこの欄を見ない。
+        decoded: crate::encoded_command::decode_program_args(&program, &args),
         ..ProgramSubject::plain(program, args)
     };
     subject.one_shot_only = false;
@@ -311,13 +311,6 @@ fn program_subject(
         }
     }
     subject
-}
-
-fn is_powershell(program: &str) -> bool {
-    let name = program.rsplit(['\\', '/']).next().unwrap_or(program);
-    let name = name.to_ascii_lowercase();
-    let name = name.strip_suffix(".exe").unwrap_or(&name);
-    name == "pwsh" || name == "powershell"
 }
 
 /// `program`を、起動する実行ファイルのパスへ解決する（D-98）。

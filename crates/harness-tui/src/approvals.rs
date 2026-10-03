@@ -12,7 +12,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use harness_core::{LlmProvider, PermissionSubject, ProgramRule, ShellRule};
+use harness_core::{
+    DecodeOutcome, DecodedLayer, EncodedSource, LlmProvider, PermissionSubject, ProgramRule,
+    ShellRule,
+};
 use harness_engine::approval_ledger::{ApprovalStore, RecordedRule};
 use harness_engine::approval_summary::{summarize_for_approval, SummaryLanguage, SummaryPiece};
 use harness_engine::Remembered;
@@ -211,25 +214,84 @@ pub(crate) fn summary_pieces(
                 text: c.line.clone(),
             });
             pieces.extend(file_pieces(&c.previews, read_scope));
+            pieces.extend(decoded_pieces(&c.decoded));
         }
         PermissionSubject::Program(p) => {
             pieces.extend(file_pieces(&p.previews, read_scope));
-            if let Some(decoded) = &p.decoded_inline {
-                pieces.push(SummaryPiece {
-                    label: "the decoded -EncodedCommand".to_string(),
-                    text: decoded.clone(),
-                });
-            } else if p.runs_code && p.files.is_empty() && !p.args.is_empty() {
-                // ファイルに縛れない＝引数そのものがコードである（`pwsh -c "…"`）。
+            // ファイルに縛れない＝引数そのものがコードである（`pwsh -c "…"`）。ただし`-EncodedCommand`の値を
+            // 解読できたなら、走るコードはその中身で、引数は符号化された塊とスイッチだけなので回さない
+            // （塊を渡すと、要約が自分で解読しようとする）。`FromBase64String`だけなら、それを戻して何をするか
+            // （`iex`等）は引数の側にあるので回す。
+            let args_are_the_code = !p.decoded.iter().any(|l| {
+                l.depth == 1
+                    && l.source == EncodedSource::EncodedCommand
+                    && matches!(l.outcome, DecodeOutcome::Text { .. })
+            });
+            if args_are_the_code && p.runs_code && p.files.is_empty() && !p.args.is_empty() {
                 pieces.push(SummaryPiece {
                     label: "the arguments, which run as code".to_string(),
                     text: p.args.join("\n"),
                 });
             }
+            pieces.extend(decoded_pieces(&p.decoded));
         }
         _ => {}
     }
     pieces
+}
+
+/// 解読した段を要約の材料にする（[BUG-224]）。**要約する LLM に自分で解読させない**——
+/// 実際に、符号化された塊を渡したら自分で解いて中身を取り違えた（`systeminfo`を`Write-Hello`と
+/// 書いた）。解読はハーネスの仕事で、要約は読んで説明する仕事である（D-100「要約は補助」）。
+///
+/// 解読できなかった段も材料に入れる。符号化された箇所があること自体が、人が知るべき事実だからである。
+/// 文言は画面の`decoded_layer_lines`（`app/approval.rs`）と同じく網羅の`match`で組む。
+fn decoded_pieces(decoded: &[DecodedLayer]) -> Vec<SummaryPiece> {
+    decoded
+        .iter()
+        .map(|layer| {
+            let place = match layer.source {
+                EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => "value",
+                EncodedSource::FromBase64String => "argument",
+            };
+            let head = format!(
+                "encoded payload, layer {} (the {place} of {})",
+                layer.depth,
+                layer.source.spelling()
+            );
+            let not_decoded = |why: String| SummaryPiece {
+                label: format!("{head}, which the harness did not decode"),
+                text: why,
+            };
+            match &layer.outcome {
+                DecodeOutcome::Text { encoding, text } => SummaryPiece {
+                    label: format!("{head}, decoded by the harness from {}", encoding.name()),
+                    text: text.clone(),
+                },
+                DecodeOutcome::MissingValue => not_decoded("No value follows it.".to_string()),
+                DecodeOutcome::NotBase64 => not_decoded(
+                    "The value is not base64 (a variable or expression decided at run time)."
+                        .to_string(),
+                ),
+                DecodeOutcome::NotText => not_decoded(
+                    "The base64 decodes to bytes that are not text (possibly compressed or encrypted)."
+                        .to_string(),
+                ),
+                DecodeOutcome::NotLiteral => not_decoded(
+                    "The argument is not a plain string literal (decided at run time).".to_string(),
+                ),
+                DecodeOutcome::DepthLimit { max_depth } => not_decoded(format!(
+                    "Nested more than {max_depth} layers deep; the harness stopped decoding here."
+                )),
+                DecodeOutcome::SizeLimit { max_bytes } => not_decoded(format!(
+                    "Decoded material exceeded {max_bytes} bytes; the harness stopped decoding here."
+                )),
+                DecodeOutcome::CountLimit { max_layers } => not_decoded(format!(
+                    "More than {max_layers} encoded payloads; the harness stopped decoding here."
+                )),
+            }
+        })
+        .collect()
 }
 
 fn file_pieces(

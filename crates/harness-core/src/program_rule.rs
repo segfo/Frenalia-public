@@ -281,7 +281,7 @@ mod tests {
             files,
             one_shot_only: false,
             previews: Vec::new(),
-            decoded_inline: None,
+            decoded: Vec::new(),
         }
     }
 
@@ -416,6 +416,7 @@ mod tests {
             files: vec![file("build.py", "a")],
             unverifiable: false,
             previews: Vec::new(),
+            decoded: Vec::new(),
         };
         let r = ShellRule::exact(&approved, WS);
         assert!(r.matches(&approved, WS));

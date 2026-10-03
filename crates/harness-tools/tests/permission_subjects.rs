@@ -192,7 +192,45 @@ async fn an_interpreter_call_binds_its_script_and_flags_inline_code() {
         p.one_shot_only,
         "inline code cannot be approved permanently"
     );
-    assert_eq!(p.decoded_inline.as_deref(), Some("Get-Date"));
+    // 符号化された中身は、ハーネスが機械的に解読して添える（§4.4。[BUG-224]）。
+    assert_eq!(p.decoded.len(), 1, "{:?}", p.decoded);
+    assert_eq!(p.decoded[0].depth, 1);
+    assert_eq!(
+        p.decoded[0].source,
+        harness_core::EncodedSource::EncodedCommand
+    );
+    assert_eq!(
+        p.decoded[0].outcome,
+        harness_core::DecodeOutcome::Text {
+            encoding: harness_core::TextEncoding::Utf16Le,
+            text: "Get-Date".to_string(),
+        }
+    );
+}
+
+/// [BUG-224] `run_shell`の行も、符号化された中身をハーネスが解読して材料に添える（§4.4）。以前は
+/// `run_program`の経路にしか配線されておらず、ユーザーが実機で見た行（中身は`systeminfo`）は
+/// 塊のまま承認ダイアログに出た。符号化の無い行は空のまま（上の表の`git status`が対照）。
+#[tokio::test]
+async fn a_shell_line_carries_its_encoded_payload_decoded() {
+    let s = subject_of(
+        "run_shell",
+        serde_json::json!({ "command": "pwsh --enc cwB5AHMAdABlAG0AaQBuAGYAbwA=" }),
+    )
+    .await
+    .unwrap();
+    let PermissionSubject::Command(c) = s else {
+        panic!("expected a Command subject")
+    };
+    assert_eq!(c.line, "pwsh --enc cwB5AHMAdABlAG0AaQBuAGYAbwA=");
+    assert_eq!(c.decoded.len(), 1, "{:?}", c.decoded);
+    assert_eq!(
+        c.decoded[0].outcome,
+        harness_core::DecodeOutcome::Text {
+            encoding: harness_core::TextEncoding::Utf16Le,
+            text: "systeminfo".to_string(),
+        }
+    );
 }
 
 /// 解決先がワークスペース内の実行ファイルは、コードを走らせる呼び出しとして扱い、実体を縛る（D-103）。

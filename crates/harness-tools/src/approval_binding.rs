@@ -288,32 +288,6 @@ pub fn is_inside_workspace(workspace_root: &Path, resolved: &Path) -> bool {
     .is_some()
 }
 
-/// PowerShell の`-EncodedCommand`（とその一意な接頭辞`-e`・`-ec`・`-enc`…）の値を、base64 と
-/// UTF-16LE として機械的に解読する（承認画面に出すため。照合には使わない）。解読できなければ`None`。
-pub fn decode_encoded_command(args: &[String]) -> Option<String> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        let name = arg.trim_start_matches(['-', '/']).to_ascii_lowercase();
-        if arg.len() == name.len() || name.is_empty() {
-            continue;
-        }
-        let is_encoded = name == "ec" || "encodedcommand".starts_with(name.as_str());
-        if !is_encoded {
-            continue;
-        }
-        let bytes = base64_decode(iter.next()?)?;
-        if bytes.len() % 2 != 0 {
-            return None;
-        }
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        return Some(String::from_utf16_lossy(&units));
-    }
-    None
-}
-
 /// 値の付いていないオプションか（`-c`・`--verbose`・`-File`）。`=`や`/`・`.`が付いたもの
 /// （`--require=./x.js`・`-r./x`・`-dauto_prepend_file=x.php`）は偽。
 fn is_plain_option(arg: &str) -> bool {
@@ -410,36 +384,6 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-/// 標準の base64（`+/`、`=`の詰め物は任意）。空白は読み飛ばす。
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
-    fn value(c: u8) -> Option<u32> {
-        Some(match c {
-            b'A'..=b'Z' => (c - b'A') as u32,
-            b'a'..=b'z' => (c - b'a' + 26) as u32,
-            b'0'..=b'9' => (c - b'0' + 52) as u32,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        })
-    }
-    let mut out = Vec::new();
-    let mut acc = 0u32;
-    let mut bits = 0u32;
-    for c in text
-        .bytes()
-        .filter(|c| !c.is_ascii_whitespace() && *c != b'=')
-    {
-        acc = (acc << 6) | value(c)?;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
 }
 
 #[cfg(test)]

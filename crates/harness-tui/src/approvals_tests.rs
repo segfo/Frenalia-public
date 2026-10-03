@@ -64,12 +64,18 @@ fn the_material_is_the_bound_files_and_any_inline_code() {
     assert_eq!(pieces.len(), 1);
     assert!(pieces[0].text.contains("Get-Date"));
 
-    // 解読した`-EncodedCommand`があればそちらを出す。
-    let mut p = ProgramSubject::plain("pwsh", vec!["-enc".into(), "RwBl".into()]);
-    p.decoded_inline = Some("Get-Date".into());
+    // [BUG-224] `-EncodedCommand`を解読できたら、その中身を回す（符号化された塊は回さない）。
+    let args = vec!["-enc".to_string(), "RwBlAHQALQBEAGEAdABlAA==".to_string()];
+    let mut p = ProgramSubject::plain("pwsh", args.clone());
+    p.decoded = harness_tools::encoded_command::decode_program_args("pwsh", &args);
     let app = app_with(PermissionSubject::Program(p));
     let pieces = summary_pieces(&app, &open_scope(ReadScopeConfig::default()));
-    assert_eq!(pieces[0].label, "the decoded -EncodedCommand");
+    assert_eq!(pieces.len(), 1, "{pieces:?}");
+    assert_eq!(
+        pieces[0].label,
+        "encoded payload, layer 1 (the value of -EncodedCommand), decoded by the harness from UTF-16LE"
+    );
+    assert_eq!(pieces[0].text, "Get-Date");
 
     // `run_shell`は行そのものも回す。
     let mut c = CommandSubject::line_only("python build.py");
@@ -78,6 +84,69 @@ fn the_material_is_the_bound_files_and_any_inline_code() {
     let pieces = summary_pieces(&app, &open_scope(ReadScopeConfig::default()));
     assert_eq!(pieces.len(), 2);
     assert_eq!(pieces[0].label, "the shell line");
+}
+
+/// [BUG-224] `run_shell`の行に符号化された中身があれば、**ハーネスが解読した段が要約の材料に入る**。
+/// ユーザーが実機で見た行（中身は`systeminfo`）で、要約は自分で解読して`Write-Hello`と書いた。
+#[test]
+fn a_shell_lines_encoded_payload_reaches_the_summary_decoded_layer_by_layer() {
+    use harness_tools::encoded_command::decode_shell_line;
+    let scope = open_scope(ReadScopeConfig::default());
+    let with_line = |line: &str| {
+        let mut c = CommandSubject::line_only(line);
+        c.decoded = decode_shell_line(line);
+        summary_pieces(&app_with(PermissionSubject::Command(c)), &scope)
+    };
+
+    let pieces = with_line("pwsh --enc cwB5AHMAdABlAG0AaQBuAGYAbwA=");
+    assert_eq!(pieces.len(), 2, "{pieces:?}");
+    assert_eq!(pieces[0].label, "the shell line");
+    assert!(pieces[1].label.contains("layer 1"), "{}", pieces[1].label);
+    assert!(pieces[1].label.contains("decoded by the harness"));
+    assert_eq!(pieces[1].text, "systeminfo");
+
+    // 2段（`-enc`の中の`-enc`）は、段ごとに別の材料になる。
+    let pieces = with_line(
+        "powershell -ec cAB3AHMAaAAgAC0AZQBuAGMAIABjAHcAQgA1AEEASABNAEEAZABBAEIAbABBAEcAMABBAGEAUQBCAHUAQQBHAFkAQQBiAHcAQQA9AA==",
+    );
+    assert_eq!(pieces.len(), 3, "{pieces:?}");
+    assert!(pieces[1].label.contains("layer 1"));
+    assert_eq!(pieces[1].text, "pwsh -enc cwB5AHMAdABlAG0AaQBuAGYAbwA=");
+    assert!(pieces[2].label.contains("layer 2"));
+    assert_eq!(pieces[2].text, "systeminfo");
+
+    // 解読できなかった段も材料に入る（「符号化された中身は無かった」と読ませない）。
+    let pieces = with_line("pwsh -enc $payload");
+    assert_eq!(pieces.len(), 2, "{pieces:?}");
+    assert!(
+        pieces[1].label.contains("did not decode"),
+        "{}",
+        pieces[1].label
+    );
+    assert!(pieces[1].text.contains("not base64"), "{}", pieces[1].text);
+
+    // 対照: 符号化された箇所の無い行は、行だけ。
+    assert_eq!(with_line("git status").len(), 1);
+}
+
+/// [BUG-224] `FromBase64String`だけなら、それを戻して何をするか（`iex`）は引数の側にあるので、
+/// **引数も解読した段も両方回す**。`-EncodedCommand`を解読できたときだけ引数を回さない（上の試験）。
+#[test]
+fn inline_code_that_decodes_base64_sends_both_the_code_and_the_decoded_layer() {
+    let code =
+        "iex([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('c3lzdGVtaW5mbw==')))";
+    let args = vec!["-c".to_string(), code.to_string()];
+    let mut p = ProgramSubject::plain("pwsh", args.clone());
+    p.decoded = harness_tools::encoded_command::decode_program_args("pwsh", &args);
+    let pieces = summary_pieces(
+        &app_with(PermissionSubject::Program(p)),
+        &open_scope(ReadScopeConfig::default()),
+    );
+    assert_eq!(pieces.len(), 2, "{pieces:?}");
+    assert_eq!(pieces[0].label, "the arguments, which run as code");
+    assert!(pieces[0].text.contains("iex("));
+    assert!(pieces[1].label.contains("FromBase64String"));
+    assert_eq!(pieces[1].text, "systeminfo");
 }
 
 /// **読取スコープで拒否される中身は送らない**（D-100）。承認のために読むときは子と同じ見え方を

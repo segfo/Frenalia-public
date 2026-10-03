@@ -609,14 +609,31 @@ impl PermissionGate for PermissionArbiter {
 }
 
 /// T-09（`plans/DESIGN-SANDBOX.md` §6.4）: `run_shell`のコマンド行がallowlistの
-/// コマンド分解を無効化しようとする構文を含むかを大小無視・部分一致で検出する。
+/// コマンド分解を無効化しようとする構文を含むかを検出する。
 /// 検出は追加ブロックにすぎず、安全の根拠は隔離Tier（M12）側にある。
+///
+/// 見方は3つある。
+///
+/// 1. **綴りの部分一致**（下の`MARKERS`）。大小を無視した部分文字列で見るので、引用符の中でも当たる。
+///    PowerShell で文字列をコードとして走らせる書き方（`[scriptblock]`・`InvokeScript`・`NewScriptBlock`・
+///    `AddScript`）と、base64 を戻す`FromBase64String`も含む——`base64 -d`・`certutil -decode`と同じ立場
+///    （[BUG-226](../../../docs/bugs/BUG-226.md)）
+/// 2. **`iex`を語として含むか**（[`mentions_iex`]）。`"iex "`・`"iex("`の部分一致では、行末の`… | iex`と
+///    `iex;`を見落とした（同）
+/// 3. **PowerShell の符号化スイッチ**（[`harness_tools::encoded_command::line_has_encoded_switch`]）。
+///    `-EncodedCommand`には PowerShell が受け付ける省略形が多数ある（`-e`・`-ec`・`--enc`・`/enc`・
+///    ダッシュ記号・前後の空白）ので、部分一致では足りない。**綴りの表は解読する側と共有する**——
+///    2箇所に持つと静かにずれる（`B-05`）。`grep -e foo`のような別のコマンドの`-e`を拾わないよう、
+///    向こうは PowerShell の起動に続く引数としてだけ見る（[BUG-222](../../../docs/bugs/BUG-222.md)）
 fn looks_like_allowlist_bypass(command: &str) -> bool {
     const MARKERS: &[&str] = &[
         "-encodedcommand",
         "invoke-expression",
-        "iex ",
-        "iex(",
+        "scriptblock]",
+        "invokescript",
+        "newscriptblock",
+        "addscript",
+        "frombase64string",
         "start-process",
         "cmd /c",
         "cmd.exe /c",
@@ -631,6 +648,19 @@ fn looks_like_allowlist_bypass(command: &str) -> bool {
     ];
     let lower = command.to_ascii_lowercase();
     MARKERS.iter().any(|m| lower.contains(m))
+        || mentions_iex(&lower)
+        || harness_tools::encoded_command::line_has_encoded_switch(command)
+}
+
+/// `iex`（`Invoke-Expression`の別名）を、前後が語の文字でない形で含むか。`index`・`iexplore`・
+/// `my_iex`・`x-iex`のように語の一部であるものは拾わない。`lower`は小文字にした行。
+fn mentions_iex(lower: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    lower.match_indices("iex").any(|(at, _)| {
+        let before = lower[..at].chars().next_back();
+        let after = lower[at + "iex".len()..].chars().next();
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
 }
 
 #[cfg(test)]
@@ -835,6 +865,7 @@ mod tests {
                 files: b.files,
                 unverifiable: b.unverifiable,
                 previews: b.previews,
+                decoded: Vec::new(),
             })
         };
         for mode in [PermissionMode::Default, PermissionMode::AcceptAll] {
@@ -881,6 +912,7 @@ mod tests {
                 files: b.files,
                 unverifiable: b.unverifiable,
                 previews: b.previews,
+                decoded: Vec::new(),
             })
         };
         assert_eq!(
@@ -967,38 +999,148 @@ mod tests {
         );
     }
 
+    /// 行そのものを規則として足した判定器で、その行を判定する（T-09 の歯を測る構成）。
+    ///
+    /// **規則が無い行は D-102 で元から聞く**ので、T-09 が効いているかは「規則と一致しているのに聞くか」
+    /// でしか測れない。以前の試験は`run_shell:*`を汎用の規則として渡していたが、`run_shell`の行は
+    /// その規則を見ないので、**T-09 を丸ごと外しても`Prompt`のまま緑だった**（[BUG-222]）。
+    fn classify_with_the_line_allowed(mode: PermissionMode, line: &str) -> Classification {
+        let ws = tempfile::tempdir().unwrap();
+        let mut arbiter = PermissionArbiter::new(mode, vec![], ws.path());
+        arbiter
+            .add_rule(parse_allowlist_rule(&format!("run_shell:{line}")).unwrap())
+            .unwrap();
+        arbiter.classify("run_shell", RiskClass::Exec, &subj("run_shell", line))
+    }
+
+    const ALL_MODES_THAT_CAN_ALLOW: [PermissionMode; 3] = [
+        PermissionMode::Default,
+        PermissionMode::AcceptEdits,
+        PermissionMode::AcceptAll,
+    ];
+
+    /// T-09（`plans/DESIGN-SANDBOX.md` §6.4）: allowlist を無効化する構文を含む行は、記録と一致しても聞く
+    /// （ヘッドレスの`decide`は Prompt を自動 Deny へ畳み込む）。**同じ構成で、記録した普通の行は通る**
+    /// ——許可側が無いと、規則の足し方が壊れて全部が聞く状態でも緑になる（`bug-pattern-rules` B-35）。
     #[test]
-    fn allowlist_bypass_syntax_forces_prompt_even_under_accept_all() {
-        let arbiter = PermissionArbiter::new(
-            PermissionMode::AcceptAll,
-            vec![AllowlistRule::new("run_shell", "*")],
-            "/workspace",
-        );
-        // ヘッドレスの`decide`はPromptを自動Denyへ畳み込む（§パーミッション「ヘッドレス時」）。
+    fn allowlist_bypass_syntax_prompts_even_when_the_line_is_recorded() {
+        for mode in ALL_MODES_THAT_CAN_ALLOW {
+            assert_eq!(
+                classify_with_the_line_allowed(mode, "git status"),
+                Classification::Allow,
+                "{mode:?}"
+            );
+            for line in [
+                "powershell -EncodedCommand abc",
+                "git status | Invoke-Expression",
+                "iex (Get-Content x.ps1 -Raw)",
+                "Start-Process notepad",
+                "cmd /c dir",
+                "echo hi | sh",
+                "bash -c ls",
+                "echo aGk= | base64 -d",
+                "certutil -decode a.b64 a.exe",
+            ] {
+                assert_eq!(
+                    classify_with_the_line_allowed(mode, line),
+                    Classification::Prompt,
+                    "{mode:?}: {line}"
+                );
+            }
+        }
+    }
+
+    /// [BUG-222] PowerShell が`-EncodedCommand`として受け付ける綴り（2026-10-04 に pwsh 7.6.6 と
+    /// Windows PowerShell 5.1 で実測した接頭辞・`-ec`・`--`/`/`/ダッシュの前置き・大小文字・前後の空白）と、
+    /// 実測で走った起こし方（スマート引用符・`-Command`の後ろ・引用符の中・引数の並びを1つの文字列で
+    /// 渡す形）でも、記録と一致しても聞く。**どの行も上の綴りの一覧（`MARKERS`）には当たらない**——
+    /// 当たる行を混ぜると、新しい判定を外しても緑になる。
+    #[test]
+    fn encoded_command_abbreviations_prompt_even_when_the_line_is_allowed() {
+        let blob = "cwB5AHMAdABlAG0AaQBuAGYAbwA=";
+        let lines = [
+            format!("pwsh --enc {blob}"),
+            format!("pwsh -e {blob}"),
+            format!("powershell /ec {blob}"),
+            format!("PowerShell.EXE -ENCODED {blob}"),
+            format!(r"& 'C:\Program Files\PowerShell\7\pwsh.exe' -NoProfile -enco {blob}"),
+            format!("pwsh \u{2013}enc {blob}"),
+            format!("Get-Date; pwsh -ec {blob}"),
+            format!("pwsh -NoProfile -ea {blob}"),
+            format!("pwsh ' -enc' {blob}"),
+            format!("pwsh \u{2018}-e\u{2019} {blob}"),
+            format!("pwsh -NoProfile -c pwsh -enc {blob}"),
+            format!("ssh build-host 'pwsh -e {blob}'"),
+            format!("[Diagnostics.Process]::Start('pwsh', '-NoProfile -e {blob}')"),
+        ];
         assert_eq!(
-            arbiter.classify(
-                "run_shell",
-                RiskClass::Exec,
-                &subj("run_shell", "powershell -EncodedCommand abc")
-            ),
-            Classification::Prompt
+            recorded_lines_that_run_unasked(&lines),
+            Vec::<String>::new()
         );
+    }
+
+    /// 記録した行のうち、聞かずに通るもの（モードごと）。**1行目で止めずに全部集める**——
+    /// どの綴りが素通りするのかを、赤のときに一度で見るため。
+    fn recorded_lines_that_run_unasked<S: AsRef<str>>(lines: &[S]) -> Vec<String> {
+        let mut unasked = Vec::new();
+        for mode in ALL_MODES_THAT_CAN_ALLOW {
+            for line in lines {
+                let line = line.as_ref();
+                let got = classify_with_the_line_allowed(mode, line);
+                if got != Classification::Prompt {
+                    unasked.push(format!("{mode:?} {got:?}: {line}"));
+                }
+            }
+        }
+        unasked
+    }
+
+    /// [BUG-226] 符号化した中身を実行する PowerShell の書き方（`FromBase64String`で戻し、`iex`・
+    /// `[scriptblock]`・`InvokeScript`・`AddScript`で走らせる）も、記録と一致しても聞く。
+    /// 行末の`| iex`は、以前の綴り（`"iex "`・`"iex("`）では当たらなかった。
+    #[test]
+    fn running_decoded_or_constructed_code_prompts_even_when_the_line_is_allowed() {
+        let lines = [
+            "'Get-Date' | iex",
+            "$code | iex; Get-Date",
+            "& ([scriptblock]::Create($code))",
+            "[ScriptBlock]::Create('Get-Date').Invoke()",
+            "[System.Management.Automation.ScriptBlock]::Create($s).Invoke()",
+            "$ExecutionContext.InvokeCommand.InvokeScript($code)",
+            "& $ExecutionContext.InvokeCommand.NewScriptBlock($code)",
+            "[powershell]::Create().AddScript($code).Invoke()",
+            "[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('cwB5AHMAdABlAG0AaQBuAGYAbwA='))",
+        ];
         assert_eq!(
-            arbiter.classify(
-                "run_shell",
-                RiskClass::Exec,
-                &subj("run_shell", "git status | Invoke-Expression")
-            ),
-            Classification::Prompt
+            recorded_lines_that_run_unasked(&lines),
+            Vec::<String>::new()
         );
-        assert_eq!(
-            arbiter.classify(
-                "run_shell",
-                RiskClass::Exec,
-                &subj("run_shell", "echo hi | sh")
-            ),
-            Classification::Prompt
-        );
+    }
+
+    /// [BUG-222]・[BUG-226] 対照（`bug-pattern-rules` B-35）: **別のコマンドの`-e`と、`iex`を語の一部に
+    /// 含むだけの名前は拾わない**。同じ構成で、規則と一致する行は聞かずに通る。PowerShell を起こした文の
+    /// 後ろでも、`;`で区切った別の文なら拾わない。
+    #[test]
+    fn another_commands_dash_e_is_not_mistaken_for_an_encoded_command() {
+        for line in [
+            "grep -e foo src",
+            "git log -e",
+            "git commit -e",
+            "sed -e s/a/b/ notes.txt",
+            "pwsh -NoProfile -c Get-Date; grep -e foo src",
+            "pwsh -NoProfile -c Get-ChildItem -ea Stop",
+            r#"git commit -m "handle the -e flag""#,
+            "Select-String -Pattern enc -Path notes.txt",
+            "Get-Content index.html",
+            "python complex_iex_report.py",
+            "Start-Sleep 1; Get-Item iexplore.exe",
+        ] {
+            assert_eq!(
+                classify_with_the_line_allowed(PermissionMode::AcceptAll, line),
+                Classification::Allow,
+                "{line}"
+            );
+        }
     }
 
     #[test]
@@ -1595,7 +1737,7 @@ mod tests {
             files: bound.files.clone(),
             one_shot_only: false,
             previews: Vec::new(),
-            decoded_inline: None,
+            decoded: Vec::new(),
         };
 
         let recorded = |files: Vec<BoundFile>| {
