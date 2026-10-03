@@ -31,7 +31,7 @@ pub use app::{
     ReviewPanelState, ReviewRow, ReviewTarget, SlashCommand,
 };
 pub use app::{ApprovalStage, PermissionView, PreviousCopy, SummaryState, SummaryWait};
-pub use approvals::ApprovalSummary;
+pub use approvals::{ApprovalRisk, ApprovalSummary};
 
 /// 承認画面を1枚描く（`examples/approval-frames.rs`のための入口）。
 ///
@@ -447,6 +447,8 @@ pub async fn run(
     tier3_warm: bool,
     // 承認画面の要約（D-100）。`None`なら作らない（設定で切った・プロバイダを作れなかった）。
     approval_summary: Option<ApprovalSummary>,
+    // 承認画面の危険度判定（外の判定モデル）。`None`なら使わない＝承認画面も要約も今までと同じ。
+    approval_risk: Option<ApprovalRisk>,
 ) -> io::Result<RunOutcome> {
     // [BUG-206] 画面の動作中に、どの部品が標準エラーへ書いても画面を崩さないよう預かり、tickごとに
     // transcriptへ出す（ポリシーエディタと同じ部品）。**端末を握るより先に作る**——宣言の逆順にdropするので、
@@ -632,6 +634,10 @@ pub async fn run(
     let mut summary_cache = approvals::SummaryCache::new();
     // いま走っている要約を落とすための札。モーダルが差し替わる・閉じるたびに落とす。
     let mut summary_cancel: Option<tokio_util::sync::CancellationToken> = None;
+    // いま走っている危険度の判定を落とすための札（要約と同じく、モーダルが差し替わる・閉じるたびに落とす）。
+    let mut risk_cancel: Option<tokio_util::sync::CancellationToken> = None;
+    // 判定モデルを温める間隔の管理（依頼を送った時点で呼ぶ。`approvals::RiskWarmUp`）。
+    let mut risk_warm = approvals::RiskWarmUp::new();
     // 要約を起こした承認要求のid（同じ要求で2本起こさないため）。
     let mut summarized_id = String::new();
     app.host_is_vscode = harness_term::host_is_vscode();
@@ -737,11 +743,31 @@ pub async fn run(
                             if let Some(token) = summary_cancel.take() {
                                 token.cancel();
                             }
+                            if let Some(token) = risk_cancel.take() {
+                                token.cancel();
+                            }
                             summarized_id = app
                                 .pending_permission
                                 .as_ref()
                                 .map(|v| v.id.clone())
                                 .unwrap_or_default();
+                            // 危険度の判定を先に起こす（要約が結果を待てるように）。判定が無い構成では何も起きない。
+                            let risk_gate = match &approval_risk {
+                                Some(risk) => {
+                                    let token = tokio_util::sync::CancellationToken::new();
+                                    let gate = approvals::start_risk(
+                                        risk,
+                                        &background_tx,
+                                        &mut app,
+                                        &token,
+                                    );
+                                    if gate.is_some() {
+                                        risk_cancel = Some(token);
+                                    }
+                                    gate
+                                }
+                                None => None,
+                            };
                             if let Some(summary) = &approval_summary {
                                 summary_cancel = approvals::start_summary(
                                     summary,
@@ -751,6 +777,7 @@ pub async fn run(
                                     &read_scope_for_summary,
                                     redact_host_paths_in_summary,
                                     display_language,
+                                    risk_gate,
                                 );
                             }
                         }
@@ -803,7 +830,13 @@ pub async fn run(
                 };
                 if let Some(action) = action {
                     match action {
-                        Action::Submit(text) => engine.submit(text),
+                        Action::Submit(text) => {
+                            // 承認が出る頃に判定モデルが読み込み済みになるよう、依頼を送った時点で温める。
+                            if let Some(risk) = &approval_risk {
+                                risk_warm.nudge(risk, std::time::Instant::now());
+                            }
+                            engine.submit(text)
+                        }
                         Action::Respond(id, decision) => engine.gate.respond(&id, decision),
                         Action::RespondRemember(id, holes) => {
                             approvals::record_approval(
@@ -1219,6 +1252,9 @@ pub async fn run(
         // モーダルが閉じた（応答した・拒否した）。要約はもう誰も読まないので落とす（B-23）。
         if app.pending_permission.is_none() {
             if let Some(token) = summary_cancel.take() {
+                token.cancel();
+            }
+            if let Some(token) = risk_cancel.take() {
                 token.cancel();
             }
             summarized_id.clear();

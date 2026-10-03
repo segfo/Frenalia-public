@@ -85,6 +85,7 @@ async fn the_summary_comes_back_and_does_not_obey_the_material() {
         }],
         false,
         None,
+        None,
         &cancel,
         &mut |_| {},
     )
@@ -158,6 +159,7 @@ async fn the_summary_comes_back_in_the_requested_language() {
         }],
         false,
         Some(SummaryLanguage::Japanese),
+        None,
         &cancel,
         &mut |chars| reports.push((started.elapsed(), chars)),
     )
@@ -219,6 +221,7 @@ async fn a_cancelled_call_does_not_reach_the_real_provider() {
             text: "print(1)".to_string(),
         }],
         false,
+        None,
         None,
         &cancel,
         &mut |_| {},

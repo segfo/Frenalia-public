@@ -29,6 +29,7 @@ pub(super) struct Configured {
     pub(super) cognition: CognitiveOrchestrator,
     /// 承認画面の要約（D-100）。`None`なら作らない。
     pub(super) approval_summary: Option<ApprovalSummaryChoice>,
+    pub(super) approval_risk: Option<harness_tui::ApprovalRisk>,
 }
 
 /// 承認画面の要約をどのプロバイダ・どのモデルで作るか（D-100）。
@@ -266,6 +267,7 @@ pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, Ex
     }
     load_recorded_approvals(&mut arbiter, &workspace_root);
     let approval_summary = resolve_approval_summary(&settings, &cli, &model);
+    let approval_risk = resolve_approval_risk(&settings);
 
     Ok(Configured {
         cli,
@@ -283,6 +285,7 @@ pub(super) async fn stage_configure(parsed: ParsedArgs) -> Result<Configured, Ex
         arbiter,
         cognition,
         approval_summary,
+        approval_risk,
     })
 }
 
@@ -341,6 +344,42 @@ fn resolve_approval_summary(
         Err(reason) => {
             eprintln!(
                 "note: could not set up approval.summary_provider {name:?} ({reason});                  the approval screen will show the contents without a summary"
+            );
+            None
+        }
+    }
+}
+
+/// 判定モデル（Ollaya）の既定の送り先とモデル。`approval.risk_base_url`・`approval.risk_model`で変える。
+const DEFAULT_RISK_BASE_URL: &str = "http://127.0.0.1:11435";
+const DEFAULT_RISK_MODEL: &str = "decider:0.8b";
+
+/// 承認画面の危険度判定（外の判定モデル。`harness_core::risk_check`）の構成を決める。
+///
+/// **既定は無効**で、`approval.risk_check: true`のときだけ使う。**作れなくても起動は止めない**
+/// ——判定は補助で、無ければ承認画面も要約も今までと同じなので、告知して切る。
+fn resolve_approval_risk(settings: &harness_config::Settings) -> Option<harness_tui::ApprovalRisk> {
+    let approval = settings.approval.as_ref()?;
+    if !approval.risk_check.unwrap_or(false) {
+        return None;
+    }
+    let base_url = approval
+        .risk_base_url
+        .as_deref()
+        .unwrap_or(DEFAULT_RISK_BASE_URL);
+    let model = approval.risk_model.as_deref().unwrap_or(DEFAULT_RISK_MODEL);
+    match harness_providers::DecideClient::new(base_url, model) {
+        Ok(client) => {
+            let label = client.label();
+            Some(harness_tui::ApprovalRisk {
+                check: std::sync::Arc::new(client),
+                label,
+            })
+        }
+        Err(reason) => {
+            eprintln!(
+                "note: could not set up approval.risk_check ({reason}); \
+                 the approval screen is shown without a risk rating"
             );
             None
         }
@@ -640,5 +679,50 @@ mod tests {
             "conv-model"
         )
         .is_none());
+    }
+
+    /// 設定→危険度判定（外の判定モデル）の構成。**既定は無効**——聞くとコマンドの1行がサーバへ出るので、
+    /// 設定が無ければ何も作らない（承認画面も要約も今までと同じ）。作れなくても起動は止めない。
+    #[test]
+    fn the_risk_check_is_off_unless_the_settings_turn_it_on() {
+        let with = |approval: Option<harness_config::ApprovalSettings>| harness_config::Settings {
+            approval,
+            ..Default::default()
+        };
+        let on = |tweak: fn(&mut harness_config::ApprovalSettings)| {
+            let mut a = harness_config::ApprovalSettings {
+                risk_check: Some(true),
+                ..Default::default()
+            };
+            tweak(&mut a);
+            with(Some(a))
+        };
+
+        // 節なし・risk_check なし・偽: 何も作らない（既定は無効）。
+        assert!(resolve_approval_risk(&with(None)).is_none());
+        assert!(resolve_approval_risk(&with(Some(Default::default()))).is_none());
+        assert!(
+            resolve_approval_risk(&with(Some(harness_config::ApprovalSettings {
+                risk_check: Some(false),
+                risk_model: Some("decider:0.8b".into()),
+                ..Default::default()
+            })))
+            .is_none()
+        );
+
+        // 有効: 送り先とモデルの既定で作り、出どころを画面用に持つ。
+        let chosen = resolve_approval_risk(&on(|_| {})).expect("有効なら作る");
+        assert_eq!(chosen.label, "ollaya / decider:0.8b");
+
+        // 指定した送り先・モデルが出どころへ出る（どこへコマンドが出たかが分かる）。
+        let chosen = resolve_approval_risk(&on(|a| {
+            a.risk_base_url = Some("http://10.0.0.5:11435".into());
+            a.risk_model = Some("winnow:e4b".into());
+        }))
+        .expect("指定どおりに作る");
+        assert_eq!(chosen.label, "ollaya / winnow:e4b");
+
+        // 作れない指定（空のモデル名）: 起動は止めず、判定だけ切る。
+        assert!(resolve_approval_risk(&on(|a| a.risk_model = Some("  ".into()))).is_none());
     }
 }

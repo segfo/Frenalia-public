@@ -32,8 +32,8 @@ use std::fmt;
 use tokio_util::sync::CancellationToken;
 
 use harness_core::{
-    CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError, Role, Sampling,
-    SystemBlock, ToolChoice,
+    CompletionRequest, ContentBlock, LlmProvider, Message, ProviderError, RiskLevel, Role,
+    Sampling, SystemBlock, ToolChoice,
 };
 
 use crate::side_call::{self, EmptyBody};
@@ -117,20 +117,26 @@ impl std::error::Error for SummaryError {}
 /// `language`が`Some`なら、固定文の後ろに「Write the summary in {言語}.」の1行を足す。`None`なら
 /// 言語を足さない（今までどおりの要求）。
 ///
+/// `risk`が注意以上なら、外の判定モデルが危険と見たことを**固定の英文1行**で足す
+/// （[`RiskLevel::summary_instruction`]。判定モデルが返した文字列は混ぜない）。`None`と`Low`は
+/// 何も足さない——**低いと言われたことを要約へ渡さない**（安心させる向きに曲げさせない）。
+///
 /// `on_output`は、出力（考える過程と本文）が届くたびに、それまでに受けた文字数の累計を受ける。
 /// 画面が待っている間に「考えた量」を出すのに使う（中身は渡さない。数だけ）。
+#[allow(clippy::too_many_arguments)] // 言語と危険度は独立した2つの任意の一言で、束ねる型を作るほどの塊ではない
 pub async fn summarize_for_approval(
     provider: &dyn LlmProvider,
     model: &str,
     pieces: &[SummaryPiece],
     redact_host_paths: bool,
     language: Option<SummaryLanguage>,
+    risk: Option<RiskLevel>,
     cancel: &CancellationToken,
     on_output: &mut (dyn FnMut(usize) + Send),
 ) -> Result<Option<String>, SummaryError> {
     let mut req = CompletionRequest {
         system: vec![SystemBlock {
-            text: system_text(language),
+            text: system_text(language, risk),
             cache: false,
         }],
         messages: vec![Message {
@@ -160,14 +166,20 @@ pub async fn summarize_for_approval(
 }
 
 /// 固定文。言語が決まっていれば、規則の最後に1行足す（**綴りは表のものだけ**。自由な文字列を混ぜない）。
-fn system_text(language: Option<SummaryLanguage>) -> String {
-    match language {
-        Some(language) => format!(
-            "{SYSTEM}\n- Write the summary in {}.",
-            language.english_name()
-        ),
-        None => SYSTEM.to_string(),
+/// 危険度が注意以上なら、その固定の1行も足す（**どちらも固定の綴りで、中身から来た文字列は入らない**）。
+fn system_text(language: Option<SummaryLanguage>, risk: Option<RiskLevel>) -> String {
+    let mut text = SYSTEM.to_string();
+    if let Some(instruction) = risk.and_then(RiskLevel::summary_instruction) {
+        text.push_str("\n- ");
+        text.push_str(instruction);
     }
+    if let Some(language) = language {
+        text.push_str(&format!(
+            "\n- Write the summary in {}.",
+            language.english_name()
+        ));
+    }
+    text
 }
 
 /// 中身を、その呼び出しのためだけに作った区切りで囲う。

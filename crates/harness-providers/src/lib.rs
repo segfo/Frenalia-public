@@ -4,9 +4,11 @@
 //! （`openai.rs`冒頭コメント参照）。
 
 pub mod anthropic;
+pub mod decide;
 pub mod mock;
 pub mod openai;
 
 pub use anthropic::AnthropicProvider;
+pub use decide::DecideClient;
 pub use mock::MockProvider;
 pub use openai::OpenAiProvider;

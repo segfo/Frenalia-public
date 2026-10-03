@@ -25,7 +25,7 @@ fn bound(rel: &str) -> harness_core::BoundFile {
     }
 }
 
-fn app_with(subject: PermissionSubject) -> AppState {
+pub(super) fn app_with(subject: PermissionSubject) -> AppState {
     let mut app = AppState::new("mock".into(), "m".into());
     app.workspace_root = "C:/ws".into();
     app.pending_permission = Some(crate::app::PermissionView::new(
@@ -40,7 +40,7 @@ fn app_with(subject: PermissionSubject) -> AppState {
     app
 }
 
-fn open_scope(cfg: ReadScopeConfig) -> ReadScope {
+pub(super) fn open_scope(cfg: ReadScopeConfig) -> ReadScope {
     ReadScope::open(&cfg)
 }
 
@@ -115,8 +115,11 @@ fn the_reuse_key_changes_with_the_material() {
         label: "a".into(),
         text: "three".into(),
     }];
-    assert_ne!(summary_key(&a, None), summary_key(&b, None));
-    assert_eq!(summary_key(&a, None), summary_key(&a.clone(), None));
+    assert_ne!(summary_key(&a, None, None), summary_key(&b, None, None));
+    assert_eq!(
+        summary_key(&a, None, None),
+        summary_key(&a.clone(), None, None)
+    );
 }
 
 /// **長さが同じでも、中身が違えば鍵は違う**（[BUG-220](../../../docs/bugs/BUG-220.md)）。以前の鍵は
@@ -137,7 +140,10 @@ fn material_of_the_same_length_does_not_share_a_key() {
         removed[0].text.len(),
         "前提: 長さが同じ"
     );
-    assert_ne!(summary_key(&listed, None), summary_key(&removed, None));
+    assert_ne!(
+        summary_key(&listed, None, None),
+        summary_key(&removed, None, None)
+    );
 
     // 区切りの文字を中身に混ぜても、別の組と同じ鍵にはならない（見出しと中身の境目を偽れない）。
     let one = vec![SummaryPiece {
@@ -154,7 +160,7 @@ fn material_of_the_same_length_does_not_share_a_key() {
             text: "y".into(),
         },
     ];
-    assert_ne!(summary_key(&one, None), summary_key(&two, None));
+    assert_ne!(summary_key(&one, None, None), summary_key(&two, None, None));
 }
 
 /// **別の承認要求へ移っていたら、遅れて届いた要約は捨てる。** 前の中身の説明を、
@@ -258,6 +264,7 @@ async fn a_summary_is_not_started_twice_for_the_same_material() {
         &SummaryCache::new(),
         &scope,
         false,
+        None,
         None
     )
     .is_none());
@@ -266,10 +273,10 @@ async fn a_summary_is_not_started_twice_for_the_same_material() {
     let mut c = CommandSubject::line_only("cargo test");
     c.previews = vec![];
     let mut app = app_with(PermissionSubject::Command(c));
-    let key = summary_key(&summary_pieces(&app, &scope), None);
+    let key = summary_key(&summary_pieces(&app, &scope), None, None);
     let mut cache = SummaryCache::new();
     cache.insert(key, "前に作った要約".into());
-    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false, None).is_none());
+    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false, None, None).is_none());
     assert_eq!(
         app.pending_permission.as_ref().unwrap().summary,
         crate::app::SummaryState::Done {
@@ -331,7 +338,7 @@ async fn a_summary_cut_off_while_thinking_says_so_on_screen() {
     )));
     let mut cache = SummaryCache::new();
 
-    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false, None).is_some());
+    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false, None, None).is_some());
     apply_until_ready(&mut rx, &mut app, &mut cache).await;
 
     let crate::app::SummaryState::Failed { reason, .. } =
@@ -354,7 +361,7 @@ async fn a_summary_cut_off_while_thinking_says_so_on_screen() {
 }
 
 /// 背景から届くもの（途中経過と結果）を、結果が届くまで画面へ反映する。
-async fn apply_until_ready(
+pub(super) async fn apply_until_ready(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<BackgroundEvent>,
     app: &mut AppState,
     cache: &mut SummaryCache,
@@ -371,8 +378,8 @@ async fn apply_until_ready(
 
 /// 送られた要求を控え、本文1行を返すプロバイダ（何が要約の呼び出しへ渡ったかを見る）。
 #[derive(Default)]
-struct Capturing {
-    seen: std::sync::Mutex<Vec<harness_core::CompletionRequest>>,
+pub(super) struct Capturing {
+    pub(super) seen: std::sync::Mutex<Vec<harness_core::CompletionRequest>>,
 }
 
 #[async_trait::async_trait]
@@ -420,7 +427,17 @@ async fn summarize_through_the_screen(
     let scope = open_scope(ReadScopeConfig::default());
     let mut cache = SummaryCache::new();
     assert!(
-        start_summary(&summary, &tx, app, &cache, &scope, false, display_language).is_some(),
+        start_summary(
+            &summary,
+            &tx,
+            app,
+            &cache,
+            &scope,
+            false,
+            display_language,
+            None
+        )
+        .is_some(),
         "要約が起きなかった"
     );
     apply_until_ready(&mut rx, app, &mut cache).await;
@@ -499,14 +516,14 @@ fn the_reuse_key_changes_with_the_language() {
         label: "the shell line".into(),
         text: "ls".into(),
     }];
-    let none = summary_key(&pieces, None);
-    let ja = summary_key(&pieces, Some(SummaryLanguage::Japanese));
-    let en = summary_key(&pieces, Some(SummaryLanguage::English));
+    let none = summary_key(&pieces, None, None);
+    let ja = summary_key(&pieces, Some(SummaryLanguage::Japanese), None);
+    let en = summary_key(&pieces, Some(SummaryLanguage::English), None);
     assert_ne!(none, ja);
     assert_ne!(ja, en);
     assert_eq!(
         ja,
-        summary_key(&pieces.clone(), Some(SummaryLanguage::Japanese))
+        summary_key(&pieces.clone(), Some(SummaryLanguage::Japanese), None)
     );
 }
 
@@ -531,13 +548,13 @@ async fn a_cached_summary_is_reused_only_for_the_same_material_and_language() {
     };
     let mut cache = SummaryCache::new();
     cache.insert(
-        summary_key(&summary_pieces(&listed(), &scope), ja),
+        summary_key(&summary_pieces(&listed(), &scope), ja, None),
         "一覧を出すだけ。".into(),
     );
 
     // 同じ中身・同じ言語なら使い回す（対照）。
     let mut again = listed();
-    assert!(start_summary(&summary, &tx, &mut again, &cache, &scope, false, ja).is_none());
+    assert!(start_summary(&summary, &tx, &mut again, &cache, &scope, false, ja, None).is_none());
     assert_eq!(
         again.pending_permission.as_ref().unwrap().summary,
         crate::app::SummaryState::Done {
@@ -550,7 +567,7 @@ async fn a_cached_summary_is_reused_only_for_the_same_material_and_language() {
     let mut removed = app_with(PermissionSubject::Command(CommandSubject::line_only(
         "rm -rf /tmp/x",
     )));
-    let token = start_summary(&summary, &tx, &mut removed, &cache, &scope, false, ja)
+    let token = start_summary(&summary, &tx, &mut removed, &cache, &scope, false, ja, None)
         .expect("別の中身なのに要約を起こさなかった");
     token.cancel();
     assert!(matches!(
@@ -568,6 +585,7 @@ async fn a_cached_summary_is_reused_only_for_the_same_material_and_language() {
         &scope,
         false,
         Some(SummaryLanguage::English),
+        None,
     )
     .expect("言語が違うのに前の要約を使い回した");
     token.cancel();
@@ -747,7 +765,7 @@ async fn progress_flows_from_the_summary_to_the_waiting_line() {
     let scope = open_scope(ReadScopeConfig::default());
     let mut app = app_with(PermissionSubject::Command(CommandSubject::line_only("ls")));
     let mut cache = SummaryCache::new();
-    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false, None).is_some());
+    assert!(start_summary(&summary, &tx, &mut app, &cache, &scope, false, None, None).is_some());
     assert_eq!(
         output_chars(&app),
         Some(0),

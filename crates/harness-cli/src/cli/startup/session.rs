@@ -21,6 +21,7 @@ pub(super) struct SessionOpened {
     pub(super) arbiter: PermissionArbiter,
     pub(super) cognition: CognitiveOrchestrator,
     pub(super) approval_summary: Option<super::configure::ApprovalSummaryChoice>,
+    pub(super) approval_risk: Option<harness_tui::ApprovalRisk>,
     pub(super) sessions_dir: PathBuf,
     pub(super) session: harness_engine::SessionStore,
     pub(super) session_messages: Vec<harness_core::Message>,
@@ -53,6 +54,7 @@ pub(super) fn stage_open_session(configured: Configured) -> Result<SessionOpened
         arbiter,
         cognition,
         approval_summary,
+        approval_risk,
     } = configured;
 
     // JSONL追記型セッション永続化（M9、§非対話モード「JSONL 追記型セッション永続化
@@ -122,6 +124,7 @@ pub(super) fn stage_open_session(configured: Configured) -> Result<SessionOpened
         // 台帳と履歴を同じ鍵で復元できるようにするため、ここで確定したIDを渡す。
         cognition: cognition.with_session_id(session.id()),
         approval_summary,
+        approval_risk,
         sessions_dir,
         session,
         session_messages,

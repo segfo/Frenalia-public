@@ -25,6 +25,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         arbiter,
         cognition,
         approval_summary,
+        approval_risk,
         sessions_dir,
         mut session,
         session_messages,
@@ -850,6 +851,7 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
                 resume_wants_picker,
                 sandbox_choice_of(cli.sandbox).wants_warm_tier3(),
                 approval_summary,
+                approval_risk,
                 &mut relaunch_into,
             )
             .await
@@ -1069,6 +1071,7 @@ async fn tui_branch(
     tier3_warm: bool,
     // 承認画面の要約（D-100）。`None`なら作らない。
     approval_summary: Option<harness_tui::ApprovalSummary>,
+    approval_risk: Option<harness_tui::ApprovalRisk>,
     // `/workspace`の移動先。TUIが自分でプロセスを起こすと、呼び出し元（`stage_run_agent`）の
     // teardown順序（MCP停止→WFP撤収→policy-learn撤収→`end_session`）を迂回することになるので、
     // 「どこへ移りたいか」だけを持ち帰らせる。
@@ -1103,6 +1106,7 @@ async fn tui_branch(
         resume_wants_picker,
         tier3_warm,
         approval_summary,
+        approval_risk,
     )
     .await;
 

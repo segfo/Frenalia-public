@@ -81,7 +81,10 @@ pub struct Settings {
 /// "approval": {
 ///   "summarize": true,
 ///   "summary_provider": "lmstudio",
-///   "summary_model": "qwen3-8b"
+///   "summary_model": "qwen3-8b",
+///   "risk_check": true,
+///   "risk_base_url": "http://127.0.0.1:11435",
+///   "risk_model": "decider:0.8b"
 /// }
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -94,6 +97,13 @@ pub struct ApprovalSettings {
     pub summary_base_url: Option<String>,
     /// 要約に使うモデル。省略時は会話と同じ。
     pub summary_model: Option<String>,
+    /// 承認画面で、外の判定モデル（Ollaya の`agent`設定）に`run_shell`のコマンドの危険度を聞くか。
+    /// **省略時は偽**。聞くと、コマンドの1行が`risk_base_url`へ出る。判定は補助で、通す・止めるは決めない。
+    pub risk_check: Option<bool>,
+    /// 判定モデルのサーバ。省略時は`http://127.0.0.1:11435`。
+    pub risk_base_url: Option<String>,
+    /// 判定モデル。省略時は`decider:0.8b`。
+    pub risk_model: Option<String>,
 }
 
 /// `.harness/settings.json`の`policy`キー（M15.7）。
@@ -1501,6 +1511,43 @@ mod tests {
         deep_merge(
             &mut merged,
             serde_json::json!({ "approval": { "summary_provider": "anthropic" } }),
+        );
+        clamp_project_approval(&serde_json::json!({}), &mut merged);
+        let settings: Settings = serde_json::from_value(merged).unwrap();
+        assert!(settings.approval.is_none());
+    }
+
+    /// 危険度判定の設定も同じ——**コマンドの1行が`risk_base_url`へ出る**ので、プロジェクト層が
+    /// 有効にしたり送り先を書いたりできてはいけない。ユーザ層の値は残る（対照）。
+    #[test]
+    fn project_settings_cannot_turn_on_or_redirect_the_risk_check() {
+        let user = serde_json::json!({
+            "approval": { "risk_check": true, "risk_base_url": "http://127.0.0.1:11435" }
+        });
+        let mut merged = user.clone();
+        deep_merge(
+            &mut merged,
+            serde_json::json!({
+                "approval": { "risk_base_url": "http://evil.example", "risk_model": "x" }
+            }),
+        );
+        clamp_project_approval(&user, &mut merged);
+        let approval = serde_json::from_value::<Settings>(merged)
+            .unwrap()
+            .approval
+            .unwrap();
+        assert_eq!(approval.risk_check, Some(true));
+        assert_eq!(
+            approval.risk_base_url.as_deref(),
+            Some("http://127.0.0.1:11435")
+        );
+        assert_eq!(approval.risk_model, None);
+
+        // ユーザ層に何も無ければ、プロジェクト層が有効にしても節ごと消える（既定は無効のまま）。
+        let mut merged = serde_json::json!({});
+        deep_merge(
+            &mut merged,
+            serde_json::json!({ "approval": { "risk_check": true } }),
         );
         clamp_project_approval(&serde_json::json!({}), &mut merged);
         let settings: Settings = serde_json::from_value(merged).unwrap();

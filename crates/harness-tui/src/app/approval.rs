@@ -21,7 +21,9 @@
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
-use harness_core::{escape_for_display, hole_accepts, PermissionSubject, RiskClass};
+use harness_core::{
+    escape_for_display, hole_accepts, PermissionSubject, RiskClass, RiskLevel, RiskVerdict,
+};
 use harness_sandbox::textdiff::{diff_hunks, DiffKind};
 
 use super::pointer::KeyHint;
@@ -125,6 +127,10 @@ pub enum LineStyle {
     Dim,
     /// 注意（確かめられない・恒久承認できない・写しが壊れている）。
     Warn,
+    /// 外の判定モデルが危険と見たコマンド（`harness_core::RiskLevel::Danger`）。画面は赤の太字で描く。
+    Danger,
+    /// 外の判定モデルが注意と見たコマンド（`RiskLevel::Caution`）。画面は黄の太字で描く。
+    Caution,
     /// 差分の追加行・削除行。
     Added,
     Removed,
@@ -187,6 +193,11 @@ pub struct PermissionView {
     pub summary: SummaryState,
     /// 要約の出どころ（プロバイダ／モデル）。**どこへ中身が出たのかを画面に残す。**
     pub summary_source: Option<String>,
+    /// 外の判定モデルが返した危険度。**判定モデルが無い・遅れている・落ちているときは`None`で、
+    /// そのときの画面は今までと同じ**（判定が間に合ったときだけ、色・見出し・1行が足される）。
+    pub verdict: Option<RiskVerdict>,
+    /// 判定モデルの出どころ（サーバ／モデル）。`verdict`の1行に添える。
+    pub verdict_source: Option<String>,
 }
 
 impl PermissionView {
@@ -220,7 +231,43 @@ impl PermissionView {
             previous: None,
             summary: SummaryState::Off,
             summary_source: None,
+            verdict: None,
+            verdict_source: None,
         }
+    }
+
+    /// 枠の見出しと、注意以上のときの危険度（枠の色に使う）。**判定が無い・低いときは今までと同じ
+    /// 「承認が必要です」**で、安全だとも書かない。
+    pub fn title(&self) -> (&'static str, Option<RiskLevel>) {
+        match self.verdict.map(|v| v.level) {
+            Some(RiskLevel::Danger) => ("危険なコマンド — 承認が必要です", Some(RiskLevel::Danger)),
+            Some(RiskLevel::Caution) => ("注意 — 承認が必要です", Some(RiskLevel::Caution)),
+            _ => ("承認が必要です", None),
+        }
+    }
+
+    /// 危険度の1行（注意以上のときだけ。低い・判定なしは何も足さない）。
+    fn verdict_lines(&self) -> Vec<ApprovalLine> {
+        let Some(verdict) = self.verdict else {
+            return Vec::new();
+        };
+        let style = match verdict.level {
+            RiskLevel::Danger => LineStyle::Danger,
+            RiskLevel::Caution => LineStyle::Caution,
+            RiskLevel::Low => return Vec::new(),
+        };
+        let source = match &self.verdict_source {
+            Some(src) => format!("判定モデル: {src}"),
+            None => "判定モデル".to_string(),
+        };
+        vec![ApprovalLine::new(
+            style,
+            format!(
+                "危険度 {:.2} / 2: {}（{source}。参考であり、安全の保証ではない）",
+                verdict.score,
+                verdict.level.reason_ja()
+            ),
+        )]
     }
 
     /// 恒久的に承認できるか。**確かめられないものを含む呼び出しは覚えない**ので、
@@ -440,6 +487,7 @@ impl PermissionView {
             LineStyle::Heading,
             format!("{}（{:?}）", self.tool, self.risk),
         )];
+        out.extend(self.verdict_lines());
         match &self.subject {
             PermissionSubject::Command(c) => {
                 out.push(ApprovalLine::new(

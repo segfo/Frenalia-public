@@ -74,6 +74,7 @@ async fn summarize(
         &[piece("a", "x")],
         false,
         None,
+        None,
         cancel,
         &mut |_| {},
     )
@@ -98,6 +99,7 @@ async fn the_call_carries_no_tools_and_a_system_of_its_own() {
         "m",
         &[piece("build.py", "print('hi')")],
         false,
+        None,
         None,
         &cancel,
         &mut |_| {},
@@ -147,6 +149,7 @@ async fn the_language_is_one_line_appended_to_the_fixed_system() {
             &[piece("build.py", "print('hi')")],
             false,
             language,
+            None,
             &cancel,
             &mut |_| {},
         )
@@ -170,6 +173,77 @@ async fn the_language_is_one_line_appended_to_the_fixed_system() {
     assert!(
         !ja_body.contains("Japanese"),
         "言語を区切りの内側へ書いていない"
+    );
+}
+
+/// **危険度は、注意以上のときだけ固定の英文1行として system に足す。** 低い・判定なしは今までと
+/// 1文字も違わない要求である（低いと言われたことを要約へ渡さない）。足す行は[`RiskLevel`]が持つ
+/// 固定の綴りで、判定モデルが返した文字列も中身（区切りの内側）も入らない。
+#[tokio::test]
+async fn the_risk_level_is_a_fixed_line_only_when_it_is_caution_or_worse() {
+    let provider = Arc::new(Capturing::default());
+    let cancel = CancellationToken::new();
+    let levels = [
+        None,
+        Some(RiskLevel::Low),
+        Some(RiskLevel::Caution),
+        Some(RiskLevel::Danger),
+    ];
+    for risk in levels {
+        summarize_for_approval(
+            provider.as_ref(),
+            "m",
+            &[piece(
+                "the shell line",
+                "rm C:\\Windows\\System32\\calc.exe",
+            )],
+            false,
+            Some(SummaryLanguage::Japanese),
+            risk,
+            &cancel,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    }
+    let plain = format!("{SYSTEM}\n- Write the summary in Japanese.");
+    let (none_system, none_body) = sent(&provider, 0);
+    let (low_system, low_body) = sent(&provider, 1);
+    let (caution_system, caution_body) = sent(&provider, 2);
+    let (danger_system, danger_body) = sent(&provider, 3);
+
+    assert_eq!(none_system, plain, "判定なしは今までと同じ");
+    assert_eq!(
+        low_system, plain,
+        "低いは何も足さない（安心させる向きに曲げさせない）"
+    );
+    for (system, level) in [
+        (&caution_system, RiskLevel::Caution),
+        (&danger_system, RiskLevel::Danger),
+    ] {
+        let line = level.summary_instruction().unwrap();
+        assert_eq!(
+            system,
+            &format!("{SYSTEM}\n- {line}\n- Write the summary in Japanese."),
+            "危険度の行は言語の行の前、固定文の中に1行だけ"
+        );
+    }
+    assert!(danger_system.contains("DANGEROUS"));
+    assert!(!caution_system.contains("DANGEROUS"));
+    // 区切りの内側（中身）は危険度で変わらない——危険度を中身の側へ書いていない。
+    let strip = |body: &str| {
+        // 区切りの綴りは呼ぶたびに変わるので、中身の行だけを比べる。
+        body.lines()
+            .filter(|l| !l.starts_with("<<<") && !l.starts_with("Summarize the material"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(strip(&none_body), strip(&low_body));
+    assert_eq!(strip(&none_body), strip(&caution_body));
+    assert_eq!(strip(&none_body), strip(&danger_body));
+    assert!(
+        !danger_body.contains("DANGEROUS"),
+        "区切りの内側へ危険度を書いていない"
     );
 }
 
@@ -269,6 +343,7 @@ async fn the_amount_of_output_is_reported_as_it_arrives() {
         &[piece("a", "x")],
         false,
         None,
+        None,
         &cancel,
         &mut |chars| seen.push(chars),
     )
@@ -361,6 +436,7 @@ async fn host_paths_are_redacted_when_asked() {
         "m",
         &[piece("a", r"open(r'C:\Users\me\secret.txt')")],
         true,
+        None,
         None,
         &cancel,
         &mut |_| {},
