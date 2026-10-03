@@ -51,19 +51,12 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
             if app.run.is_some() {
                 keys.push(shown("ホイール 枠内をさかのぼる"));
             }
-            if app.is_running() {
-                let run = app.run.as_ref().expect("is_running implies a run");
-                if run.phase.stop_takes_effect_now() {
-                    keys.push(press("Esc 停止", KeyCode::Esc));
-                } else if run.phase.stop_can_be_queued() {
-                    keys.push(press("Esc 停止を予約", KeyCode::Esc));
-                }
-            } else {
+            // 記録の開始と停止はここに無い——「記録」の枠の右下のボタン（[`record_buttons`]）へ移した。
+            if !app.is_running() {
                 // 終わった記録の結果を見ている間も、次の操作は同じ（もう一度実行する／
                 // 候補を見に行く）。**押せるものを隠さない**——結果を読んだ後に何をすれば
                 // よいかが画面から消えると、そこで手が止まる。
                 keys.push(press("Tab 項目移動", KeyCode::Tab));
-                keys.push(press("Enter 記録を開始", KeyCode::Enter));
                 if app.has_finished_run() {
                     keys.push(press("F2 候補を見る", KeyCode::F(2)));
                 }
@@ -162,6 +155,30 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
         }
     }
     keys
+}
+
+/// 記録画面の「記録」の枠の右下に並べるボタン（`record_screen`が描く。2026-10-03）。
+///
+/// 会話画面（`harness.exe`）の入力欄の右下に「送信」「中断」のボタンを置いたのと同じ形——ユーザーが会話画面を実機で
+/// 見て「送信ボタンが独立してあると思っている。括弧書きの注釈では押せると分からない」と指摘し、このエディタの
+/// 記録のコマンド欄も`Enter 記録を開始`をキー案内の行でしか示していなかった。見た目は同じ部品（`harness_term::button`）。
+///
+/// - 実行前は`Enter 記録を開始`。コマンドが空でも押せる——押すと開始できない理由が出る（`App::start_recording`。
+///   押しても無反応にしない、B-23(c)）。
+/// - 実行中は、止められるときだけ`Esc 停止`／`Esc 停止を予約`（効かない操作を案内しない。B-32）。
+///
+/// キー案内の行（[`screen_keys`]）には出さない——同じ操作を2か所に並べない（会話画面の見出しから送信・中断を外したのと同じ）。
+pub(super) fn record_buttons(app: &App) -> Vec<KeyHint> {
+    let Some(run) = app.run.as_ref().filter(|_| app.is_running()) else {
+        return vec![press("Enter 記録を開始", KeyCode::Enter)];
+    };
+    if run.phase.stop_takes_effect_now() {
+        vec![press("Esc 停止", KeyCode::Esc)]
+    } else if run.phase.stop_can_be_queued() {
+        vec![press("Esc 停止を予約", KeyCode::Esc)]
+    } else {
+        Vec::new()
+    }
 }
 
 /// 全画面に共通のキー案内。画面ごとの項目の後ろに並べる。

@@ -148,37 +148,73 @@ impl AppState {
 
     /// 入力欄の見出しに出すキーの案内（**押せば同じキーを押したのと同じ**。`app::pointer`）。
     ///
-    /// 送信のキーは設定と端末で変わる（[`Self::enter_submits`]・[`Self::host_is_vscode`]）ので、案内もここで決める。
-    /// `PageUp/PageDown`は1つのキーに決まらないので押せない。`Ctrl-C=終了`は押せる——ポリシーエディタのキー案内も
+    /// 送信と中断はここに無い——入力欄の右下のボタン（[`Self::input_buttons`]）へ移した（2026-10-03）。
+    /// 残るのはキーボードの人のための案内で、`PageUp/PageDown`は1つのキーに決まらないので押せない。`Enter=改行`は
+    /// 素のEnterが改行のとき（[`Self::enter_submits`]が偽）だけ出す。`Ctrl-C=終了`は押せる——ポリシーエディタのキー案内も
     /// 終了の項目を押せる（`plans/POLICY-EDITOR-TOMOYO-DIG.md`決定62の「マウスで操作できるようにした」の表の5）。
     pub fn input_key_hints(&self) -> Vec<KeyHint> {
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        let mut hints = if self.enter_submits {
-            vec![KeyHint::press_key("Enter=送信", enter)]
-        } else if self.host_is_vscode {
-            vec![
-                KeyHint::press_key("Enter=改行", enter),
-                KeyHint::press_key(
-                    "Alt+Enter=送信",
-                    KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
-                ),
-            ]
-        } else {
-            vec![
-                KeyHint::press_key("Enter=改行", enter),
-                KeyHint::press_key(
-                    "Shift+Enter=送信",
-                    KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
-                ),
-            ]
-        };
-        hints.push(KeyHint::press("Esc=中断", KeyCode::Esc));
+        let mut hints = Vec::new();
+        if !self.enter_submits {
+            hints.push(KeyHint::press("Enter=改行", KeyCode::Enter));
+        }
         hints.push(KeyHint::shown("PageUp/PageDown=スクロール"));
         hints.push(KeyHint::press_key(
             "Ctrl-C=終了",
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         ));
         hints
+    }
+
+    /// 入力欄の右下に並べるボタン（左から「中断」「送信」。2026-10-03、ユーザーが実機で「送信やキャンセルが
+    /// できると直感的に分からない」と指摘した）。**押せば同じキーを押したのと同じ**（`app::pointer`）。
+    ///
+    /// - **送信**はいつも出す。キーは設定と端末で変わる（[`Self::enter_submits`]・[`Self::host_is_vscode`]——
+    ///   VS Codeの統合ターミナルはShift+EnterのShiftを落とすので`Alt+Enter`を案内する）ので、文言もここで決める。
+    ///   入力欄が空白だけの間は**押せない**（`key`が`None`。送信キーを押しても何も起きない——[`Self::submit_input`]）。
+    /// - **中断**は止めるものが走っている間（[`Self::can_cancel`]）だけ出す。走っていない間に`Esc`を押しても
+    ///   何も止まらないので、効かない操作を案内しない（ポリシーエディタの記録画面の`Esc 停止`と同じ。B-32）。
+    ///
+    /// 中断を送信の**左**に置くのは、出たり消えたりしても送信の位置が動かないようにするため。
+    pub fn input_buttons(&self) -> Vec<InputButton> {
+        let mut buttons = Vec::with_capacity(2);
+        if self.can_cancel() {
+            buttons.push(InputButton {
+                hint: KeyHint::press("Esc=中断", KeyCode::Esc),
+                short: "中断",
+            });
+        }
+        let (label, key) = if self.enter_submits {
+            (
+                "Enter=送信",
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+        } else if self.host_is_vscode {
+            (
+                "Alt+Enter=送信",
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+            )
+        } else {
+            (
+                "Shift+Enter=送信",
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            )
+        };
+        buttons.push(InputButton {
+            hint: match self.input.trim().is_empty() {
+                true => KeyHint::shown(label),
+                false => KeyHint::press_key(label, key),
+            },
+            short: "送信",
+        });
+        buttons
+    }
+
+    /// `Esc`で止めるものが走っているか——応答中のターンか、走り始めた`/compact`の要約。
+    ///
+    /// `Esc`はエンジンの「いま走っているもの」の取り消しを発火させる（`crate::engine::EngineHandle::cancel_current`）。
+    /// キューで待っているだけの`/compact`は、まだ取り消しの的に入っていないので数えない（BUG-071）。
+    pub fn can_cancel(&self) -> bool {
+        self.turn_in_flight || self.busy_progress.as_ref().is_some_and(|b| b.is_running())
     }
 
     /// キー入力を処理し、engineアクター/InteractiveGateへ伝えるべきアクションを返す。

@@ -555,7 +555,8 @@ harness-policy-editor — LLMを介さずに「このコマンドに何を許す
 
 マウス
   クリック  タブ（F1〜F3 と承認待ちのタブ）・一覧の行・[x] / [ ]・▸ / ▾・入力欄・
-            下のキー案内・確認画面の y=書く と n / Esc=やめる を押せます
+            下のキー案内・記録の枠の右下のボタン（記録を開始・停止）・
+            確認画面の y=書く と n / Esc=やめる を押せます
             （どれもキーを押したのと同じ動きです。入力欄は Tab で入ったのと同じ）
             一括の操作（宣言画面の A・遷移タブの X）はキーでだけ押せます
   ホイール  ポインタの下の枠を送ります（ヘルプか確認画面が開いている間はそれを送ります）
@@ -644,8 +645,9 @@ const MODAL_WIDTH: u16 = 88;
 /// `y=書く`・`n / Esc=やめる`（読むだけのダイアログは`Enter / Esc=閉じる`）は、クリックでそのキーを
 /// 押せる。**`a`で確認ダイアログを開いてから書く2段構えは変えない**——押せるようになったのは2段目の`y`で、
 /// 1段目の`a`を押さずに書くことはできない。ボタンは枠の見出しではなく自分で下辺へ描き、描いた位置を
-/// 登録する（`harness_term::scrollable::draw_with_buttons`）。見た目は見出しに置いていた頃と同じで、
-/// 下辺の右の「N〜M/T行」はボタンの残りの幅に収まる形を選ぶ（ボタンを覆わない）。
+/// 登録する（`harness_term::scrollable::draw_with_buttons`）。見た目は会話TUIの入力欄・承認ダイアログの
+/// ボタンと同じ部品（`harness_term::button`。2026-10-03からボタンの間に1桁空けて枠線を見せる——以前は2つの
+/// ボタンが1本の帯に見えた）で、下辺の右の「N〜M/T行」はボタンの残りの幅に収まる形を選ぶ（ボタンを覆わない）。
 /// ダイアログの外側は押せない（決定32: 書き込みの確認は`y`か`n`/`Esc`を選ばせる）。
 ///
 /// **末尾の空行は数えも描きもしない。** 明細の組み立ては節の区切りに空行を足すので（付け替えの明細など）、
@@ -680,28 +682,23 @@ fn draw_modal(
     // 開いている間は、画面のどこでホイールを回しても確認ダイアログを送る（`tui::scroll`）。
     targets.wheel(screen, Wheel::Modal);
 
-    // ボタンとその間（見た目は1つの見出しだった頃の「 y=書く   n / Esc=やめる 」と同じ）。
-    let buttons: &[(&str, Option<KeyCode>)] = if modal.confirm.asks() {
+    // ボタンの見た目と間の空け方は会話TUIの入力欄・承認ダイアログと共有する（`harness_term::button`）。
+    let buttons: &[(&str, KeyCode)] = if modal.confirm.asks() {
         &[
-            (" y=書く ", Some(KeyCode::Char('y'))),
-            (" ", None),
-            (" n / Esc=やめる ", Some(KeyCode::Char('n'))),
+            ("y=書く", KeyCode::Char('y')),
+            ("n / Esc=やめる", KeyCode::Char('n')),
         ]
     } else {
-        &[(" Enter / Esc=閉じる ", Some(KeyCode::Enter))]
+        &[("Enter / Esc=閉じる", KeyCode::Enter)]
     };
     let color = if modal.confirm.asks() {
         Color::Yellow
     } else {
         Color::Red
     };
-    let button_style = Style::default()
-        .fg(Color::Black)
-        .bg(color)
-        .add_modifier(Modifier::BOLD);
     let spans: Vec<Span> = buttons
         .iter()
-        .map(|(label, _)| Span::styled(*label, button_style))
+        .map(|(label, _)| harness_term::button::active(label, color))
         .collect();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -721,9 +718,7 @@ fn draw_modal(
         &spans,
     );
     for ((_, code), rect) in buttons.iter().zip(drawn.buttons) {
-        if let Some(code) = code {
-            targets.click(rect, Click::Keys(vec![pointer::key(*code)]));
-        }
+        targets.click(rect, Click::Keys(vec![pointer::key(*code)]));
     }
     drawn.max_top
 }

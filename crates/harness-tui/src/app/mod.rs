@@ -66,7 +66,7 @@ pub use approval::{
 };
 use commands::parse_slash_command;
 pub use commands::{Action, FsStageCommand, MemoryCommand, SlashCommand};
-pub use pointer::{Click, DrawFeedback, KeyHint, ReviewDrawn, Step, Targets, Wheel};
+pub use pointer::{Click, DrawFeedback, InputButton, KeyHint, ReviewDrawn, Step, Targets, Wheel};
 pub use review::{
     commit_selection, CommitSelection, PartialFile, ReviewCommand, ReviewDiffLine, ReviewFocus,
     ReviewPanelState, ReviewRow, ReviewTarget,
