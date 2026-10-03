@@ -108,19 +108,13 @@ pub fn render_permission_modal(
         ..rect
     };
 
-    // 外の判定モデルが注意以上と見たコマンドは、見出しと枠線の色を変える（赤＝危険、黄＝注意）。
+    // 外の判定モデルが危険と見たコマンドは、見出しと枠線の色を変える（赤）。
     // 判定が無い・低いときは今までと同じ見た目（`PermissionView::title`）。
     let (title_text, elevated) = pending.title();
     let (title_style, border_style) = match elevated {
         Some(RiskLevel::Danger) => (
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             Style::default().fg(Color::Red),
-        ),
-        Some(RiskLevel::Caution) => (
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Yellow),
         ),
         _ => (Style::default(), Style::default()),
     };
@@ -189,9 +183,6 @@ fn styled(line: crate::app::ApprovalLine) -> Line<'static> {
         LineStyle::Dim => Style::default().fg(Color::DarkGray),
         LineStyle::Warn => Style::default().fg(Color::Yellow),
         LineStyle::Danger => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        LineStyle::Caution => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
         LineStyle::Added => Style::default().fg(Color::Green),
         LineStyle::Removed => Style::default().fg(Color::Red),
         LineStyle::Selected => Style::default().add_modifier(Modifier::REVERSED),

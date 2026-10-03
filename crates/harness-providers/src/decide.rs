@@ -16,8 +16,8 @@
 //!
 //! # 待ちの上限
 //!
-//! 接続は1秒で諦める（サーバが無いときに承認画面を待たせない）。応答全体は30秒で諦める
-//! （モデルの読み込みに約11秒かかった実測がある）。上限を超えたら`Err`で、呼び出し側は
+//! 接続は1秒で諦める（サーバが無いときに承認画面を待たせない）。応答全体は60秒で諦める
+//! （モデルの読み込みに、`decider:0.8b` で約11秒、`winnow:e4b`（8GB）はそれ以上かかり得る）。上限を超えたら`Err`で、呼び出し側は
 //! 判定が無かったものとして今までどおり進める。
 
 use std::time::Duration;
@@ -29,7 +29,7 @@ use serde::Deserialize;
 /// 接続を諦める時間。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// 応答全体を諦める時間（モデルの初回の読み込み込み）。
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Ollaya の判定設定の名前。コマンドを判定する設定（`GET /api/presets`の`agent`）。
 const PRESET: &str = "agent";
 

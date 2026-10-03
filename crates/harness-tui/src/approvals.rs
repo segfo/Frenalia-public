@@ -330,13 +330,12 @@ pub(crate) fn summary_key(
 /// 今までと同じ要求なので、同じ鍵（空）になる。
 fn risk_key(risk: Option<RiskLevel>) -> &'static str {
     match risk {
-        Some(RiskLevel::Caution) => "caution",
         Some(RiskLevel::Danger) => "danger",
         Some(RiskLevel::Low) | None => "",
     }
 }
 
-/// 要約へ危険度を渡す段階。注意以上だけ（低いは渡さない。[`RiskLevel::summary_instruction`]）。
+/// 要約へ危険度を渡す段階。危険だけ（低いは渡さない。[`RiskLevel::summary_instruction`]）。
 fn summary_hint(verdict: RiskVerdict) -> Option<RiskLevel> {
     verdict.level.is_elevated().then_some(verdict.level)
 }
@@ -508,11 +507,13 @@ pub(crate) fn start_summary(
     // 作った前の要約（危険と言っていない要約）を出してはいけない。段階ごとの候補だけ先に引いておき、
     // 判定が決まってから選ぶ（間に合わなければ「危険度なし」の候補＝今までと同じ使い回しになる）。
     let candidates: Vec<(String, String)> = match pending {
-        true => [None, Some(RiskLevel::Caution), Some(RiskLevel::Danger)]
+        true => [None, Some(RiskLevel::Danger)]
             .into_iter()
             .filter_map(|hint| {
                 let candidate_key = summary_key(&pieces, language, hint);
-                cache.get(&candidate_key).map(|t| (candidate_key, t.clone()))
+                cache
+                    .get(&candidate_key)
+                    .map(|t| (candidate_key, t.clone()))
             })
             .collect(),
         false => Vec::new(),

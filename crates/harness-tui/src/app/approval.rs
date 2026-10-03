@@ -129,8 +129,6 @@ pub enum LineStyle {
     Warn,
     /// 外の判定モデルが危険と見たコマンド（`harness_core::RiskLevel::Danger`）。画面は赤の太字で描く。
     Danger,
-    /// 外の判定モデルが注意と見たコマンド（`RiskLevel::Caution`）。画面は黄の太字で描く。
-    Caution,
     /// 差分の追加行・削除行。
     Added,
     Removed,
@@ -236,24 +234,22 @@ impl PermissionView {
         }
     }
 
-    /// 枠の見出しと、注意以上のときの危険度（枠の色に使う）。**判定が無い・低いときは今までと同じ
+    /// 枠の見出しと、危険のときの危険度（枠の色に使う）。**判定が無い・低いときは今までと同じ
     /// 「承認が必要です」**で、安全だとも書かない。
     pub fn title(&self) -> (&'static str, Option<RiskLevel>) {
         match self.verdict.map(|v| v.level) {
             Some(RiskLevel::Danger) => ("危険なコマンド — 承認が必要です", Some(RiskLevel::Danger)),
-            Some(RiskLevel::Caution) => ("注意 — 承認が必要です", Some(RiskLevel::Caution)),
             _ => ("承認が必要です", None),
         }
     }
 
-    /// 危険度の1行（注意以上のときだけ。低い・判定なしは何も足さない）。
+    /// 危険度の1行（危険のときだけ。低い・判定なしは何も足さない）。
     fn verdict_lines(&self) -> Vec<ApprovalLine> {
         let Some(verdict) = self.verdict else {
             return Vec::new();
         };
         let style = match verdict.level {
             RiskLevel::Danger => LineStyle::Danger,
-            RiskLevel::Caution => LineStyle::Caution,
             RiskLevel::Low => return Vec::new(),
         };
         let source = match &self.verdict_source {

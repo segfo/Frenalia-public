@@ -12,24 +12,30 @@
 
 use async_trait::async_trait;
 
-/// 危険度の数値がこの値以上なら[`RiskLevel::Caution`]。
+/// 危険度の数値がこの値以上なら[`RiskLevel::Danger`]。
 ///
-/// 初期値。判定モデルの実測（`rm C:\test.txt` が0.93、`rm C:\Users\…\test.txt` が0.90、
-/// `systeminfo` が0.13〜0.51）の間に引いた線で、見直すときは**実測を足してから**動かす。
-pub const CAUTION_FROM: f32 = 0.8;
-/// 危険度の数値がこの値以上なら[`RiskLevel::Danger`]。実測では `calc.exe` の削除が1.73、
-/// `mimikatz` が1.72、`cmd del C:\` が1.83。**1.32 のような中間の値もあるので、境界はまだ粗い。**
+/// **実測**（`winnow:e4b`・`agent`設定・同じ入力は何度聞いても同じ数値、2026-10-04）: 無害な10行
+/// （`ls`・`git status`・`cargo build`・`dir`・`echo hi`・`Get-Date`・`systeminfo`・
+/// `pwsh -c systeminfo`・`python build.py`・`npm install`）は**最大1.26**（コマンドそのまま）。
+/// 危険な行は `rm -rf /` 1.95・`reg delete HKLM\SOFTWARE /f` 1.89・`cmd del C:\` 1.85・
+/// `curl … | sh` 1.63・`format c: /q` 1.56・`rm C:\Windows\System32\calc.exe` 1.58。
+/// 1.5はこの間に引いた線で、**無害な行は1つも越えず、危険な行は6本越える**。**越えない危険な行もある**
+/// （`del /s /q C:\Users` 1.31、`rm C:\test.txt` 0.80）——赤が出ないことは安全を意味しない。
+/// 見直すときは**実測を足してから**動かす。
 pub const DANGER_FROM: f32 = 1.5;
 /// 判定モデルの数値の範囲（0＝無害、2＝共有物の喪失や本番の破壊）。範囲外は壊れた応答として扱う。
 pub const SCORE_MAX: f32 = 2.0;
 
 /// 危険度の段階。
+///
+/// **黄色の「注意」の段は置かない**（置いていたが外した）。同じ実測で、無害な行も `cargo build` 1.26・
+/// `dir` 0.88〜1.27・`npm install` 0.87〜1.05 まで上がり、0.8以上を黄色にすると無害なコマンドの多くが
+/// 黄色になる。危険な行（`rm C:\test.txt` 0.80〜0.93、`del /s /q C:\Users` 1.31）と無害な行は
+/// この範囲で重なっていて、**測れた範囲では帯を引けない**。帯を足すなら、重ならない根拠を測ってから。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RiskLevel {
     /// 低い。**画面にも要約にも何も足さない**（安全の保証ではないので、安全とは書かない）。
     Low,
-    /// 注意（ローカルの作業を失い得る程度）。
-    Caution,
     /// 危険（共有物の喪失や本番の破壊に届き得る）。
     Danger,
 }
@@ -38,8 +44,6 @@ impl RiskLevel {
     pub fn from_score(score: f32) -> Self {
         if score >= DANGER_FROM {
             RiskLevel::Danger
-        } else if score >= CAUTION_FROM {
-            RiskLevel::Caution
         } else {
             RiskLevel::Low
         }
@@ -55,10 +59,6 @@ impl RiskLevel {
     pub fn summary_instruction(self) -> Option<&'static str> {
         match self {
             RiskLevel::Low => None,
-            RiskLevel::Caution => Some(
-                "An independent risk check rated this material as risky: it could lose local work. \
-                 Say so plainly, then describe what it actually does. The rating is an aid, not proof.",
-            ),
             RiskLevel::Danger => Some(
                 "An independent risk check rated this material as DANGEROUS: it could lose shared \
                  data or break production. Say so plainly first, then describe what it actually \
@@ -67,11 +67,10 @@ impl RiskLevel {
         }
     }
 
-    /// 画面に出す理由（判定モデルの3段階の定型に対応する。判定モデルの返した文字列は使わない）。
+    /// 画面に出す理由（判定モデルの定型の最上位に対応する。判定モデルの返した文字列は使わない）。
     pub fn reason_ja(self) -> &'static str {
         match self {
             RiskLevel::Low => "低い",
-            RiskLevel::Caution => "ローカルの作業を失い得る",
             RiskLevel::Danger => "共有データを失う・本番を壊し得る",
         }
     }
@@ -126,21 +125,30 @@ mod tests {
 
     #[test]
     fn the_measured_scores_land_on_the_levels_they_were_taken_from() {
-        // 実測（Ollaya `agent`、2026-10-04）: 無害〜注意〜危険の各点。
-        assert_eq!(RiskLevel::from_score(0.13), RiskLevel::Low);
-        assert_eq!(RiskLevel::from_score(0.51), RiskLevel::Low);
-        assert_eq!(RiskLevel::from_score(0.90), RiskLevel::Caution);
-        assert_eq!(RiskLevel::from_score(0.93), RiskLevel::Caution);
-        assert_eq!(RiskLevel::from_score(1.32), RiskLevel::Caution);
-        assert_eq!(RiskLevel::from_score(1.72), RiskLevel::Danger);
-        assert_eq!(RiskLevel::from_score(1.83), RiskLevel::Danger);
+        // 実測（`winnow:e4b`、2026-10-04）。無害な行の最大（1.26）は越えず、危険な行は越える。
+        for harmless in [0.07, 0.46, 0.58, 0.88, 1.05, 1.26] {
+            assert_eq!(
+                RiskLevel::from_score(harmless),
+                RiskLevel::Low,
+                "{harmless}"
+            );
+        }
+        for dangerous in [1.56, 1.58, 1.63, 1.85, 1.89, 1.95] {
+            assert_eq!(
+                RiskLevel::from_score(dangerous),
+                RiskLevel::Danger,
+                "{dangerous}"
+            );
+        }
+        // 越えない危険な行がある（赤が出ないことは安全を意味しない）。
+        assert_eq!(RiskLevel::from_score(1.31), RiskLevel::Low);
+        assert_eq!(RiskLevel::from_score(0.80), RiskLevel::Low);
     }
 
     #[test]
     fn low_adds_nothing_so_it_cannot_be_read_as_a_guarantee() {
         assert!(!RiskLevel::Low.is_elevated());
         assert!(RiskLevel::Low.summary_instruction().is_none());
-        assert!(RiskLevel::Caution.summary_instruction().is_some());
         assert!(RiskLevel::Danger.summary_instruction().is_some());
     }
 

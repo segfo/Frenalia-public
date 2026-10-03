@@ -154,24 +154,26 @@ async fn a_dangerous_verdict_reaches_the_title_the_line_and_the_summary() {
     assert_eq!(fake.lines.lock().unwrap().as_slice(), [DANGEROUS_LINE]);
 }
 
-/// **注意は黄の段階。** 同じ経路で、要約へは別の（危険より弱い）固定の1行が届く。
+/// **危険の線（1.5）に届かない数値は、何も足さない。** 測った範囲では、危険な行にも届かないもの
+/// （`rm C:	est.txt` 0.80〜0.93）があるが、同じ範囲に無害な行（`cargo build` 1.26 など）も居る。
+/// 黄色の帯を引くと無害なコマンドが黄色になるので、線に届かなければ判定を使わない構成と同じにする。
 #[tokio::test]
-async fn a_cautious_verdict_is_yellow_and_asks_the_summary_for_a_weaker_line() {
-    let fake = FakeRisk::scoring(0.93);
-    let mut app = shell_app("rm C:\\test.txt");
+async fn a_score_below_the_danger_line_adds_nothing_even_when_it_is_not_tiny() {
+    let fake = FakeRisk::scoring(1.26);
+    let mut with_check = shell_app("cargo build");
+    let mut plain = shell_app("cargo build");
     let mut cache = SummaryCache::new();
-    let req = run_dialog(&mut app, Some(&risk_of(&fake)), &mut cache).await;
+    let checked = run_dialog(&mut with_check, Some(&risk_of(&fake)), &mut cache).await;
+    let mut cache = SummaryCache::new();
+    let unchecked = run_dialog(&mut plain, None, &mut cache).await;
 
-    assert_eq!(view(&app).title().1, Some(RiskLevel::Caution));
-    assert!(view(&app)
+    assert_eq!(fake.calls(), 1, "対照: 判定は呼ばれている");
+    assert_eq!(view(&with_check).title(), view(&plain).title());
+    assert_eq!(checked.system[0].text, unchecked.system[0].text);
+    assert!(!view(&with_check)
         .body(clock())
         .iter()
-        .any(|l| l.style == crate::app::LineStyle::Caution));
-    let system = &req.system[0].text;
-    assert!(
-        system.contains("risky") && !system.contains("DANGEROUS"),
-        "{system}"
-    );
+        .any(|l| l.style == crate::app::LineStyle::Danger));
 }
 
 /// **低いと判定されても、何も足さない。** 低いは安全の保証ではないので、見出しも1行も要約への一言も
@@ -396,12 +398,9 @@ fn the_reuse_key_changes_with_the_risk_level_that_reaches_the_summary() {
     }];
     let none = summary_key(&pieces, None, None);
     let low = summary_key(&pieces, None, Some(RiskLevel::Low));
-    let caution = summary_key(&pieces, None, Some(RiskLevel::Caution));
     let danger = summary_key(&pieces, None, Some(RiskLevel::Danger));
     assert_eq!(none, low, "低いは今までと同じ要求なので同じ鍵");
-    assert_ne!(none, caution);
     assert_ne!(none, danger);
-    assert_ne!(caution, danger);
 }
 
 /// 判定済みの危険な行は、**判定なしで作った要約を使い回さない**。鍵に段階が入るので、別の鍵で聞き直す。
@@ -460,7 +459,9 @@ async fn a_cached_summary_is_still_reused_when_the_verdict_is_low_or_missing() {
         let scope = open_scope(ReadScopeConfig::default());
         let mut again = shell_app("systeminfo");
         let gate = start_risk(&risk_of(&fake), &tx, &mut again, &CancellationToken::new());
-        assert!(start_summary(&summary, &tx, &mut again, &cache, &scope, false, None, gate).is_some());
+        assert!(
+            start_summary(&summary, &tx, &mut again, &cache, &scope, false, None, gate).is_some()
+        );
         apply_until_ready(&mut rx, &mut again, &mut cache).await;
 
         assert!(

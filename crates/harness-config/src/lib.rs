@@ -84,7 +84,7 @@ pub struct Settings {
 ///   "summary_model": "qwen3-8b",
 ///   "risk_check": true,
 ///   "risk_base_url": "http://127.0.0.1:11435",
-///   "risk_model": "decider:0.8b"
+///   "risk_model": "winnow:e4b"
 /// }
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -102,7 +102,7 @@ pub struct ApprovalSettings {
     pub risk_check: Option<bool>,
     /// 判定モデルのサーバ。省略時は`http://127.0.0.1:11435`。
     pub risk_base_url: Option<String>,
-    /// 判定モデル。省略時は`decider:0.8b`。
+    /// 判定モデル。省略時は`winnow:e4b`。
     pub risk_model: Option<String>,
 }
 

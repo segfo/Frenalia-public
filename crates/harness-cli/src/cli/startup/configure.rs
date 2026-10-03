@@ -352,7 +352,7 @@ fn resolve_approval_summary(
 
 /// 判定モデル（Ollaya）の既定の送り先とモデル。`approval.risk_base_url`・`approval.risk_model`で変える。
 const DEFAULT_RISK_BASE_URL: &str = "http://127.0.0.1:11435";
-const DEFAULT_RISK_MODEL: &str = "decider:0.8b";
+const DEFAULT_RISK_MODEL: &str = "winnow:e4b";
 
 /// 承認画面の危険度判定（外の判定モデル。`harness_core::risk_check`）の構成を決める。
 ///
@@ -704,7 +704,7 @@ mod tests {
         assert!(
             resolve_approval_risk(&with(Some(harness_config::ApprovalSettings {
                 risk_check: Some(false),
-                risk_model: Some("decider:0.8b".into()),
+                risk_model: Some("winnow:e4b".into()),
                 ..Default::default()
             })))
             .is_none()
@@ -712,15 +712,15 @@ mod tests {
 
         // 有効: 送り先とモデルの既定で作り、出どころを画面用に持つ。
         let chosen = resolve_approval_risk(&on(|_| {})).expect("有効なら作る");
-        assert_eq!(chosen.label, "ollaya / decider:0.8b");
+        assert_eq!(chosen.label, "ollaya / winnow:e4b");
 
         // 指定した送り先・モデルが出どころへ出る（どこへコマンドが出たかが分かる）。
         let chosen = resolve_approval_risk(&on(|a| {
             a.risk_base_url = Some("http://10.0.0.5:11435".into());
-            a.risk_model = Some("winnow:e4b".into());
+            a.risk_model = Some("decider:0.8b".into());
         }))
         .expect("指定どおりに作る");
-        assert_eq!(chosen.label, "ollaya / winnow:e4b");
+        assert_eq!(chosen.label, "ollaya / decider:0.8b");
 
         // 作れない指定（空のモデル名）: 起動は止めず、判定だけ切る。
         assert!(resolve_approval_risk(&on(|a| a.risk_model = Some("  ".into()))).is_none());
