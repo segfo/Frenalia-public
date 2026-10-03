@@ -24,6 +24,8 @@ pub mod scrollable;
 pub mod scrollback;
 /// 画面を握っている間、このプロセスの標準エラーを預かって画面の中へ出す（会話TUIとポリシーエディタが共有。BUG-206）。
 pub mod stderr_capture;
+/// タブ——並んだ中から1つを選び、いまどれを開いているかを示し続ける（ボタンとは別の部品。ポリシーエディタが使う）。
+pub mod tab;
 /// 折り返して描く本文の、数える幅と描く幅（会話TUIとポリシーエディタが共有。BUG-200）。
 pub mod wrap;
 

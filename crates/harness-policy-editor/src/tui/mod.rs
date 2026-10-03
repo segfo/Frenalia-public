@@ -93,7 +93,7 @@ use std::time::Duration;
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders};
 use ratatui::{Frame, Terminal};
@@ -356,47 +356,31 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
     feedback
 }
 
-/// タブの見た目（一番上の画面のタブと、承認待ちのタブで同じ）。
-fn tab_style(active: bool) -> Style {
-    if active {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    }
-}
-
 /// 一番上の行（画面のタブ）。タブはクリックでその画面へ移る場所として登録する（`F1`〜`F3`を押したのと同じ）。
+/// 見た目と並べ方は承認待ちのタブと同じ部品（`harness_term::tab`。タブはボタンとは別の部品——同モジュールのdoc）。
 fn draw_tabs(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
-    let screens = [
-        (Screen::Record, " F1 記録 "),
-        (Screen::Edit, " F2 承認待ち "),
-        (Screen::Declared, " F3 宣言 "),
-    ];
-    let mut spans = Vec::new();
-    let mut at = Vec::new();
-    for (i, (screen, label)) in screens.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        at.push(spans.len());
-        spans.push(Span::styled(*label, tab_style(app.screen == *screen)));
-    }
-    spans.push(Span::styled(
-        "  Ctrl+N で切替",
-        Style::default().fg(Color::DarkGray),
-    ));
-    spans.push(Span::raw("   "));
-    spans.push(Span::styled(
-        format!("workspace: {}", app.workspace_root.display()),
-        Style::default().fg(Color::DarkGray),
-    ));
-    let drawn = harness_term::row::draw(frame, area, &spans);
-    for ((screen, _), index) in screens.iter().zip(at) {
-        targets.click(drawn[index], Click::Screen(*screen));
-    }
+    let tabs = [
+        (Screen::Record, "F1 記録"),
+        (Screen::Edit, "F2 承認待ち"),
+        (Screen::Declared, "F3 宣言"),
+    ]
+    .map(|(screen, label)| harness_term::tab::Tab {
+        label,
+        selected: app.screen == screen,
+        target: Click::Screen(screen),
+    });
+    let hint = Style::default().fg(Color::DarkGray);
+    harness_term::tab::draw(
+        frame,
+        area,
+        &tabs,
+        &[
+            Span::styled("  Ctrl+N で切替", hint),
+            Span::raw("   "),
+            Span::styled(format!("workspace: {}", app.workspace_root.display()), hint),
+        ],
+        targets,
+    );
 }
 
 /// 承認待ち（`F2`）のタブの行（2026-10-02）。並びは`F2`で巡回する順（[`PendingTab`]の`next`）。
@@ -406,34 +390,32 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
 /// 同じく承認待ちの本体の一番上に1行で並べる。押すと`F2`の巡回と同じ処理でそのタブへ移る。
 fn draw_pending_tabs(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
     // タブの一覧を別に持たない（`F2`の巡回の順そのものを辿る。片方だけ足すと並びがずれる）。
-    let mut tabs = vec![PendingTab::FsNet];
+    let mut order = vec![PendingTab::FsNet];
     loop {
-        let next = tabs[tabs.len() - 1].next();
+        let next = order[order.len() - 1].next();
         if next == PendingTab::FsNet {
             break;
         }
-        tabs.push(next);
+        order.push(next);
     }
-    let mut spans = Vec::new();
-    let mut at = Vec::new();
-    for (i, tab) in tabs.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
-        at.push(spans.len());
-        spans.push(Span::styled(
-            format!(" {} ", tab.label()),
-            tab_style(app.pending.tab.0 == *tab),
-        ));
-    }
-    spans.push(Span::styled(
-        "  F2 で切替",
-        Style::default().fg(Color::DarkGray),
-    ));
-    let drawn = harness_term::row::draw(frame, area, &spans);
-    for (tab, index) in tabs.iter().zip(at) {
-        targets.click(drawn[index], Click::PendingTab(*tab));
-    }
+    let tabs: Vec<_> = order
+        .into_iter()
+        .map(|tab| harness_term::tab::Tab {
+            label: tab.label(),
+            selected: app.pending.tab.0 == tab,
+            target: Click::PendingTab(tab),
+        })
+        .collect();
+    harness_term::tab::draw(
+        frame,
+        area,
+        &tabs,
+        &[Span::styled(
+            "  F2 で切替",
+            Style::default().fg(Color::DarkGray),
+        )],
+        targets,
+    );
 }
 
 /// 知らせの行（キー案内の1行上）に出す文。

@@ -486,6 +486,146 @@ fn a_pending_tab_switches_to_that_tab() {
     }
 }
 
+/// 製品と同じ形で1フレーム描き（描いて分かったことを状態へ書き戻す）、`rows`の各行を「見た目が同じセルの連なり」ごとに
+/// `«文字色/背景/修飾»文字`と書き並べたものと、その行で押すと何が起きるか（押せる桁の連なりごとに`桁..桁=動き`）を返す。
+/// 作業ディレクトリの綴りは`<ws>`に置き換え、行末の空白は落とす。
+fn tab_rows(app: &mut App, width: u16, rows: &[u16]) -> Vec<(String, String)> {
+    let mut terminal = Terminal::new(TestBackend::new(width, SIZE.1)).expect("test terminal");
+    let mut feedback = DrawFeedback::default();
+    terminal
+        .draw(|f| feedback = draw(f, app))
+        .expect("描画は落ちてはいけない");
+    app.apply_draw_feedback(feedback);
+    let buffer = terminal.backend().buffer();
+    let ws = app.workspace_root.display().to_string();
+    let name =
+        |color: Option<ratatui::style::Color>| color.map_or("-".to_string(), |c| format!("{c:?}"));
+    rows.iter()
+        .map(|&y| {
+            let mut looks = String::new();
+            let mut current = None;
+            let mut second_half = false;
+            for x in 0..width {
+                let cell = &buffer[(x, y)];
+                // 全角文字の後ろのセル（2桁目）は読まない（ratatuiはそこを既定の見た目の空白にし、端末は前の文字で覆う）。
+                if std::mem::take(&mut second_half) {
+                    continue;
+                }
+                second_half = unicode_width::UnicodeWidthStr::width(cell.symbol()) == 2;
+                let style = cell.style();
+                if current != Some(style) {
+                    looks.push_str(&format!(
+                        "«{}/{}/{:?}»",
+                        name(style.fg),
+                        name(style.bg),
+                        style.add_modifier
+                    ));
+                    current = Some(style);
+                }
+                looks.push_str(cell.symbol());
+            }
+            let mut clicks = Vec::new();
+            let mut run: Option<(u16, Click)> = None;
+            for x in 0..=width {
+                let hit = (x < width).then(|| app.pointer.clicked(x, y)).flatten();
+                if run.as_ref().map(|(_, click)| Some(click)) != Some(hit.as_ref()) {
+                    if let Some((start, click)) = run.take() {
+                        clicks.push(format!("{start}..{x}={click:?}"));
+                    }
+                    run = hit.map(|click| (x, click));
+                }
+            }
+            (
+                looks.replace(&ws, "<ws>").trim_end().to_string(),
+                clicks.join(" "),
+            )
+        })
+        .collect()
+}
+
+/// **一番上の画面のタブと承認待ちのタブの行は、描いた見た目（文字・色・太字）と押せる桁がこのとおり。**
+/// タブを`harness_term`の部品へ切り出したとき（2026-10-03）に、切り出す前の画面を1セルも変えていないことを固定するため、
+/// 切り出す**前**に描いた結果をそのまま期待値にした（`docs/CODE-STRUCTURE-RULES.md`§6の characterization test）。
+/// 選ばれているタブ（シアンの背景に黒の太字）は画面とタブごとに動き、狭い端末では右端で切れる（切れたタブも描かれた
+/// 桁だけ押せる）。
+#[test]
+fn the_tab_rows_look_and_press_exactly_as_before() {
+    let ws = workspace();
+    let mut app = record_screen_with_content(ws.path());
+    let mut seen = Vec::new();
+    seen.push(("記録", tab_rows(&mut app, SIZE.0, &[0])));
+    press(&mut app, KeyCode::F(2));
+    seen.push(("承認待ち・FS/ネット", tab_rows(&mut app, SIZE.0, &[0, 1])));
+    press(&mut app, KeyCode::F(2));
+    seen.push(("承認待ち・観測から", tab_rows(&mut app, SIZE.0, &[1])));
+    press(&mut app, KeyCode::F(2));
+    seen.push(("承認待ち・拒否から", tab_rows(&mut app, SIZE.0, &[1])));
+    seen.push(("承認待ち・40桁", tab_rows(&mut app, 40, &[0, 1])));
+    seen.push(("承認待ち・20桁", tab_rows(&mut app, 20, &[0, 1])));
+    press(&mut app, KeyCode::F(3));
+    seen.push(("宣言", tab_rows(&mut app, SIZE.0, &[0])));
+    let shown: Vec<String> = seen
+        .iter()
+        .flat_map(|(case, rows)| {
+            rows.iter()
+                .map(move |(looks, clicks)| format!("{case}\n{looks}\n{clicks}"))
+        })
+        .collect();
+    let want = [
+        concat!(
+            "記録\n",
+            "«Black/Cyan/BOLD» F1 記録 «Reset/Reset/NONE» «Gray/Reset/NONE» F2 承認待ち «Reset/Reset/NONE» «Gray/Reset/NONE» F3 宣言 «DarkGray/Reset/NONE»  Ctrl+N で切替«Reset/Reset/NONE»   «DarkGray/Reset/NONE»workspace: <ws>«Reset/Reset/NONE»\n",
+            "0..9=Screen(Record) 10..23=Screen(Edit) 24..33=Screen(Declared)",
+        ),
+        concat!(
+            "承認待ち・FS/ネット\n",
+            "«Gray/Reset/NONE» F1 記録 «Reset/Reset/NONE» «Black/Cyan/BOLD» F2 承認待ち «Reset/Reset/NONE» «Gray/Reset/NONE» F3 宣言 «DarkGray/Reset/NONE»  Ctrl+N で切替«Reset/Reset/NONE»   «DarkGray/Reset/NONE»workspace: <ws>«Reset/Reset/NONE»\n",
+            "0..9=Screen(Record) 10..23=Screen(Edit) 24..33=Screen(Declared)",
+        ),
+        concat!(
+            "承認待ち・FS/ネット\n",
+            "«Black/Cyan/BOLD» FS/ネット «Reset/Reset/NONE» «Gray/Reset/NONE» 遷移・観測から «Reset/Reset/NONE» «Gray/Reset/NONE» 遷移・拒否から «DarkGray/Reset/NONE»  F2 で切替«Reset/Reset/NONE»\n",
+            "0..11=PendingTab(FsNet) 12..28=PendingTab(TransitionsObserved) 29..45=PendingTab(TransitionsDenied)",
+        ),
+        concat!(
+            "承認待ち・観測から\n",
+            "«Gray/Reset/NONE» FS/ネット «Reset/Reset/NONE» «Black/Cyan/BOLD» 遷移・観測から «Reset/Reset/NONE» «Gray/Reset/NONE» 遷移・拒否から «DarkGray/Reset/NONE»  F2 で切替«Reset/Reset/NONE»\n",
+            "0..11=PendingTab(FsNet) 12..28=PendingTab(TransitionsObserved) 29..45=PendingTab(TransitionsDenied)",
+        ),
+        concat!(
+            "承認待ち・拒否から\n",
+            "«Gray/Reset/NONE» FS/ネット «Reset/Reset/NONE» «Gray/Reset/NONE» 遷移・観測から «Reset/Reset/NONE» «Black/Cyan/BOLD» 遷移・拒否から «DarkGray/Reset/NONE»  F2 で切替«Reset/Reset/NONE»\n",
+            "0..11=PendingTab(FsNet) 12..28=PendingTab(TransitionsObserved) 29..45=PendingTab(TransitionsDenied)",
+        ),
+        concat!(
+            "承認待ち・40桁\n",
+            "«Gray/Reset/NONE» F1 記録 «Reset/Reset/NONE» «Black/Cyan/BOLD» F2 承認待ち «Reset/Reset/NONE» «Gray/Reset/NONE» F3 宣言 «DarkGray/Reset/NONE»  Ctrl+\n",
+            "0..9=Screen(Record) 10..23=Screen(Edit) 24..33=Screen(Declared)",
+        ),
+        concat!(
+            "承認待ち・40桁\n",
+            "«Gray/Reset/NONE» FS/ネット «Reset/Reset/NONE» «Gray/Reset/NONE» 遷移・観測から «Reset/Reset/NONE» «Black/Cyan/BOLD» 遷移・拒否\n",
+            "0..11=PendingTab(FsNet) 12..28=PendingTab(TransitionsObserved) 29..40=PendingTab(TransitionsDenied)",
+        ),
+        concat!(
+            "承認待ち・20桁\n",
+            "«Gray/Reset/NONE» F1 記録 «Reset/Reset/NONE» «Black/Cyan/BOLD» F2 承認待\n",
+            "0..9=Screen(Record) 10..20=Screen(Edit)",
+        ),
+        concat!(
+            "承認待ち・20桁\n",
+            "«Gray/Reset/NONE» FS/ネット «Reset/Reset/NONE» «Gray/Reset/NONE» 遷移・«Reset/Reset/NONE»\n",
+            "0..11=PendingTab(FsNet) 12..19=PendingTab(TransitionsObserved)",
+        ),
+        concat!(
+            "宣言\n",
+            "«Gray/Reset/NONE» F1 記録 «Reset/Reset/NONE» «Gray/Reset/NONE» F2 承認待ち «Reset/Reset/NONE» «Black/Cyan/BOLD» F3 宣言 «DarkGray/Reset/NONE»  Ctrl+N で切替«Reset/Reset/NONE»   «DarkGray/Reset/NONE»workspace: <ws>«Reset/Reset/NONE»\n",
+            "0..9=Screen(Record) 10..23=Screen(Edit) 24..33=Screen(Declared)",
+        ),
+    ];
+    assert_eq!(shown, want, "\n{}", shown.join("\n\n"));
+}
+
 // ---------------------------------------------------------------------------
 // 2. 一覧（行・[x]・▾/▸）
 // ---------------------------------------------------------------------------
