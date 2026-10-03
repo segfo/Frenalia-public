@@ -778,49 +778,92 @@ fn the_send_button_sends_like_the_send_key() {
     assert!(screen.try_find("Enter=改行").is_none(), "{}", screen.text());
 }
 
-/// **入力が空白だけの間、「送信」は枠も文字も薄く描かれ、押しても何も起きない**（送信キーも何もしない）。
-/// 打てば同じ場所で押せる見た目に変わり、押すと送る（対）。押せないことは、描いたセルの色と太字で見る。
+/// 入力欄が空白だけのまま送ったときの知らせ（ポリシーエディタの「記録するコマンドを入力してください」と同じ形）。
+const EMPTY_NOTICE: &str = "送る文字を入力してください";
+
+/// transcriptに積まれた、空のまま送ったときの知らせの数。
+fn empty_notices(app: &AppState) -> usize {
+    app.transcript
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::Info(text) if text == EMPTY_NOTICE))
+        .count()
+}
+
+/// **入力が空白だけでも、「送信」はいつも押せる形（枠も文言もシアン、文言は太字）で描かれ、押すと送らずに理由を1行
+/// 出す**——ポリシーエディタの「記録を開始」がコマンド欄が空でも押せて、押すと理由を出すのと同じ作り（2026-10-03、
+/// 「ボタンの色はポリシーエディタに合わせられる？」。それまでは灰色で押せなかった）。知らせは画面に描かれ、2回押しても
+/// 1行だけ（連打で埋めない）。さかのぼっていたら末尾へ戻して見せる。送信キーで空のまま送っても、同じ知らせが同じ1行に
+/// 重なる。打てば同じ場所・同じ見た目のボタンが送る（対）。送った後にまた空で押せば、間に項目が入ったので知らせは
+/// もう1行出る（重ねないのは直前が同じ知らせのときだけ）。見た目は描いたセルの色と太字で、押す位置は描いたセルで見る。
 #[test]
-fn the_send_button_is_dim_and_does_nothing_while_the_input_is_blank() {
+fn the_send_button_stays_pressable_and_explains_when_the_input_is_blank() {
     for blank in ["", "   ", "\n"] {
-        let mut app = app_with_transcript(3);
+        let mut app = app_with_transcript(100);
+        app.scroll_lines(5);
         app.input = blank.to_string();
         app.input_cursor = blank.chars().count();
         let screen = draw(&mut app);
         let frame = framed_button(&screen, "送信");
         let at = screen.find_last("送信");
         let look = screen.style(at);
-        assert_eq!(look.fg, Some(Color::DarkGray), "{blank:?}: 文言が薄くない");
+        assert_eq!(
+            look.fg,
+            Some(Color::Cyan),
+            "{blank:?}: 文言が押せる色でない"
+        );
         assert_eq!(
             screen.style((frame.x, frame.y)).fg,
-            Some(Color::DarkGray),
-            "{blank:?}: 枠が薄くない"
+            Some(Color::Cyan),
+            "{blank:?}: 枠が押せる色でない"
         );
-        assert!(!look.add_modifier.contains(Modifier::BOLD), "{blank:?}");
-        let before = input_state(&app);
+        assert!(look.add_modifier.contains(Modifier::BOLD), "{blank:?}");
         for place in [at, (frame.x, frame.y)] {
-            assert!(click(&mut app, place).is_none(), "{blank:?}");
-            assert_eq!(
-                input_state(&app),
-                before,
-                "{blank:?}: 押せないはずの送信で何か変わった"
+            assert!(
+                click(&mut app, place).is_none(),
+                "{blank:?}: 空のまま送った"
             );
         }
+        assert_eq!(app.input, blank, "{blank:?}: 入力欄が変わった");
+        assert_eq!(
+            empty_notices(&app),
+            1,
+            "{blank:?}: 知らせが1行でない: {:?}",
+            app.transcript.last()
+        );
+        assert_eq!(app.scroll_offset(), 0, "{blank:?}: 末尾へ戻っていない");
+        let screen = draw(&mut app);
+        assert!(
+            screen.try_find(EMPTY_NOTICE).is_some(),
+            "{blank:?}: 知らせが画面に無い:\n{}",
+            screen.text()
+        );
     }
 
+    // 送信キーで空のまま送っても、同じ知らせ（ボタンと合わせて1行）。
     let mut app = app_with_transcript(3);
-    let blank_at = draw(&mut app).find_last("送信");
+    let blank = draw(&mut app);
+    let blank_at = blank.find_last("送信");
+    let blank_look = blank.style(blank_at);
+    assert!(press_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)).is_none());
+    assert_eq!(empty_notices(&app), 1, "送信キーで知らせが出ない");
+    let screen = draw(&mut app);
+    assert!(click(&mut app, screen.find_last("送信")).is_none());
+    assert_eq!(empty_notices(&app), 1, "キーとボタンで知らせが2行になった");
+
+    // 対: 打てば同じ場所・同じ見た目のボタンが送る。
     type_text(&mut app, "hi");
     let screen = draw(&mut app);
     let at = screen.find_last("送信");
     assert_eq!(at, blank_at, "打つと送信の場所が動いた");
-    assert_eq!(
-        screen.style(at).fg,
-        Some(Color::Cyan),
-        "押せる見た目になっていない"
-    );
-    assert!(screen.style(at).add_modifier.contains(Modifier::BOLD));
-    assert!(matches!(click(&mut app, at), Some(Action::Submit(_))));
+    assert_eq!(screen.style(at), blank_look, "打つと送信の見た目が変わった");
+    assert!(matches!(
+        click(&mut app, at),
+        Some(Action::Submit(ref text)) if text == "hi"
+    ));
+    // 送った後（間に「> hi」が入った）に空で押すと、知らせはもう1行出る。
+    draw(&mut app);
+    assert!(click(&mut app, at).is_none());
+    assert_eq!(empty_notices(&app), 2, "{:?}", app.transcript);
 }
 
 /// **「中断」は止めるものが走っている間だけ出る**——応答中のターン（`TurnStarted`〜`TurnCompleted`）と、

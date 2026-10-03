@@ -6,9 +6,29 @@
 
 use super::*;
 
+/// 入力欄が空白だけのまま送ろうとしたときに出す知らせ（[`AppState::submit_input`]）。
+/// ポリシーエディタの「記録を開始」を空のコマンド欄で押したときの「記録するコマンドを入力してください」と同じ形。
+pub(crate) const EMPTY_SUBMIT_NOTICE: &str = "送る文字を入力してください";
+
 impl AppState {
+    /// 入力欄の内容を送る。送信キー（[`Self::on_key`]）と入力欄の右の「送信」ボタン（キーを押す。`app::pointer`）が
+    /// どちらもここを通る。
+    ///
+    /// **入力欄が空白だけなら送らず、理由を1行出す**（[`EMPTY_SUBMIT_NOTICE`]。押しても無反応にしない、B-23(c)——
+    /// ポリシーエディタの`start_recording`と同じ）。会話画面には知らせの行が無いので、付随的な通知（`TranscriptItem::Info`）
+    /// として transcript の末尾に出し、さかのぼっていたら末尾へ戻して見せる。**直前の項目が同じ知らせなら重ねない**
+    /// ——連打で transcript が埋まらないように（間に別の項目が入れば、次はまた出す）。
     pub(super) fn submit_input(&mut self) -> Option<Action> {
         if self.input.trim().is_empty() {
+            let shown = matches!(
+                self.transcript.last(),
+                Some(TranscriptItem::Info(text)) if text == EMPTY_SUBMIT_NOTICE
+            );
+            if !shown {
+                self.transcript
+                    .push(TranscriptItem::Info(EMPTY_SUBMIT_NOTICE.to_string()));
+            }
+            self.scroll.reset();
             return None;
         }
         // A local submit starts a new visible turn. Even if the user had been
@@ -170,7 +190,11 @@ impl AppState {
     ///
     /// - **送信**はいつも出す。キーは設定と端末で変わる（[`Self::enter_submits`]・[`Self::host_is_vscode`]——
     ///   VS Codeの統合ターミナルはShift+EnterのShiftを落とすので`Alt+Enter`を案内する）ので、下辺に添える綴りもここで
-    ///   決める。入力欄が空白だけの間は**押せない**（`key`が`None`。送信キーを押しても何も起きない——[`Self::submit_input`]）。
+    ///   決める。**入力欄が空白だけでも押せる**（いつも押せる形で描く）——押すと送らずに理由を1行出す
+    ///   （[`Self::submit_input`]）。ポリシーエディタの「記録を開始」がコマンド欄が空でも押せるのと同じ作り
+    ///   （`key_hints::record_buttons`）。2026-10-03まではここで押せない形（灰色）にしていたが、ユーザーが2つの画面を
+    ///   見比べて「ボタンの色が違う。ポリシーエディタに合わせられる？」と言った（空の入力欄の「送信」が灰色、エディタの
+    ///   「記録を開始」がシアンに見えた。色の指定は両方ともシアンで、違いは押せない形かどうかだけだった）。
     /// - **中断**は止めるものが走っている間（[`Self::can_cancel`]）だけ出す。走っていない間に`Esc`を押しても
     ///   何も止まらないので、効かない操作を案内しない（ポリシーエディタの記録画面の`Esc 停止`と同じ。B-32）。
     ///
@@ -193,7 +217,7 @@ impl AppState {
         let mut buttons = vec![InputButton {
             label: "送信",
             key_label,
-            key: (!self.input.trim().is_empty()).then_some(key),
+            key: Some(key),
         }];
         if self.can_cancel() {
             buttons.push(InputButton {
