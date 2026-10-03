@@ -57,6 +57,8 @@ mod events;
 mod input;
 mod pointer;
 mod review;
+/// 画面の文章をマウスで選んでクリップボードへ写す（2026-10-03。部品は`harness_term::select`・`clipboard`）。
+mod select;
 /// [BUG-206] 預かった標準エラーの行を transcript へ出す。
 mod stderr;
 
@@ -73,6 +75,7 @@ pub use review::{
     commit_selection, CommitSelection, PartialFile, ReviewCommand, ReviewDiffLine, ReviewFocus,
     ReviewPanelState, ReviewRow, ReviewTarget,
 };
+pub use select::CopyNotice;
 
 #[cfg(test)]
 #[path = "app_state_tests.rs"]
@@ -241,6 +244,11 @@ pub struct AppState {
     /// 動き[`Click`]の値）。押した瞬間に入り（`app::pointer`）、離していて最低時間が過ぎたら[`Self::tick`]が戻す
     /// （`harness_term::button::Press`）。
     pub(crate) press: harness_term::button::Press<Click>,
+    /// マウスで選んでいる文章（`app::select`。枠の名前はホイールで送るときの名前）。描くたびに
+    /// [`Self::apply_draw_feedback`]がその描画で決まった範囲を受け取る。
+    pub(crate) selection: harness_term::select::Selection<Wheel>,
+    /// 写した結果の知らせ（transcriptの枠の上辺に出す。次にキーかマウスのボタンを押すと消える。`app::select`）。
+    pub copy_notice: Option<CopyNotice>,
 }
 
 // スクロール量（`PageUp`/`PageDown`とホイール1ノッチの行数）は
@@ -288,6 +296,8 @@ impl AppState {
             input_buttons_drawn: Vec::new(),
             input_buttons_moved_at: None,
             press: Default::default(),
+            selection: Default::default(),
+            copy_notice: None,
         }
     }
 
@@ -343,6 +353,10 @@ impl AppState {
     pub(crate) fn tick_at(&mut self, now: Instant) {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
         self.press.tick(now);
+        // 文章を選びながらポインタを枠の上下の外で止めている間も送り続ける（`app::select`）。
+        if let Some(scroll) = self.selection.tick(&self.pointer, now) {
+            self.on_wheel(scroll.surface, scroll.up);
+        }
     }
 
     /// ターン以外のバックグラウンド処理（`/compact`の要約など）を**キューへ入れた**ことを

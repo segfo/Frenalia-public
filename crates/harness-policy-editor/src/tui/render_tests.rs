@@ -348,7 +348,10 @@ fn screen_labels(app: &App) -> Vec<String> {
 
 /// 全画面に共通のキー案内の文言（`key_hints::common_keys`）。
 fn common_labels() -> Vec<String> {
-    common_keys().into_iter().map(|hint| hint.label).collect()
+    common_keys(false)
+        .into_iter()
+        .map(|hint| hint.label)
+        .collect()
 }
 
 /// キー案内の項目が違う画面を全部並べる（承認待ちは3タブそれぞれ）。
@@ -707,6 +710,7 @@ fn the_last_line_of_a_confirmation_is_never_cut_off_silently() {
                         0,
                         &Default::default(),
                         &mut Targets::default(),
+                        &Default::default(),
                     );
                 });
                 let screen = flatten(&rows);
@@ -776,6 +780,7 @@ fn a_confirmation_that_fits_is_drawn_as_before_and_does_not_offer_scrolling() {
             0,
             &Default::default(),
             &mut Targets::default(),
+            &Default::default(),
         );
     });
     assert_eq!(
@@ -813,6 +818,7 @@ fn a_wrapped_confirmation_that_fits_shows_every_line_without_a_scroll_hint() {
                 0,
                 &Default::default(),
                 &mut Targets::default(),
+                &Default::default(),
             );
         }));
         for line in &modal.lines {
@@ -1190,11 +1196,18 @@ fn paint_short_modal(frame: &mut Frame) {
         0,
         &Default::default(),
         &mut Targets::default(),
+        &Default::default(),
     );
 }
 
 fn paint_help(frame: &mut Frame) {
-    draw_help(frame, frame.area(), 0, &mut Targets::default());
+    draw_help(
+        frame,
+        frame.area(),
+        0,
+        &mut Targets::default(),
+        &Default::default(),
+    );
 }
 
 /// 画面へ重ねる枠を1つ描く手順。
@@ -1398,6 +1411,11 @@ fn a_wrapped_box_keeps_its_right_border_when_a_line_ends_with_a_wide_character()
             Block::default().borders(Borders::ALL).title("説明"),
             0,
             wrap::panel_look(Style::default()),
+            harness_term::select::Selectable::new(
+                &mut Targets::default(),
+                Wheel::Modal,
+                &Default::default(),
+            ),
         );
     };
     // 確認ダイアログ。枠は88桁（`MODAL_WIDTH`）で、中は86桁。
@@ -1414,6 +1432,7 @@ fn a_wrapped_box_keeps_its_right_border_when_a_line_ends_with_a_wide_character()
             0,
             &Default::default(),
             &mut Targets::default(),
+            &Default::default(),
         );
     };
     let boxes: [(&str, &str, Paint); 3] = [
@@ -1505,7 +1524,7 @@ fn every_wrapped_text_and_overlay_goes_through_harness_term() {
 #[test]
 fn the_help_box_is_as_tall_as_its_wrapped_text() {
     let screen = flatten(&paint_rows(100, 400, |f| {
-        draw_help(f, f.area(), 0, &mut Targets::default());
+        draw_help(f, f.area(), 0, &mut Targets::default(), &Default::default());
     }));
     let last = squash(HELP_TEXT.lines().last().expect("ヘルプが空"));
     assert!(
@@ -1524,12 +1543,12 @@ fn the_help_box_is_as_tall_as_its_wrapped_text() {
 #[test]
 fn a_help_taller_than_the_terminal_says_how_many_lines_are_cut() {
     let text_rows = box_height(&paint_rows(100, 400, |f| {
-        draw_help(f, f.area(), 0, &mut Targets::default());
+        draw_help(f, f.area(), 0, &mut Targets::default(), &Default::default());
     })) - 2;
     let height = 40u16;
     let visible = usize::from(height - 2);
     let screen = flatten(&paint_rows(100, height, |f| {
-        draw_help(f, f.area(), 0, &mut Targets::default());
+        draw_help(f, f.area(), 0, &mut Targets::default(), &Default::default());
     }));
     assert!(
         screen.contains(&format!("1〜{visible}/{text_rows}行ホイールで送る")),

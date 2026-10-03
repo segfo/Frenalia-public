@@ -1782,3 +1782,7 @@ fn a_long_review_list_keeps_the_selected_row_visible() {
     click(&mut app, moved.find("file35.txt"));
     assert_eq!(panel(&app).selected, 35);
 }
+
+/// 画面の文章を選んで写す試験（`app::select`）。この試験の描き方・押し方の道具を使うので、ここの子にする。
+#[path = "select_tests.rs"]
+mod select_tests;

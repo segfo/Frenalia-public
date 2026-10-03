@@ -18,6 +18,7 @@ use crate::tui::state::{
 };
 use crate::tui::text_input::TextInput;
 use crate::tui::wrap;
+use harness_term::select::{Selectable, Selection};
 
 /// 入力欄のラベル幅（全角6文字ぶん）。
 const LABEL_WIDTH: u16 = 12;
@@ -37,6 +38,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedbac
                 app.panels,
                 &mut feedback.panels,
                 &mut feedback.targets,
+                &app.selection,
             );
         }
         None => feedback.panels.set(
@@ -382,11 +384,13 @@ fn draw_notice(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) 
             .title(" 実行するとどうなるか "),
         app.panels.top(Panel::RecordNotice),
         wrap::panel_look(Style::default()),
+        Selectable::new(targets, Wheel::Panel(Panel::RecordNotice), &app.selection),
     )
 }
 
 /// 実行中の枠を描く。見出し枠と警告枠の送れる上限は`limits`へ入れ、3枠のさかのぼり上限を返す。
-/// 描いた5枠は、ホイールで送る枠として`targets`へ登録する。
+/// 描いた5枠は、ホイールで送る枠として`targets`へ登録する（文章は`selection`で選べる。`tui::select`）。
+#[allow(clippy::too_many_arguments)]
 fn draw_progress(
     frame: &mut Frame,
     area: Rect,
@@ -394,6 +398,7 @@ fn draw_progress(
     panels: PanelScroll,
     limits: &mut PanelLimits,
     targets: &mut Targets,
+    selection: &Selection<Wheel>,
 ) -> ScrollLimits {
     // **対応が要る事実は専用の枠へ出す。** 進行ログは末尾だけを見せる窓なので、早い段階で
     // 出た警告（実行ファイルへ届かない等）は実行が終わる頃には流れて**見えなくなる**。
@@ -429,6 +434,7 @@ fn draw_progress(
                 .title(header_title),
             panels.top(Panel::RecordHeader),
             wrap::panel_look(header_border),
+            Selectable::new(targets, Wheel::Panel(Panel::RecordHeader), selection),
         ),
     );
 
@@ -456,6 +462,7 @@ fn draw_progress(
                     .title(format!(" ⚠ 対応が要ります（{}件） ", run.warnings.len())),
                 panels.top(Panel::RecordWarnings),
                 wrap::panel_look(border),
+                Selectable::new(targets, Wheel::Panel(Panel::RecordWarnings), selection),
             ),
         );
     }
@@ -472,6 +479,7 @@ fn draw_progress(
                 harness_term::scrollback::title_with_scroll(" 進行 ", run.log_scroll, SCROLL_HINT),
             ),
             run.log_scroll,
+            Selectable::new(targets, Wheel::Record(ScrollPane::Log), selection),
         );
 
     let output_title = match (run.exit_code, run.dropped) {
@@ -492,6 +500,7 @@ fn draw_progress(
                 SCROLL_HINT,
             )),
         run.output_scroll,
+        Selectable::new(targets, Wheel::Record(ScrollPane::Output), selection),
     );
 
     let mut noise_limit = 0;
@@ -509,6 +518,7 @@ fn draw_progress(
                     SCROLL_HINT,
                 )),
             run.noise_scroll,
+            Selectable::new(targets, Wheel::Record(ScrollPane::Noise), selection),
         );
     }
 

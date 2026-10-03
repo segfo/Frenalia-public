@@ -205,7 +205,10 @@ pub(super) fn record_buttons(app: &App) -> Vec<RecordButton> {
 /// **Esc×2は案内しないと見つけられない。** 単押しは画面遷移なので、二度押しが終了である
 /// ことは画面から推測できない。クリックでは`Esc`を2回続けて押す（キーで二度押ししたのと同じ。
 /// 記録中は`Esc`が停止なので、キーと同じく終了しない）。
-pub(super) fn common_keys() -> [KeyHint; 3] {
+///
+/// `copying`が真（マウスで選んだ文章がある）の間は、`Ctrl+C`は写すので`Ctrl+C コピー`と案内する（効く操作を案内する、
+/// B-32。`tui::select`）。項目を足さずに文言だけを変える——この行は幅が足りずに項目を落としている（`fit_key_hints`）。
+pub(super) fn common_keys(copying: bool) -> [KeyHint; 3] {
     [
         press("F4 ヘルプ", KeyCode::F(4)),
         KeyHint {
@@ -213,7 +216,12 @@ pub(super) fn common_keys() -> [KeyHint; 3] {
             keys: vec![key(KeyCode::Esc), key(KeyCode::Esc)],
         },
         KeyHint {
-            label: "Ctrl+C 終了".to_string(),
+            label: if copying {
+                "Ctrl+C コピー"
+            } else {
+                "Ctrl+C 終了"
+            }
+            .to_string(),
             keys: vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
         },
     ]
@@ -225,7 +233,11 @@ pub(super) const KEY_SEPARATOR: &str = "  |  ";
 /// キー案内の行を描き、押せる項目をそのキーを押す場所として登録する（`tui::pointer`）。
 pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
     let style = Style::default().fg(Color::DarkGray);
-    let hints = fit_key_hints(&screen_keys(app), usize::from(area.width));
+    let hints = fit_key_hints(
+        &screen_keys(app),
+        usize::from(area.width),
+        app.selection.has_text(),
+    );
     let mut spans = Vec::with_capacity(hints.len() * 2);
     let mut at = Vec::with_capacity(hints.len());
     for (i, hint) in hints.iter().enumerate() {
@@ -263,14 +275,14 @@ pub(super) fn draw(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targe
 ///
 /// 全部収まるときは以前と1文字も変わらない。共通の案内そのものより狭い端末では、
 /// 共通の案内も末尾から切れる（描画が落ちないことだけを保つ）。
-fn fit_key_hints(screen: &[KeyHint], width: usize) -> Vec<KeyHint> {
+fn fit_key_hints(screen: &[KeyHint], width: usize, copying: bool) -> Vec<KeyHint> {
     use unicode_width::UnicodeWidthStr;
 
     let line = |kept: &[KeyHint], omitted: Option<KeyHint>| -> Vec<KeyHint> {
         kept.iter()
             .cloned()
             .chain(omitted)
-            .chain(common_keys())
+            .chain(common_keys(copying))
             .collect()
     };
     let width_of = |hints: &[KeyHint]| -> usize {

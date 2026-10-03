@@ -89,6 +89,7 @@
 //! # 限界
 //!
 //! - クリックは左ボタンを押した瞬間に効く（離したときではない）。押してから外へずらして取り消すことはできない。
+//!   文章の上で押してずらしたときの選択とコピーは`tui::select`が持つ（ヘルプの文章の上だけは、離したときに閉じる）。
 //! - 入力欄を押しても、押した桁へカーソルは移らない（`Tab`で入ったときと同じく、カーソルはそのまま）。
 //! - キーボードの`Esc`の後にクリックを挟むと、`Esc`の二度押し（終了）の続きは切れる（キーと同じ規則）。
 //! - 確認ダイアログのボタンには、開いた直後の窓を置かない——開くのは利用者の操作（`a`・`y`等）だけで、狙っていない
@@ -98,7 +99,7 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use harness_term::pointer::Pointer;
 use ratatui::layout::Rect;
 use ratatui::text::Span;
@@ -272,15 +273,31 @@ impl App {
     ///
     /// 左ボタンの押下・離上とボタンを押さない移動は、前に押したボタンを離したことを表すので、まず押されている形を
     /// 戻すかを見る（`harness_term::button::Press::pointer`）。`now`はイベントを受けた時刻。
+    ///
+    /// 文章の上（押せる場所ではない所）で押したら、文章を選び始める（`tui::select`）。押したままの移動と離上・右クリックは
+    /// 選択が先に受ける。それ以外の場所を押したら、押した場所の動きを起こしてから、選んでいた文章を外す。
     pub fn on_mouse(&mut self, event: MouseEvent, now: Instant) -> Option<Action> {
         self.press.pointer(event.kind, now);
-        match self.pointer.resolve(&event)? {
-            Pointer::Wheel { target, up } => {
-                self.on_wheel(target, up);
-                None
-            }
-            Pointer::Click(click) => self.on_click(click, now),
+        if let Some(handled) = self.on_selection_mouse(event, now) {
+            return handled;
         }
+        let pressed = event.kind == MouseEventKind::Down(MouseButton::Left);
+        let action = match self.pointer.resolve(&event) {
+            Some(Pointer::Wheel { target, up }) => {
+                self.on_wheel(target, up);
+                return None;
+            }
+            Some(Pointer::Text(surface)) => {
+                self.press_text(surface, event.column, event.row);
+                return None;
+            }
+            Some(Pointer::Click(click)) => self.on_click(click, now),
+            None => None,
+        };
+        if pressed {
+            self.selection.clear();
+        }
+        action
     }
 
     fn on_click(&mut self, click: Click, now: Instant) -> Option<Action> {

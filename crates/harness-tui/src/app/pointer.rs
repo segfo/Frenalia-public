@@ -84,10 +84,13 @@
 //! - 入力欄の右のボタンの窓は、動いた後に描いた画面で数える。動く前の画面のうちに届いたクリックは、動く前の
 //!   ボタンを押す（狙ったとおり）。
 //! - セッションのピッカー（`crate::picker`）は自分のループで描いて引く（同じ部品・同じ形）。
+//! - 文章を押してずらしたときの選択とコピーは`app::select`が持つ（押した瞬間のクリックは変えない）。
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use harness_term::pointer::Pointer;
 use ratatui::layout::Rect;
 
@@ -230,7 +233,9 @@ impl AppState {
     /// キーは[`Self::on_key`]（押下だけ。Windowsのコンソールは押下と離上の両方を送るので、離上も渡すと
     /// 1文字が2回入る）、マウスは[`Self::on_mouse`]（左クリックとホイールだけ。`harness_term::pointer::acts`）。
     /// マウスのボタンを離した・ボタンを押さずに動いたことは、押されている形のボタンを戻すかを見るためにだけ使う
-    /// （モジュールdoc「押したボタンは、押した瞬間に色を変える」）。リサイズは何もしないが描き直す（次の描画で反映される）。
+    /// （モジュールdoc「押したボタンは、押した瞬間に色を変える」）。ただし**文章を選んでいる途中**（文章の上で押したまま）の
+    /// 移動と離上、選んでいるときの右クリックは選択が受けて描き直す（`app::select`）。リサイズは何もしないが描き直す
+    /// （次の描画で反映される）。
     pub fn handle_event(&mut self, event: Event) -> Step {
         self.handle_event_at(event, Instant::now())
     }
@@ -248,17 +253,28 @@ impl AppState {
                 if key.kind != KeyEventKind::Press {
                     return Step::Unchanged;
                 }
+                // 写した知らせは、次にキーを押したら消す（`app::select`）。
+                self.copy_notice = None;
                 Step::Handled(self.on_key(key))
             }
             Event::Mouse(mouse) => {
                 // 左ボタンの押下・離上・ボタンを押さない移動は、前に押したボタンを離したことを表す（押されている形を
                 // 戻すかもしれない）。押下でボタンを押したなら、この後の`on_click`が押されている形にする。
                 let released = self.press.pointer(mouse.kind, now);
+                // 写した知らせは、次にボタンを押したら消す（`app::select`）。
+                if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                    self.copy_notice = None;
+                }
+                // 文章を選んでいる途中の移動と離上・右クリックは、選択が先に受ける（`app::select`）。
+                if let Some(step) = self.on_selection_mouse(mouse, now) {
+                    return step;
+                }
                 if harness_term::pointer::acts(mouse.kind) {
                     return Step::Handled(self.on_mouse(mouse, now));
                 }
-                // それ以外（離上・移動・ドラッグ・右ボタン）は何にも当たらない（`EnableMouseCapture`は移動もすべて
-                // 報告する）。押されている形が戻ったときだけ描き直す——いつも描き直すと、マウスを動かしている間ずっと描き続ける。
+                // それ以外（離上・移動・ドラッグ・右ボタン。文章を選んでいないとき）は何にも当たらない（`EnableMouseCapture`は
+                // 移動もすべて報告する）。押されている形が戻ったときだけ描き直す——いつも描き直すと、マウスを動かしている間ずっと
+                // 描き続ける。
                 if released {
                     Step::Handled(None)
                 } else {
@@ -271,14 +287,27 @@ impl AppState {
 
     /// マウスのイベント（左クリックとホイール）。直前に描いた画面の登録で引く。押せる場所・送れる枠の外では
     /// **何もしない**——外した位置で別のものが動くほうが混乱する。`now`は押したボタンを押されている形にした時刻。
+    ///
+    /// 文章の上（押せる場所ではない所）で押したら、文章を選び始める（`app::select`）。それ以外の場所を押したら、
+    /// 押した場所の動きを起こしてから、選んでいた文章を外す（押す場所を狙った手は、選んだ文章を見ていない）。
     pub fn on_mouse(&mut self, event: MouseEvent, now: Instant) -> Option<Action> {
-        match self.pointer.resolve(&event)? {
-            Pointer::Wheel { target, up } => {
+        let pressed = event.kind == MouseEventKind::Down(MouseButton::Left);
+        let action = match self.pointer.resolve(&event) {
+            Some(Pointer::Wheel { target, up }) => {
                 self.on_wheel(target, up);
-                None
+                return None;
             }
-            Pointer::Click(click) => self.on_click(click, now),
+            Some(Pointer::Text(surface)) => {
+                self.press_text(surface, event.column, event.row);
+                return None;
+            }
+            Some(Pointer::Click(click)) => self.on_click(click, now),
+            None => None,
+        };
+        if pressed {
+            self.selection.clear();
         }
+        action
     }
 
     /// ポインタの下の枠をホイール1刻み送る（`up`が真なら先頭・過去の向き）。
@@ -372,7 +401,7 @@ impl AppState {
     }
 
     /// レビューパネルのフォーカスを`focus`へ移す（違えば`Tab`を押す。`Tab`は2つのペインを行き来するだけ）。
-    fn focus_review(&mut self, focus: ReviewFocus) {
+    pub(super) fn focus_review(&mut self, focus: ReviewFocus) {
         if self.review_panel.as_ref().is_some_and(|p| p.focus != focus) {
             self.on_key(plain(KeyCode::Tab));
         }
@@ -380,6 +409,8 @@ impl AppState {
 
     /// 1フレーム描いて分かったことを状態へ書き戻す（[`DrawFeedback`]のdoc）。
     pub(crate) fn apply_draw_feedback(&mut self, feedback: DrawFeedback) {
+        // この描画で決まった選択の範囲と文章を受け取る（描かなかった枠・文章が変わった範囲は外れる。`app::select`）。
+        self.selection.after_draw(&feedback.targets);
         self.scroll.clamp(feedback.transcript);
         if let (Some(pending), Some(max)) = (self.pending_permission.as_mut(), feedback.approval) {
             pending.clamp_scroll(max);

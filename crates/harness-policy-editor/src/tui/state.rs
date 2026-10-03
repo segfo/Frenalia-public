@@ -699,6 +699,9 @@ pub enum Action {
     StartPass1(Box<Pass1Request>),
     StartPass2(Box<Pass2Request>),
     Quit,
+    /// 選んだ文章をクリップボードへ写す（改行は`CRLF`にしてある）。イベントループが書き、結果を
+    /// `App::note_copied`へ渡す（`tui::select`。状態はクリップボードへ触らない）。
+    Copy(String),
 }
 
 pub struct App {
@@ -728,6 +731,8 @@ pub struct App {
     pub press: harness_term::button::Press<crate::tui::pointer::ButtonId>,
     /// 「記録」の枠の右のボタンの働きが変わった時刻（直後のクリックを捨てる。`tui::pointer`、BUG-210）。
     pub record_shift: crate::tui::pointer::ButtonShift,
+    /// マウスで選んでいる文章（`tui::select`。枠の名前はホイールで送るときの名前）。
+    pub selection: harness_term::select::Selection<crate::tui::scroll::Wheel>,
 
     // 記録画面
     pub pass: Pass,
@@ -898,6 +903,7 @@ impl App {
             pointer: Default::default(),
             press: Default::default(),
             record_shift: Default::default(),
+            selection: Default::default(),
             pass: Pass::One,
             net_mode: NetMode::RecordAll,
             command: TextInput::default(),
@@ -1442,6 +1448,8 @@ impl App {
     /// **どちらも書き戻さないと壊れる**——前者を怠ると端で空回りし（BUG-076）、
     /// 後者を怠るとカーソルが窓の中を動かず一覧の方が滑る。
     pub fn apply_draw_feedback(&mut self, feedback: crate::tui::DrawFeedback) {
+        // この描画で決まった選択の範囲と文章を受け取る（描かなかった枠・文章が変わった範囲は外れる。`tui::select`）。
+        self.selection.after_draw(&feedback.targets);
         self.clamp_scroll(feedback.scroll);
         if let Some(max) = feedback.modal_scroll_max {
             self.modal_scroll = self.modal_scroll.min(max);
@@ -1478,6 +1486,10 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
         if key.kind != KeyEventKind::Press {
             return None;
+        }
+        // 選んでいる文章があれば、`Ctrl+C`は写し、`Esc`は外すだけ（確認ダイアログ・ヘルプより先。`tui::select`）。
+        if let Some(handled) = self.on_selection_key(key) {
+            return handled;
         }
 
         // 終了要求。実行中なら**撤収まで待つ**（ここで抜けるとマニフェストが`Running`のまま残る）。

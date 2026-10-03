@@ -150,4 +150,8 @@ pub enum Action {
     /// `None`なら全コンフリクト対象。呼び出し側（`harness-tui::run`）が
     /// `harness_sandbox::resolve`を叩き、エディタ起動の前後で端末を中断・復帰させる。
     ResolveChanges(Option<String>),
+    /// 選んだ文章をクリップボードへ写す（`Ctrl+C`・右クリック。改行はクリップボードの形の`CRLF`にしてある）。呼び出し側
+    /// （`harness-tui::run`）が`harness_term::clipboard::write`で書き、結果を`AppState::note_copied`へ渡す
+    /// （`AppState`自体はクリップボードへ触らない。`app::select`のモジュールdoc）。
+    Copy(String),
 }

@@ -93,6 +93,7 @@ fn action_kind(action: &Option<Action>) -> &'static str {
         Some(Action::Quit) => "終了",
         Some(Action::StartPass1(_)) => "パス1を開始",
         Some(Action::StartPass2(_)) => "パス2を開始",
+        Some(Action::Copy(_)) => "コピー",
     }
 }
 
@@ -1813,6 +1814,8 @@ fn nothing_behind_a_confirmation_can_be_clicked() {
 }
 
 /// **ヘルプが開いている間は、どこを押しても閉じるだけで、後ろは押されない**（何かキーを押したのと同じ）。
+/// ヘルプの文章の上は文章を選べる場所なので、**押した瞬間ではなく、ずらさずに離したときに閉じる**（2026-10-03、
+/// `tui::select`）。ヘルプの外（後ろのタブの位置）は今までどおり押した瞬間に閉じる。
 #[test]
 fn a_click_closes_the_help_and_does_not_reach_behind_it() {
     type Make = fn(&std::path::Path) -> App;
@@ -1834,19 +1837,38 @@ fn a_click_closes_the_help_and_does_not_reach_behind_it() {
         &|_, _| back,
         &[k(KeyCode::Char('x'))],
     );
-    assert_click_is_keys(
-        "ヘルプの中",
-        &with_help,
-        &|grid, _| {
-            cell_of(
-                grid,
-                Some(boxed(grid, " ヘルプ")),
-                "harness-policy-editor",
-                None,
-            )
-        },
-        &[k(KeyCode::Char('x'))],
+    // ヘルプの中: 押した瞬間は開いたまま（文章を選び始めるかもしれない）、ずらさずに離すと閉じる。閉じた後の状態は
+    // 何でもないキーを押したのと同じ。
+    let (ws_click, ws_keys) = (workspace(), workspace());
+    let mut clicked = with_help(ws_click.path());
+    let mut keyed = with_help(ws_keys.path());
+    let grid = frame(&mut clicked, SIZE.0, SIZE.1);
+    let at = cell_of(
+        &grid,
+        Some(boxed(&grid, " ヘルプ")),
+        "harness-policy-editor",
+        None,
     );
+    assert!(mouse(
+        &mut clicked,
+        MouseEventKind::Down(MouseButton::Left),
+        at.0,
+        at.1
+    )
+    .is_none());
+    assert!(clicked.help, "ヘルプの文章を押した瞬間に閉じた（選べない）");
+    frame(&mut clicked, SIZE.0, SIZE.1);
+    assert!(mouse(
+        &mut clicked,
+        MouseEventKind::Up(MouseButton::Left),
+        at.0,
+        at.1
+    )
+    .is_none());
+    assert!(!clicked.help, "ヘルプの文章をクリックしても閉じない");
+    frame(&mut keyed, SIZE.0, SIZE.1);
+    keyed.on_key(k(KeyCode::Char('x')));
+    assert_eq!(snapshot(&clicked), snapshot(&keyed), "ヘルプの中");
 }
 
 /// 押せる場所の登録は、描くたびに入れ替わる——画面を移った後は、前の画面の行の位置を押しても前の画面の操作は起きない。
@@ -1866,3 +1888,7 @@ fn the_targets_of_a_screen_that_is_no_longer_drawn_are_gone() {
     );
     assert_eq!(app.screen, Screen::Record);
 }
+
+/// 画面の文章を選んで写す試験（`tui::select`）。押す位置の探し方を共有するので、ここの子にする。
+#[path = "select_tests.rs"]
+mod select_tests;

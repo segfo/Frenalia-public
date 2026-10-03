@@ -42,13 +42,14 @@ pub fn render_approval_modal_for_example(
     area: ratatui::layout::Rect,
     pending: &PermissionView,
 ) -> u16 {
-    // 押せる場所の登録は、描画ループの外では使わないので捨てる（押されている形のボタンも無い）。
+    // 押せる場所の登録は、描画ループの外では使わないので捨てる（押されている形のボタンも、選んだ文章も無い）。
     ui::render_permission_modal(
         f,
         area,
         pending,
         &Default::default(),
         &mut app::Targets::default(),
+        &Default::default(),
     )
 }
 pub use engine::{spawn_engine, EngineHandle};
@@ -807,6 +808,17 @@ pub async fn run(
                             );
                         }
                         Action::Cancel => engine.cancel_current(),
+                        // クリップボードは開けるまで数回待つので、ブロッキング用のスレッドで書く（B-31。
+                        // `harness_term::clipboard`のdoc）。書けたかどうかは画面に出す（`app::select`）。
+                        Action::Copy(text) => {
+                            let written = text.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                harness_term::clipboard::write(&written)
+                            })
+                            .await
+                            .unwrap_or_else(|e| Err(format!("書き込みのスレッドが止まりました: {e}")));
+                            app.note_copied(&text, result);
+                        }
                         Action::Slash(cmd) => match cmd {
                             SlashCommand::Model(m) => engine.set_model(m),
                             SlashCommand::Mode(mode) => {

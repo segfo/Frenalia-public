@@ -39,6 +39,13 @@
 //! 本文の何行目を一番上に出すかを決める）は、折り返すと番号がずれる。そういう枠は折り返さずに描き、
 //! 送る上限・スクロールバー・下辺の「N〜M/T行」だけを同じ形にする。
 //!
+//! # 文章はマウスで選べる（2026-10-03。[`crate::select`]）
+//!
+//! どの描き方も[`Selectable`]を受け取り、選んでいる範囲に選択の色を付けて描いて、描いた文字の場所を押せる場所と一緒に
+//! 登録する（[`crate::pointer::Targets::text`]）。**引数で必ず受けるので、選べない枠を描く書き方が無い**——
+//! 文章を出す枠を足した人が登録を書き忘れて、その枠だけ選べない、ということが起きない
+//! （タブの部品`crate::tab`が押す場所の登録を部品の中でしているのと同じ理由）。
+//!
 //! # 限界
 //!
 //! - 折り返し方そのもの（空白で切り、日本語の禁則を見ない）は[`crate::wrap`]のまま。
@@ -51,6 +58,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::Frame;
 
+use crate::select::map::{prepare, Shape};
+use crate::select::Selectable;
 use crate::wrap::{line_rows, Wrapped};
 
 /// 送れる枠の見せ方。入り切らないときにだけ使う（入り切る枠は何も変わらない）。
@@ -84,21 +93,23 @@ pub struct Drawn {
 /// 上限へ切り詰める。呼び出し側は戻り値で状態の側を切り詰める（モジュールdoc。BUG-076）。
 ///
 /// 本文が入り切らないときだけ、下辺の右に「N〜M/T行  送り方」を出し、右の枠線の上にスクロールバーを出す。
-/// 下辺が狭い枠では送り方を落とす（[`Window::notice`]）。
-pub fn draw<'a>(
+/// 下辺が狭い枠では送り方を落とす（[`Window::notice`]）。文章は`on`の選択で選べる（モジュールdoc）。
+pub fn draw<'a, C: Clone, W: Clone + PartialEq>(
     frame: &mut Frame,
     area: Rect,
     text: impl Into<Text<'a>>,
     block: Block<'a>,
     top: u16,
     look: Look,
+    on: Selectable<'_, C, W>,
 ) -> u16 {
-    draw_with_buttons(frame, area, text, block, top, look, &[]).max_top
+    draw_with_buttons(frame, area, text, block, top, look, &[], on).max_top
 }
 
 /// [`draw`]に加えて、下辺の左に`buttons`（[`crate::button::span`]で作ったもの）を間を空けて描き、
 /// それぞれが描かれた矩形を返す（モジュールdoc）。本文の各行が描かれた矩形も返す（[`Drawn::lines`]）。
-pub fn draw_with_buttons<'a>(
+#[allow(clippy::too_many_arguments)]
+pub fn draw_with_buttons<'a, C: Clone, W: Clone + PartialEq>(
     frame: &mut Frame,
     area: Rect,
     text: impl Into<Text<'a>>,
@@ -106,8 +117,19 @@ pub fn draw_with_buttons<'a>(
     top: u16,
     look: Look,
     buttons: &[Span],
+    on: Selectable<'_, C, W>,
 ) -> Drawn {
-    draw_text(frame, area, text.into(), block, top, look, buttons, true)
+    draw_text(
+        frame,
+        area,
+        text.into(),
+        block,
+        top,
+        look,
+        buttons,
+        true,
+        on,
+    )
 }
 
 /// [`draw`]と同じ送れる枠を、**折り返さずに**描く（長い行は右で切る。1行は必ず1つの表示行）。
@@ -115,20 +137,22 @@ pub fn draw_with_buttons<'a>(
 /// 行の番号がそのまま表示行の番号になるので、状態の側が「何行目を枠の一番上に出すか」を本文の行で決める枠
 /// （会話TUIの差分ペインのハンクへの追従）に使う。送る上限・スクロールバー・下辺の「N〜M/T行」は[`draw`]と同じ。
 /// 右で切った行の全角文字は、入り切らなければ描かれない（右の枠線を覆わない。ratatuiの切り方）。
-pub fn draw_unwrapped<'a>(
+/// 選んで写すときは、右で切れて見えていない部分も行の続きとして写す（行の右端より右まで選んだとき）。
+pub fn draw_unwrapped<'a, C: Clone, W: Clone + PartialEq>(
     frame: &mut Frame,
     area: Rect,
     text: impl Into<Text<'a>>,
     block: Block<'a>,
     top: u16,
     look: Look,
+    on: Selectable<'_, C, W>,
 ) -> Drawn {
-    draw_text(frame, area, text.into(), block, top, look, &[], false)
+    draw_text(frame, area, text.into(), block, top, look, &[], false, on)
 }
 
 /// [`draw_with_buttons`]と[`draw_unwrapped`]の本体（違うのは行を折り返すかだけ）。
 #[allow(clippy::too_many_arguments)]
-fn draw_text<'a>(
+fn draw_text<'a, C: Clone, W: Clone + PartialEq>(
     frame: &mut Frame,
     area: Rect,
     text: Text<'a>,
@@ -137,6 +161,7 @@ fn draw_text<'a>(
     look: Look,
     buttons: &[Span],
     wrapped: bool,
+    on: Selectable<'_, C, W>,
 ) -> Drawn {
     let inner = block.inner(area);
     // 行ごとの表示行の数。合計が本文全体の表示行の数（`crate::wrap::line_rows`のdoc）。
@@ -146,6 +171,17 @@ fn draw_text<'a>(
         vec![1; text.lines.len()]
     };
     let window = Window::new(heights.iter().sum(), usize::from(inner.height), top);
+    // 選んでいる範囲に色を付け、見えている文字の場所を数える（色を付けても折り返しは変わらない。`crate::select::map`）。
+    let (text, map) = prepare(
+        text,
+        Shape {
+            inner,
+            heights: &heights,
+            top: window.top,
+            wrapped,
+        },
+        on.selection.mark(&on.surface),
+    );
     // 下辺のうち、左右の角とボタン（とその後ろの1桁）を除いた幅。
     let taken = if buttons.is_empty() {
         0
@@ -172,6 +208,7 @@ fn draw_text<'a>(
     } else {
         crate::button::draw_left(frame, crate::row::bottom_edge(area), buttons)
     };
+    on.targets.text(map, on.surface);
     Drawn {
         max_top: u16::try_from(window.max_top()).unwrap_or(u16::MAX),
         buttons,
@@ -326,6 +363,13 @@ mod tests {
 
     use super::*;
 
+    /// 選択の無い枠として描く（この試験は文章を選ばない。登録先は描くたびに捨てる）。
+    fn unselected() -> Selectable<'static, (), ()> {
+        let targets = Box::leak(Box::default());
+        let selection = Box::leak(Box::default());
+        Selectable::new(targets, (), selection)
+    }
+
     const LOOK: Look = Look {
         how: "↑↓ PgUp/PgDn・ホイールで送る",
         notice: Style::new(),
@@ -352,6 +396,7 @@ mod tests {
                 0,
                 LOOK,
                 buttons,
+                unselected(),
             ));
         })
         .expect("draw");
@@ -490,9 +535,18 @@ mod tests {
                     let block = Block::default().borders(Borders::ALL);
                     inner = block.inner(f.area());
                     drawn = Some(if wrapped {
-                        draw_with_buttons(f, f.area(), tagged_lines(), block, top, LOOK, &[])
+                        draw_with_buttons(
+                            f,
+                            f.area(),
+                            tagged_lines(),
+                            block,
+                            top,
+                            LOOK,
+                            &[],
+                            unselected(),
+                        )
                     } else {
-                        draw_unwrapped(f, f.area(), tagged_lines(), block, top, LOOK)
+                        draw_unwrapped(f, f.area(), tagged_lines(), block, top, LOOK, unselected())
                     });
                 })
                 .expect("draw");
@@ -536,6 +590,7 @@ mod tests {
                 Block::default().borders(Borders::ALL),
                 u16::MAX,
                 LOOK,
+                unselected(),
             ));
         })
         .expect("draw");

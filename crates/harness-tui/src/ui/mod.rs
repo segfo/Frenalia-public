@@ -64,6 +64,7 @@ pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
             pending,
             &app.press,
             &mut targets,
+            &app.selection,
         ));
     } else if let Some(panel) = &app.review_panel {
         behind_overlay(&mut targets, f.area(), root[0]);
@@ -72,6 +73,7 @@ pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
             f.area(),
             panel,
             &mut targets,
+            &app.selection,
         ));
     } else if app.selection_range().is_none() {
         // 端末の実カーソルを入力欄の入力末尾へ明示的に置く。ratatuiは`set_cursor_position`を
@@ -94,12 +96,14 @@ pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
 }
 
 /// 承認ダイアログ・レビューパネルを重ねる前に呼ぶ。**後ろの画面は押せなくし、transcriptだけはホイールで
-/// 送れるまま残す**（承認待ちの間も前の会話を読み返せるように。`crate::app::pointer`のモジュールdoc）。
+/// 送れるまま、文章も選べるまま残す**（承認待ちの間も前の会話を読み返し、写せるように。`crate::app::pointer`・
+/// `crate::app::select`のモジュールdoc）。
 /// 重ねる枠は、この後に自分の矩形を覆ってから（`Targets::cover`）自分の場所を登録する——覆わないと、
 /// 枠の中で何も登録していない場所（余白・案内の行）でホイールを回したときに、後ろのtranscriptが送られる。
 fn behind_overlay(targets: &mut Targets, screen: Rect, transcript: Rect) {
     targets.cover(screen);
     targets.wheel(transcript, Wheel::Transcript);
+    targets.lift_text(&Wheel::Transcript);
 }
 
 /// キー案内の項目の間の桁数（承認ダイアログとレビューパネルの案内の行）。
@@ -289,8 +293,8 @@ fn build_input_lines(input: &str, selection: Option<(usize, usize)>) -> Vec<Line
                     // 選択ハイライトは`REVERSED`ではなく明示的な背景色にする。選択終端の直後の
                     // セルにカーソルが重なると、`REVERSED`同士では選択範囲がその1文字分
                     // 余分に見え、実際は未選択の文字まで削除されるつもりで消し漏らす
-                    // 「幽霊」誤認を招くため。
-                    Span::styled(selected, Style::default().bg(Color::Blue).fg(Color::White)),
+                    // 「幽霊」誤認を招くため。色はマウスで選んだ文章と同じ（`harness_term::select::SELECTED`）。
+                    Span::styled(selected, harness_term::select::SELECTED),
                     Span::raw(after),
                 ])
             }
@@ -507,17 +511,51 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &AppState, targets: &mut Ta
         Block::default().borders(Borders::ALL),
         app.scroll,
         Style::default(),
+        harness_term::select::Selectable::new(targets, Wheel::Transcript, &app.selection),
     );
     targets.wheel(area, Wheel::Transcript);
     let notice =
-        harness_term::scrollback::scrolled_notice(app.scroll, "下へホイールかここを押すと最新へ");
-    let title = [
-        Span::raw("transcript "),
-        Span::raw(notice.unwrap_or_default()),
-    ];
-    let drawn = harness_term::row::draw(f, harness_term::row::top_edge(area), &title);
+        harness_term::scrollback::scrolled_notice(app.scroll, "下へホイールかここを押すと最新へ")
+            .unwrap_or_default();
+    let edge = harness_term::row::top_edge(area);
+    // 写した結果の知らせも上辺に出す（中身を動かさない。`crate::app::select`のモジュールdoc）。入り切らなければ末尾を
+    // `…`で切る——失敗したこと（頭の「コピーできませんでした」）は必ず見える。
+    let head = "transcript ";
+    let room = usize::from(edge.width).saturating_sub(head.width() + notice.width());
+    let copied = match &app.copy_notice {
+        Some(copied) => Span::styled(
+            fit_width(&format!("[{}] ", copied.text), room),
+            Style::default().fg(if copied.ok { Color::Green } else { Color::Red }),
+        ),
+        None => Span::raw(""),
+    };
+    let title = [Span::raw(head), Span::raw(notice), copied];
+    let drawn = harness_term::row::draw(f, edge, &title);
     targets.click(drawn[1], Click::ScrollToLatest);
     max
+}
+
+/// `text`を表示幅`width`桁に収める。入り切らなければ末尾を`…`にして切る（切ったことを黙らない）。
+fn fit_width(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    if width > 0 {
+        out.push('…');
+    }
+    out
 }
 
 /// ステータスバーに出すモデル名の上限文字数。超えた分は中間を省略する。

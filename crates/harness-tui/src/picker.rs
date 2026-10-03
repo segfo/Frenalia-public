@@ -131,7 +131,8 @@ impl Picker {
                 None
             }
             Pointer::Click(PickerClick::Key(code)) => self.on_key(code),
-            Pointer::Wheel { .. } => None,
+            // ピッカーは選べる文章を登録しない（押せる行の一覧。文章の選択は送れる枠だけ——`harness_term::select`）。
+            Pointer::Wheel { .. } | Pointer::Text(()) => None,
         }
     }
 }

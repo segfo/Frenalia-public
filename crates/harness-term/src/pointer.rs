@@ -23,14 +23,25 @@
 //! マウスのイベントを[`Targets::resolve`]で引く。イベントを1つ処理するたびに描き直すイベントループなら、
 //! 引くのはいつも「利用者がいま見ている画面」になる。
 //!
+//! # 文章を選べる場所（2026-10-03）
+//!
+//! 送れる枠は、描いた文章の各文字がどこに描かれたか（[`TextMap`]）を、ホイールで送るときと同じ名前`W`で登録する
+//! （[`Targets::text`]。登録するのは枠の描画——`crate::scrollable`・`crate::scrollback`——で、呼び出し側は
+//! [`crate::select::Selectable`]を渡すだけ）。左ボタンを押した所が押せる場所ではなく文章の上なら
+//! [`Pointer::Text`]を返す。**押せる場所が上に登録されていれば、そちらが勝つ**（文章の中の押せる行・ボタンは
+//! 今までどおりクリック。選び始めない）。
+//!
 //! # 限界
 //!
 //! - **左ボタンを押した瞬間**（`Down`）をクリックとする。離した瞬間（`Up`）・ドラッグ・右/中ボタン・横スクロールは
-//!   何にも当たらない。押してから外へずらして取り消す、という操作は無い。
+//!   何にも当たらない。押してから外へずらして取り消す、という操作は無い（ドラッグは文章を選ぶときだけ
+//!   `crate::select::Selection`が見る）。
 //! - 描いてから次に描くまでの間に状態が変わる作りでは、古い画面で引くことになる（1イベントごとに描き直すこと）。
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
+
+use crate::select::TextMap;
 
 /// 登録した場所の1件。
 #[derive(Debug, Clone)]
@@ -39,6 +50,8 @@ enum Entry<C, W> {
     Click(Rect, C),
     /// ホイールを受ける。
     Wheel(Rect, W),
+    /// 文章を選べる（`W`はその枠をホイールで送るときの名前）。
+    Text(TextMap, W),
     /// 後ろを覆う（重ねた枠）。ここより前に登録したものへは届かない。
     Cover(Rect),
 }
@@ -64,6 +77,8 @@ pub enum Pointer<C, W> {
     Click(C),
     /// 送れる場所の上でホイールが回された。`up`が真なら上（先頭の向き）。
     Wheel { target: W, up: bool },
+    /// 文章を選べる枠の、押せる場所ではない所で左ボタンが押された（`crate::select::Selection::press`へ渡す）。
+    Text(W),
 }
 
 impl<C: Clone, W: Clone> Targets<C, W> {
@@ -88,12 +103,34 @@ impl<C: Clone, W: Clone> Targets<C, W> {
         }
     }
 
-    /// `(column, row)`をクリックしたときの動き。押せる場所でなければ`None`。
+    /// 文章を選べる場所として、描いた文字の場所`map`を登録する（`surface`はその枠をホイールで送るときの名前）。
+    /// 描いた送れる枠が自分で呼ぶ（`crate::select::Selectable`）。文章を描く矩形が空なら登録しない。
+    pub(crate) fn text(&mut self, map: TextMap, surface: W) {
+        if !map.area().is_empty() {
+            self.entries.push(Entry::Text(map, surface));
+        }
+    }
+
+    /// `(column, row)`をクリックしたときの動き。押せる場所でなければ`None`（文章の上も`None`——[`Self::resolve`]が
+    /// [`Pointer::Text`]を返す）。
     pub fn clicked(&self, column: u16, row: u16) -> Option<C> {
+        match self.pressed(column, row)? {
+            Pressed::Click(target) => Some(target),
+            Pressed::Text(_) => None,
+        }
+    }
+
+    /// `(column, row)`で左ボタンを押したときに当たるもの（いちばん上の押せる場所か文章）。
+    fn pressed(&self, column: u16, row: u16) -> Option<Pressed<C, W>> {
         let at = Position::new(column, row);
         for entry in self.entries.iter().rev() {
             match entry {
-                Entry::Click(area, target) if area.contains(at) => return Some(target.clone()),
+                Entry::Click(area, target) if area.contains(at) => {
+                    return Some(Pressed::Click(target.clone()))
+                }
+                Entry::Text(map, surface) if map.area().contains(at) => {
+                    return Some(Pressed::Text(surface.clone()))
+                }
                 Entry::Cover(area) if area.contains(at) => return None,
                 _ => {}
             }
@@ -121,7 +158,11 @@ impl<C: Clone, W: Clone> Targets<C, W> {
         }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                self.clicked(event.column, event.row).map(Pointer::Click)
+                self.pressed(event.column, event.row)
+                    .map(|pressed| match pressed {
+                        Pressed::Click(target) => Pointer::Click(target),
+                        Pressed::Text(surface) => Pointer::Text(surface),
+                    })
             }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => self
                 .wheeled(event.column, event.row)
@@ -134,9 +175,36 @@ impl<C: Clone, W: Clone> Targets<C, W> {
     }
 }
 
+impl<C, W: Clone + PartialEq> Targets<C, W> {
+    /// 枠`surface`に描いた文字の場所（いちばん後に登録したもの）。その枠を描いていなければ`None`。
+    pub(crate) fn text_map(&self, surface: &W) -> Option<&TextMap> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            Entry::Text(map, s) if s == surface => Some(map),
+            _ => None,
+        })
+    }
+
+    /// 前に登録した枠`surface`の文章を、**いまの重なりの一番上へ登録し直す**（後ろを覆った後でも、外に見えている部分を
+    /// 選べるようにする。会話画面は承認ダイアログ・レビューパネルの外に見えているtranscriptを選ばせる）。
+    /// 登録し直した後に覆ったもの（重ねた枠）は、今までどおりその上にある。
+    pub fn lift_text(&mut self, surface: &W) {
+        if let Some(map) = self.text_map(surface).cloned() {
+            self.entries.push(Entry::Text(map, surface.clone()));
+        }
+    }
+}
+
+/// 左ボタンの押下が当たったもの。
+enum Pressed<C, W> {
+    Click(C),
+    Text(W),
+}
+
 /// この種類のイベントが[`Targets::resolve`]で何かに当たり得るか（左ボタンの押下とホイールの上下）。
 ///
-/// **当たり得ない種類（ポインタの移動・離す・ドラッグ・右/中ボタン・横スクロール）は、画面の何も変えない。**
+/// **当たり得ない種類（ポインタの移動・離す・ドラッグ・右/中ボタン・横スクロール）は、画面の何も変えない**
+/// （文章を選んでいる途中のドラッグ・離上と、選んでいるときの右クリックだけは例外で、呼び出し側が
+/// `crate::select::Selection`へ先に渡す）。
 /// `EnableMouseCapture`はポインタの移動もすべて報告するので、イベントを1つ読むたびに描き直すループは、
 /// これで描き直しを省ける（省かないと、マウスを動かすだけで描き直し続ける）。[`Targets::resolve`]も
 /// 同じこれで絞るので、「描き直さなかったのに何かが変わった」は起きない。
@@ -265,6 +333,48 @@ mod tests {
             assert_eq!(targets.resolve(&mouse(kind, 1, 1)), None, "{kind:?}");
         }
         assert_eq!(targets.resolve(&down(9, 9)), None, "押せる場所の外");
+    }
+
+    /// **文章の上の押下は[`Pointer::Text`]**。上に登録した押せる場所が勝ち、覆った範囲では文章にも届かない。
+    /// 押せる場所を引く`clicked`は、文章の上では何も返さない（クリックではない）。
+    #[test]
+    fn a_press_on_text_resolves_to_the_text_unless_something_is_on_top() {
+        let mut targets: Targets<&str, &str> = Targets::default();
+        targets.click(Rect::new(0, 0, 20, 10), "pane");
+        targets.text(TextMap::empty(Rect::new(1, 1, 18, 8)), "body");
+        targets.click(Rect::new(1, 2, 18, 1), "candidate");
+        assert_eq!(targets.resolve(&down(5, 4)), Some(Pointer::Text("body")));
+        assert_eq!(targets.clicked(5, 4), None);
+        assert_eq!(
+            targets.resolve(&down(5, 2)),
+            Some(Pointer::Click("candidate")),
+            "上の押せる行が勝つ"
+        );
+        assert_eq!(
+            targets.resolve(&down(0, 0)),
+            Some(Pointer::Click("pane")),
+            "文章の外（枠線）は下の押せる場所"
+        );
+        targets.cover(Rect::new(0, 0, 10, 10));
+        assert_eq!(targets.resolve(&down(5, 4)), None, "覆った後ろの文章");
+        // 覆った後で登録し直すと、外に見えている部分は選べる（覆った範囲は覆ったまま）。
+        targets.lift_text(&"body");
+        targets.cover(Rect::new(0, 0, 10, 10));
+        assert_eq!(targets.resolve(&down(15, 4)), Some(Pointer::Text("body")));
+        assert_eq!(targets.resolve(&down(5, 4)), None);
+        assert_eq!(
+            targets.text_map(&"body").map(TextMap::area),
+            Some(Rect::new(1, 1, 18, 8))
+        );
+        assert_eq!(targets.text_map(&"other"), None);
+    }
+
+    /// 文章を描く矩形が空なら登録しない（押せない）。
+    #[test]
+    fn an_empty_text_area_is_not_registered() {
+        let mut targets: Targets<&str, &str> = Targets::default();
+        targets.text(TextMap::empty(Rect::new(1, 1, 0, 3)), "body");
+        assert_eq!(targets.text_map(&"body"), None);
     }
 
     /// [`acts`]が偽の種類は、押せる場所と送れる場所の真上でも何にも当たらず、真の種類は当たる

@@ -25,7 +25,8 @@
 //! 選択肢を本文の枠の外（仕切りの下）に置くのは、位置の案内を本文の枠の下辺に出し、選択肢を押し出させないため。
 //!
 //! 選択肢の各項目と、確認の段の「毎回変わってよい引数」の候補の行は、**描いたその場所で**押せる場所として登録する
-//! （`crate::app::pointer`）。枠の全体はホイールで本文を送る場所になる。
+//! （`crate::app::pointer`）。枠の全体はホイールで本文を送る場所になる。本文の文章はマウスで選んで写せる
+//! （候補の行は押せる場所なので、そこからは選び始めない。`crate::app::select`）。
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -37,6 +38,7 @@ use ratatui::Frame;
 use crate::app::{ApprovalStage, Click, LineStyle, PermissionView, Targets, Wheel};
 use harness_sandbox::textdiff::DiffKind;
 use harness_term::button::Press;
+use harness_term::select::{Selectable, Selection};
 
 /// 承認モーダルを描き、**この描画で判明したスクロールの上限**を返す。押せる場所と送れる枠を`targets`へ登録する
 /// （呼び出し側は、後ろの画面を先に覆っておく。`crate::ui::render`）。選択肢のボタンのうち、いま押されているもの
@@ -47,6 +49,7 @@ pub fn render_permission_modal(
     pending: &PermissionView,
     press: &Press<Click>,
     targets: &mut Targets,
+    selection: &Selection<Wheel>,
 ) -> u16 {
     let rect = super::centered_rect(84, 70, area);
     // 後ろのtranscriptの全角文字が枠の左隣から始まっても左の枠線が欠けないよう、共有の部品で消す
@@ -125,6 +128,7 @@ pub fn render_permission_modal(
             bar: Style::default().fg(Color::White),
         },
         &[],
+        Selectable::new(targets, Wheel::Approval, selection),
     );
     for (line, candidate) in drawn.lines.iter().zip(&candidates) {
         if let Some(row) = candidate {
@@ -203,6 +207,7 @@ mod tests {
                 pending,
                 &Default::default(),
                 &mut Default::default(),
+                &Default::default(),
             );
         })
         .unwrap();
@@ -246,6 +251,7 @@ mod tests {
                 &pending,
                 &Default::default(),
                 &mut Default::default(),
+                &Default::default(),
             )
         })
         .unwrap();
@@ -274,6 +280,7 @@ mod tests {
                 &pending,
                 &Default::default(),
                 &mut Default::default(),
+                &Default::default(),
             );
         })
         .unwrap();

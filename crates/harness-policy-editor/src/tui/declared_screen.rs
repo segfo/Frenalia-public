@@ -39,6 +39,11 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedbac
             Block::default().borders(Borders::ALL).title(" この画面 "),
             app.panels.top(Panel::DeclaredNotes),
             wrap::panel_look(Style::default()),
+            harness_term::select::Selectable::new(
+                &mut feedback.targets,
+                Wheel::Panel(Panel::DeclaredNotes),
+                &app.selection,
+            ),
         ),
     );
     feedback

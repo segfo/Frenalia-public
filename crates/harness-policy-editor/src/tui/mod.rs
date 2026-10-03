@@ -22,6 +22,7 @@
 //! **マウスでも操作できる**（2026-10-02）——タブ・一覧の行と`[x]`・`▾`/`▸`・入力欄・キー案内の項目・確認ダイアログの
 //! ボタンを押すと、対応するキーを押したのと同じになり、ホイールはポインタの下の枠を送る。当たり判定は、描いた矩形を
 //! 描くときにそのまま登録したもの（[`pointer`]。土台は会話TUIと共有する`harness_term::pointer`）。
+//! 文章を出す枠は、押してずらすと文字を選べ、`Ctrl+C`か右クリックでクリップボードへ写せる（2026-10-03。[`select`]）。
 //!
 //! # 承認待ちは3つのタブを持つ（決定62、段階⑦）
 //!
@@ -73,6 +74,8 @@ mod proposal_tree;
 pub mod record_screen;
 /// 送れる枠（説明欄・ヘルプ・確認ダイアログ・記録画面の3枠）の位置と、ホイールで送ること（2026-10-02）。
 mod scroll;
+/// 画面の文章をマウスで選んでクリップボードへ写す（2026-10-03。部品は`harness_term::select`・`clipboard`）。
+mod select;
 mod text_input;
 /// [段階⑦] 承認待ち画面（`F2`）の遷移2タブの状態遷移。
 pub mod transition;
@@ -98,6 +101,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders};
 use ratatui::{Frame, Terminal};
 
+use harness_term::select::{Selectable, Selection};
 use pointer::{Click, Targets};
 use scroll::Wheel;
 use state::{Action, App, Screen};
@@ -239,6 +243,12 @@ pub fn run(
             Some(Action::StartPass2(request)) => {
                 app.attach_handle(worker::spawn_pass2(*request));
             }
+            // 選んだ文章を写す。クリップボードを開けるまで数回待つ（最長でおよそ100ms。このループは同期なので
+            // そのまま呼ぶ）。書けたかどうかは知らせの行に出す（`tui::select`）。
+            Some(Action::Copy(text)) => {
+                let result = harness_term::clipboard::write(&text);
+                app.note_copied(&text, result);
+            }
             None => {}
         }
     }
@@ -301,6 +311,10 @@ pub(crate) fn handle_event_at(
 ///   ループは1周に1イベントなので、クリック・キー・記録の終了のどれで変わっても、次のイベントを読む前にここを通る。
 pub(crate) fn tick(app: &mut App, now: std::time::Instant) {
     app.press.tick(now);
+    // 文章を選びながらポインタを枠の上下の外で止めている間も送り続ける（`tui::select`）。
+    if let Some(scroll) = app.selection.tick(&app.pointer, now) {
+        app.on_wheel(scroll.surface, scroll.up);
+    }
     let work = key_hints::record_buttons(app)
         .first()
         .map(|button| button.key);
@@ -369,7 +383,7 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
 
     if app.help {
         let top = app.panels.top(scroll::Panel::Help);
-        let max = draw_help(frame, area, top, &mut feedback.targets);
+        let max = draw_help(frame, area, top, &mut feedback.targets, &app.selection);
         feedback.panels.set(scroll::Panel::Help, max);
     }
     if let Some(modal) = app.modal.as_ref() {
@@ -381,6 +395,7 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
             app.modal_scroll,
             &app.press,
             &mut feedback.targets,
+            &app.selection,
         ));
     }
     feedback
@@ -583,7 +598,11 @@ harness-policy-editor — LLMを介さずに「このコマンドに何を許す
             （どれもキーを押したのと同じ動きです。入力欄は Tab で入ったのと同じ）
             一括の操作（宣言画面の A・遷移タブの X）はキーでだけ押せます
   ホイール  ポインタの下の枠を送ります（ヘルプか確認画面が開いている間はそれを送ります）
-  ヘルプはクリックでも閉じます。
+  ドラッグ  文章の枠（説明・記録の出力・このヘルプ・確認画面）を押してずらすと文字を選べます
+            Ctrl+C か右クリックでクリップボードへ写します（選んでいないときの Ctrl+C は終了）
+            枠の上下の外までずらすと送ります。Esc で選択を外します
+            一覧の行・入力欄は選べません
+  ヘルプはクリックでも閉じます（文章の上では、ずらさずに離したときに閉じます）。
 
 停止（Esc）が効く範囲
   停止フラグを見ているのは、対象コマンドを回しているループの中だけです。収集器の起動
@@ -607,7 +626,13 @@ const HELP_WIDTH: u16 = 78;
 ///
 /// 開いている間は、画面のどこでホイールを回してもヘルプを送り、どこを押しても閉じる
 /// （「何かキーを押すと閉じる」と同じ。`tui::pointer`）。後ろの画面は押せない（[`open_overlay`]）。
-fn draw_help(frame: &mut Frame, area: Rect, top: u16, targets: &mut Targets) -> u16 {
+fn draw_help(
+    frame: &mut Frame,
+    area: Rect,
+    top: u16,
+    targets: &mut Targets,
+    selection: &Selection<Wheel>,
+) -> u16 {
     // **高さは本文から数える。** 固定値（26行）だった頃、本文はとうに44行あり
     // 半分以上が枠の外で切れていた——ヘルプに書いたのに読めない状態は「書いていない」のと
     // 同じである（B-09）。行数を手で持つと本文を足すたびにまたずれるので持たない（B-05）。
@@ -631,6 +656,8 @@ fn draw_help(frame: &mut Frame, area: Rect, top: u16, targets: &mut Targets) -> 
             .title(" ヘルプ（何かキーを押すかクリックすると閉じます） "),
         top,
         wrap::panel_look(Style::default()),
+        // 文章は選べる（その上のただのクリックは、離したときに閉じる。`tui::select`）。
+        Selectable::new(targets, Wheel::Panel(scroll::Panel::Help), selection),
     )
 }
 
@@ -684,6 +711,7 @@ fn draw_modal(
     scroll: u16,
     press: &harness_term::button::Press<pointer::ButtonId>,
     targets: &mut Targets,
+    selection: &Selection<Wheel>,
 ) -> u16 {
     let written = modal
         .lines
@@ -747,6 +775,7 @@ fn draw_modal(
             bar: Style::default().fg(color),
         },
         &spans,
+        Selectable::new(targets, Wheel::Modal, selection),
     );
     for ((label, code), rect) in buttons.iter().zip(drawn.buttons) {
         targets.click(

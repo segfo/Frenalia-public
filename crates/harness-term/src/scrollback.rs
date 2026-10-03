@@ -22,12 +22,21 @@
 //! [`Scrollback::clamp`]で状態そのものを切り詰める。描画側だけでクランプすると、
 //! 先頭まで遡った後もホイールを回した分だけ内部の値が伸び続け、戻すときに空回りする
 //! （BUG-076の再発）。
+//!
+//! # 文章はマウスで選べる（2026-10-03。[`crate::select`]）
+//!
+//! 先頭から読ませる枠（[`crate::scrollable`]）と同じく、描くときに[`Selectable`]を受け取って、選んでいる範囲に色を
+//! 付けて描き、描いた文字の場所を登録する。選んだ範囲は文章の位置で持つので、末尾に新しい行が流れ込んで表示が
+//! 動いても、選んだ文章は変わらない。
 
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::Line;
+use ratatui::text::{Line, Text};
 use ratatui::widgets::Block;
 use ratatui::Frame;
+
+use crate::select::map::{prepare, Shape};
+use crate::select::Selectable;
 
 /// ホイール1刻みで動かす行数（端末の既定送り量に合わせる）。
 pub const WHEEL_SCROLL_LINES: i32 = 3;
@@ -97,15 +106,16 @@ impl Scrollback {
 
 /// 末尾追従で`lines`を描き、**この描画で判明した`offset`の上限**を返す。
 ///
-/// 呼び出し側は戻り値で[`Scrollback::clamp`]を呼ぶこと（モジュールdoc）。
-pub fn render(
+/// 呼び出し側は戻り値で[`Scrollback::clamp`]を呼ぶこと（モジュールdoc）。文章は`on`の選択で選べる。
+pub fn render<C: Clone, W: Clone + PartialEq>(
     frame: &mut Frame,
     area: Rect,
     lines: Vec<Line<'static>>,
     block: Block<'static>,
     scroll: Scrollback,
+    on: Selectable<'_, C, W>,
 ) -> u16 {
-    render_inner(frame, area, lines, block, scroll, None)
+    render_inner(frame, area, lines, block, scroll, None, on)
 }
 
 /// [`render`]に加えて、本文が枠に収まらないときだけ右の枠線の上にスクロールバーを描く
@@ -113,37 +123,53 @@ pub fn render(
 ///
 /// 下端に貼り付いている間は、つまみが一番下に付いている。会話TUIのtranscriptが使う
 /// （ポリシーエディタの記録画面の3枠は[`render`]のままで、スクロールバーを出さない）。
-pub fn render_with_bar(
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_bar<C: Clone, W: Clone + PartialEq>(
     frame: &mut Frame,
     area: Rect,
     lines: Vec<Line<'static>>,
     block: Block<'static>,
     scroll: Scrollback,
     bar: Style,
+    on: Selectable<'_, C, W>,
 ) -> u16 {
-    render_inner(frame, area, lines, block, scroll, Some(bar))
+    render_inner(frame, area, lines, block, scroll, Some(bar), on)
 }
 
-fn render_inner(
+fn render_inner<C: Clone, W: Clone + PartialEq>(
     frame: &mut Frame,
     area: Rect,
     lines: Vec<Line<'static>>,
     block: Block<'static>,
     scroll: Scrollback,
     bar: Option<Style>,
+    on: Selectable<'_, C, W>,
 ) -> u16 {
     // 折り返し後の行数で数える。ここをバッファ行にすると、長い行がある枠で
     // 末尾まで戻り切れなくなる（モジュールdoc）。数える幅と描く幅は`crate::wrap`が揃える
     // （行末の全角文字が右の枠線を覆わないよう、どちらも右端の1桁を空ける。BUG-200）。
+    // 行ごとに数える（合計は`crate::wrap::rows`と同じ。どの行が見えているかを選択の地図が使う）。
     let inner = block.inner(area);
-    let rows = crate::wrap::rows(lines.clone(), inner.width);
+    let heights = crate::wrap::line_rows(lines.clone(), inner.width);
+    let rows: usize = heights.iter().sum();
     let total = u16::try_from(rows).unwrap_or(u16::MAX);
     let max_offset = total.saturating_sub(inner.height);
     // 表示にはクランプ後の値を使う（状態そのものは呼び出し側が`clamp`で直す）。
     let offset = scroll.offset().min(max_offset);
     let top = max_offset.saturating_sub(offset);
+    // 選んでいる範囲に色を付け、見えている文字の場所を数える（`crate::select::map`）。
+    let (text, map) = prepare(
+        Text::from(lines),
+        Shape {
+            inner,
+            heights: &heights,
+            top: usize::from(top),
+            wrapped: true,
+        },
+        on.selection.mark(&on.surface),
+    );
 
-    crate::wrap::Wrapped::new(lines)
+    crate::wrap::Wrapped::new(text)
         .block(block)
         .scroll(top)
         .render(frame, area);
@@ -152,6 +178,7 @@ fn render_inner(
         let window = crate::scrollable::Window::new(rows, usize::from(inner.height), top);
         crate::scrollable::draw_scrollbar(frame, area, window, bar);
     }
+    on.targets.text(map, on.surface);
     max_offset
 }
 
@@ -176,6 +203,13 @@ pub fn scrolled_notice(scroll: Scrollback, hint: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 選択の無い枠として描く（この試験は文章を選ばない。登録先は描くたびに捨てる）。
+    fn unselected() -> Selectable<'static, (), ()> {
+        let targets = Box::leak(Box::default());
+        let selection = Box::leak(Box::default());
+        Selectable::new(targets, (), selection)
+    }
 
     #[test]
     fn a_fresh_scrollback_is_pinned_to_the_bottom() {
@@ -271,6 +305,7 @@ mod tests {
                     lines,
                     Block::default().borders(Borders::ALL),
                     Scrollback::default(),
+                    unselected(),
                 );
             })
             .expect("draw");
@@ -302,6 +337,7 @@ mod tests {
                 Block::default().borders(Borders::ALL),
                 scroll,
                 Style::default(),
+                unselected(),
             );
         })
         .expect("draw");

@@ -40,6 +40,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedbac
             Block::default().borders(Borders::ALL).title(title),
             app.panels.top(panel),
             wrap::panel_look(Style::default()),
+            harness_term::select::Selectable::new(targets, Wheel::Panel(panel), &app.selection),
         ),
     );
     feedback

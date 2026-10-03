@@ -31,6 +31,7 @@ use ratatui::Frame;
 
 use harness_sandbox::textdiff::DiffKind;
 use harness_term::scrollable::{Look, Window};
+use harness_term::select::{Selectable, Selection};
 
 use crate::app::{
     Click, ReviewDiffLine, ReviewDrawn, ReviewFocus, ReviewPanelState, Targets, Wheel,
@@ -43,6 +44,7 @@ pub(super) fn render_review_panel(
     area: Rect,
     panel: &ReviewPanelState,
     targets: &mut Targets,
+    selection: &Selection<Wheel>,
 ) -> ReviewDrawn {
     let rect = super::centered_rect(90, 80, area);
     // 後ろの画面の全角文字に左の枠線が欠けないよう、共有の部品で消す（`harness_term::overlay`）。
@@ -64,7 +66,7 @@ pub(super) fn render_review_panel(
 
     let joined = hint_height > 0;
     let list_offset = render_list(f, cols[0], panel, joined, targets);
-    let diff_max = render_diff(f, cols[1], panel, joined, targets);
+    let diff_max = render_diff(f, cols[1], panel, joined, targets, selection);
     if joined {
         let block = Block::default().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM);
         let inner = block.inner(hints);
@@ -191,13 +193,15 @@ fn render_list(
     state.offset()
 }
 
-/// 差分ペインを描き、送れる上限を返す。
+/// 差分ペインを描き、送れる上限を返す。差分の文章はマウスで選んで写せる（ハンクの見出しは押せる場所なので、
+/// そこからは選び始めない。`crate::app::select`）。
 fn render_diff(
     f: &mut Frame,
     area: Rect,
     panel: &ReviewPanelState,
     joined: bool,
     targets: &mut Targets,
+    selection: &Selection<Wheel>,
 ) -> u16 {
     // ハンクがrejectされている間は本文もくすませる（見出しの`[ ]`だけだと、
     // 長いハンクをスクロールしている最中にどちら側を見ているのか分からなくなる）。
@@ -281,6 +285,7 @@ fn render_diff(
             notice: Style::default().fg(Color::DarkGray),
             bar: border,
         },
+        Selectable::new(targets, Wheel::ReviewDiff, selection),
     );
     // ハンク単位の操作が使えない行では、見出しも印も押せない（`Enter`も何もしない）。
     if selectable {
@@ -335,6 +340,7 @@ mod tests {
                 f.area(),
                 panel,
                 &mut Default::default(),
+                &Default::default(),
             ))
         })
         .unwrap();

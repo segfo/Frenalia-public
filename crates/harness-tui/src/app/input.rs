@@ -178,8 +178,14 @@ impl AppState {
             hints.push(KeyHint::press("Enter=改行", KeyCode::Enter));
         }
         hints.push(KeyHint::shown("PageUp/PageDown=スクロール"));
+        // 写せる選択があるあいだは、同じキーが写す（`app::select`。効く操作を案内する、B-32）。
+        let ctrl_c = if self.has_copyable_selection() {
+            "Ctrl-C=コピー"
+        } else {
+            "Ctrl-C=終了"
+        };
         hints.push(KeyHint::press_key(
-            "Ctrl-C=終了",
+            ctrl_c,
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         ));
         hints
@@ -238,7 +244,25 @@ impl AppState {
     }
 
     /// キー入力を処理し、engineアクター/InteractiveGateへ伝えるべきアクションを返す。
+    ///
+    /// 選んでいる文章があれば、`Ctrl+C`はそれを写し、`Esc`はそれを外すだけにする（承認ダイアログ・レビューパネルが
+    /// 開いていても先に。`app::select`のモジュールdoc）。入力欄にキーボードで選択を作ったら、マウスの選択は外す
+    /// （2つの選択を同時に持たない）。
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if let Some(handled) = self.on_selection_key(key) {
+            return handled;
+        }
+        let before = self.selection_range();
+        let action = self.on_key_after_selection(key);
+        let after = self.selection_range();
+        if after.is_some() && after != before {
+            self.selection.clear();
+        }
+        action
+    }
+
+    /// [`Self::on_key`]の本体（選択が受けなかったキー）。
+    fn on_key_after_selection(&mut self, key: KeyEvent) -> Option<Action> {
         // 承認モーダルは自分でキーを解釈する（確認の一段・穴の選択・枠のスクロールがあるので、
         // 「決定キー以外は捨てる」では足りない）。ここに残るのは**応答への写像**だけである
         // （審査パネルと同じ分け方。`app::approval`のモジュールdoc参照）。
