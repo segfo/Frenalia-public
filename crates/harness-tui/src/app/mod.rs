@@ -232,6 +232,11 @@ pub struct AppState {
     /// 直前に描いた画面の、押せる場所と送れる枠（`app::pointer`）。マウスのイベントはこれで引く。
     /// 描くたびに[`Self::apply_draw_feedback`]が差し替える。
     pub(crate) pointer: Targets,
+    /// 直前に描いた画面の、入力欄の右のボタン（文言と矩形）。次に描いた画面と比べる（`app::pointer`のモジュールdoc）。
+    input_buttons_drawn: Vec<(&'static str, ratatui::layout::Rect)>,
+    /// 入力欄の右のボタンが、別のボタンの居た場所へ最後に動いた時刻。そこから`pointer::BUTTON_SHIFT_GRACE`の間は
+    /// そのボタンのクリックを捨てる。
+    input_buttons_moved_at: Option<Instant>,
 }
 
 // スクロール量（`PageUp`/`PageDown`とホイール1ノッチの行数）は
@@ -276,6 +281,8 @@ impl AppState {
             overlay_session_id: None,
             conversation_session_id: String::new(),
             pointer: Targets::default(),
+            input_buttons_drawn: Vec::new(),
+            input_buttons_moved_at: None,
         }
     }
 

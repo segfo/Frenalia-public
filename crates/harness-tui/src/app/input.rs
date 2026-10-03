@@ -148,7 +148,7 @@ impl AppState {
 
     /// 入力欄の見出しに出すキーの案内（**押せば同じキーを押したのと同じ**。`app::pointer`）。
     ///
-    /// 送信と中断はここに無い——入力欄の右下のボタン（[`Self::input_buttons`]）へ移した（2026-10-03）。
+    /// 送信と中断はここに無い——入力欄の右の枠付きのボタン（[`Self::input_buttons`]）へ移した（2026-10-03）。
     /// 残るのはキーボードの人のための案内で、`PageUp/PageDown`は1つのキーに決まらないので押せない。`Enter=改行`は
     /// 素のEnterが改行のとき（[`Self::enter_submits`]が偽）だけ出す。`Ctrl-C=終了`は押せる——ポリシーエディタのキー案内も
     /// 終了の項目を押せる（`plans/POLICY-EDITOR-TOMOYO-DIG.md`決定62の「マウスで操作できるようにした」の表の5）。
@@ -165,47 +165,43 @@ impl AppState {
         hints
     }
 
-    /// 入力欄の右下に並べるボタン（左から「中断」「送信」。2026-10-03、ユーザーが実機で「送信やキャンセルが
-    /// できると直感的に分からない」と指摘した）。**押せば同じキーを押したのと同じ**（`app::pointer`）。
+    /// 入力欄の右に並べる枠付きのボタン（左から「送信」「中断」。2026-10-03、ユーザーが実機を見て図を描いた——
+    /// 「ボタンと分かるように、枠で囲んだものを入力欄の右に」）。**押せば同じキーを押したのと同じ**（`app::pointer`）。
     ///
     /// - **送信**はいつも出す。キーは設定と端末で変わる（[`Self::enter_submits`]・[`Self::host_is_vscode`]——
-    ///   VS Codeの統合ターミナルはShift+EnterのShiftを落とすので`Alt+Enter`を案内する）ので、文言もここで決める。
-    ///   入力欄が空白だけの間は**押せない**（`key`が`None`。送信キーを押しても何も起きない——[`Self::submit_input`]）。
+    ///   VS Codeの統合ターミナルはShift+EnterのShiftを落とすので`Alt+Enter`を案内する）ので、下辺に添える綴りもここで
+    ///   決める。入力欄が空白だけの間は**押せない**（`key`が`None`。送信キーを押しても何も起きない——[`Self::submit_input`]）。
     /// - **中断**は止めるものが走っている間（[`Self::can_cancel`]）だけ出す。走っていない間に`Esc`を押しても
     ///   何も止まらないので、効かない操作を案内しない（ポリシーエディタの記録画面の`Esc 停止`と同じ。B-32）。
     ///
-    /// 中断を送信の**左**に置くのは、出たり消えたりしても送信の位置が動かないようにするため。
+    /// 中断は送信の**右**に並ぶ（ユーザーの図のとおり）。出たり消えたりすると送信の位置が動くので、動いた直後の
+    /// クリックは捨てる（`app::pointer`のモジュールdoc）。
     pub fn input_buttons(&self) -> Vec<InputButton> {
-        let mut buttons = Vec::with_capacity(2);
-        if self.can_cancel() {
-            buttons.push(InputButton {
-                hint: KeyHint::press("Esc=中断", KeyCode::Esc),
-                short: "中断",
-            });
-        }
-        let (label, key) = if self.enter_submits {
-            (
-                "Enter=送信",
-                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            )
+        let (key_label, key) = if self.enter_submits {
+            ("Enter", KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
         } else if self.host_is_vscode {
             (
-                "Alt+Enter=送信",
+                "Alt+Enter",
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
             )
         } else {
             (
-                "Shift+Enter=送信",
+                "Shift+Enter",
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
             )
         };
-        buttons.push(InputButton {
-            hint: match self.input.trim().is_empty() {
-                true => KeyHint::shown(label),
-                false => KeyHint::press_key(label, key),
-            },
-            short: "送信",
-        });
+        let mut buttons = vec![InputButton {
+            label: "送信",
+            key_label,
+            key: (!self.input.trim().is_empty()).then_some(key),
+        }];
+        if self.can_cancel() {
+            buttons.push(InputButton {
+                label: "中断",
+                key_label: "Esc",
+                key: Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            });
+        }
         buttons
     }
 

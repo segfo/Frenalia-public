@@ -148,24 +148,35 @@ pub enum ScrollPane {
     Noise,
 }
 
+/// 「記録」の枠の右にボタンを置いても、枠に残す幅（枠線2桁＋ラベル＋値。`harness_term::button::KEEP_TEXT_WIDTH`）。
+const FORM_MIN_WIDTH: u16 = LABEL_WIDTH + harness_term::button::KEEP_TEXT_WIDTH + 2;
+
 /// 入力欄は、`Tab`で入るのと同じ状態にする場所として登録する（ラベルも含めた1行。`tui::pointer`）。
 ///
-/// 枠の下辺の右に、記録の開始・停止のボタンを置く（`key_hints::record_buttons`。会話画面の入力欄の「送信」「中断」と
-/// 同じ部品・同じ置き方）。押すとそのキーを押したのと同じ。入り切らない幅では途中で切らずに描かない。
+/// 枠の右隣に、記録の開始・停止の枠付きのボタンを置く（`key_hints::record_buttons`）。会話画面の入力欄の右の「送信」
+/// 「中断」と同じ部品・同じ置き方（`harness_term::button::place_framed`）——枠の下端にそろえ、下辺にキーを添え、
+/// 狭ければキーを落とした短い形、それも入らなければ置かない（枠が幅いっぱい。キーは今までどおり効く）。
+/// 枠の中の右下に置かないのは、記録中の段階の1行（スピナー・経過・ゲージ・観測件数）が右へ長く伸びて重なるため。
+/// 押すとそのキーを押したのと同じ。
 fn draw_form(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
+    let buttons = super::key_hints::record_buttons(app);
+    let framed: Vec<harness_term::button::Framed> = buttons
+        .iter()
+        .map(|button| harness_term::button::Framed {
+            label: button.label,
+            key: button.key_label,
+            pressable: true,
+        })
+        .collect();
+    let (area, row) = harness_term::button::place_framed(area, &framed, FORM_MIN_WIDTH);
+    if let Some(row) = row {
+        for (button, rect) in buttons.iter().zip(row.draw(frame, Color::Cyan)) {
+            targets.click(rect, Click::Keys(vec![button.key]));
+        }
+    }
     let block = Block::default().borders(Borders::ALL).title(" 記録 ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let buttons = super::key_hints::record_buttons(app);
-    let spans: Vec<Span> = buttons
-        .iter()
-        .map(|hint| harness_term::button::active(&hint.label, Color::Cyan))
-        .collect();
-    let drawn =
-        harness_term::button::draw_right(frame, harness_term::row::bottom_edge(area), &[&spans]);
-    for (hint, rect) in buttons.iter().zip(drawn) {
-        targets.click(rect, Click::Keys(hint.keys.clone()));
-    }
 
     let rows = Layout::vertical([
         Constraint::Length(1),

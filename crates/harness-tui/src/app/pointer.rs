@@ -3,8 +3,8 @@
 //!
 //! # 当たり判定は、描いた矩形そのもの
 //!
-//! 描画（`crate::ui::render`）が、transcript・入力欄の見出しのキー案内と右下のボタン・承認ダイアログ・レビューパネル・
-//! それぞれの押せる項目を**描いたその矩形で**[`Targets`]へ登録し、[`DrawFeedback`]で状態へ書き戻す
+//! 描画（`crate::ui::render`）が、transcript・入力欄の見出しのキー案内・入力欄の右の枠付きのボタン・承認ダイアログ・
+//! レビューパネル・それぞれの押せる項目を**描いたその矩形で**[`Targets`]へ登録し、[`DrawFeedback`]で状態へ書き戻す
 //! （[`AppState::apply_draw_feedback`]）。マウスのイベントは、直前に描いたその登録で引く。以前はホイールが
 //! 座標を見ずに必ずtranscriptを送っていた（どこで回しても同じ）。当たり判定のために割り付けを写さない
 //! （ポリシーエディタの[BUG-194](../../../../docs/bugs/BUG-194.md)）。
@@ -46,26 +46,49 @@
 //!   走っている間だけ出る（[`AppState::input_buttons`]）。
 //! - 入力欄の中を押しても、押した桁へカーソルは移らない（ポリシーエディタと同じ）。
 //!
+//! # 入力欄の右のボタンは、別のボタンが居た場所へ動いた直後の300msだけ押せない
+//!
+//! 「中断」はユーザーの図のとおり「送信」の**右**に並ぶ（2026-10-03）。だから応答が始まると「中断」が送信の居た
+//! 右端に現れて「送信」が左へずれ、応答が終わると逆に「送信」が中断の居た右端へ戻る。そのままでは、送信を
+//! ダブルクリックした2回目が「中断」に当たって送ったばかりのターンを止め、中断を押した瞬間に応答が終わると
+//! 「送信」に当たって書きかけの入力を送る。押した人が狙ったのは動く前のボタンである。
+//!
+//! そこで、描いたボタンが**前の画面で別のボタンが居た場所と重なった**ら、その時刻を覚え（[`AppState::apply_draw_feedback`]）、
+//! そこから[`BUTTON_SHIFT_GRACE`]の間は入力欄の右のボタンのクリックを捨てる。長さと考え方は承認ダイアログの
+//! 開いた直後の窓（D-106。現れたものへ、別のものを狙った手の入力が流れ込む）と同じ。**キーは捨てない**——
+//! `Esc`や送信キーは押す場所を狙わないので、ボタンが動いても押し間違いにならない。
+//!
 //! # 限界
 //!
 //! - クリックは左ボタンを押した瞬間に効く（離したときではない。`harness_term::pointer`）。
 //! - **承認ダイアログを開いてから300ms未満のクリックは、キーと同じく捨てる**（D-106。クリックはキーを押すので、
 //!   `PermissionView::on_key`の窓がそのまま効く）。ホイールは捨てない——送るだけで、何も決めないから。
+//! - 入力欄の右のボタンの窓は、動いた後に描いた画面で数える。動く前の画面のうちに届いたクリックは、動く前の
+//!   ボタンを押す（狙ったとおり）。
 //! - セッションのピッカー（`crate::picker`）は自分のループで描いて引く（同じ部品・同じ形）。
+
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use harness_term::pointer::Pointer;
+use ratatui::layout::Rect;
 
 use super::{Action, AppState, ReviewFocus};
 
 /// 1フレームで描いた、押せる場所と送れる枠。
 pub type Targets = harness_term::pointer::Targets<Click, Wheel>;
 
+/// 入力欄の右のボタンが、別のボタンの居た場所へ動いてからクリックを捨てる長さ（モジュールdoc）。
+/// 承認ダイアログを開いた直後の窓（D-106）と同じ長さにする。
+pub(crate) const BUTTON_SHIFT_GRACE: Duration = super::approval::MODAL_INPUT_GRACE;
+
 /// クリックで起こすこと。どれもキーの処理を呼ぶ（モジュールdoc）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Click {
     /// キーを押す（入力欄の見出し・承認ダイアログ・レビューパネルの案内の項目）。
     Key(KeyEvent),
+    /// 入力欄の右のボタン（「送信」「中断」）。キーを押すが、ボタンが動いた直後は捨てる（モジュールdoc）。
+    InputButton(KeyEvent),
     /// transcriptの「さかのぼり中」の案内。末尾へ戻る。
     ScrollToLatest,
     /// 承認ダイアログの確認の段の、`n`番目の候補（毎回変わってよい引数）の行。そこへ移って`Space`。
@@ -128,15 +151,18 @@ impl KeyHint {
     }
 }
 
-/// 入力欄の右下のボタン1つ（[`AppState::input_buttons`]）。
+/// 入力欄の右の枠付きのボタン1つ（[`AppState::input_buttons`]。`harness_term::button::Framed`で描く）。
+/// **文言・下辺に添えるキーの綴り・押すキーを1つに並べて持つ**（[`KeyHint`]と同じ理由。B-05）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputButton {
-    /// 文言と押すキー（`Shift+Enter=送信`）。`key`が`None`なら**いまは押せない**——薄く描き、押す場所を登録しない
-    /// （`harness_term::button::inactive`）。承認ダイアログの押せない案内（1つのキーに決まらない`PageUp/PageDown`）とは
-    /// 意味が違う——こちらはボタンで、キーを押しても何も起きない間だけ押せない。
-    pub hint: KeyHint,
-    /// 幅が足りないときの文言（キーを落とした`送信`）。
-    pub short: &'static str,
+    /// 枠の中の文言（`送信`）。
+    pub label: &'static str,
+    /// 枠の下辺に添えるキーの綴り（`Shift+Enter`）。幅が足りないときは添えない。
+    pub key_label: &'static str,
+    /// 押したときのキー。`None`なら**いまは押せない**——薄く描き、押す場所を登録しない。承認ダイアログの押せない
+    /// 案内（1つのキーに決まらない`PageUp/PageDown`）とは意味が違う——こちらはボタンで、キーを押しても何も起きない
+    /// 間だけ押せない。
+    pub key: Option<KeyEvent>,
 }
 
 /// **1フレーム描いて初めて分かること。** 描画（`crate::ui::render`）が返し、[`AppState::apply_draw_feedback`]で
@@ -152,6 +178,9 @@ pub struct DrawFeedback {
     pub review: Option<ReviewDrawn>,
     /// この描画で描いた、押せる場所と送れる枠（重なりは描いた順。後が上）。
     pub targets: Targets,
+    /// この描画で入力欄の右に描いたボタン（文言と矩形。押せないものも含む）。前の画面と比べて、ボタンが別のボタンの
+    /// 居た場所へ動いたかを見る（モジュールdoc）。
+    pub input_buttons: Vec<(&'static str, Rect)>,
 }
 
 /// レビューパネルを描いて分かったこと。
@@ -237,6 +266,14 @@ impl AppState {
     fn on_click(&mut self, click: Click) -> Option<Action> {
         match click {
             Click::Key(pressed) => self.on_key(pressed),
+            Click::InputButton(_)
+                if self
+                    .input_buttons_moved_at
+                    .is_some_and(|moved| moved.elapsed() < BUTTON_SHIFT_GRACE) =>
+            {
+                None
+            }
+            Click::InputButton(pressed) => self.on_key(pressed),
             Click::ScrollToLatest => {
                 self.scroll.reset();
                 None
@@ -298,7 +335,24 @@ impl AppState {
             panel.list_offset = drawn.list_offset;
         }
         self.pointer = feedback.targets;
+        if buttons_took_each_others_place(&self.input_buttons_drawn, &feedback.input_buttons) {
+            self.input_buttons_moved_at = Some(Instant::now());
+        }
+        self.input_buttons_drawn = feedback.input_buttons;
     }
+}
+
+/// 今の画面の入力欄の右のボタンのどれかが、前の画面で**別の**ボタン（文言が違うもの）が居た場所と重なったか
+/// （モジュールdoc）。同じボタンが動いただけ・押せるかどうかが変わっただけ・前の画面にボタンが無かったときは偽。
+fn buttons_took_each_others_place(
+    before: &[(&'static str, Rect)],
+    now: &[(&'static str, Rect)],
+) -> bool {
+    now.iter().any(|(label, rect)| {
+        before
+            .iter()
+            .any(|(was, place)| was != label && place.intersects(*rect))
+    })
 }
 
 /// 修飾キー無しのキー。

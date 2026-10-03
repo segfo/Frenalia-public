@@ -725,7 +725,7 @@ fn a_field_click_enters_it_like_tab_and_typing_goes_there() {
 // ---------------------------------------------------------------------------
 
 /// **キー案内の項目を押すと、そのキーを押したのと同じになる**（代表: 画面ごとの項目・ヘルプ・終了）。
-/// 記録の開始・停止はキー案内から「記録」の枠のボタンへ移した（[`the_record_buttons_do_what_their_keys_do`]）。
+/// 記録の開始・停止はキー案内から「記録」の枠の右のボタンへ移した（[`the_record_buttons_do_what_their_keys_do`]）。
 #[test]
 fn a_key_hint_does_what_its_key_does() {
     type Make = fn(&std::path::Path) -> App;
@@ -794,39 +794,84 @@ fn a_key_hint_does_what_its_key_does() {
     }
 }
 
-/// 「記録」の枠の下辺（枠線の行）。
-fn record_box_bottom(grid: &[Vec<String>]) -> Rect {
-    let area = boxed(grid, " 記録 ");
-    Rect::new(area.x, area.bottom() - 1, area.width, 1)
+/// 「記録」の枠の右側（枠と同じ行の、枠より右の全部）。
+fn right_of_record_box(grid: &[Vec<String>]) -> Rect {
+    let form = boxed(grid, " 記録 ");
+    let width = u16::try_from(grid[0].len()).expect("端末の幅");
+    Rect::new(form.right(), form.y, width - form.right(), form.height)
 }
 
-/// **「記録」の枠の右下のボタンは、そのキーを押したのと同じ**（2026-10-03、会話画面の入力欄の「送信」「中断」と
-/// 同じ形）。実行前は`Enter 記録を開始`（コマンドが空でも押せて、キーと同じく理由が出る）、記録中は`Esc 停止`。
-/// どちらもキー案内の行には無い（同じ操作を2か所に並べない）。ボタンは枠の右下の角のすぐ左で終わる。
+/// 「記録」の枠の右の、文言が`label`の枠付きのボタン（枠線を含む）。**4つの角を描いたセルから読む**（当たり判定と
+/// 同じ計算で作らない）。角がそろっていなければ落ちる。
+fn record_button(grid: &[Vec<String>], label: &str) -> Rect {
+    let (x, y) = cell_of(grid, Some(right_of_record_box(grid)), label, None);
+    let (x, y) = (usize::from(x), usize::from(y));
+    let row = &grid[y];
+    let left = (0..x).rev().find(|&c| row[c] == "│").expect("左の枠線");
+    let right = (x..row.len()).find(|&c| row[c] == "│").expect("右の枠線");
+    let corners = [
+        grid[y - 1][left].as_str(),
+        grid[y - 1][right].as_str(),
+        grid[y + 1][left].as_str(),
+        grid[y + 1][right].as_str(),
+    ];
+    assert_eq!(
+        corners,
+        ["┌", "┐", "└", "┘"],
+        "「{label}」が枠で囲まれていない:\n{}",
+        grid.iter()
+            .map(|r| r.concat())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let cell = |n: usize| u16::try_from(n).expect("端末の大きさはu16に収まる");
+    Rect::new(cell(left), cell(y - 1), cell(right - left + 1), 3)
+}
+
+/// 枠付きのボタンの下辺の、角を除いた文字（キーを添えていれば`──Enter───`のような形）。
+fn button_bottom_edge(grid: &[Vec<String>], button: Rect) -> String {
+    grid[usize::from(button.bottom() - 1)]
+        [usize::from(button.x) + 1..usize::from(button.right()) - 1]
+        .concat()
+}
+
+/// コマンドを入れた記録画面（押せば記録が始まる）。
+fn record_screen_with_command(ws: &std::path::Path) -> App {
+    let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+    app.command.set_text("cargo build");
+    app
+}
+
+/// **「記録」の枠の右隣の、枠で囲んだボタンは、そのキーを押したのと同じ**（2026-10-03、会話画面の入力欄の右の
+/// 「送信」「中断」と同じ形・同じ部品）。実行前は「記録を開始」（下辺に`Enter`。コマンドが空でも押せて、キーと同じく
+/// 理由が出る）、記録中は「停止」（下辺に`Esc`）。どちらもキー案内の行には無い（同じ操作を2か所に並べない）。
+/// ボタンは枠の右隣で、枠の下端にそろい、画面の右端で終わる。
 #[test]
 fn the_record_buttons_do_what_their_keys_do() {
     type Make = fn(&std::path::Path) -> App;
-    let with_command: Make = |ws| {
-        let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
-        app.command.set_text("cargo build");
-        app
-    };
     let empty: Make = |ws| App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
-    let cases: [(&str, Make, &str, KeyCode); 3] = [
-        ("開始", with_command, "Enter 記録を開始", KeyCode::Enter),
-        ("コマンドが空", empty, "Enter 記録を開始", KeyCode::Enter),
+    let cases: [(&str, Make, &str, &str, KeyCode); 3] = [
+        (
+            "開始",
+            record_screen_with_command,
+            "記録を開始",
+            "Enter",
+            KeyCode::Enter,
+        ),
+        ("コマンドが空", empty, "記録を開始", "Enter", KeyCode::Enter),
         (
             "記録中の停止",
             running_record_screen,
-            "Esc 停止",
+            "停止",
+            "Esc",
             KeyCode::Esc,
         ),
     ];
-    for (case, make, button, key) in cases {
+    for (case, make, label, key_label, key) in cases {
         assert_click_is_keys(
             case,
             &make,
-            &|grid, _| cell_of(grid, Some(record_box_bottom(grid)), button, None),
+            &|grid, _| cell_of(grid, Some(right_of_record_box(grid)), label, None),
             &[k(key)],
         );
 
@@ -835,14 +880,32 @@ fn the_record_buttons_do_what_their_keys_do() {
         let grid = frame(&mut app, SIZE.0, SIZE.1);
         let keys = squash(&grid[usize::from(key_row(&grid).y)].concat());
         assert!(
-            !keys.contains(&squash(button)),
-            "{case}: キー案内の行にも「{button}」がある: {keys}"
+            !keys.contains(label),
+            "{case}: キー案内の行にも「{label}」がある: {keys}"
         );
-        let bottom = record_box_bottom(&grid);
-        let edge = squash(&grid[usize::from(bottom.y)][..usize::from(bottom.right())].concat());
-        assert!(
-            edge.ends_with(&format!("{}┘", squash(button))),
-            "{case}: ボタンが枠の右下の角の手前に無い: {edge}"
+        let form = boxed(&grid, " 記録 ");
+        let button = record_button(&grid, label);
+        assert_eq!(button.x, form.right(), "{case}: 枠の右隣に無い");
+        assert_eq!(
+            button.bottom(),
+            form.bottom(),
+            "{case}: 枠の下端にそろっていない"
+        );
+        assert_eq!(button.right(), SIZE.0, "{case}: 右端で終わっていない");
+        assert_eq!(
+            button_bottom_edge(&grid, button).trim_matches('─'),
+            key_label,
+            "{case}: 下辺のキー"
+        );
+        // 枠線の上を押しても同じ（ボタンは枠ごと押せる）。
+        assert_click_is_keys(
+            &format!("{case}（枠線の上）"),
+            &make,
+            &|grid, _| {
+                let button = record_button(grid, label);
+                (button.x, button.y)
+            },
+            &[k(key)],
         );
     }
     // 空のコマンドで押すと、キーと同じく開始できない理由が出る（無反応にしない）。
@@ -851,28 +914,73 @@ fn the_record_buttons_do_what_their_keys_do() {
     let grid = frame(&mut app, SIZE.0, SIZE.1);
     let action = click(
         &mut app,
-        cell_of(
-            &grid,
-            Some(record_box_bottom(&grid)),
-            "Enter 記録を開始",
-            None,
-        ),
+        cell_of(&grid, Some(right_of_record_box(&grid)), "記録を開始", None),
     );
     assert_eq!(action_kind(&action), "なし");
     assert!(app.status.contains("コマンドを入力"), "{}", app.status);
     // 押せば始まる（許可側）。
-    let mut app = with_command(ws.path());
+    let mut app = record_screen_with_command(ws.path());
     let grid = frame(&mut app, SIZE.0, SIZE.1);
     let action = click(
         &mut app,
-        cell_of(
-            &grid,
-            Some(record_box_bottom(&grid)),
-            "Enter 記録を開始",
-            None,
-        ),
+        cell_of(&grid, Some(right_of_record_box(&grid)), "記録を開始", None),
     );
     assert_eq!(action_kind(&action), "パス1を開始");
+}
+
+/// **狭い端末では、「記録」の枠に34桁（ラベル12桁・値20桁・枠線2桁）を残せる形を選ぶ**——キーを添える形 → キーを
+/// 落とした短い形 → 置かない（枠が幅いっぱい）。枠とボタンは重ならず、ボタンは途中で切れない。短い形でも押せば始まる。
+/// 「記録を開始」のボタンは、キーを添える形で18桁、短い形で14桁（手で数えた値）。
+#[test]
+fn the_record_button_shrinks_and_then_disappears_on_a_narrow_terminal() {
+    for (width, form_of_button) in [
+        (120u16, "キー付き"),
+        (52, "キー付き"),
+        (51, "短い"),
+        (48, "短い"),
+        (47, "無し"),
+    ] {
+        let ws = workspace();
+        let mut app = record_screen_with_command(ws.path());
+        let grid = frame(&mut app, width, SIZE.1);
+        let form = boxed(&grid, " 記録 ");
+        if form_of_button == "無し" {
+            assert_eq!(form.right(), width, "{width}桁: 枠が幅いっぱいでない");
+            let rows: String = grid[usize::from(form.y)..usize::from(form.bottom())]
+                .iter()
+                .map(|row| row.concat())
+                .collect();
+            assert!(
+                !rows.contains("記録を開始"),
+                "{width}桁: 入らないボタンを描いた"
+            );
+            continue;
+        }
+        let button = record_button(&grid, "記録を開始");
+        assert_eq!(
+            button.x,
+            form.right(),
+            "{width}桁: 枠とボタンが重なるか離れた"
+        );
+        assert_eq!(button.right(), width, "{width}桁");
+        assert!(form.width >= 34, "{width}桁: 枠が{}桁しかない", form.width);
+        let edge = button_bottom_edge(&grid, button);
+        match form_of_button {
+            "キー付き" => assert_eq!(edge.trim_matches('─'), "Enter", "{width}桁"),
+            _ => {
+                assert!(
+                    edge.chars().all(|c| c == '─'),
+                    "{width}桁: 短い形にキーが残った: {edge}"
+                );
+                assert_eq!(button.width, 14, "{width}桁");
+            }
+        }
+        let action = click(
+            &mut app,
+            cell_of(&grid, Some(right_of_record_box(&grid)), "記録を開始", None),
+        );
+        assert_eq!(action_kind(&action), "パス1を開始", "{width}桁");
+    }
 }
 
 /// 終了の項目は、押すと終了の操作を返す（キーと同じ。上の試験は種類が一致することしか見ないので、ここで値を見る）。

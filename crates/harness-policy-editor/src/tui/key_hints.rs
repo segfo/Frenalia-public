@@ -51,7 +51,7 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
             if app.run.is_some() {
                 keys.push(shown("ホイール 枠内をさかのぼる"));
             }
-            // 記録の開始と停止はここに無い——「記録」の枠の右下のボタン（[`record_buttons`]）へ移した。
+            // 記録の開始と停止はここに無い——「記録」の枠の右の枠付きのボタン（[`record_buttons`]）へ移した。
             if !app.is_running() {
                 // 終わった記録の結果を見ている間も、次の操作は同じ（もう一度実行する／
                 // 候補を見に行く）。**押せるものを隠さない**——結果を読んだ後に何をすれば
@@ -157,25 +157,42 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
     keys
 }
 
-/// 記録画面の「記録」の枠の右下に並べるボタン（`record_screen`が描く。2026-10-03）。
+/// 「記録」の枠の右の枠付きのボタン1つ（[`record_buttons`]。`harness_term::button::Framed`で描く）。
+/// 文言・下辺に添えるキーの綴り・押すキーを1つに並べて持つ（[`KeyHint`]と同じ理由。B-05）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RecordButton {
+    /// 枠の中の文言（`記録を開始`）。
+    pub label: &'static str,
+    /// 枠の下辺に添えるキーの綴り（`Enter`）。
+    pub key_label: &'static str,
+    /// クリックしたときに押すキー。
+    pub key: KeyEvent,
+}
+
+/// 記録画面の「記録」の枠の右隣に置く枠付きのボタン（`record_screen`が描く。2026-10-03）。
 ///
-/// 会話画面（`harness.exe`）の入力欄の右下に「送信」「中断」のボタンを置いたのと同じ形——ユーザーが会話画面を実機で
-/// 見て「送信ボタンが独立してあると思っている。括弧書きの注釈では押せると分からない」と指摘し、このエディタの
-/// 記録のコマンド欄も`Enter 記録を開始`をキー案内の行でしか示していなかった。見た目は同じ部品（`harness_term::button`）。
+/// 会話画面（`harness.exe`）の入力欄の右隣に枠で囲んだ「送信」「中断」を置いたのと同じ形・同じ部品
+/// （`harness_term::button::place_framed`）——ユーザーが会話画面を実機で見て図を描き、「ボタンと分かるように枠で
+/// 囲んだものを右に」と希望した。このエディタの記録のコマンド欄も、同じ日に枠の下辺へ載せたボタンだった。
 ///
-/// - 実行前は`Enter 記録を開始`。コマンドが空でも押せる——押すと開始できない理由が出る（`App::start_recording`。
-///   押しても無反応にしない、B-23(c)）。
-/// - 実行中は、止められるときだけ`Esc 停止`／`Esc 停止を予約`（効かない操作を案内しない。B-32）。
+/// - 実行前は「記録を開始」（下辺に`Enter`）。コマンドが空でも押せる——押すと開始できない理由が出る
+///   （`App::start_recording`。押しても無反応にしない、B-23(c)）。
+/// - 実行中は、止められるときだけ「停止」／「停止を予約」（下辺に`Esc`。効かない操作を案内しない。B-32）。
 ///
 /// キー案内の行（[`screen_keys`]）には出さない——同じ操作を2か所に並べない（会話画面の見出しから送信・中断を外したのと同じ）。
-pub(super) fn record_buttons(app: &App) -> Vec<KeyHint> {
+pub(super) fn record_buttons(app: &App) -> Vec<RecordButton> {
+    let button = |label, key_label, code| RecordButton {
+        label,
+        key_label,
+        key: key(code),
+    };
     let Some(run) = app.run.as_ref().filter(|_| app.is_running()) else {
-        return vec![press("Enter 記録を開始", KeyCode::Enter)];
+        return vec![button("記録を開始", "Enter", KeyCode::Enter)];
     };
     if run.phase.stop_takes_effect_now() {
-        vec![press("Esc 停止", KeyCode::Esc)]
+        vec![button("停止", "Esc", KeyCode::Esc)]
     } else if run.phase.stop_can_be_queued() {
-        vec![press("Esc 停止を予約", KeyCode::Esc)]
+        vec![button("停止を予約", "Esc", KeyCode::Esc)]
     } else {
         Vec::new()
     }
