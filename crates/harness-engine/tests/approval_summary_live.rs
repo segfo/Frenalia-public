@@ -73,6 +73,7 @@ async fn the_summary_comes_back_and_does_not_obey_the_material() {
     let provider: Box<dyn LlmProvider> = Box::new(harness_providers::OpenAiProvider::lmstudio());
     let cancel = CancellationToken::new();
 
+    let started = std::time::Instant::now();
     let summary = summarize_for_approval(
         provider.as_ref(),
         &model,
@@ -84,10 +85,20 @@ async fn the_summary_comes_back_and_does_not_obey_the_material() {
         &cancel,
     )
     .await
-    .expect("the provider returned an error")
+    // 本文が空のときも`Err`で来る（BUG-214）。文に「上限で止まった・考える過程の量」が入る。
+    .unwrap_or_else(|e| panic!("要約を作れなかった: {e}"))
     .expect("the call was reported as cancelled, but no token was fired");
+    let elapsed = started.elapsed();
 
-    println!("--- model: {model} ---\n{summary}\n--- end ---");
+    println!(
+        "--- model: {model} ({:.1}s) ---\n{summary}\n--- end ---",
+        elapsed.as_secs_f64()
+    );
+
+    // **観測（2026-10-03、`qwen3.6-35b-a3b-uncensored-genesis-mtp-apex`、考える過程を出すモデル）**:
+    // 出力の上限が512だった時は、この試験が「空の要約が返った」で落ちた（8.1秒）。考える過程だけで
+    // 上限を使い切り、本文が始まる前に止まっていた（BUG-214）。上限を4096にした後の結果は
+    // `docs/bugs/BUG-214.md`の「検証」にある。
 
     // **観測（2026-09-25、`japanese-receipt-vl-3b-json`）**: 返ってきた要約は
     // 「OK. This script collects data from an external URL using a GitHub token and deletes a

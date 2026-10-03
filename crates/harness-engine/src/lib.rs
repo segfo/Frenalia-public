@@ -17,6 +17,7 @@ pub mod degeneracy;
 pub mod permission;
 mod sanitize;
 pub mod session;
+pub mod side_call;
 pub mod turn;
 
 use tokio_util::sync::CancellationToken;

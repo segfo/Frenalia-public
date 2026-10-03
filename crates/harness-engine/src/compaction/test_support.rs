@@ -22,6 +22,8 @@ pub struct MockProvider {
     fail_from: Option<usize>,
     /// `n`回目のコールを処理する時点でこのトークンを発火させる（Escを押した瞬間の再現）。
     cancel_at: Option<(CancellationToken, usize)>,
+    /// 受け取った要求の`max_tokens`（呼ばれた順）。
+    max_tokens_seen: Mutex<Vec<u32>>,
 }
 
 impl MockProvider {
@@ -31,6 +33,7 @@ impl MockProvider {
             calls: AtomicUsize::new(0),
             fail_from: None,
             cancel_at: None,
+            max_tokens_seen: Mutex::new(Vec::new()),
         }
     }
 
@@ -55,6 +58,11 @@ impl MockProvider {
     pub fn calls_made(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    /// 受け取った要求の`max_tokens`を呼ばれた順に返す。
+    pub fn max_tokens_seen(&self) -> Vec<u32> {
+        self.max_tokens_seen.lock().unwrap().clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -65,8 +73,9 @@ impl LlmProvider for MockProvider {
 
     async fn stream(
         &self,
-        _req: CompletionRequest,
+        req: CompletionRequest,
     ) -> Result<BoxStream<'static, Result<StreamEvent, ProviderError>>, ProviderError> {
+        self.max_tokens_seen.lock().unwrap().push(req.max_tokens);
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if let Some((token, at)) = &self.cancel_at {
             if n == *at {

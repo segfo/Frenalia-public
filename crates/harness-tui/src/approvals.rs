@@ -267,8 +267,10 @@ pub(crate) fn start_summary(
         {
             // キャンセルされたときは何も送らない（モーダルはもう別のものを見ている）。
             Ok(None) => return,
-            Ok(Some(text)) if text.is_empty() => Err("モデルが空の要約を返した".to_string()),
+            // 本文が空なら engine が`Err`で返す（BUG-214）。ここで空かどうかを見直さない——
+            // 見直すと「なぜ空か」を持たない固定の文に戻ってしまう。
             Ok(Some(text)) => Ok(text),
+            // 本文が空のときは「出力の上限で止まった・考える過程が何文字あった」まで文になる。
             Err(e) => Err(e.to_string()),
         };
         let _ = background.send(BackgroundEvent::SummaryReady {
