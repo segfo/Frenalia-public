@@ -54,6 +54,82 @@ pub struct FilePreview {
     pub truncated: bool,
 }
 
+/// ハーネスが機械的に解読した、符号化された中身の1段（`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §4.4）。
+///
+/// **表示と要約のためだけで、照合に使わない**（[`FilePreview`]と同じ立場）。解読するのは
+/// `harness-tools`の`encoded_command`で、ここは器だけを持つ。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecodedLayer {
+    /// 何段目か（1から）。2段目は、1段目を解読した中身の中に見つかったもの。
+    pub depth: u32,
+    /// どの書き方から取り出したか。
+    pub source: EncodedSource,
+    pub outcome: DecodeOutcome,
+}
+
+/// 符号化された中身を、どの書き方から取り出したか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EncodedSource {
+    /// PowerShell の`-EncodedCommand`（とその省略形）の値。
+    EncodedCommand,
+    /// PowerShell の`-EncodedArguments`（とその省略形）の値。
+    EncodedArguments,
+    /// `[Convert]::FromBase64String('…')`の文字列リテラル。
+    FromBase64String,
+}
+
+impl EncodedSource {
+    /// 画面と要約に出す綴り（PowerShell の正式な書き方）。
+    pub fn spelling(self) -> &'static str {
+        match self {
+            EncodedSource::EncodedCommand => "-EncodedCommand",
+            EncodedSource::EncodedArguments => "-EncodedArguments",
+            EncodedSource::FromBase64String => "[Convert]::FromBase64String",
+        }
+    }
+}
+
+/// 1段を解読した結果。**解読できなかったこと・上限で止めたことも1段として残す**——黙って落とすと、
+/// 見る人には「符号化された中身は無かった」と区別がつかない。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DecodeOutcome {
+    /// 文字として読めた。
+    Text {
+        encoding: TextEncoding,
+        text: String,
+    },
+    /// 綴りの後ろに値が無い。
+    MissingValue,
+    /// 値が base64 として読めない（PowerShell も受け付けない形。変数や式なら実行時に決まる）。
+    NotBase64,
+    /// base64 は読めたが、UTF-8 でも UTF-16LE でも文字にならない（圧縮・暗号化・実行ファイルなど）。
+    NotText,
+    /// `FromBase64String`の引数が文字列リテラルではない（実行時に決まる）。
+    NotLiteral,
+    /// 深さの上限で止めた（ここから先は解読していない）。
+    DepthLimit { max_depth: u32 },
+    /// 解読した中身の合計の大きさの上限で止めた。
+    SizeLimit { max_bytes: usize },
+    /// 段の数の上限で止めた（これ以降は探していない）。
+    CountLimit { max_layers: usize },
+}
+
+/// 文字として読んだときの符号化。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextEncoding {
+    Utf16Le,
+    Utf8,
+}
+
+impl TextEncoding {
+    pub fn name(self) -> &'static str {
+        match self {
+            TextEncoding::Utf16Le => "UTF-16LE",
+            TextEncoding::Utf8 => "UTF-8",
+        }
+    }
+}
+
 /// `run_shell`の材料。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandSubject {
@@ -68,6 +144,10 @@ pub struct CommandSubject {
     /// 表示用（照合に使わない）。
     #[serde(default)]
     pub previews: Vec<FilePreview>,
+    /// 行に符号化された中身（PowerShell の`-EncodedCommand`など）があれば、ハーネスが機械的に
+    /// 解読したもの（表示と要約のため、照合に使わない）。
+    #[serde(default)]
+    pub decoded: Vec<DecodedLayer>,
 }
 
 impl CommandSubject {
@@ -78,6 +158,7 @@ impl CommandSubject {
             files: Vec::new(),
             unverifiable: false,
             previews: Vec::new(),
+            decoded: Vec::new(),
         }
     }
 }
@@ -106,9 +187,10 @@ pub struct ProgramSubject {
     /// 表示用（照合に使わない）。
     #[serde(default)]
     pub previews: Vec<FilePreview>,
-    /// `-EncodedCommand`をハーネスが機械的に解読した文字列（表示用、照合に使わない）。
+    /// 引数に符号化された中身（PowerShell の`-EncodedCommand`など）があれば、ハーネスが機械的に
+    /// 解読したもの（表示と要約のため、照合に使わない）。
     #[serde(default)]
-    pub decoded_inline: Option<String>,
+    pub decoded: Vec<DecodedLayer>,
 }
 
 impl ProgramSubject {
@@ -146,7 +228,7 @@ impl ProgramSubject {
             files: Vec::new(),
             one_shot_only: runs_code,
             previews: Vec::new(),
-            decoded_inline: None,
+            decoded: Vec::new(),
         }
     }
 }

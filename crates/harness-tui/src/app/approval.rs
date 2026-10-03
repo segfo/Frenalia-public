@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use harness_core::{
-    escape_for_display, hole_accepts, PermissionSubject, RiskClass, RiskLevel, RiskVerdict,
+    escape_for_display, hole_accepts, DecodeOutcome, DecodedLayer, EncodedSource,
+    PermissionSubject, RiskClass, RiskLevel, RiskVerdict,
 };
 use harness_sandbox::textdiff::{diff_hunks, DiffKind};
 
@@ -154,6 +155,64 @@ impl ApprovalLine {
             candidate: None,
         }
     }
+}
+
+/// 解読した1段を、人に見せる行にする。段の深さだけ字下げして、どの段がどの段の中にあったかを見せる。
+///
+/// **`match`は網羅で書く**——解読の結果や書き方に種類を足したら、ここがビルドで落ちて文言の追随漏れが
+/// 分かる（`bug-pattern-rules` B-06 の「数えなくてよくする」）。要約へ回す英語の文言
+/// （`approvals.rs`の`decoded_pieces`）も同じ形で網羅している。
+fn decoded_layer_lines(layer: &DecodedLayer) -> Vec<ApprovalLine> {
+    let indent = "  ".repeat(layer.depth as usize);
+    let place = match layer.source {
+        EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => "の値",
+        EncodedSource::FromBase64String => "の引数",
+    };
+    let head = format!(
+        "{indent}{}段目: {} {place}",
+        layer.depth,
+        layer.source.spelling()
+    );
+    let reason = match &layer.outcome {
+        DecodeOutcome::Text { encoding, text } => {
+            let mut out = vec![ApprovalLine::new(
+                LineStyle::Warn,
+                format!("{head}（{}として読んだ）:", encoding.name()),
+            )];
+            out.extend(text.lines().map(|line| {
+                ApprovalLine::new(
+                    LineStyle::Normal,
+                    format!("{indent}    {}", escape_for_display(line)),
+                )
+            }));
+            return out;
+        }
+        DecodeOutcome::MissingValue => "値が続いていない（解読するものが無い）".to_string(),
+        DecodeOutcome::NotBase64 => {
+            "base64 として読めない（変数や式なら、中身は実行時に決まる）".to_string()
+        }
+        DecodeOutcome::NotText => {
+            "base64 は読めたが文字にならない（圧縮・暗号化された中身かもしれない）".to_string()
+        }
+        DecodeOutcome::NotLiteral => {
+            "引数が文字列そのものではない（中身は実行時に決まる）".to_string()
+        }
+        DecodeOutcome::DepthLimit { max_depth } => {
+            format!("入れ子が深すぎるので{max_depth}段で止めた（ここから先は解読していない）")
+        }
+        DecodeOutcome::SizeLimit { max_bytes } => {
+            format!(
+                "解読した中身が{max_bytes}バイトを超えたので止めた（ここから先は解読していない）"
+            )
+        }
+        DecodeOutcome::CountLimit { max_layers } => {
+            format!("符号化された箇所が多すぎるので{max_layers}個で止めた（ここから先は解読していない）")
+        }
+    };
+    vec![ApprovalLine::new(
+        LineStyle::Warn,
+        format!("{head}: {reason}"),
+    )]
 }
 
 /// 前回の承認で残した写し1件（差分表示用）。読めなければ理由。
@@ -523,18 +582,6 @@ impl PermissionView {
                 if p.args.is_empty() {
                     out.push(ApprovalLine::new(LineStyle::Dim, "  （引数なし）"));
                 }
-                if let Some(decoded) = &p.decoded_inline {
-                    out.push(ApprovalLine::new(
-                        LineStyle::Warn,
-                        "-EncodedCommand を解読した中身:",
-                    ));
-                    for line in decoded.lines() {
-                        out.push(ApprovalLine::new(
-                            LineStyle::Warn,
-                            format!("  {}", escape_for_display(line)),
-                        ));
-                    }
-                }
                 if p.runs_code && p.one_shot_only {
                     out.push(ApprovalLine::new(
                         LineStyle::Warn,
@@ -551,10 +598,39 @@ impl PermissionView {
                 out.push(ApprovalLine::new(LineStyle::Normal, escape_for_display(t)))
             }
         }
+        out.extend(self.decoded_lines());
         out.extend(self.bound_file_lines());
         out.extend(self.summary_lines(clock));
         out.extend(self.pane_lines());
         out
+    }
+
+    /// 符号化された中身を、ハーネスが解読したもの（§4.4。[BUG-224]）。**`run_shell`の行と
+    /// `run_program`の引数の両方で同じ形で出す**——出す場所が片方だけだと、同じ中身を
+    /// `run_shell`に書くだけで読めない塊のまま承認させられる。
+    ///
+    /// 解読できなかったこと・上限で止めたことも1行として出す（黙って落とすと、見る人には
+    /// 「符号化された中身は無かった」と区別がつかない）。
+    fn decoded_lines(&self) -> Vec<ApprovalLine> {
+        let decoded = self.decoded();
+        if decoded.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![ApprovalLine::new(
+            LineStyle::Heading,
+            "符号化された中身（ハーネスが機械的に解読した。照合には使わない）",
+        )];
+        out.extend(decoded.iter().flat_map(decoded_layer_lines));
+        out
+    }
+
+    /// 解読した段（材料の変種によらず同じ欄を見る）。
+    fn decoded(&self) -> &[DecodedLayer] {
+        match &self.subject {
+            PermissionSubject::Command(c) => &c.decoded,
+            PermissionSubject::Program(p) => &p.decoded,
+            _ => &[],
+        }
     }
 
     fn bound_file_lines(&self) -> Vec<ApprovalLine> {

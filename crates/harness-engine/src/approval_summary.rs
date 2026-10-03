@@ -62,6 +62,10 @@ Rules:\n\
 credential or environment-variable access, process or service creation, privilege changes, \
 encoded or obfuscated payloads.\n\
 - If something looks deliberately hidden or misleading, say so plainly.\n\
+- Encoded payloads are decoded for you by the harness and given as separate material labelled \
+\"decoded by the harness\". Never decode base64 or any other encoding yourself: say what the \
+decoded material does. If a payload is labelled as one the harness could not decode, report that \
+it is encoded and unreadable — do not guess what it contains.\n\
 - Be concise: at most 8 short lines. Output only the summary.";
 
 /// 要約に回す材料1つ。

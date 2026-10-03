@@ -22,6 +22,9 @@
 pub mod approval_binding;
 mod can_run_program;
 mod dial;
+/// PowerShell が符号化して受け取るコード（`-EncodedCommand`等）の綴りの判定と解読。
+/// **T-09の検出（`harness-engine`）と承認画面の表示が同じ綴りの表を見るための公開**である（B-05）。
+pub mod encoded_command;
 pub mod fake_dns;
 mod fs_tools;
 pub mod net_proxy;

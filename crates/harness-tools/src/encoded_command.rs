@@ -1,0 +1,693 @@
+//! PowerShell が符号化して受け取るコード（`-EncodedCommand`等）を、**機械的に解読して見せる**
+//! （`plans/DESIGN-RUNSHELL-ALLOWLIST.md` §4.4、T-09＝`plans/DESIGN-SANDBOX.md` §6.4）。
+//!
+//! # 何のためにあるのか
+//!
+//! 承認を求める画面は「人を輪の中に残す」ための道具である（§0）。ところが
+//! `pwsh --enc cwB5AHMAdABlAG0AaQBuAGYAbwA=` のような行は、**人にもモデルにも中身が読めない**。
+//! 実際に起きたこと（[BUG-224](../../../docs/bugs/BUG-224.md)）——画面には符号化された塊がそのまま出て、
+//! 要約する LLM が自分で解読しようとして**間違えた**（中身は`systeminfo`なのに「`Write-Hello`」と書いた）。
+//! 読めないものを承認させているあいだ、承認は形だけになる。
+//!
+//! だからハーネスが**自分で**解読して、段ごとに並べて出す。解読した中身にさらに符号化された箇所があれば
+//! 続けて解読する（2段目・3段目…）。解読できなかったこと・上限で止めたことも1段として残す
+//! ——黙って落とすと、見る人には「符号化された中身は無かった」と区別がつかない。
+//!
+//! # ここが引き受ける2つの仕事
+//!
+//! 1. **綴りの判定**（[`encoded_switch`]）。PowerShell が `-EncodedCommand` として受け付ける
+//!    省略形を1箇所で決める。T-09の検出（`harness-engine`の`looks_like_allowlist_bypass`が呼ぶ
+//!    [`line_has_encoded_switch`]）と、承認画面の解読が**同じこの関数**を通る——綴りの一覧を2箇所に
+//!    持つと静かにずれる（`B-05`。[BUG-222](../../../docs/bugs/BUG-222.md)）
+//! 2. **解読**（[`decode_shell_line`]・[`decode_program_args`]）。段ごとに[`DecodedLayer`]を返す
+//!
+//! # 照合には使わない
+//!
+//! 解読した中身は**表示と要約のためだけ**である（[`harness_core::FilePreview`]と同じ立場）。
+//! 承認の判定が見るのは行そのものと縛ったファイルのハッシュで、ここが何を返しても自動承認は広がらない。
+//! T-09 が使うのは「符号化のスイッチがあるか」の真偽だけで、これも**聞く方向にしか働かない**。
+//!
+//! # 受け付ける綴り（2026-10-04 に実測した。pwsh 7.6.6・Windows PowerShell 5.1）
+//!
+//! 子の PowerShell へ argv を直接渡し、符号化したコードが走ったかで見た。
+//!
+//! | 形 | pwsh | 5.1 |
+//! |---|---|---|
+//! | `-EncodedCommand`の接頭辞（`-e`・`-en`・`-enc`・`-encoded`…）・大小無視 | 走る | 走る |
+//! | `-ec`（頭文字の略。接頭辞ではない） | 走る | 走る |
+//! | `/enc`・`/ec`（スラッシュ） | 走る | 走る |
+//! | `–enc`（U+2013・U+2014・U+2015 のダッシュ1つ） | 走る | 走る |
+//! | **前後に空白の付いた引数**（`' -enc'`・`'-enc '`・タブ） | 走る | 走る |
+//! | `--enc`・`--ec`（ハイフン2つ）・`––enc`（同じダッシュ2つ） | 走る | 走らない |
+//! | `---enc`・`//enc`・`-–enc`（3つ以上・違う文字を混ぜる） | 走らない | 走らない |
+//! | `-enc:<値>`（コロンで繋ぐ）・`-ecx` | 走らない | 走らない |
+//! | `-ea`・`-encodeda`…＝`-EncodedArguments`（`/ea`も） | 走る | 走る |
+//! | `--ea` | 走る | 走らない |
+//! | `-c pwsh -enc <値>`（`-Command`の後ろで2つ目を起こす） | 走る | 走る |
+//! | `-NoProfile x.ps1 -e <値>`・`-File x.ps1 -e <値>`（ファイルの後ろ） | 走らない | 走らない |
+//!
+//! **どちらかが走るものは全部検出する**（片方でしか走らない形でも、走る側で素通りさせない）。
+//!
+//! 行を読む側（`run_shell`の行を実行する PowerShell）についても実測した: **`‘-e’`・`“-e”`
+//! （U+2018〜U+201E の引用符）は普通の引用符として剥がされ**、子には`-e`が渡って走った。
+//! `[Diagnostics.Process]::Start('pwsh', '-e <値>')`・`pwsh -c 'pwsh -e <値>'`・`pwsh --% -e <値>`・
+//! `pwsh @('-e', '<値>')`も走った。
+//!
+//! # 行の割り方
+//!
+//! `approval_binding`の`shell_tokens`（字面に出るファイルを縛るための割り方）とは別に持つ。あちらは
+//! 引用符の中まで割る——ファイルの参照を広く拾う方が聞く方向に倒れるからである。ここは逆に、
+//! **引用符の中を1語に保たないと`& 'C:\Program Files\PowerShell\7\pwsh.exe' -e …`の起動が読めない**。
+//! 約束が逆なので、1つへ畳まない。
+//!
+//! # 限界（同じ場所で言う）
+//!
+//! - **字面に出るものしか解読できない。** 変数・連結・実行時に組み立てる式（`$b='c'+'wB5'`・
+//!   `pwsh @a`・`-e$x`）は読めない。見落としても結果は「元どおり記録との完全一致」に戻るだけである
+//! - **PowerShell の起動を名前で見る**（`pwsh`・`powershell`、`.exe`・パス付き）。8.3 の短い名前
+//!   （`POWERS~1.EXE`）・別名を付けた写し・`dotnet pwsh.dll`は見ない
+//! - **PowerShell が受け付けない形まで解読して見せることがある**（詰め物`=`を欠く base64 など）。
+//!   表示は広い側へ倒す——解読できたものを隠さない
+//! - **`run_program`で`powershell`（5.1）へ位置引数でコードを渡すとき、引数を1つずつ読む。**
+//!   5.1 は位置引数の残りを空白で繋いでコードにするので、複数の引数にまたがる起動は見落とす
+//! - **これは検出であって境界ではない**（§0・D-14）。綴りの網から漏れた形は元の照合に戻るだけである
+
+use harness_core::{DecodeOutcome, DecodedLayer, EncodedSource, TextEncoding};
+
+/// 解読する段の深さの上限。これより深い段は解読せず、[`DecodeOutcome::DepthLimit`]を残して止める。
+pub const MAX_DECODE_DEPTH: u32 = 4;
+/// 解読した中身の合計の上限（バイト）。超えたら[`DecodeOutcome::SizeLimit`]を残して止める。
+pub const MAX_DECODED_BYTES: usize = 64 * 1024;
+/// 残す段の数の上限。超えたら[`DecodeOutcome::CountLimit`]を残して止める。
+pub const MAX_DECODED_LAYERS: usize = 16;
+/// 引用符の中をさらに行として読む深さの上限。
+///
+/// **実際の行はこの深さに届かない。** 引用符は2種類しかなく、2段下の同じ種類の引用符は`''`・`""`と
+/// 重ねて書くしかないので、入れ子は2段ごとに長さが倍になる（64段には 2^32 バイト級の行が要る）。
+/// 届かない上限を置くのは、割り方を直し損ねて再帰が線形に積み上がる形になったときにスタックを守るため。
+/// **小さくしない**——以前の版の 8 は数百バイトの行で届き、その下に置いた`pwsh -e`を見落とした。
+const MAX_QUOTE_NESTING: u32 = 64;
+
+/// `program`が PowerShell か（ディレクトリ・`.exe`・大小を畳んだ名前の完全一致）。
+///
+/// `harness_core::is_interpreter_program`より狭い——**符号化の綴りは PowerShell のものだから**、
+/// `python`や`cmd`の`-e`を拾わないようにここで絞る。
+pub fn is_powershell(program: &str) -> bool {
+    let name = program.rsplit(['\\', '/']).next().unwrap_or(program);
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    stem == "pwsh" || stem == "powershell"
+}
+
+/// 1つの引数が、符号化された値を取る PowerShell のスイッチか（モジュールdocの表）。
+///
+/// **T-09の検出と承認画面の解読が、同じこの関数で綴りを決める**（`B-05`）。
+pub fn encoded_switch(arg: &str) -> Option<EncodedSource> {
+    let name = switch_name(arg)?;
+    // `-ec`・`-ea`は頭文字の略で、接頭辞ではないので名指しする。`-e`は PowerShell が
+    // `-ExecutionPolicy`（`-ex`から）より先に`-EncodedCommand`へ解く。
+    if name == "ec" || "encodedcommand".starts_with(&name) {
+        return Some(EncodedSource::EncodedCommand);
+    }
+    // `-encoded`までは上で`-EncodedCommand`に取られるので、ここへ来るのは`-encodeda`以上の長さだけ。
+    if name == "ea" || "encodedarguments".starts_with(&name) {
+        return Some(EncodedSource::EncodedArguments);
+    }
+    None
+}
+
+/// 残りの引数を PowerShell がどう受け取るか（スイッチとしては読まないもの）。
+enum Rest {
+    /// `-Command`・`-CommandWithArgs`: 残りはコード。
+    Code,
+    /// `-File`: 残りはスクリプトとその引数。
+    Script,
+}
+
+/// 残りをコードやファイルとして受け取るスイッチか。ここから先の語は**そのコードの一部**なので、
+/// PowerShell の起動のスイッチとしては読まない——読むと`Get-ChildItem -ea Stop`の`-ea`を
+/// `-EncodedArguments`と取り違える。逆に、**コードの中で起こした2つ目の PowerShell は読む**
+/// （実測: `pwsh -c pwsh -enc <値>`は走る）。
+fn rest_of_arguments(arg: &str) -> Option<Rest> {
+    let name = switch_name(arg)?;
+    // `-c`〜`-command`は`-ConfigurationName`（`-config`から）とぶつからない。実測で`-co`は`-Command`。
+    if "command".starts_with(&name) || name == "cwa" || name == "commandwithargs" {
+        return Some(Rest::Code);
+    }
+    if "file".starts_with(&name) {
+        return Some(Rest::Script);
+    }
+    None
+}
+
+/// スイッチの名前（前置きを剥がし、小文字にしたもの）。スイッチの形でなければ`None`。
+///
+/// **PowerShell は引数の前後の空白を削ってから見る**（実測: `' -enc'`でも走る）ので、ここも削る。
+fn switch_name(arg: &str) -> Option<String> {
+    let name = strip_switch_prefix(arg.trim())?;
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(name.to_ascii_lowercase())
+}
+
+/// スイッチの前置き（`-`・`--`・`/`・U+2013〜U+2015 のダッシュ1〜2つ）を剥がす。
+///
+/// **同じ文字の繰り返しだけを認める**（実測: `---enc`・`//enc`・`-–enc`はどちらの PowerShell でも
+/// スイッチにならない）。`/`は1つだけ。2つ重ねは pwsh だけが受けるが、検出は広い側に合わせる。
+fn strip_switch_prefix(arg: &str) -> Option<&str> {
+    let mut chars = arg.chars();
+    let first = chars.next()?;
+    let max_repeat = match first {
+        '-' | '\u{2013}' | '\u{2014}' | '\u{2015}' => 2,
+        '/' => 1,
+        _ => return None,
+    };
+    let mut prefix_len = first.len_utf8();
+    let mut repeat = 1;
+    for c in chars {
+        if c == first && repeat < max_repeat {
+            repeat += 1;
+            prefix_len += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    Some(&arg[prefix_len..])
+}
+
+/// `run_shell`の行に、PowerShell の符号化スイッチが字面で現れるか（T-09）。
+///
+/// **聞く方向にしか働かない**（`DESIGN-RUNSHELL-ALLOWLIST.md` §0）。PowerShell の起動に続く引数
+/// としてだけ見るので、`grep -e foo`・`git log -e`のような**別のコマンドの`-e`**は拾わない。
+/// 引用符の中（`cmd /c "pwsh -e …"`・`pwsh -c 'pwsh -e …'`）も行として読む。
+pub fn line_has_encoded_switch(line: &str) -> bool {
+    scan_text(line).iter().any(|f| {
+        matches!(
+            f.source,
+            EncodedSource::EncodedCommand | EncodedSource::EncodedArguments
+        )
+    })
+}
+
+/// `run_shell`の行を解読する（段ごと。見つからなければ空）。
+pub fn decode_shell_line(line: &str) -> Vec<DecodedLayer> {
+    decode_found(scan_text(line))
+}
+
+/// `run_program`の引数を解読する（段ごと）。
+///
+/// `program`が PowerShell なら、引数をそのまま PowerShell の起動のスイッチとして読み、`-Command`の
+/// 残りは PowerShell と同じく空白で繋いでコードとして読む。スイッチでない引数（スイッチの値・5.1 の
+/// 位置引数のコード）も行として読む——`pwsh -c "…FromBase64String('…')…"`のように、コードそのものを
+/// 引数で渡す形があるため。PowerShell でなければ（`cmd /c pwsh -e …`）、引数を空白で繋いだ行として読む。
+pub fn decode_program_args(program: &str, args: &[String]) -> Vec<DecodedLayer> {
+    let found = match is_powershell(program) {
+        true => scan_powershell_args(args),
+        false => scan_text(&args.join(" ")),
+    };
+    decode_found(found)
+}
+
+fn decode_found(found: Vec<Found>) -> Vec<DecodedLayer> {
+    let mut decoder = Decoder::default();
+    decoder.walk(found, 1);
+    decoder.layers
+}
+
+/// 解読の進み具合（上限の勘定を1箇所に持つ）。
+#[derive(Default)]
+struct Decoder {
+    layers: Vec<DecodedLayer>,
+    decoded_bytes: usize,
+    /// 上限で止めた。これ以降は1段も解読しない（止めたことは最後の段に残っている）。
+    stopped: bool,
+}
+
+impl Decoder {
+    /// この段で見つかったものを順に解読し、読めた中身をさらに1段深く読む。
+    fn walk(&mut self, found: Vec<Found>, depth: u32) {
+        for f in found {
+            if self.stopped {
+                return;
+            }
+            if depth > MAX_DECODE_DEPTH {
+                self.stop(
+                    depth,
+                    f.source,
+                    DecodeOutcome::DepthLimit {
+                        max_depth: MAX_DECODE_DEPTH,
+                    },
+                );
+                return;
+            }
+            if self.layers.len() >= MAX_DECODED_LAYERS {
+                self.stop(
+                    depth,
+                    f.source,
+                    DecodeOutcome::CountLimit {
+                        max_layers: MAX_DECODED_LAYERS,
+                    },
+                );
+                return;
+            }
+            let outcome = self.decode_one(&f);
+            let next = match &outcome {
+                DecodeOutcome::Text { text, .. } => scan_text(text),
+                _ => Vec::new(),
+            };
+            self.layers.push(DecodedLayer {
+                depth,
+                source: f.source,
+                outcome,
+            });
+            if !next.is_empty() {
+                self.walk(next, depth + 1);
+            }
+        }
+    }
+
+    fn stop(&mut self, depth: u32, source: EncodedSource, outcome: DecodeOutcome) {
+        self.layers.push(DecodedLayer {
+            depth,
+            source,
+            outcome,
+        });
+        self.stopped = true;
+    }
+
+    fn decode_one(&mut self, f: &Found) -> DecodeOutcome {
+        let text = match &f.value {
+            Value::Missing => return DecodeOutcome::MissingValue,
+            Value::NotLiteral => return DecodeOutcome::NotLiteral,
+            Value::Text(text) => text,
+        };
+        let Some(bytes) = base64_decode(text) else {
+            return DecodeOutcome::NotBase64;
+        };
+        if self.decoded_bytes + bytes.len() > MAX_DECODED_BYTES {
+            self.stopped = true;
+            return DecodeOutcome::SizeLimit {
+                max_bytes: MAX_DECODED_BYTES,
+            };
+        }
+        self.decoded_bytes += bytes.len();
+        match as_text(&bytes, f.source) {
+            Some((encoding, text)) => DecodeOutcome::Text { encoding, text },
+            None => DecodeOutcome::NotText,
+        }
+    }
+}
+
+/// 解読したバイト列を文字として読む。読めなければ`None`。
+///
+/// - **`-EncodedCommand`・`-EncodedArguments`は、PowerShell が必ず UTF-16LE として読む**ので、
+///   その読み方のまま出す（読めない符号単位は U+FFFD）。「文字に見えるか」で判定しない——判定すると、
+///   制御文字を混ぜるだけで「文字にならない」と表示させて中身を隠せる
+/// - **`FromBase64String`の結果は、後ろのコードがどう読むか次第**（UTF-8・UTF-16LE・圧縮・実行ファイル）
+///   なので、厳密に読めて文字に見える方のうち、ASCII の割合が高い方を採る。どちらも文字に見えなければ`None`
+fn as_text(bytes: &[u8], source: EncodedSource) -> Option<(TextEncoding, String)> {
+    match source {
+        EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => {
+            Some((TextEncoding::Utf16Le, utf16le_lossy(bytes)))
+        }
+        EncodedSource::FromBase64String => {
+            let utf8 = std::str::from_utf8(bytes).ok().map(str::to_string);
+            let utf16 = bytes
+                .len()
+                .is_multiple_of(2)
+                .then(|| String::from_utf16(&utf16_units(bytes)).ok())
+                .flatten();
+            [(TextEncoding::Utf8, utf8), (TextEncoding::Utf16Le, utf16)]
+                .into_iter()
+                .filter_map(|(encoding, text)| text.map(|t| (encoding, t)))
+                .filter(|(_, text)| looks_like_text(text))
+                .max_by(|a, b| ascii_ratio(&a.1).total_cmp(&ascii_ratio(&b.1)))
+        }
+    }
+}
+
+fn utf16_units(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
+}
+
+/// PowerShell（`Encoding.Unicode.GetString`）と同じく、読めない符号単位と奇数の最後の1バイトを
+/// U+FFFD にして読む。
+fn utf16le_lossy(bytes: &[u8]) -> String {
+    let mut text = String::from_utf16_lossy(&utf16_units(bytes));
+    if !bytes.len().is_multiple_of(2) {
+        text.push('\u{FFFD}');
+    }
+    text
+}
+
+/// 文字として見せられるか（空でなく、制御文字が1割以下）。UTF-16LE の ASCII を UTF-8 として読むと
+/// 半分が NUL になり、圧縮した中身を UTF-16LE として読むと制御文字が混ざるので、ここで落ちる。
+fn looks_like_text(text: &str) -> bool {
+    let total = text.chars().count();
+    let unreadable = text
+        .chars()
+        .filter(|&c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+        .count();
+    total > 0 && unreadable * 10 <= total
+}
+
+/// ASCII の印字可能文字（と改行・タブ）の割合。どちらの読み方かを選ぶのに使う。
+fn ascii_ratio(text: &str) -> f32 {
+    let total = text.chars().count();
+    if total == 0 {
+        return 0.0;
+    }
+    let ascii = text
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || matches!(c, ' ' | '\t' | '\n' | '\r'))
+        .count();
+    ascii as f32 / total as f32
+}
+
+/// 行の中に見つけた、符号化された中身1つ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Found {
+    source: EncodedSource,
+    value: Value,
+}
+
+/// 見つけた箇所の値。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Value {
+    /// 綴りの後ろに値が無い。
+    Missing,
+    /// `FromBase64String`の引数が、字面で決まる文字列ではない（変数・連結・展開する文字列）。
+    NotLiteral,
+    Text(String),
+}
+
+/// 行を割った語1つ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Word {
+    /// 引用符を剥がした中身。
+    text: String,
+    /// 引用符で囲まれた部分を含んでいたか（中身をさらに行として読むかの判定に使う）。
+    quoted: bool,
+    /// 語全体が1組の引用符だけでできていて、展開する部分（二重引用符の中の`$`）を含まないか。
+    /// `'abc'`は真、`'ab'+'cd'`・`ab'cd'`・`"$x"`は偽。`FromBase64String`の引数が字面で決まるかに使う。
+    literal: bool,
+}
+
+/// 語か、文の区切りか、まとまりの記号か。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token {
+    Word(Word),
+    /// `;`・`|`・`&`・改行。**ここで PowerShell の引数は終わる**——これを跨いで引数を数えると、
+    /// `pwsh -c Get-Date; grep -e foo`の`-e`を PowerShell のスイッチとして読んでしまう。
+    Separator,
+    /// `(`・`)`・`{`・`}`・`,`・`=`・`<`・`>`（と`>&`の`&`）。語を切るが、**文は切らない**——
+    /// `FromBase64String('…')`の値はこの括弧の向こうにあり、`2>&1`の後ろにも同じ起動の引数が続く。
+    Group(char),
+}
+
+/// 文字列を行として読み、符号化された中身を探す。
+fn scan_text(text: &str) -> Vec<Found> {
+    scan(text, false, 0)
+}
+
+/// `in_powershell`は、行の頭が既に PowerShell の起動の引数の中か（引用符の中を読み直すとき）。
+fn scan(text: &str, in_powershell: bool, nesting: u32) -> Vec<Found> {
+    let tokens = tokenize(text);
+    let mut out = Vec::new();
+    let mut in_powershell = in_powershell;
+    let mut i = 0;
+    while i < tokens.len() {
+        let word = match &tokens[i] {
+            Token::Separator => {
+                in_powershell = false;
+                i += 1;
+                continue;
+            }
+            Token::Group(_) => {
+                i += 1;
+                continue;
+            }
+            Token::Word(word) => word,
+        };
+        // `[Convert]::FromBase64String('…')` は PowerShell の起動と関係なく現れる。
+        if is_from_base64_call(&word.text) {
+            let (value, next) = call_argument(&tokens, i);
+            out.push(Found {
+                source: EncodedSource::FromBase64String,
+                value,
+            });
+            i = next;
+            continue;
+        }
+        if in_powershell {
+            if let Some(source) = encoded_switch(&word.text) {
+                let (value, next) = switch_value(&tokens, i);
+                out.push(Found { source, value });
+                i = next;
+                continue;
+            }
+            if rest_of_arguments(&word.text).is_some() {
+                // 残りはコード（またはスクリプトの引数）。新しい文として読み直す。
+                in_powershell = false;
+            } else if word.quoted {
+                // `Process.Start('pwsh', '-NoProfile -e …')`: 引数の並びを1つの文字列で渡す形。
+                // スイッチで始まるときだけ、同じ起動の続きとして読む。
+                let continues = strip_switch_prefix(word.text.trim()).is_some();
+                out.extend(scan_quoted(&word.text, continues, nesting));
+            }
+        } else if is_powershell(&word.text) {
+            in_powershell = true;
+        } else if word.quoted {
+            // `cmd /c "pwsh -e …"`・`ssh host 'pwsh -e …'`: 文字列の中で起こす形。
+            out.extend(scan_quoted(&word.text, false, nesting));
+        }
+        i += 1;
+    }
+    out
+}
+
+fn scan_quoted(text: &str, in_powershell: bool, nesting: u32) -> Vec<Found> {
+    if nesting >= MAX_QUOTE_NESTING {
+        return Vec::new();
+    }
+    scan(text, in_powershell, nesting + 1)
+}
+
+/// `run_program`の PowerShell の引数（既に1要素ずつに割れている）から探す。
+fn scan_powershell_args(args: &[String]) -> Vec<Found> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some(source) = encoded_switch(arg) {
+            let value = args
+                .get(i + 1)
+                .map_or(Value::Missing, |v| Value::Text(v.clone()));
+            out.push(Found { source, value });
+            i += 2;
+            continue;
+        }
+        match rest_of_arguments(arg) {
+            // PowerShell は`-Command`の残りを空白で繋いで1つのコードにする。
+            Some(Rest::Code) => {
+                out.extend(scan_text(&args[i + 1..].join(" ")));
+                return out;
+            }
+            Some(Rest::Script) => return out,
+            None => {}
+        }
+        if switch_name(arg).is_none() {
+            out.extend(scan_text(arg));
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `[Convert]::FromBase64String` の呼び出しの綴りか（名前空間の有無・大小を問わない）。
+fn is_from_base64_call(word: &str) -> bool {
+    word.to_ascii_lowercase().ends_with("frombase64string")
+}
+
+/// スイッチの値（括弧は跨ぐが、**文の区切りは跨がない**）と、その次の位置。
+fn switch_value(tokens: &[Token], i: usize) -> (Value, usize) {
+    for (j, token) in tokens.iter().enumerate().skip(i + 1) {
+        match token {
+            Token::Group(_) => continue,
+            Token::Word(w) => return (Value::Text(w.text.clone()), j + 1),
+            Token::Separator => return (Value::Missing, j),
+        }
+    }
+    (Value::Missing, tokens.len())
+}
+
+/// `FromBase64String(…)`の引数と、その次の位置。**`('…')`の形のときだけ値になる**——
+/// `('ab'+'cd')`・`($s)`・`("$x")`・括弧の無い参照（`$f = [Convert]::FromBase64String`）は
+/// 実行時に決まるので、字面を解読すると別物を見せてしまう。
+fn call_argument(tokens: &[Token], i: usize) -> (Value, usize) {
+    match tokens.get(i + 1..i + 4) {
+        Some([Token::Group('('), Token::Word(w), Token::Group(')')]) if w.literal => {
+            (Value::Text(w.text.clone()), i + 4)
+        }
+        _ => (Value::NotLiteral, i + 1),
+    }
+}
+
+/// 引用符の種類。PowerShell は U+2018〜U+201B を`'`と、U+201C〜U+201E を`"`と同じに読む
+/// （実測: `pwsh ‘-e’ <値>`は子へ`-e`を渡して走った）。開けた文字と閉じる文字は違ってよい。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quote {
+    Single,
+    Double,
+}
+
+fn quote_of(c: char) -> Option<Quote> {
+    match c {
+        '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => Some(Quote::Single),
+        '"' | '\u{201C}' | '\u{201D}' | '\u{201E}' => Some(Quote::Double),
+        _ => None,
+    }
+}
+
+/// 組み立て中の語。
+#[derive(Default)]
+struct WordBuilder {
+    text: String,
+    /// 引用符の組の数。
+    spans: u32,
+    /// 引用符の外の文字があったか。
+    bare: bool,
+    /// 二重引用符の中に`$`があったか（PowerShell が展開する）。
+    expands: bool,
+}
+
+impl WordBuilder {
+    fn push_bare(&mut self, c: char) {
+        self.text.push(c);
+        self.bare = true;
+    }
+
+    fn finish(&mut self, out: &mut Vec<Token>) {
+        let word = std::mem::take(self);
+        if !word.text.is_empty() || word.spans > 0 {
+            out.push(Token::Word(Word {
+                literal: word.spans == 1 && !word.bare && !word.expands,
+                quoted: word.spans > 0,
+                text: word.text,
+            }));
+        }
+    }
+}
+
+/// 行を語と区切りへ割る（PowerShell の読み方に寄せる）。
+///
+/// - 引用符（`'`・`"`と、同じに読まれる U+2018〜U+201E）の中は割らない。引用符は剥がし、
+///   囲まれていたことは[`Word::quoted`]に残す。同じ種類の引用符を2つ重ねたもの（`''`）はその文字自身
+/// - バッククォートは次の1文字をそのまま語へ入れる（二重引用符の中でも）。**行末のバッククォートは
+///   行の継続**で、文を切らない——切ると`pwsh `⏎`-e …`の`-e`を別の文として読み落とす
+/// - `>&`の`&`はリダイレクト（`2>&1`）で、文を切らない
+fn tokenize(line: &str) -> Vec<Token> {
+    let mut out = Vec::new();
+    let mut word = WordBuilder::default();
+    let mut in_quote: Option<Quote> = None;
+    let mut prev: Option<char> = None;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if let Some(q) = in_quote {
+            if quote_of(c) == Some(q) {
+                match chars.peek().copied().filter(|&n| quote_of(n) == Some(q)) {
+                    Some(n) => {
+                        chars.next();
+                        word.text.push(n);
+                    }
+                    None => in_quote = None,
+                }
+            } else if c == '`' && q == Quote::Double {
+                if let Some(n) = chars.next() {
+                    word.text.push(n);
+                }
+            } else {
+                if c == '$' && q == Quote::Double {
+                    word.expands = true;
+                }
+                word.text.push(c);
+            }
+            continue;
+        }
+        match c {
+            c if quote_of(c).is_some() => {
+                in_quote = quote_of(c);
+                word.spans += 1;
+            }
+            '`' => match chars.next() {
+                Some('\n') => word.finish(&mut out),
+                Some('\r') => {
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    word.finish(&mut out);
+                }
+                Some(n) => word.push_bare(n),
+                None => {}
+            },
+            '&' if prev == Some('>') => {
+                word.finish(&mut out);
+                out.push(Token::Group(c));
+            }
+            ';' | '|' | '&' | '\n' | '\r' => {
+                word.finish(&mut out);
+                out.push(Token::Separator);
+            }
+            '(' | ')' | '{' | '}' | ',' | '=' | '<' | '>' => {
+                word.finish(&mut out);
+                out.push(Token::Group(c));
+            }
+            c if c.is_whitespace() => word.finish(&mut out),
+            c => word.push_bare(c),
+        }
+        prev = Some(c);
+    }
+    word.finish(&mut out);
+    out
+}
+
+/// 標準の base64（`+/`、`=`の詰め物は任意）。空白は読み飛ばす。読めなければ・空なら`None`。
+///
+/// **詰め物を欠くものも読む。** PowerShell はそれを断るが、ここは表示のためなので広い側へ倒す
+/// （読めたものを隠さない）。
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    fn value(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+    let mut out = Vec::new();
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for c in text
+        .bytes()
+        .filter(|c| !c.is_ascii_whitespace() && *c != b'=')
+    {
+        acc = (acc << 6) | value(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+#[cfg(test)]
+#[path = "encoded_command_tests.rs"]
+mod tests;

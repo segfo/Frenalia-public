@@ -34,7 +34,8 @@ pub use net_policy::{
     DomainPolicyDecision,
 };
 pub use permission_subject::{
-    BoundFile, CommandSubject, FilePreview, PermissionSubject, ProgramSubject,
+    BoundFile, CommandSubject, DecodeOutcome, DecodedLayer, EncodedSource, FilePreview,
+    PermissionSubject, ProgramSubject, TextEncoding,
 };
 pub use program_rule::{
     escape_for_display, fold_path_for_rule, hole_accepts, is_format_char, ArgPattern, ProgramRule,

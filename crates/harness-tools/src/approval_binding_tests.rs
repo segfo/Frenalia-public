@@ -1,4 +1,4 @@
-//! `approval_binding`の回帰テスト。内部関数（`is_plain_option`・`shell_tokens`・`base64_decode`）へ
+//! `approval_binding`の回帰テスト。内部関数（`is_plain_option`・`shell_tokens`）へ
 //! 触れるため`#[cfg(test)]`のまま別ファイルへ分けている（`docs/CODE-STRUCTURE-RULES.md`規則2）。
 
 use super::*;
@@ -233,30 +233,6 @@ fn the_staged_view_reads_the_real_file_because_the_child_does() {
     let view = ChildView::for_ctx(&ctx).unwrap();
     let f = file_of(bind_path(&view, dir.path(), "build.py", false));
     assert_eq!(f.sha256, sha256_hex(b"print('build')"));
-}
-
-#[test]
-fn encoded_commands_are_decoded_for_display() {
-    // "Get-Date" を UTF-16LE で base64 にしたもの。
-    let encoded = "RwBlAHQALQBEAGEAdABlAA==";
-    for flag in ["-EncodedCommand", "-enc", "-e", "-ec", "-ENC", "/enc"] {
-        let args = vec![
-            "-NoProfile".to_string(),
-            flag.to_string(),
-            encoded.to_string(),
-        ];
-        assert_eq!(
-            decode_encoded_command(&args).as_deref(),
-            Some("Get-Date"),
-            "{flag}"
-        );
-    }
-    let args = vec!["-ExecutionPolicy".to_string(), "Bypass".to_string()];
-    assert_eq!(decode_encoded_command(&args), None);
-    assert_eq!(
-        decode_encoded_command(&["-enc".to_string(), "!!".to_string()]),
-        None
-    );
 }
 
 #[test]

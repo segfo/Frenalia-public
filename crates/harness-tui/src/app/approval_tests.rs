@@ -313,3 +313,67 @@ fn the_time_it_took_stays_after_the_summary_is_done() {
     };
     assert!(body_text(&v).contains("要約を作れなかった（2.0s）: 接続できない"));
 }
+
+/// [BUG-224] `run_shell`の承認でも、ハーネスが解読した中身を**段ごとに**出す（以前は`run_program`にしか
+/// 無く、`run_shell`の行は符号化された塊のまま承認させていた）。2段目は1段目より深く字下げする。
+/// 解読できなかった段も出す。符号化の無い行には何も足さない（対照）。
+#[test]
+fn a_shell_lines_encoded_payload_is_shown_decoded_layer_by_layer() {
+    use harness_tools::encoded_command::decode_shell_line;
+    let with_line = |line: &str| {
+        let mut c = CommandSubject::line_only(line);
+        c.decoded = decode_shell_line(line);
+        body_text(&view(PermissionSubject::Command(c)))
+    };
+
+    // 2段: 1段目は`pwsh -enc …`、その中の2段目が`systeminfo`。
+    let text = with_line(
+        "powershell -ec cAB3AHMAaAAgAC0AZQBuAGMAIABjAHcAQgA1AEEASABNAEEAZABBAEIAbABBAEcAMABBAGEAUQBCAHUAQQBHAFkAQQBiAHcAQQA9AA==",
+    );
+    assert!(
+        text.contains("符号化された中身（ハーネスが機械的に解読した"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  1段目: -EncodedCommand の値（UTF-16LEとして読んだ）:"),
+        "{text}"
+    );
+    assert!(
+        text.contains("      pwsh -enc cwB5AHMAdABlAG0AaQBuAGYAbwA="),
+        "{text}"
+    );
+    assert!(
+        text.contains("    2段目: -EncodedCommand の値（UTF-16LEとして読んだ）:"),
+        "{text}"
+    );
+    assert!(text.contains("        systeminfo"), "{text}");
+
+    let text = with_line("pwsh -enc $payload; [Convert]::FromBase64String($b)");
+    assert!(
+        text.contains("1段目: -EncodedCommand の値: base64 として読めない"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1段目: [Convert]::FromBase64String の引数: 引数が文字列そのものではない"),
+        "{text}"
+    );
+
+    assert!(!with_line("git status").contains("符号化された中身"));
+}
+
+/// `run_program`の承認も同じ形で出す（表示は材料の変種によらず1か所）。
+#[test]
+fn a_programs_encoded_argument_is_shown_decoded_in_the_same_form() {
+    let args: Vec<String> = ["-NoProfile", "-enc", "cwB5AHMAdABlAG0AaQBuAGYAbwA="]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    let mut p = ProgramSubject::plain("pwsh", args.clone());
+    p.decoded = harness_tools::encoded_command::decode_program_args("pwsh", &args);
+    let text = body_text(&view(PermissionSubject::Program(p)));
+    assert!(
+        text.contains("  1段目: -EncodedCommand の値（UTF-16LEとして読んだ）:"),
+        "{text}"
+    );
+    assert!(text.contains("      systeminfo"), "{text}");
+}

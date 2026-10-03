@@ -403,11 +403,16 @@ impl Tool for RunShellTool {
                     // 見え方を開けなければ、何も確かめられない。記録と照合しない。
                     Err(_) => (Vec::new(), Vec::new(), true),
                 };
+            // [BUG-224] 行に符号化された中身があれば、ハーネスが機械的に解読して承認画面と要約へ渡す
+            // （§4.4）。**照合には使わない**——`ShellRule::matches`も`same_for_approval`もこの欄を
+            // 見ない。解読は`run_program`と同じ関数を通る（綴りの表を2箇所に持たない、B-05）。
+            let decoded = crate::encoded_command::decode_shell_line(&line);
             PermissionSubject::Command(CommandSubject {
                 line,
                 files,
                 unverifiable,
                 previews,
+                decoded,
             })
         })
         .await
