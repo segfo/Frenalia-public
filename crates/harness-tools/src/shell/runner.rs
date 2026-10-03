@@ -49,8 +49,34 @@ pub(crate) enum Launch<'a> {
 #[cfg(windows)]
 const POWERSHELL_STDIN_ARGS: [&str; 4] = ["-NoProfile", "-NonInteractive", "-Command", "-"];
 
-/// Tierに応じて実行経路を切り替える。戻り値は`(stdout, stderr, exit_code, launch_label)`。
-/// `exit_code`は`None`ならkill済み（timeout）を表す呼び出し元エラーへ畳み込む。
+/// [`run_isolated`]の結果。
+pub(crate) struct IsolatedRun {
+    pub(crate) out: String,
+    pub(crate) err: String,
+    /// `None`ならkill済み（timeout）を表す呼び出し元エラーへ畳み込む。
+    pub(crate) code: Option<i32>,
+    pub(crate) launch_label: &'static str,
+    /// [BUG-208] 子を起こす前の準備で起きた、**モデルが知るべきこと**（フッタへ`[warning: …]`の1行で出す）。
+    ///
+    /// いまの源はTier1の低ILラベルを付けられなかったときだけである。付けられないと、子は作業フォルダの
+    /// 中にも1つも書けないのに、モデルには`Access is denied`しか見えず、書き方を変えて再試行し続ける
+    /// （システムプロンプトの「ワークスペース直下には書ける」が、この回だけ外れる）。
+    pub(crate) setup_warning: Option<String>,
+}
+
+impl IsolatedRun {
+    fn plain((out, err, code, launch_label): (String, String, Option<i32>, &'static str)) -> Self {
+        Self {
+            out,
+            err,
+            code,
+            launch_label,
+            setup_warning: None,
+        }
+    }
+}
+
+/// Tierに応じて実行経路を切り替える。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_isolated(
     launch: Launch<'_>,
@@ -66,7 +92,7 @@ pub(crate) async fn run_isolated(
     cow_diff_layer_dir: Option<&Path>,
     granted_passthrough: &[harness_core::GrantedPassthrough],
     #[cfg(windows)] spawn_daemon: Option<&harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
-) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+) -> Result<IsolatedRun, ToolError> {
     // Tier2a以外はcapability機構自体が無いため`net`を消費しない（呼び出し元のフッタで
     // 「このTierでは無効」と明記する、`call`参照）。
     let _ = &net;
@@ -75,7 +101,9 @@ pub(crate) async fn run_isolated(
     #[cfg(not(windows))]
     let _ = (workspace_root, cow_diff_layer_dir, granted_passthrough);
     if tier == ShellTier::Tier3 {
-        return run_tier3(launch, cwd, env, dur, vm_sandbox).await;
+        return run_tier3(launch, cwd, env, dur, vm_sandbox)
+            .await
+            .map(IsolatedRun::plain);
     }
     #[cfg(windows)]
     {
@@ -93,7 +121,8 @@ pub(crate) async fn run_isolated(
                 granted_passthrough,
                 spawn_daemon,
             )
-            .await;
+            .await
+            .map(IsolatedRun::plain);
         }
         if tier == ShellTier::Tier1 {
             return run_windows_tier1(launch, cwd, env, dur).await;
@@ -102,11 +131,15 @@ pub(crate) async fn run_isolated(
     #[cfg(target_os = "linux")]
     {
         if tier == ShellTier::Tier2b {
-            return run_linux_tier2b(launch, cwd, env, dur).await;
+            return run_linux_tier2b(launch, cwd, env, dur)
+                .await
+                .map(IsolatedRun::plain);
         }
     }
     // Tier0（保険）。上記いずれにも該当しない場合のフォールバックでもある。
-    run_tier0(launch, cwd, env, dur).await
+    run_tier0(launch, cwd, env, dur)
+        .await
+        .map(IsolatedRun::plain)
 }
 
 /// Tier3（Hyper-V外層VM + Incusコンテナ）実行経路。他Tierと異なり実プロセスをホスト側に
@@ -376,23 +409,35 @@ async fn run_windows_tier1(
     cwd: &Path,
     env: &[(String, String)],
     dur: Duration,
-) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+) -> Result<IsolatedRun, ToolError> {
     let _ = std::fs::create_dir_all(cwd);
     // cwd1つだけに低ILラベルを付与する（非再帰・冪等、モジュールdocの既知の限界参照）。
     //
     // **失敗を握り潰さない**（B-10）。このラベルが付かないと低ILの子はcwd**内**にも書けなくなる
     // ——つまり「Tier1は範囲内なら書ける」という保証そのものが静かに消える。実際、BUG-018の
     // 案Aが入れた不正なSDDLでこの関数はずっと失敗し続けており、ここが`let _ =`だったせいで
-    // 誰も気付けなかった。致命的にはしない（D-43と同じくharnessは止めない）が、
-    // **事実は必ず出力へ残す**。
-    // stdoutは機械可読出力の契約なので使わない（B-24、BUG-064）。診断はstderrへ出す。
-    if let Err(e) = harness_sandbox::tier1::win_restricted::set_low_integrity_label(cwd) {
-        eprintln!(
-            "warning: failed to apply the low-integrity label to the Tier1 cwd ({}): {e}. \
-             Writes inside the sandbox cwd will be denied by Mandatory Integrity Control.",
-            cwd.display()
-        );
-    }
+    // 誰も気付けなかった。致命的にはしない（D-43と同じくharnessは止めない。範囲外への書込の
+    // 拒否は付かなくても成り立つ）が、**事実は必ず出力へ残す**——2か所へ出す（BUG-208）:
+    //
+    // - 利用者へ: stderr（stdoutは機械可読出力の契約なので使わない。B-24、BUG-064）。会話TUIの
+    //   間は画面が預かってtranscriptへ出す（BUG-206）。**同じフォルダのアクセス拒否は1回だけ**
+    //   言う——フォルダのACLの性質なので、コマンドのたびに同じ行を積んでも情報が増えない。
+    // - モデルへ: 結果のフッタ（`IsolatedRun::setup_warning`）。**毎回**付ける——無いと
+    //   `Access is denied`の理由が分からず、書き方を変えて再試行し続ける。
+    let setup_warning = match harness_sandbox::tier1::win_restricted::set_low_integrity_label(cwd) {
+        Ok(()) => None,
+        Err(e) => {
+            let text = super::tier1_label::label_failure_text(
+                cwd,
+                &e,
+                &super::tier1_label::Remedy::from_env(),
+            );
+            if super::tier1_label::should_tell_the_user(cwd, &e) {
+                eprintln!("warning: {text}");
+            }
+            Some(text)
+        }
+    };
 
     let cwd_owned = cwd.to_path_buf();
     let mut env_owned = env.to_vec();
@@ -439,7 +484,13 @@ async fn run_windows_tier1(
     });
 
     match timeout(dur, handle).await {
-        Ok(Ok(Ok((out, err, code)))) => Ok((out, err, Some(code), shell_label)),
+        Ok(Ok(Ok((out, err, code)))) => Ok(IsolatedRun {
+            out,
+            err,
+            code: Some(code),
+            launch_label: shell_label,
+            setup_warning,
+        }),
         Ok(Ok(Err(e))) => Err(ToolError::ExecutionFailed(e.to_string())),
         Ok(Err(join_err)) => Err(ToolError::ExecutionFailed(join_err.to_string())),
         Err(_) => {

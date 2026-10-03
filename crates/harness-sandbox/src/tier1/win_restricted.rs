@@ -26,6 +26,11 @@
 //! 巻き込んだためだが、**継承させないことと「子ディレクトリの中に書けない」ことは別**である
 //! ——上表2行目のとおり、実際には書ける。この2つを混同した記述が長く残っていたので表にした。
 //!
+//! **ラベルを付けられるのは、このアカウントが`WRITE_OWNER`を持つ場所だけである**（[`LabelError::AccessDenied`]）。
+//! ドライブ直下に一般ユーザーが作ったフォルダ（`C:\harness-e2e\...`等）は既定で「変更」までしか持たないので
+//! 付けられず、そのときは上表1・2行目も成立しない（`cwd`の中にも1つも書けない。範囲外の拒否は変わらない）。
+//! 付けられなかったことは`harness-tools`の`run_windows_tier1`が利用者とモデルの両方へ言う（BUG-208）。
+//!
 //! **したがってTier1では`cargo build`/`cargo test`/`git commit`が通らない。**
 //! 理由は`target/`がサブディレクトリだからではなく（新規作成なら書ける）、
 //! (1) cargoが`cwd`の**外**（`$CARGO_HOME/.package-cache`・`~/.rustup/tmp`）へ書くこと、
@@ -85,12 +90,47 @@ impl From<windows::core::Error> for RestrictedError {
     }
 }
 
+/// [`set_low_integrity_label`]の失敗。**アクセス拒否だけを別の値にする**（[BUG-208]）。
+///
+/// アクセス拒否は「このフォルダには付けられない」という**場所の性質**で、利用者に次の一手がある
+/// （ラベルを付けられる場所を作業フォルダにする・権限を足す）。ほかの失敗（SDDLの解釈など）は
+/// 実装の側の誤りなので、同じ値に潰すと利用者を直せない方向へ送る。
+///
+/// [BUG-208]: ../../../../docs/bugs/BUG-208.md
+#[derive(Debug, thiserror::Error)]
+pub enum LabelError {
+    /// `SetNamedSecurityInfoW`が`ERROR_ACCESS_DENIED`を返した。必須ラベル（SACLの中のACE）を書くには、
+    /// そのオブジェクトに対する`WRITE_OWNER`（エクスプローラーの「所有権の取得」）が要る
+    /// （Microsoftの`SECURITY_INFORMATION`の文書: `LABEL_SECURITY_INFORMATION`の設定に要る権利は
+    /// `WRITE_OWNER`）。「変更」（Modify）にも、所有者が暗黙に持つ権利（`READ_CONTROL`・`WRITE_DAC`）にも
+    /// 含まれないので、**ドライブ直下に一般ユーザーが作ったフォルダ**では既定で拒否される
+    /// （直下の既定のACLから「変更」までしか引き継がない）。ユーザープロファイルの下は
+    /// 「フル コントロール」を引き継ぐので付けられる。
+    #[error(
+        "access denied while writing the mandatory label on {}: this account was not granted \
+         WRITE_OWNER (the \"Take ownership\" permission) on it, which writing a mandatory label requires",
+        dir.display()
+    )]
+    AccessDenied { dir: std::path::PathBuf },
+    #[error(transparent)]
+    Other(#[from] RestrictedError),
+}
+
+impl From<windows::core::Error> for LabelError {
+    fn from(e: windows::core::Error) -> Self {
+        LabelError::Other(RestrictedError::from(e))
+    }
+}
+
 /// 低Integrity LevelのSDDL文字列（`S-1-16-4096`、Windowsの既定Low IL SID）。
 const LOW_IL_SDDL: &str = "S-1-16-4096";
 
 /// `dir`1つだけに低ILの必須ラベルACEを設定する（非再帰・冪等）。
 /// 既存の子孫には遡って効かない（モジュールdocコメントの既知の限界を参照）。
-pub fn set_low_integrity_label(dir: &Path) -> Result<(), RestrictedError> {
+///
+/// **付けられない場所がある**——そのディレクトリに`WRITE_OWNER`を持たないと[`LabelError::AccessDenied`]
+/// になる（ドライブ直下に作ったフォルダが典型。[`LabelError::AccessDenied`]のdoc）。
+pub fn set_low_integrity_label(dir: &Path) -> Result<(), LabelError> {
     // SDDL: "S:(ML;;NW;;;LW)" = SACL(mandatory label)、継承フラグ無し（子孫へ伝播させない）、
     // no-write-up、対象SIDはLow mandatory level。
     //
@@ -122,7 +162,7 @@ pub fn set_low_integrity_label(dir: &Path) -> Result<(), RestrictedError> {
             GetSecurityDescriptorSacl(sd, &mut sacl_present, &mut sacl_ptr, &mut sacl_defaulted);
         if let Err(e) = sacl_result {
             let _ = LocalFree(HLOCAL(sd.0));
-            return Err(RestrictedError::from(e));
+            return Err(LabelError::from(e));
         }
 
         let path_w = wide(&dir.to_string_lossy());
@@ -136,10 +176,15 @@ pub fn set_low_integrity_label(dir: &Path) -> Result<(), RestrictedError> {
             Some(sacl_ptr as *const _),
         );
         let _ = LocalFree(HLOCAL(sd.0));
+        if err == windows::Win32::Foundation::ERROR_ACCESS_DENIED {
+            return Err(LabelError::AccessDenied {
+                dir: dir.to_path_buf(),
+            });
+        }
         if err.0 != 0 {
-            return Err(RestrictedError::Win32(format!(
+            return Err(LabelError::Other(RestrictedError::Win32(format!(
                 "SetNamedSecurityInfoW failed: {err:?}"
-            )));
+            ))));
         }
     }
     Ok(())
@@ -565,6 +610,76 @@ mod tests {
             !label_line.contains("(OI)") && !label_line.contains("(CI)"),
             "the mandatory label must not carry inheritance flags (BUG-018): {label_line}"
         );
+    }
+
+    /// [BUG-208] 試験用の一時ディレクトリのDACLを、継承を切ったうえで`sddl`（`D:P(...)`）だけにする。
+    ///
+    /// 作ったのはこのプロセスなので所有者は自分で、所有者は暗黙に`WRITE_DAC`を持つ（DACLに自分宛の
+    /// ACEが無くても、もう一度書き直せる）。**試験の一時ディレクトリ以外へ使わない。**
+    fn set_protected_dacl(dir: &Path, sddl: &str) {
+        use windows::Win32::Foundation::BOOL;
+        use windows::Win32::Security::{
+            GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        unsafe {
+            let sddl_w = wide(sddl);
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(sddl_w.as_ptr()),
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            )
+            .expect("parse the test DACL");
+            let mut present = BOOL(0);
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut defaulted = BOOL(0);
+            GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted)
+                .expect("take the DACL out of the descriptor");
+            let path_w = wide(&dir.to_string_lossy());
+            let err = SetNamedSecurityInfoW(
+                PCWSTR(path_w.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                PSID::default(),
+                PSID::default(),
+                Some(dacl as *const _),
+                None,
+            );
+            let _ = LocalFree(HLOCAL(sd.0));
+            assert_eq!(err.0, 0, "set the test DACL on {}: {err:?}", dir.display());
+        }
+    }
+
+    /// [BUG-208] 「変更」（Modify）しか持たない場所には付けられず、**アクセス拒否として**返る。
+    /// `WRITE_OWNER`を1つ足すと付けられる——足りないのがこの1つであることを、1差分で固定する。
+    ///
+    /// 実機で崩れたフォルダ（`C:\harness-e2e\tui-check`、ドライブ直下に一般ユーザーが作ったもの）は
+    /// `NT AUTHORITY\Authenticated Users:(M)`しか書込の権利を持たなかった。同じ形
+    /// （`Authenticated Users`へ`0x1301bf`＝Modify、継承なし）を一時ディレクトリに作って測る。
+    /// 拒否側だけだと「どこでも必ず拒否される」実装でも通るので、許可側と対にする（B-35）。
+    ///
+    /// **昇格した試験では測らない**——管理者として動くと別の世界を測ることになる（BUG-109）。
+    #[test]
+    fn a_folder_without_write_owner_cannot_be_labeled_and_says_so() {
+        if crate::tier2a::privhelper::is_elevated() {
+            eprintln!("skipping: the test process is elevated (this measures a non-elevated user)");
+            return;
+        }
+        const MODIFY: &str = "D:P(A;;0x1301bf;;;AU)";
+        const MODIFY_AND_WRITE_OWNER: &str = "D:P(A;;0x1b01bf;;;AU)";
+
+        let dir = tempfile::tempdir().unwrap();
+        set_protected_dacl(dir.path(), MODIFY);
+        match set_low_integrity_label(dir.path()) {
+            Err(LabelError::AccessDenied { dir: denied }) => assert_eq!(denied, dir.path()),
+            other => panic!("Modifyだけの場所はアクセス拒否として返るはず: {other:?}"),
+        }
+
+        set_protected_dacl(dir.path(), MODIFY_AND_WRITE_OWNER);
+        set_low_integrity_label(dir.path())
+            .expect("WRITE_OWNERを足せば付けられる（足りないのはこの1つ）");
     }
 
     /// **モジュールdocの「既知の限界」が実際にそうなっているかを、実機で測って固定する。**

@@ -39,6 +39,9 @@ mod net_decision;
 mod platform;
 mod program;
 mod runner;
+/// [BUG-208] Tier1が作業フォルダへ低ILラベルを付けられなかったことを、利用者とモデルへ言う文。
+#[cfg(windows)]
+mod tier1_label;
 /// [段階6f-3] 拒否された遷移を、モデルが読める1行にする（§19.3.8）。
 /// **ツールの名前を持っている側に置いてある**（同ファイルのモジュールdoc）。
 mod transition_note;
@@ -283,7 +286,7 @@ async fn run_in_tier(
     ctx: &ToolCtx,
     prepared: &PreparedRun,
     #[cfg(windows)] spawn_daemon: Option<&harness_sandbox::tier2a::spawnd::SharedSpawnDaemon>,
-) -> Result<(String, String, Option<i32>, &'static str), ToolError> {
+) -> Result<runner::IsolatedRun, ToolError> {
     run_isolated(
         launch,
         cwd,
@@ -425,7 +428,13 @@ impl Tool for RunShellTool {
         let transition_cursor =
             transition_queue_cursor(self.report_transition_denials, &ctx.workspace_root);
 
-        let (out, err, code, shell_label) = run_in_tier(
+        let runner::IsolatedRun {
+            out,
+            err,
+            code,
+            launch_label: shell_label,
+            setup_warning,
+        } = run_in_tier(
             runner::Launch::Shell {
                 command: &input.command,
             },
@@ -463,7 +472,14 @@ impl Tool for RunShellTool {
         );
         #[cfg(not(windows))]
         let transition_note = None;
-        push_run_footer(&mut content, ctx, net_decision, transition_note, &prepared);
+        push_run_footer(
+            &mut content,
+            ctx,
+            net_decision,
+            setup_warning,
+            transition_note,
+            &prepared,
+        );
 
         Ok(ToolOutput {
             content,
@@ -473,12 +489,18 @@ impl Tool for RunShellTool {
 }
 
 /// 出力の末尾に付けるフッタのうち、`run_shell`と`run_program`で共通の部分
-/// （着地したTier・ネットワーク許可アプリ・断られた遷移・非隔離とステージングの警告・
-/// プロキシと偽DNSの監査）。**文言と順序はここ1箇所が持つ**（`B-05`）。
+/// （着地したTier・子を起こす前の準備の警告・ネットワーク許可アプリ・断られた遷移・非隔離と
+/// ステージングの警告・プロキシと偽DNSの監査）。**文言と順序はここ1箇所が持つ**（`B-05`）。
+///
+/// `setup_warning`は[`runner::IsolatedRun::setup_warning`]（[BUG-208]: Tier1が作業フォルダへ
+/// 低ILラベルを付けられなかった）。文そのものは利用者へ出すstderrの行と同じものである。
+///
+/// [BUG-208]: ../../../../docs/bugs/BUG-208.md
 fn push_run_footer(
     content: &mut String,
     ctx: &ToolCtx,
     net_decision: NetDecision,
+    setup_warning: Option<String>,
     transition_note: Option<String>,
     prepared: &PreparedRun,
 ) {
@@ -493,6 +515,9 @@ fn push_run_footer(
     // 着地したTierだけを出す。**「(downgraded from ...)」はもう付かない**——D-75で
     // 降格が消え、`select_tier`が返した時点で要求どおりのTierに居るためである。
     content.push_str(&format!("\n[tier: {}]", ctx.shell_tier.tier.label()));
+    if let Some(warning) = setup_warning {
+        content.push_str(&format!("\n[warning: {warning}]"));
+    }
     if !ctx.net_app.allow_apps.is_empty() {
         match (
             net_domain_policy_requested,

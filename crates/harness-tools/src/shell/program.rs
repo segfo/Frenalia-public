@@ -192,7 +192,13 @@ impl Tool for RunProgramTool {
         let transition_cursor =
             transition_queue_cursor(self.report_transition_denials, &ctx.workspace_root);
 
-        let (out, err, code, _launch_label) = run_in_tier(
+        let super::runner::IsolatedRun {
+            out,
+            err,
+            code,
+            setup_warning,
+            ..
+        } = run_in_tier(
             Launch::Program {
                 exe: exe_str,
                 args: &args,
@@ -221,7 +227,14 @@ impl Tool for RunProgramTool {
         );
         #[cfg(not(windows))]
         let transition_note = None;
-        push_run_footer(&mut content, ctx, net_decision, transition_note, &prepared);
+        push_run_footer(
+            &mut content,
+            ctx,
+            net_decision,
+            setup_warning,
+            transition_note,
+            &prepared,
+        );
 
         Ok(ToolOutput {
             content,

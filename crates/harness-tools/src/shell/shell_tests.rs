@@ -1039,6 +1039,107 @@ mod tests {
             "the file must actually exist on disk after a successful write: {}",
             out.content
         );
+        // [BUG-208] 下の`run_shell_tier1_tells_the_model_why_writes_fail_when_the_cwd_cannot_be_labeled`の対:
+        // 付けられたときは「付けられなかった」行を出さない（常に出す実装を止める）。
+        assert!(
+            !out.content.contains(LABEL_FAILURE_FOOTER),
+            "the label was applied, so the footer must not say otherwise: {}",
+            out.content
+        );
+    }
+
+    /// [BUG-208] 結果のフッタの頭（`tier1_label::label_failure_text`の書き出し）。
+    #[cfg(windows)]
+    const LABEL_FAILURE_FOOTER: &str = "[warning: Tier1 could not apply the low-integrity label";
+
+    /// [BUG-208] 低ILラベルを付けられない作業フォルダでは、**モデルが読む結果に**理由と直し方が載り、
+    /// 書込は実際に拒否される。
+    ///
+    /// 直す前は結果に何も載らず、モデルには`Access is denied`しか見えなかった（理由はstderrにだけ出て、
+    /// 会話TUIでは画面を崩していた。BUG-206）。実機で崩れたフォルダ（`C:\harness-e2e\tui-check`）と同じく、
+    /// 継承を切って`Authenticated Users`に「変更」だけを与えた一時ディレクトリで測る。
+    ///
+    /// **昇格した試験では測らない**（管理者として動くと別の世界を測る。BUG-109）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_tier1_tells_the_model_why_writes_fail_when_the_cwd_cannot_be_labeled() {
+        if harness_sandbox::tier2a::privhelper::is_elevated() {
+            eprintln!("skipping: the test process is elevated (this measures a non-elevated user)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/inheritance:r", "/grant:r", "*S-1-5-11:(M)"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run icacls");
+        assert!(
+            status.success(),
+            "icacls must restrict the test folder: {status}"
+        );
+
+        let inside = dir.path().join("tier1-unlabeled-cwd.txt");
+        let command = format!(
+            "Set-Content -Path '{}' -Value 'denied' -ErrorAction Stop",
+            inside.display()
+        );
+        let out = RunShellTool::default()
+            .call(
+                json!({ "command": command }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            out.is_error && !inside.exists(),
+            "without the label the write inside the cwd must be denied: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains(LABEL_FAILURE_FOOTER),
+            "the model must be told why the write failed: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("WRITE_OWNER") && out.content.contains("Full control"),
+            "the footer says what is missing and what to do: {}",
+            out.content
+        );
+
+        // **文が勧める直し方そのもの**（所有者が管理者権限なしで自分に「所有権の取得」を足す）で、
+        // 同じフォルダに書けるようになり、行も消える。直し方を推測のまま書かないための対（B-32）。
+        let account = crate::shell::tier1_label::Remedy::from_env()
+            .account
+            .expect("USERNAME is set on Windows");
+        let status = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/grant", &format!("{account}:(WO)")])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run icacls");
+        assert!(
+            status.success(),
+            "the owner can grant itself WRITE_OWNER: {status}"
+        );
+        let out = RunShellTool::default()
+            .call(
+                json!({ "command": command }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !out.is_error && inside.exists(),
+            "after following the advice the write inside the cwd must succeed: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains(LABEL_FAILURE_FOOTER),
+            "the label is applied now, so the footer must not say otherwise: {}",
+            out.content
+        );
     }
 
     /// Tier2a（AppContainer）の隔離セマンティクスを決定論的に検証する（LLM非依存、絶対パスを
