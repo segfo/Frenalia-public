@@ -415,7 +415,8 @@ fn a_successful_recording_adds_no_failure_line_to_the_warning_panel() {
     );
 }
 
-/// 実行中の終了要求は**その場で抜けない**——収集器の撤収とマニフェストの確定が終わってから。
+/// 実行中の終了要求（`Ctrl+Q`）は**その場で抜けない**——収集器の撤収とマニフェストの確定が終わってから。
+/// 記録中の`Esc`は停止で二度押しに数えないので、記録中に閉じる口はこれだけである（`Ctrl+C`は終了に使わない）。
 #[test]
 fn quitting_while_recording_waits_for_the_teardown() {
     let ws = workspace();
@@ -423,7 +424,7 @@ fn quitting_while_recording_waits_for_the_teardown() {
     start_pass1(&mut app, "cargo build").expect("開始");
     app.on_worker(WorkerMsg::Pass1(RecordEvent::ChildStarted));
 
-    let action = app.on_key(ctrl('c'));
+    let action = app.on_key(ctrl('q'));
 
     assert!(action.is_none(), "実行中に即座に終了してはいけない");
     assert!(!app.should_exit(), "撤収が終わるまでは抜けない");
@@ -439,7 +440,33 @@ fn quitting_while_idle_exits_immediately() {
     let ws = workspace();
     let mut app = app_with(&ws);
 
-    assert!(matches!(app.on_key(ctrl('c')), Some(Action::Quit)));
+    assert!(matches!(app.on_key(ctrl('q')), Some(Action::Quit)));
+}
+
+/// **`Ctrl+C`は、何も選んでいなければ終了しない**（2026-10-03。コピーのつもりの連打で終わっていた——
+/// `harness_term::double_esc`）。待機中も記録中も、終了も停止も予約もせず、終了の仕方を知らせの行に出す
+/// （押しても無反応にしない、B-23(c)）。記録中の終了は`Ctrl+Q`のまま（上の試験。禁止側と許可側の対）。
+#[test]
+fn ctrl_c_neither_quits_nor_stops_and_says_how_to_quit() {
+    let ws = workspace();
+    let mut app = app_with(&ws);
+    assert!(
+        app.on_key(ctrl('c')).is_none(),
+        "待機中の`Ctrl+C`で終了した"
+    );
+    assert_eq!(app.status, harness_term::double_esc::CTRL_C_NOTICE);
+
+    start_pass1(&mut app, "cargo build").expect("開始");
+    app.on_worker(WorkerMsg::Pass1(RecordEvent::ChildStarted));
+    for _ in 0..3 {
+        assert!(app.on_key(ctrl('c')).is_none());
+    }
+    assert!(!app.quit_after_run, "記録中の`Ctrl+C`で終了を予約した");
+    assert!(
+        !app.run.as_ref().unwrap().stop_requested,
+        "記録中の`Ctrl+C`で記録を止めた"
+    );
+    assert_eq!(app.status, harness_term::double_esc::CTRL_C_NOTICE);
 }
 
 /// パス2は**承認済みのドメインが無ければ始まらない**（開くべき穴が開いていない状態で
@@ -661,22 +688,120 @@ fn two_escapes_do_not_quit_while_a_recording_is_running() {
     assert!(!app.quit_after_run, "終了を予約もしない");
 }
 
-/// しきい値の外なら終了しない。`Instant`を作れる形（純粋関数）にしてあるので**待たずに測れる**。
+/// しきい値の外なら終了しない。境目（ちょうど1秒）は内側。時刻を渡す入口（`on_key_at`）があるので**待たずに測れる**
+/// （窓の長さは会話画面と共有する`harness_term::double_esc::WINDOW`）。
 #[test]
 fn escapes_further_apart_than_the_window_do_not_quit() {
-    let now = std::time::Instant::now();
-    let long_ago = now
-        .checked_sub(crate::tui::state::ESC_QUIT_WINDOW + std::time::Duration::from_millis(1))
-        .expect("しきい値より前の時刻");
-    assert!(!crate::tui::state::is_double_esc(Some(long_ago), now));
+    use harness_term::double_esc::WINDOW;
+    let ws = workspace();
+    let t0 = std::time::Instant::now();
+    let ms = std::time::Duration::from_millis(1);
+
+    let mut app = app_with(&ws);
+    assert!(app.on_key_at(key(KeyCode::Esc), t0).is_none());
     assert!(
-        crate::tui::state::is_double_esc(Some(now), now),
-        "同時刻は窓の内側"
+        app.on_key_at(key(KeyCode::Esc), t0 + WINDOW + ms).is_none(),
+        "窓の外の2回目で終了した"
     );
     assert!(
-        !crate::tui::state::is_double_esc(None, now),
-        "1回目は終了しない"
+        matches!(
+            app.on_key_at(key(KeyCode::Esc), t0 + WINDOW + ms + WINDOW),
+            Some(Action::Quit)
+        ),
+        "窓の外の2回目が新しい1回目にならない"
     );
+
+    let mut app = app_with(&ws);
+    app.on_key_at(key(KeyCode::Esc), t0);
+    assert!(
+        matches!(
+            app.on_key_at(key(KeyCode::Esc), t0 + WINDOW),
+            Some(Action::Quit)
+        ),
+        "境目の2回目で終了しない"
+    );
+}
+
+/// **キーを離したことは数え直しにしない**——Windowsのコンソールは押下と離上の両方を送るので、離上で数え直すと
+/// `Esc`の二度押しが一度も成立しない。
+#[test]
+fn a_key_release_between_the_escapes_does_not_start_over() {
+    let ws = workspace();
+    let mut app = app_with(&ws);
+    let t0 = std::time::Instant::now();
+    app.on_key_at(key(KeyCode::Esc), t0);
+    let mut release = key(KeyCode::Esc);
+    release.kind = crossterm::event::KeyEventKind::Release;
+    assert!(app.on_key_at(release, t0).is_none());
+    assert!(matches!(
+        app.on_key_at(key(KeyCode::Esc), t0),
+        Some(Action::Quit)
+    ));
+}
+
+/// **確認ダイアログ・ヘルプを閉じた`Esc`は数えない**——閉じた直後に`Esc`を1回押しても終了せず（それが1回目）、
+/// もう1回で終了する。時刻はどれも窓の中（窓が理由で終了しないのではないことを確かめるため）。
+#[test]
+fn an_escape_that_closed_a_dialog_or_the_help_is_not_counted() {
+    let ws = workspace();
+    let t0 = std::time::Instant::now();
+    for case in ["確認ダイアログ", "ヘルプ"] {
+        let mut app = app_with(&ws);
+        // 1回目を数えた状態から開く（開くキーで数え直しになるので、ここでは状態を直接作る）。
+        app.on_key_at(key(KeyCode::Esc), t0);
+        app.screen = Screen::Record;
+        match case {
+            "確認ダイアログ" => {
+                app.modal = Some(Modal {
+                    title: "確認".to_string(),
+                    lines: vec!["本文".to_string()],
+                    confirm: Confirm::ReadOnly,
+                })
+            }
+            _ => app.help = true,
+        }
+        assert!(app.on_key_at(key(KeyCode::Esc), t0).is_none(), "{case}");
+        assert!(
+            app.modal.is_none() && !app.help,
+            "{case}: 試験の前提: 閉じていない"
+        );
+        assert!(
+            app.on_key_at(key(KeyCode::Esc), t0).is_none(),
+            "{case}: 閉じた`Esc`を数えた"
+        );
+        assert!(
+            matches!(app.on_key_at(key(KeyCode::Esc), t0), Some(Action::Quit)),
+            "{case}: 何もしていない`Esc`の2回で終了しない"
+        );
+    }
+}
+
+/// **1回目の`Esc`で、もう一度押せば終了することを知らせの行に出す。** 窓の中は出したまま、窓が過ぎたら描画の合図
+/// （`tui::tick`）で消す。ほかの知らせに書き換わっていたら、そちらは消さない。
+#[test]
+fn the_first_escape_says_a_second_one_quits_until_the_window_passes() {
+    use harness_term::double_esc::{armed_notice, WINDOW};
+    let ws = workspace();
+    let t0 = std::time::Instant::now();
+    let ms = std::time::Duration::from_millis(1);
+
+    let mut app = app_with(&ws);
+    app.status.clear();
+    app.on_key_at(key(KeyCode::Esc), t0);
+    assert_eq!(app.status, armed_notice());
+    crate::tui::tick(&mut app, t0 + WINDOW);
+    assert_eq!(app.status, armed_notice(), "窓の中で消えた");
+    crate::tui::tick(&mut app, t0 + WINDOW + ms);
+    assert_eq!(
+        app.status, "",
+        "窓が過ぎても残った（押しても終了しないのに「もう一度で終了」と言い続ける）"
+    );
+
+    let mut app = app_with(&ws);
+    app.on_key_at(key(KeyCode::Esc), t0);
+    app.status = "別の知らせ".to_string();
+    crate::tui::tick(&mut app, t0 + WINDOW + ms);
+    assert_eq!(app.status, "別の知らせ", "ほかの知らせを消した");
 }
 
 /// 記録画面の入力欄はTabで巡回し、パス1ではドメイン欄を飛ばす（パス1に無い項目なので）。

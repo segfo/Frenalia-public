@@ -206,25 +206,24 @@ pub(super) fn record_buttons(app: &App) -> Vec<RecordButton> {
 /// ことは画面から推測できない。クリックでは`Esc`を2回続けて押す（キーで二度押ししたのと同じ。
 /// 記録中は`Esc`が停止なので、キーと同じく終了しない）。
 ///
-/// `copying`が真（マウスで選んだ文章がある）の間は、`Ctrl+C`は写すので`Ctrl+C コピー`と案内する（効く操作を案内する、
-/// B-32。`tui::select`）。項目を足さずに文言だけを変える——この行は幅が足りずに項目を落としている（`fit_key_hints`）。
-pub(super) fn common_keys(copying: bool) -> [KeyHint; 3] {
-    [
+/// `copying`が真（マウスで選んだ文章がある）の間だけ`Ctrl+C コピー`を出す（効く操作を案内する、B-32。`tui::select`）。
+/// **`Ctrl+C`は終了に使わない**（2026-10-03。`harness_term::double_esc`）ので、選んでいない間は何も出さない——
+/// それまでの`Ctrl+C 終了`の項目が消えるだけで、項目は増えない（この行は幅が足りずに項目を落としている。`fit_key_hints`）。
+pub(super) fn common_keys(copying: bool) -> Vec<KeyHint> {
+    let mut keys = vec![
         press("F4 ヘルプ", KeyCode::F(4)),
         KeyHint {
             label: "Esc×2 終了".to_string(),
             keys: vec![key(KeyCode::Esc), key(KeyCode::Esc)],
         },
-        KeyHint {
-            label: if copying {
-                "Ctrl+C コピー"
-            } else {
-                "Ctrl+C 終了"
-            }
-            .to_string(),
+    ];
+    if copying {
+        keys.push(KeyHint {
+            label: "Ctrl+C コピー".to_string(),
             keys: vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
-        },
-    ]
+        });
+    }
+    keys
 }
 
 /// キー案内の項目の区切り。

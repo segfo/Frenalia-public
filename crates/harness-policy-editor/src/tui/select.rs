@@ -16,8 +16,9 @@
 //!   （**ヘルプの文章の上だけは、離したときに閉じる**——押した瞬間に閉じると選べないため。ヘルプの外を押したときは
 //!   今までどおり押した瞬間に閉じる）。枠の上下の外までずらすとその向きへ送る（止めていても送り続ける）。
 //! - **選んでいるときの`Ctrl+C`と右クリックは写す**。写したら選択を外し、知らせの行に「N文字をコピーしました」を出す
-//!   （書けなければ理由を出す）。**選んでいないときの`Ctrl+C`は今までどおり終了**（記録中は撤収を待つ）、右クリックは
-//!   何もしない。キー案内の`Ctrl+C 終了`は、写せる間だけ`Ctrl+C コピー`になる。
+//!   （書けなければ理由を出す）。**`Ctrl+C`は終了に使わない**（2026-10-03から。会話画面と同じ——`harness_term::double_esc`）
+//!   ——選んでいないときは何も写さず、知らせの行に「終了は Esc を2回」を出す。終了は`Esc`の二度押しと`Ctrl+Q`（記録中は
+//!   撤収を待つ）。右クリックは何もしない。キー案内の`Ctrl+C コピー`は写せる間だけ出る。
 //! - **選んでいる間の`Esc`は選択を外すだけ**（確認ダイアログ・ヘルプを閉じず、記録も止めず、`Esc`の二度押しにも
 //!   数えない）。もう一度押せば今までどおり。
 //! - 別の場所を押すと選択は外れる。
@@ -47,17 +48,21 @@ impl App {
         self.status = harness_term::clipboard::notice(text, &result);
     }
 
-    /// キーの前に、選択が先に受けるもの（`Ctrl+C`で写す・`Esc`で外す）。受けたら`Some`（中身はキーの結果）。
+    /// キーの前に、選択が先に受けるもの（`Ctrl+C`・`Esc`で外す）。受けたら`Some`（中身はキーの結果）。
+    ///
+    /// **`Ctrl+C`はいつもここで終わる**——選んでいれば写し、選んでいなければ終了の仕方を知らせの行に出す（押しても
+    /// 無反応にしない、B-23(c)）。確認ダイアログ・ヘルプより先に受けるので、どの状態でも意味は同じ。
+    /// 選択を外した`Esc`は二度押しに数えない（呼び出し側`App::on_key_at`が1回目を捨てた状態で来るので、何もしなくてよい）。
     pub(super) fn on_selection_key(&mut self, pressed: KeyEvent) -> Option<Option<Action>> {
         if pressed.code == KeyCode::Char('c') && pressed.modifiers.contains(KeyModifiers::CONTROL) {
-            if let Some(action) = self.copy_selection() {
-                return Some(Some(action));
+            let copied = self.copy_selection();
+            if copied.is_none() {
+                self.status = harness_term::double_esc::CTRL_C_NOTICE.to_string();
             }
+            return Some(copied);
         }
         if pressed.code == KeyCode::Esc && self.selection.is_active() {
             self.selection.clear();
-            // 選択を外した`Esc`は、二度押し（終了）の1回目に数えない。
-            self.last_esc = None;
             return Some(None);
         }
         None
@@ -94,7 +99,7 @@ impl App {
     /// 枠`surface`の文章の上で左ボタンを押した（押せる場所ではない所。`harness_term::pointer::Pointer::Text`）。
     pub(super) fn press_text(&mut self, surface: Wheel, column: u16, row: u16) {
         // 押したのは`Esc`ではない。二度押しの途中に挟まったら続きを切る（クリックと同じ規則）。
-        self.last_esc = None;
+        self.double_esc.reset();
         self.selection.press(&self.pointer, surface, column, row);
     }
 }

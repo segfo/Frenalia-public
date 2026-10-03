@@ -20,8 +20,8 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    AppState, Click, DrawFeedback, KeyHint, Targets, ToolCardStatus, TranscriptItem, Wheel,
-    SPINNER_FRAMES,
+    AppState, Click, DrawFeedback, KeyHint, NoticeTone, Targets, ToolCardStatus, TranscriptItem,
+    Wheel, SPINNER_FRAMES,
 };
 
 /// 入力欄が自動で伸びる最大行数。これを超えると内部スクロールする（カーソル行が
@@ -178,6 +178,8 @@ pub(super) fn hint_rows(hints: &[KeyHint], look: HintLook, width: u16) -> u16 {
 }
 
 /// 描いた項目の矩形`drawn`（`hints`と同じ順）のうち、押せる項目を、押すと`click`（キー→動き）になる場所として登録する。
+/// 2回続けて押す項目（`KeyHint::twice`。`Esc×2=終了`）は[`Click::KeyTwice`]——入力欄の見出し（案内の文字のまま描く）にしか
+/// 無い。
 fn register_hints(
     targets: &mut Targets,
     hints: &[KeyHint],
@@ -186,7 +188,12 @@ fn register_hints(
 ) {
     for (hint, rect) in hints.iter().zip(drawn) {
         if let Some(key) = hint.key {
-            targets.click(*rect, click(key));
+            let pressed = if hint.twice {
+                Click::KeyTwice(key)
+            } else {
+                click(key)
+            };
+            targets.click(*rect, pressed);
         }
     }
 }
@@ -518,18 +525,22 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &AppState, targets: &mut Ta
         harness_term::scrollback::scrolled_notice(app.scroll, "下へホイールかここを押すと最新へ")
             .unwrap_or_default();
     let edge = harness_term::row::top_edge(area);
-    // 写した結果の知らせも上辺に出す（中身を動かさない。`crate::app::select`のモジュールdoc）。入り切らなければ末尾を
-    // `…`で切る——失敗したこと（頭の「コピーできませんでした」）は必ず見える。
+    // 写した結果・終了の仕方の知らせも上辺に出す（中身を動かさない。`crate::app::select`・`crate::app::quit`の
+    // モジュールdoc）。入り切らなければ末尾を`…`で切る——失敗したこと（頭の「コピーできませんでした」）は必ず見える。
     let head = "transcript ";
     let room = usize::from(edge.width).saturating_sub(head.width() + notice.width());
-    let copied = match &app.copy_notice {
-        Some(copied) => Span::styled(
-            fit_width(&format!("[{}] ", copied.text), room),
-            Style::default().fg(if copied.ok { Color::Green } else { Color::Red }),
+    let told = match &app.edge_notice {
+        Some(told) => Span::styled(
+            fit_width(&format!("[{}] ", told.text), room),
+            Style::default().fg(match told.tone {
+                NoticeTone::Done => Color::Green,
+                NoticeTone::Failed => Color::Red,
+                NoticeTone::Hint => Color::Yellow,
+            }),
         ),
         None => Span::raw(""),
     };
-    let title = [Span::raw(head), Span::raw(notice), copied];
+    let title = [Span::raw(head), Span::raw(notice), told];
     let drawn = harness_term::row::draw(f, edge, &title);
     targets.click(drawn[1], Click::ScrollToLatest);
     max
@@ -667,7 +678,7 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
 /// （IMEのカーソルを置く場所。[`set_input_cursor`]）。
 ///
 /// ```text
-/// ┌input (Enter=改行, PageUp/PageDown=スクロール, Ctrl-C=終了)────────┐┌──────────┐┌──────────┐
+/// ┌input (Enter=改行, PageUp/PageDown=スクロール)────────────────────┐┌──────────┐┌──────────┐
 /// │こんにちは                                                        ││   送信   ││   中断   │
 /// └──────────────────────────────────────────────────────────────────┘└Alt+Enter─┘└───Esc────┘
 /// ```

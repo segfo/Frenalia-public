@@ -134,8 +134,8 @@ fn dragging_past_the_bottom_scrolls_and_selects_lines_that_were_off_screen() {
     assert_eq!(copied, want.join("\r\n"));
 }
 
-/// (d) **選んでいるときの`Ctrl+C`は写して終了しない。選んでいないときは今までどおり終了する。** 右クリックも同じく、
-/// 選んでいるときだけ写す（選んでいないときは何もしない）。
+/// (d) **選んでいるときの`Ctrl+C`は写して終了しない。選んでいないときも終了せず、終了の仕方を知らせる**（2026-10-03から。
+/// `app::quit`）。右クリックも同じく、選んでいるときだけ写す（選んでいないときは何もしない）。
 #[test]
 fn ctrl_c_and_the_right_button_copy_only_while_something_is_selected() {
     let mut app = app_with_transcript(5);
@@ -145,11 +145,17 @@ fn ctrl_c_and_the_right_button_copy_only_while_something_is_selected() {
     let (copied, other) = ctrl_c(&mut app);
     assert_eq!(copied.as_deref(), Some("transcript"), "{other}");
     assert!(!app.should_quit, "写したのに終了した");
-    // 写したら選択は外れるので、次の`Ctrl+C`は終了（禁止側と許可側の対）。
+    // 写したら選択は外れるので、次の`Ctrl+C`は何も写さない——終了もしない（禁止側と許可側の対）。
     let (copied, other) = ctrl_c(&mut app);
     assert_eq!(copied, None);
-    assert_eq!(other, shown(&Some(Action::Quit)));
-    assert!(app.should_quit);
+    assert_eq!(other, shown(&None));
+    assert!(!app.should_quit, "選んでいない`Ctrl+C`で終了した");
+    assert!(
+        draw(&mut app)
+            .try_find(harness_term::double_esc::CTRL_C_NOTICE)
+            .is_some(),
+        "選んでいない`Ctrl+C`が無反応"
+    );
 
     let mut app = app_with_transcript(5);
     let screen = draw(&mut app);
@@ -264,7 +270,7 @@ fn a_selection_whose_text_changed_is_dropped_instead_of_copying_something_else()
 }
 
 /// (g) **入力欄にキーボードの選択があるときの`Ctrl+C`は、入力欄の選択を写す**（終了しない）。見出しの案内も、
-/// 写せる間だけ`Ctrl-C=コピー`。写したら選択は外れて`Ctrl-C=終了`に戻る。
+/// 写せる間だけ`Ctrl-C=コピー`。写したら選択は外れて、同じ場所が`Esc×2=終了`に戻る（`app::quit`）。
 #[test]
 fn ctrl_c_copies_the_input_selection() {
     let mut app = app_with_transcript(3);
@@ -284,7 +290,7 @@ fn ctrl_c_copies_the_input_selection() {
     assert_eq!(app.input, "hello world", "写しただけで入力が変わった");
     let screen = draw(&mut app);
     assert!(
-        screen.try_find("Ctrl-C=終了").is_some(),
+        screen.try_find("Esc×2=終了").is_some() && screen.try_find("Ctrl-C").is_none(),
         "{}",
         screen.text()
     );

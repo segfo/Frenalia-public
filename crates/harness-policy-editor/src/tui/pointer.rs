@@ -160,7 +160,7 @@ pub enum ButtonId {
 pub(crate) const BUTTON_SHIFT_GRACE: Duration = Duration::from_millis(300);
 
 /// 「記録」の枠の右のボタンの働き（押すキー）が最後に変わった時刻（モジュールdoc「働きが変わった直後の300msだけ押せない」）。
-/// 時刻は外から渡す（`harness_term::button::Press`・`state::is_double_esc`と同じ。試験は時刻を作って渡す）。
+/// 時刻は外から渡す（`harness_term::button::Press`・`harness_term::double_esc`と同じ。試験は時刻を作って渡す）。
 #[derive(Debug, Default)]
 pub struct ButtonShift {
     /// 最後に見た働き（ボタンが無ければ`None`）。外側の`None`は、まだ1度も見ていない（起動直後）。
@@ -315,13 +315,13 @@ impl App {
         }
         // クリックは`Esc`ではない。`Esc`の二度押し（終了）の途中に挟まったら続きを切る
         // （`on_key`が`Esc`以外のキーで切るのと同じ規則。キーを押すクリックは`on_key`がもう一度判定する）。
-        self.last_esc = None;
+        self.double_esc.reset();
         match click {
-            Click::Keys(keys) => self.press_keys(&keys),
+            Click::Keys(keys) => self.press_keys(&keys, now),
             // ここへ来たボタンは押して動作が起きるので、押されている形にする（捨てるクリックは上で返している）。
             Click::Button { id, key } => {
                 self.press.down(id, now);
-                self.press_keys(&[key])
+                self.press_keys(&[key], now)
             }
             Click::Screen(screen) => {
                 if self.screen == screen {
@@ -360,18 +360,19 @@ impl App {
         }
     }
 
-    /// キー案内の項目・ボタンが押すキーを押す。文字キーを押すなら先に入力欄から出る（モジュールdoc）。
-    fn press_keys(&mut self, keys: &[KeyEvent]) -> Option<Action> {
+    /// キー案内の項目・ボタンが押すキーを押す。文字キーを押すなら先に入力欄から出る（モジュールdoc）。`now`はクリックの
+    /// 時刻（`Esc×2 終了`の2回の`Esc`は同じ時刻に押したことになる）。
+    fn press_keys(&mut self, keys: &[KeyEvent], now: Instant) -> Option<Action> {
         if keys.iter().any(types_text) {
             self.leave_text_field();
         }
-        self.press_all(keys)
+        self.press_all(keys, now)
     }
 
     /// キーを順に押す。途中で操作（記録の開始・終了）が返ったら、そこで止めて返す。
-    fn press_all(&mut self, keys: &[KeyEvent]) -> Option<Action> {
+    fn press_all(&mut self, keys: &[KeyEvent], now: Instant) -> Option<Action> {
         for &pressed in keys {
-            if let Some(action) = self.on_key(pressed) {
+            if let Some(action) = self.on_key_at(pressed, now) {
                 return Some(action);
             }
         }

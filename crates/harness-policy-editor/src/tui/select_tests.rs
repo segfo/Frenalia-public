@@ -91,8 +91,8 @@ fn a_wrapped_modal_line_is_copied_as_one_line_and_lines_join_with_crlf() {
     );
 }
 
-/// **選んでいるときの`Ctrl+C`と右クリックは写して終了しない。選んでいないときの`Ctrl+C`は今までどおり終了**、
-/// 右クリックは何もしない（許可側と禁止側の対）。
+/// **選んでいるときの`Ctrl+C`と右クリックは写して終了しない。選んでいないときの`Ctrl+C`も終了せず、終了の仕方を
+/// 知らせの行に出す**（2026-10-03から。`harness_term::double_esc`）。右クリックは何もしない（許可側と禁止側の対）。
 #[test]
 fn ctrl_c_and_the_right_button_copy_only_while_something_is_selected() {
     let ws = workspace();
@@ -121,8 +121,17 @@ fn ctrl_c_and_the_right_button_copy_only_while_something_is_selected() {
     assert_eq!(copied(ctrl_c(&mut app)).as_deref(), Some("alpha"));
     assert_eq!(
         action_kind(&ctrl_c(&mut app)),
-        "終了",
-        "選んでいない`Ctrl+C`が終了しない"
+        "なし",
+        "選んでいない`Ctrl+C`で何かが起きた"
+    );
+    assert!(
+        app.modal.is_some(),
+        "選んでいない`Ctrl+C`で確認ダイアログが閉じた"
+    );
+    assert_eq!(
+        app.status,
+        harness_term::double_esc::CTRL_C_NOTICE,
+        "選んでいない`Ctrl+C`が無反応"
     );
 }
 
@@ -211,10 +220,10 @@ fn escape_first_drops_the_selection() {
         "選択を外す`Esc`で確認ダイアログが閉じた"
     );
     assert!(
-        app.last_esc.is_none(),
+        !app.double_esc.is_armed(Instant::now()),
         "選択を外す`Esc`を二度押しの1回目に数えた"
     );
-    assert_eq!(action_kind(&ctrl_c(&mut app)), "終了", "選択が外れていない");
+    assert_eq!(action_kind(&ctrl_c(&mut app)), "なし", "選択が外れていない");
     let mut app = with_modal(ws.path(), vec!["alpha beta".into()]);
     frame(&mut app, SIZE.0, SIZE.1);
     press(&mut app, KeyCode::Esc);
@@ -263,7 +272,9 @@ fn the_result_and_the_hint_follow_what_can_be_copied() {
 
     let grid = frame(&mut app, SIZE.0, SIZE.1);
     let keys: String = grid[usize::from(SIZE.1 - 1)].concat();
-    assert!(squash(&keys).contains("Ctrl+C終了"), "{keys}");
+    // 選んでいない間は`Ctrl+C`の項目そのものが無い（終了には使わない。`Esc×2 終了`は残る）。
+    assert!(!squash(&keys).contains("Ctrl+C"), "{keys}");
+    assert!(squash(&keys).contains("Esc×2終了"), "{keys}");
     let at = cell_of(&grid, Some(modal_box(&grid, &app)), "alpha", None);
     drag(&mut app, at, (at.0 + 4, at.1));
     let grid = frame(&mut app, SIZE.0, SIZE.1);

@@ -875,7 +875,7 @@ fn a_key_hint_does_what_its_key_does() {
         press(&mut app, KeyCode::Char(' '));
         app
     };
-    let cases: [(&str, Make, &str, Vec<KeyEvent>); 8] = [
+    let cases: [(&str, Make, &str, Vec<KeyEvent>); 7] = [
         (
             "承認待ち・t",
             edit_screen_with_a_tree,
@@ -917,12 +917,6 @@ fn a_key_hint_does_what_its_key_does() {
             declared_screen_with_a_tree,
             "Esc×2 終了",
             ks(KeyCode::Esc, 2),
-        ),
-        (
-            "共通・Ctrl+C",
-            record_screen_with_content,
-            "Ctrl+C 終了",
-            vec![KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)],
         ),
     ];
     for (case, make, hint, keys) in cases {
@@ -1125,15 +1119,19 @@ fn the_record_button_shrinks_and_then_disappears_on_a_narrow_terminal() {
 }
 
 /// 終了の項目は、押すと終了の操作を返す（キーと同じ。上の試験は種類が一致することしか見ないので、ここで値を見る）。
+/// 終了の項目は`Esc×2 終了`だけで、キー案内に`Ctrl+C`の項目は無い（`Ctrl+C`は終了に使わない。2026-10-03）。
 #[test]
 fn the_quit_hints_actually_quit() {
-    for hint in ["Esc×2 終了", "Ctrl+C 終了"] {
-        let ws = workspace();
-        let mut app = declared_screen_with_a_tree(ws.path());
-        let grid = frame(&mut app, SIZE.0, SIZE.1);
-        let action = click(&mut app, cell_of(&grid, Some(key_row(&grid)), hint, None));
-        assert_eq!(action_kind(&action), "終了", "{hint}");
-    }
+    let ws = workspace();
+    let mut app = declared_screen_with_a_tree(ws.path());
+    let grid = frame(&mut app, SIZE.0, SIZE.1);
+    let row: String = grid[usize::from(SIZE.1 - 1)].concat();
+    assert!(!row.contains("Ctrl+C"), "{row}");
+    let action = click(
+        &mut app,
+        cell_of(&grid, Some(key_row(&grid)), "Esc×2 終了", None),
+    );
+    assert_eq!(action_kind(&action), "終了");
 }
 
 /// 狭い端末で項目が落ちたときの`… 他N件`は、押すとヘルプが開く（`F4`と同じ。落とした項目はヘルプに載っている）。

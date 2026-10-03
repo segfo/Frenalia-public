@@ -56,6 +56,8 @@ mod commands;
 mod events;
 mod input;
 mod pointer;
+/// `Esc`の二度押しで閉じる（2026-10-03。判定は`harness_term::double_esc`）。`Ctrl+C`は終了に使わない。
+mod quit;
 mod review;
 /// 画面の文章をマウスで選んでクリップボードへ写す（2026-10-03。部品は`harness_term::select`・`clipboard`）。
 mod select;
@@ -75,11 +77,39 @@ pub use review::{
     commit_selection, CommitSelection, PartialFile, ReviewCommand, ReviewDiffLine, ReviewFocus,
     ReviewPanelState, ReviewRow, ReviewTarget,
 };
-pub use select::CopyNotice;
-
 #[cfg(test)]
 #[path = "app_state_tests.rs"]
 mod tests;
+
+/// transcriptの枠の上辺に出す短い知らせ——写した結果（`app::select`）と、終了の仕方（`app::quit`）。会話画面には知らせの
+/// 行が無く、transcriptへ1行足すと末尾に貼り付いている間は画面の文章が動くので、中身を動かさない上辺に出す
+/// （`app::select`のモジュールdoc「知らせを出す場所」）。次にキーかマウスのボタンを押すと消える。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeNotice {
+    pub text: String,
+    pub tone: NoticeTone,
+}
+
+/// 知らせの色の使い分け。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeTone {
+    /// できた（写せた）。
+    Done,
+    /// できなかった（写せなかった）。
+    Failed,
+    /// 操作の案内（もう一度`Esc`で終了・`Ctrl+C`はコピーだけ）。
+    Hint,
+}
+
+impl EdgeNotice {
+    /// 操作の案内。
+    pub(crate) fn hint(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            tone: NoticeTone::Hint,
+        }
+    }
+}
 
 /// ターン以外のバックグラウンド処理（`/compact`の要約）の進捗
 /// （[BUG-070](../../../docs/bugs/BUG-070.md)・[BUG-071](../../../docs/bugs/BUG-071.md)）。
@@ -247,8 +277,10 @@ pub struct AppState {
     /// マウスで選んでいる文章（`app::select`。枠の名前はホイールで送るときの名前）。描くたびに
     /// [`Self::apply_draw_feedback`]がその描画で決まった範囲を受け取る。
     pub(crate) selection: harness_term::select::Selection<Wheel>,
-    /// 写した結果の知らせ（transcriptの枠の上辺に出す。次にキーかマウスのボタンを押すと消える。`app::select`）。
-    pub copy_notice: Option<CopyNotice>,
+    /// transcriptの枠の上辺に出す知らせ（写した結果・終了の仕方。次にキーかマウスのボタンを押すと消える。[`EdgeNotice`]）。
+    pub edge_notice: Option<EdgeNotice>,
+    /// `Esc`の二度押しの1回目（`app::quit`。何もしていない`Esc`のときだけ残る）。
+    pub(crate) double_esc: harness_term::double_esc::DoubleEsc,
 }
 
 // スクロール量（`PageUp`/`PageDown`とホイール1ノッチの行数）は
@@ -297,7 +329,8 @@ impl AppState {
             input_buttons_moved_at: None,
             press: Default::default(),
             selection: Default::default(),
-            copy_notice: None,
+            edge_notice: None,
+            double_esc: Default::default(),
         }
     }
 
@@ -344,7 +377,8 @@ impl AppState {
     }
 
     /// 描画tick（33ms間隔）ごとに呼ぶ。スピナーのフレームを送り、押されている形のボタンを、離していて最低時間が
-    /// 過ぎていれば戻す（`harness_term::button::Press::tick`。呼び出し側はこの後で必ず描き直す）。
+    /// 過ぎていれば戻す（`harness_term::button::Press::tick`。呼び出し側はこの後で必ず描き直す）。`Esc`の二度押しの
+    /// 1回目は、窓が過ぎたら知らせごと捨てる（`app::quit`）。
     pub fn tick(&mut self) {
         self.tick_at(Instant::now());
     }
@@ -353,6 +387,7 @@ impl AppState {
     pub(crate) fn tick_at(&mut self, now: Instant) {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
         self.press.tick(now);
+        self.expire_quiet_esc(now);
         // 文章を選びながらポインタを枠の上下の外で止めている間も送り続ける（`app::select`）。
         if let Some(scroll) = self.selection.tick(&self.pointer, now) {
             self.on_wheel(scroll.surface, scroll.up);

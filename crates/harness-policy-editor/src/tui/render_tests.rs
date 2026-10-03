@@ -1518,6 +1518,30 @@ fn every_wrapped_text_and_overlay_goes_through_harness_term() {
     );
 }
 
+/// [BUG-218] **ヘルプの終了の説明は、キーの実際の働きと同じ。** 記録中の`Esc`は停止で二度押しに数えず、記録中に
+/// 閉じるのは`Ctrl+Q`、`Ctrl+C`では終了しない（働きは`state_tests`の`two_escapes_do_not_quit_while_a_recording_is_running`・
+/// `quitting_while_recording_waits_for_the_teardown`・`ctrl_c_neither_quits_nor_stops_and_says_how_to_quit`が固定している）。
+/// 窓の長さは`harness_term::double_esc::WINDOW`の値で書く（数字を複製しない、B-05）。
+#[test]
+fn the_help_describes_quitting_as_the_keys_behave() {
+    let window = harness_term::double_esc::WINDOW.as_secs();
+    assert!(
+        HELP_TEXT.contains(&format!("Esc を{window}秒以内に2回")),
+        "窓の長さが値と違う"
+    );
+    assert!(
+        !HELP_TEXT.contains("記録中なら撤収を待ちます"),
+        "記録中の`Esc`の二度押しで閉じると書いている"
+    );
+    for said in [
+        "記録中の Esc は停止なので数えません",
+        "記録中に閉じるときは Ctrl+Q",
+        "Ctrl+C では終了しません",
+    ] {
+        assert!(HELP_TEXT.contains(said), "ヘルプに「{said}」が無い");
+    }
+}
+
 /// [BUG-192] ヘルプの高さも折り返した後の行数で数える。**端末が十分に高ければ最後の行まで読める。**
 ///
 /// 「高さは本文から数える」（B-09）はヘルプが先に直していたが、数えていたのは折り返す前の行だった。

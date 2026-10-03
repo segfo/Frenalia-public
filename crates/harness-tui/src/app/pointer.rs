@@ -17,7 +17,8 @@
 //!
 //! クリック用の処理は書かない（同じ操作を2か所に持つと、片方だけ直る）。[`Click`]はどれも次のどれかで終わる。
 //!
-//! - **キーを押す**（[`AppState::on_key`]）——キー案内の項目・入力欄の「送信」「中断」のボタン・承認ダイアログの
+//! - **キーを押す**（[`AppState::on_key`]）——キー案内の項目（入力欄の見出しの`Esc×2=終了`は`Esc`を2回続けて）・
+//!   入力欄の「送信」「中断」のボタン・承認ダイアログの
 //!   ボタン・レビューパネルの案内・ペイン（`Tab`）・取り込みの印（`Enter`）・確認の段の候補（`↑↓`で移って`Space`）。
 //! - **キーが呼ぶのと同じ関数を、行で呼ぶ**——レビューパネルの一覧の行（`↑↓`が呼ぶ`select_row`）。
 //! - **キーが変えるのと同じ状態を、押した場所の分だけ変える**——差分のハンクの見出し（フォーカスとハンクの
@@ -85,6 +86,8 @@
 //!   ボタンを押す（狙ったとおり）。
 //! - セッションのピッカー（`crate::picker`）は自分のループで描いて引く（同じ部品・同じ形）。
 //! - 文章を押してずらしたときの選択とコピーは`app::select`が持つ（押した瞬間のクリックは変えない）。
+//! - キーボードの`Esc`の後にクリックを挟むと、`Esc`の二度押し（終了）の続きは切れる（キーと同じ規則。`app::quit`）。
+//!   捨てるクリック（動いた直後の入力欄の右のボタン）と、押せる場所の外のクリック・ホイールは切らない。
 
 use std::time::{Duration, Instant};
 
@@ -109,6 +112,9 @@ pub(crate) const BUTTON_SHIFT_GRACE: Duration = super::approval::MODAL_INPUT_GRA
 pub enum Click {
     /// キーを押す（入力欄の見出し・レビューパネルの案内の項目。ボタンの形ではないので押されている形は無い）。
     Key(KeyEvent),
+    /// キーを2回続けて押す（入力欄の見出しの`Esc×2=終了`。キーで二度押ししたのと同じ——1回目で何かが返ったら、そこで
+    /// 止めて返す。ポリシーエディタのキー案内の`Esc×2 終了`と同じ）。
+    KeyTwice(KeyEvent),
     /// キーを押すボタン（承認ダイアログの選択肢）。開いた直後の窓（D-106）の間はキーと同じく捨てる。
     Button(KeyEvent),
     /// 入力欄の右のボタン（「送信」「中断」）。キーを押すが、ボタンが動いた直後は捨てる（モジュールdoc）。
@@ -150,6 +156,9 @@ pub struct KeyHint {
     pub label: String,
     /// 押したときのキー。`None`は押せない（1つのキーに決まらない案内・一括の操作）。
     pub key: Option<KeyEvent>,
+    /// 押すと`key`を2回続けて押す（[`Click::KeyTwice`]。`Esc×2=終了`だけ）。案内の文字のまま描く項目にだけ使う
+    /// （ボタンの形で描く案内は1回押すだけ——`crate::ui`の`register_hints`）。
+    pub twice: bool,
 }
 
 impl KeyHint {
@@ -163,6 +172,15 @@ impl KeyHint {
         Self {
             label: label.into(),
             key: Some(key),
+            twice: false,
+        }
+    }
+
+    /// 押すと`code`を2回続けて押す項目（修飾キー無し）。
+    pub fn press_twice(label: impl Into<String>, code: KeyCode) -> Self {
+        Self {
+            twice: true,
+            ..Self::press(label, code)
         }
     }
 
@@ -171,6 +189,7 @@ impl KeyHint {
         Self {
             label: label.into(),
             key: None,
+            twice: false,
         }
     }
 }
@@ -250,20 +269,21 @@ impl AppState {
                 // `HARNESS_KEY_DEBUG=1`時は画面にもecho（Press/Release両方を観測するため
                 // Pressに絞る前に呼ぶ）。無効時は`note_key_event`が即returnする。
                 self.note_key_event(key);
+                // 離上は`Esc`の二度押しの間に挟まっても数え直さない（Windowsのコンソールは押下と離上の両方を送る）。
                 if key.kind != KeyEventKind::Press {
                     return Step::Unchanged;
                 }
-                // 写した知らせは、次にキーを押したら消す（`app::select`）。
-                self.copy_notice = None;
-                Step::Handled(self.on_key(key))
+                // 上辺の知らせ（写した結果・終了の仕方）は、次にキーを押したら消す（`app::select`・`app::quit`）。
+                self.edge_notice = None;
+                Step::Handled(self.on_key_at(key, now))
             }
             Event::Mouse(mouse) => {
                 // 左ボタンの押下・離上・ボタンを押さない移動は、前に押したボタンを離したことを表す（押されている形を
                 // 戻すかもしれない）。押下でボタンを押したなら、この後の`on_click`が押されている形にする。
                 let released = self.press.pointer(mouse.kind, now);
-                // 写した知らせは、次にボタンを押したら消す（`app::select`）。
+                // 上辺の知らせは、次にボタンを押したら消す（`app::select`・`app::quit`）。
                 if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                    self.copy_notice = None;
+                    self.edge_notice = None;
                 }
                 // 文章を選んでいる途中の移動と離上・右クリックは、選択が先に受ける（`app::select`）。
                 if let Some(step) = self.on_selection_mouse(mouse, now) {
@@ -333,8 +353,23 @@ impl AppState {
     }
 
     fn on_click(&mut self, click: Click, now: Instant) -> Option<Action> {
+        // 入力欄の右のボタンが動いた直後のクリックは捨てる（モジュールdoc）。押していないのと同じく何もしない——
+        // `Esc`の二度押しの続きも切らない（ポリシーエディタの「記録」の枠の右のボタンと同じ）。
+        if matches!(click, Click::InputButton(_))
+            && self
+                .input_buttons_moved_at
+                .is_some_and(|moved| moved.elapsed() < BUTTON_SHIFT_GRACE)
+        {
+            return None;
+        }
+        // クリックは`Esc`ではない。二度押しの途中に挟まったら数え直す（`app::quit`。キーを押すクリックは`on_key_at`が
+        // もう一度判定する）。
+        self.double_esc.reset();
         match click {
-            Click::Key(pressed) => self.on_key(pressed),
+            Click::Key(pressed) => self.on_key_at(pressed, now),
+            Click::KeyTwice(pressed) => self
+                .on_key_at(pressed, now)
+                .or_else(|| self.on_key_at(pressed, now)),
             Click::Button(pressed) => {
                 // 開いた直後の窓（D-106）の間は、キーと同じく`on_key`が捨てる。捨てるクリックに押した色を付けない。
                 if self
@@ -344,18 +379,11 @@ impl AppState {
                 {
                     self.press.down(click, now);
                 }
-                self.on_key(pressed)
-            }
-            Click::InputButton(_)
-                if self
-                    .input_buttons_moved_at
-                    .is_some_and(|moved| moved.elapsed() < BUTTON_SHIFT_GRACE) =>
-            {
-                None
+                self.on_key_at(pressed, now)
             }
             Click::InputButton(pressed) => {
                 self.press.down(click, now);
-                self.on_key(pressed)
+                self.on_key_at(pressed, now)
             }
             Click::ScrollToLatest => {
                 self.scroll.reset();

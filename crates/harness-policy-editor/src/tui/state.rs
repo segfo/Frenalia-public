@@ -841,9 +841,9 @@ pub struct App {
     pub declared_approval: crate::tui::declared::DeclaredApprovalState,
     /// 宣言画面の付け替え（`c`・`R`）の予約。中身は`tui::declared`の子が持つ（上と同じ理由）。
     pub declared_reassign: crate::tui::declared::declared_reassign::DeclaredReassignState,
-    /// `Esc`を最後に押した時刻。**2回連続で押されたか**を判定するためだけに持つ
-    /// （[`is_double_esc`]）。`Esc`以外のキーが来たら捨てる。
-    pub last_esc: Option<std::time::Instant>,
+    /// `Esc`の二度押しの1回目（判定と窓の長さは会話画面と共有する`harness_term::double_esc`）。何もしていない`Esc`の
+    /// ときだけ残る——`Esc`以外のキーも、他の働きをした`Esc`も数え直し（[`App::on_key_at`]）。
+    pub double_esc: harness_term::double_esc::DoubleEsc,
     /// 編集画面の`[x]`重ねに使う、**いまドメイン欄に入っている名前**の宣言のスナップショット。
     ///
     /// # なぜキャッシュするのか
@@ -872,19 +872,7 @@ pub enum DeclaredRow {
     Entry(crate::unapprove::UnapproveTarget),
 }
 
-/// `Esc`が「1秒以内に2回」押されたか。
-///
-/// # なぜ純粋関数にするのか
-///
-/// `Instant::now()`を直接読むと、しきい値の境界（1秒を超えたら終了しない）を確かめるのに
-/// テストでsleepするしかなくなる。`checked_sub`で「古い前回」を作れる形にしておけば、
-/// **待たずに3ケースとも固定できる**。
-pub fn is_double_esc(previous: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    previous.is_some_and(|last| now.duration_since(last) <= ESC_QUIT_WINDOW)
-}
-
-/// `Esc`の2回目をどれだけ待つか。**この値の持ち主は1つ**（案内文もここを参照する）。
-pub const ESC_QUIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+// `Esc`の二度押しの判定と窓の長さ（1秒）は`harness_term::double_esc`が持つ（会話画面と同じ規則。2026-10-03にここから移した）。
 
 impl App {
     /// `require_sandbox`はCLIのルート引数から解決した値を渡す（[BUG-127](../../../../docs/bugs/BUG-127.md)）。
@@ -940,7 +928,7 @@ impl App {
             unapproved: BTreeSet::new(),
             declared_approval: Default::default(),
             declared_reassign: Default::default(),
-            last_esc: None,
+            double_esc: Default::default(),
             declared_domain: None,
         };
         app.reload_sessions();
@@ -1483,30 +1471,37 @@ impl App {
 
     // マウス（`on_mouse`）は`tui::pointer`、ホイールで送ること（`on_wheel`）は`tui::scroll`が持つ。
 
+    /// キー1つ（いまの時刻で。[`Self::on_key_at`]）。
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
+        self.on_key_at(key, std::time::Instant::now())
+    }
+
+    /// [`Self::on_key`]の本体。`now`はキーを押した時刻（`Esc`の二度押しを数える。試験は時刻を作って渡す）。
+    pub fn on_key_at(&mut self, key: KeyEvent, now: std::time::Instant) -> Option<Action> {
+        // 離上は何もしない（`Esc`の二度押しも数え直さない——Windowsのコンソールは押下と離上の両方を送る）。
         if key.kind != KeyEventKind::Press {
             return None;
         }
-        // 選んでいる文章があれば、`Ctrl+C`は写し、`Esc`は外すだけ（確認ダイアログ・ヘルプより先。`tui::select`）。
+        // **`Esc`の二度押しの1回目は、他のどのキーよりも先に取り出して捨てた状態にする。** 戻すのは下の判定の1か所
+        // だけ——`Esc`以外のキーも、選択を外した・確認ダイアログやヘルプを閉じた・記録を止めた`Esc`も、経路ごとに
+        // 書き足さなくても数え直しになる（「連続で2回」を文字どおりにする。挟まっても生き残る作りにすると、無関係な
+        // 操作のあとの`Esc`1回で突然終了する——ドラッグ選択のアンカーを「明らかなキーだけ」でリセットして踏んだのと
+        // 同型の穴）。
+        let first_esc = std::mem::take(&mut self.double_esc);
+        // `Ctrl+C`はいつもここで終わる（選んでいれば写し、選んでいなければ終了の仕方を知らせる）。選んでいる文章が
+        // あれば`Esc`は外すだけ（確認ダイアログ・ヘルプより先。`tui::select`）。
         if let Some(handled) = self.on_selection_key(key) {
             return handled;
         }
 
-        // 終了要求。実行中なら**撤収まで待つ**（ここで抜けるとマニフェストが`Running`のまま残る）。
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q'))
-        {
+        // 終了要求（`Ctrl+Q`）。実行中なら**撤収まで待つ**（ここで抜けるとマニフェストが`Running`のまま残る）。
+        // `Ctrl+C`は終了に使わない（2026-10-03。コピーのつもりの連打で終わっていた——`harness_term::double_esc`）。
+        // 記録中の`Esc`は停止で二度押しに数えないので、記録中に閉じる口はこれだけである。
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
             return self.request_quit();
         }
         // 画面切替の予備のキー。**F1/F2は端末に届かないことがある**——VS Codeの統合ターミナルは
         // F1をコマンドパレットに奪う。入力欄に文字が入ってしまわないよう修飾キー付きにする。
-        // **`Esc`の連続判定は他のどのキーよりも先に捨てる。** 「連続で2回」を文字どおりにする
-        // ——間に別のキーが挟まっても生き残る作りにすると、無関係な操作のあとの`Esc`1回で
-        // 突然終了する（ドラッグ選択のアンカーを「明らかなキーだけ」でリセットして踏んだのと
-        // 同型の穴）。ここで捨てて、`Esc`だった場合だけ後段で積み直す。
-        if key.code != KeyCode::Esc {
-            self.last_esc = None;
-        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
             self.screen = self.next_screen();
             self.on_enter_screen();
@@ -1526,19 +1521,21 @@ impl App {
         // 書くと、画面を足した人が写し忘れる。
         //
         // モーダル・ヘルプの**後**に置いてある（上の早期returnを通っている）ので、
-        // ダイアログを閉じる`Esc`の既存の意味は変わらない。
+        // ダイアログを閉じる`Esc`の既存の意味は変わらず、閉じた`Esc`は数えない（1回目は捨てたまま）。
         // **記録中は数えない。** 記録中の`Esc`は「停止」で、止めたいときは連打されやすいキーである
         // ——そこで終了に転ぶと、止めたつもりがプログラムごと終わる。既存のテストが
         // 「止めたつもりが画面だけ変わる、が一番困る」と書いている判断の延長で、こちらの方が
-        // 困る。記録中の終了は従来どおり`Ctrl+C`/`Ctrl+Q`（撤収を待つ経路）を使う。
+        // 困る。記録中の終了は`Ctrl+Q`（撤収を待つ経路）を使う。
         if key.code == KeyCode::Esc && !self.is_running() {
-            let now = std::time::Instant::now();
-            if is_double_esc(self.last_esc, now) {
-                self.last_esc = None;
+            let mut esc = first_esc;
+            if esc.press(now) {
                 // 終了は既存の経路へ合流させる（2つ目の終了経路を作らない）。
                 return self.request_quit();
             }
-            self.last_esc = Some(now);
+            self.double_esc = esc;
+            // 1回目で、もう一度押せば終了することを知らせる（窓が過ぎたら`tui::tick`が消す）。画面ごとの意味が
+            // 知らせの行を書き換えたら、そちらを残す。
+            self.status = harness_term::double_esc::armed_notice();
             // 1回目はここで止めず、画面ごとの既存の意味（記録画面へ戻る等）へ流す。
         }
 

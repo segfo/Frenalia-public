@@ -496,7 +496,7 @@ fn nothing_behind_the_approval_dialog_or_off_its_buttons_can_be_clicked() {
     for place in [
         screen.find_last("中断"),
         screen.find_last("送信"),
-        screen.find("Ctrl-C"),
+        screen.find("Enter=改行"),
         (1, 2),
         screen.find("program: git"),
         screen.find("PageUp/PageDown ス"),
@@ -656,9 +656,10 @@ fn running_app() -> AppState {
     app
 }
 
-/// **入力欄の見出しに残ったキー案内は、そのキーを押したのと同じ**（`Enter=改行`・`Ctrl-C=終了`）。
+/// **入力欄の見出しに残ったキー案内は、そのキーを押したのと同じ**（`Enter=改行`・`Esc×2=終了`は`Esc`を2回）。
 /// `PageUp/PageDown=スクロール`は1つのキーに決まらないので押せない。**送信と中断は見出しから外れて**、
-/// 入力欄の右のボタンにだけある（同じ操作を2か所に並べない）。
+/// 入力欄の右のボタンにだけある（同じ操作を2か所に並べない）。応答中は`Esc`が中断なので`Esc×2=終了`は出ない
+/// （`app::quit`）。
 #[test]
 fn the_input_title_hints_press_their_keys() {
     let mut app = running_app();
@@ -683,10 +684,17 @@ fn the_input_title_hints_press_their_keys() {
     let screen = draw(&mut app);
     assert!(click(&mut app, screen.find("PageUp/PageDown=")).is_none());
     assert_eq!(app.scroll_offset(), 0);
+    assert!(
+        screen.try_find("Esc×2").is_none(),
+        "応答中に終了の案内が出た"
+    );
 
+    // 応答していないときの`Esc×2=終了`は、`Esc`を2回押したのと同じく終了する。
+    let mut app = app_with_transcript(3);
+    type_text(&mut app, "hi");
     let screen = draw(&mut app);
     assert!(matches!(
-        click(&mut app, screen.find("Ctrl-C")),
+        click(&mut app, screen.find("Esc×2=終了")),
         Some(Action::Quit)
     ));
     assert!(app.should_quit);
@@ -1049,7 +1057,8 @@ fn the_buttons_stay_at_the_bottom_right_when_the_input_grows() {
 /// 応答中・既定の送信キー（`Shift+Enter`）で、キーを添える形は13桁×2、短い形は8桁×2（手で数えた値）。
 #[test]
 fn a_narrow_terminal_never_overlaps_or_cuts_the_input_and_its_buttons() {
-    let titles = ["Enter=改行", "PageUp/PageDown=スクロール", "Ctrl-C=終了"];
+    // 応答中なので`Esc×2=終了`は出ない（`app::quit`）。
+    let titles = ["Enter=改行", "PageUp/PageDown=スクロール"];
     for width in [100u16, 60, 48, 47, 38, 37, 20, 8] {
         let mut app = running_app();
         type_text(&mut app, "hi");
@@ -1786,3 +1795,7 @@ fn a_long_review_list_keeps_the_selected_row_visible() {
 /// 画面の文章を選んで写す試験（`app::select`）。この試験の描き方・押し方の道具を使うので、ここの子にする。
 #[path = "select_tests.rs"]
 mod select_tests;
+
+/// `Esc`の二度押しで閉じる試験（`app::quit`）。同じ理由でここの子にする。
+#[path = "quit_tests.rs"]
+mod quit_tests;

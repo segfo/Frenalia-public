@@ -22,12 +22,14 @@
 //! - **選んでいるときの`Ctrl+C`と右クリックは写す**（VS Codeの統合ターミナルの既定と同じ。ただし VS Code の
 //!   統合ターミナルは右クリックを自分で受けて貼り付けにするので、そこでは右クリックはアプリへ届かない——
 //!   `harness_term::select`の限界）。写したら選択を外し、
-//!   transcriptの枠の上辺に「N文字をコピーしました」を出す。**選んでいないときの`Ctrl+C`は今までどおり終了**、
-//!   右クリックは今までどおり何もしない。入力欄にキーボードの選択（`Shift+矢印`・`Ctrl+A`）があるときの
-//!   `Ctrl+C`と右クリックは、入力欄の選択を写す。入力欄の見出しの案内は、写せる間だけ`Ctrl-C=コピー`になる。
-//! - **選んでいる間の`Esc`は選択を外すだけ**（中断も、承認ダイアログの拒否も、レビューパネルを閉じることもしない）。
-//!   `Esc`はいちばん内側のものから効く（承認ダイアログ→レビューパネル→中断）。選んだ範囲はそのどれよりも上に
-//!   見えているので、先に外す。もう一度押せば今までどおり。
+//!   transcriptの枠の上辺に「N文字をコピーしました」を出す。**`Ctrl+C`は終了に使わない**（2026-10-03から。`app::quit`）
+//!   ——選んでいないときは何も写さず、同じ上辺に「終了は Esc を2回」を出す。重ねた枠が開いていても同じ（どの枠も
+//!   `Ctrl+C`を自分の文字のキーとして受けない。BUG-212）。右クリックは今までどおり何もしない。入力欄にキーボードの選択
+//!   （`Shift+矢印`・`Ctrl+A`）があるときの`Ctrl+C`と右クリックは、入力欄の選択を写す。入力欄の見出しの案内は、写せる間だけ
+//!   `Ctrl-C=コピー`になる。
+//! - **選んでいる間の`Esc`は選択を外すだけ**（中断も、承認ダイアログの拒否も、レビューパネルを閉じることもしない。
+//!   `Esc`の二度押しにも数えない）。`Esc`はいちばん内側のものから効く（承認ダイアログ→レビューパネル→中断→二度押しで
+//!   終了）。選んだ範囲はそのどれよりも上に見えているので、先に外す。もう一度押せば今までどおり。
 //! - 選択は**別の場所を押したとき**にも外れる。マウスの選択と入力欄の選択は同時に持たない（後から作ったほうが残る）。
 //!
 //! # 写すのはイベントループ
@@ -51,17 +53,9 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use super::{Action, AppState, ReviewFocus, Step, Wheel};
+use super::{Action, AppState, EdgeNotice, NoticeTone, ReviewFocus, Step, Wheel};
 
-/// 写した結果の知らせ（transcriptの枠の上辺に出す。モジュールdoc）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CopyNotice {
-    pub text: String,
-    /// 写せたか（色を変える）。
-    pub ok: bool,
-}
-
-/// 写すキー（`Ctrl+C`。選んでいないときは終了——`AppState::on_key`）。
+/// 写すキー（`Ctrl+C`。選んでいないときは終了の仕方を知らせるだけ——[`AppState::on_selection_key`]）。
 pub(crate) fn is_copy_key(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
@@ -86,18 +80,27 @@ impl AppState {
 
     /// 写した結果（イベントループがクリップボードへ書いた後に呼ぶ。`text`は写した文章）。
     pub fn note_copied(&mut self, text: &str, result: Result<(), String>) {
-        self.copy_notice = Some(CopyNotice {
+        self.edge_notice = Some(EdgeNotice {
             text: harness_term::clipboard::notice(text, &result),
-            ok: result.is_ok(),
+            tone: if result.is_ok() {
+                NoticeTone::Done
+            } else {
+                NoticeTone::Failed
+            },
         });
     }
 
-    /// キーの前に、選択が先に受けるもの（`Ctrl+C`で写す・`Esc`で外す）。受けたら`Some`（中身はキーの結果）。
+    /// キーの前に、選択が先に受けるもの（`Ctrl+C`・`Esc`で外す）。受けたら`Some`（中身はキーの結果）。
+    ///
+    /// **`Ctrl+C`はいつもここで終わる**——選んでいれば写し、選んでいなければ終了の仕方を知らせる（`app::quit`。押しても
+    /// 無反応にしない、B-23(c)）。重ねた枠より先に受けるので、どの状態でも`Ctrl+C`の意味は同じ。
     pub(super) fn on_selection_key(&mut self, key: KeyEvent) -> Option<Option<Action>> {
         if is_copy_key(&key) {
-            if let Some(action) = self.copy_selection() {
-                return Some(Some(action));
+            let copied = self.copy_selection();
+            if copied.is_none() {
+                self.edge_notice = Some(EdgeNotice::hint(harness_term::double_esc::CTRL_C_NOTICE));
             }
+            return Some(copied);
         }
         if key.code == KeyCode::Esc && self.selection.is_active() {
             self.selection.clear();
@@ -139,6 +142,8 @@ impl AppState {
         if surface == Wheel::ReviewDiff {
             self.focus_review(ReviewFocus::Diff);
         }
+        // 押したのは`Esc`ではない。二度押しの途中に挟まったら数え直す（クリックと同じ規則。`app::quit`）。
+        self.double_esc.reset();
         self.selection.press(&self.pointer, surface, column, row);
     }
 }

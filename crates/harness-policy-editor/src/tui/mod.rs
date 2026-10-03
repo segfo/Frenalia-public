@@ -41,8 +41,9 @@
 //! # `Esc`を1秒以内に2回でプログラムを終了する
 //!
 //! `Esc`の単押しは記録画面へ戻る（画面遷移）で、`Ctrl+N`も遷移に使う。終了の口が無くなるので、
-//! `Esc`の二度押しを終了に割り当てている（判定は[`state::is_double_esc`]、時間は
-//! [`state::ESC_QUIT_WINDOW`]）。
+//! `Esc`の二度押しを終了に割り当てている（判定は`App::on_key_at`の1か所、数え方と窓の長さは会話画面と共有する
+//! `harness_term::double_esc`）。記録中の`Esc`は停止で数えないので、記録中に閉じるのは`Ctrl+Q`（撤収を待つ）。
+//! **`Ctrl+C`は終了に使わない**（2026-10-03。選んだ文章を写すだけ——[`select`]）。
 //!
 //! # テスト（宣言どおりの強制での検証）は、別の画面ではなくパス2の「強制」で行う
 //!
@@ -297,7 +298,7 @@ pub(crate) fn handle_event_at(
     now: std::time::Instant,
 ) -> Option<Action> {
     match event {
-        Event::Key(key) => app.on_key(key),
+        Event::Key(key) => app.on_key_at(key, now),
         Event::Mouse(mouse) => app.on_mouse(mouse, now),
         _ => None,
     }
@@ -311,6 +312,10 @@ pub(crate) fn handle_event_at(
 ///   ループは1周に1イベントなので、クリック・キー・記録の終了のどれで変わっても、次のイベントを読む前にここを通る。
 pub(crate) fn tick(app: &mut App, now: std::time::Instant) {
     app.press.tick(now);
+    // `Esc`の二度押しの1回目は、窓が過ぎたら捨て、その知らせがまだ出ていれば消す（`harness_term::double_esc`）。
+    if app.double_esc.expire(now) && app.status == harness_term::double_esc::armed_notice() {
+        app.status.clear();
+    }
     // 文章を選びながらポインタを枠の上下の外で止めている間も送り続ける（`tui::select`）。
     if let Some(scroll) = app.selection.tick(&app.pointer, now) {
         app.on_wheel(scroll.surface, scroll.up);
@@ -505,7 +510,11 @@ harness-policy-editor — LLMを介さずに「このコマンドに何を許す
 
 画面の行き来（3通り。使える方をどうぞ）
   Esc          記録画面へ戻る（記録中は「停止」が優先されます）
-  **Esc を1秒以内に2回でこのプログラムを終了します**（記録中なら撤収を待ちます）
+  **Esc を1秒以内に2回でこのプログラムを終了します**（1回目で知らせの行に案内が出ます）
+               記録中の Esc は停止なので数えません。記録中に閉じるときは Ctrl+Q
+               （記録を止め、撤収が終わってから閉じます。Ctrl+Q が届かない端末では、
+               Esc で止めて記録が終わってから Esc を2回）
+               Ctrl+C では終了しません（選んだ文章のコピーに使います）
   Ctrl+N       記録 → 承認待ち → 宣言 → 記録 と巡回
   F1 / F2 / F3 記録 / 承認待ち / 宣言 を直接指定（F4 はこのヘルプ）
   F2 をもう一度押すと、承認待ちの**タブ**が切り替わります
@@ -599,7 +608,7 @@ harness-policy-editor — LLMを介さずに「このコマンドに何を許す
             一括の操作（宣言画面の A・遷移タブの X）はキーでだけ押せます
   ホイール  ポインタの下の枠を送ります（ヘルプか確認画面が開いている間はそれを送ります）
   ドラッグ  文章の枠（説明・記録の出力・このヘルプ・確認画面）を押してずらすと文字を選べます
-            Ctrl+C か右クリックでクリップボードへ写します（選んでいないときの Ctrl+C は終了）
+            Ctrl+C か右クリックでクリップボードへ写します（Ctrl+C で終了はしません）
             VS Code のターミナルでは右クリックが貼り付けになるので、Ctrl+C を使ってください
             枠の上下の外までずらすと送ります。Esc で選択を外します
             一覧の行・入力欄は選べません

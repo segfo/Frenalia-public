@@ -170,24 +170,28 @@ impl AppState {
     ///
     /// 送信と中断はここに無い——入力欄の右の枠付きのボタン（[`Self::input_buttons`]）へ移した（2026-10-03）。
     /// 残るのはキーボードの人のための案内で、`PageUp/PageDown`は1つのキーに決まらないので押せない。`Enter=改行`は
-    /// 素のEnterが改行のとき（[`Self::enter_submits`]が偽）だけ出す。`Ctrl-C=終了`は押せる——ポリシーエディタのキー案内も
-    /// 終了の項目を押せる（`plans/POLICY-EDITOR-TOMOYO-DIG.md`決定62の「マウスで操作できるようにした」の表の5）。
+    /// 素のEnterが改行のとき（[`Self::enter_submits`]が偽）だけ出す。
+    ///
+    /// 3つめの項目は1つの場所を状態で使い分ける（項目を増やさない——見出しは幅が足りないと後ろから項目を落とす）。
+    /// 写せる選択があれば`Ctrl-C=コピー`（`app::select`）。無ければ、`Esc`の二度押しが終了に数えられる間
+    /// （[`Self::esc_would_count`]）だけ`Esc×2=終了`（`app::quit`）——止めるものが走っている間・重ねた枠が開いている間は
+    /// `Esc`が別の働きをするので出さない（効く操作を案内する、B-32）。`Esc×2=終了`は押すと`Esc`を2回続けて押す
+    /// （ポリシーエディタのキー案内の`Esc×2 終了`と同じ。`plans/POLICY-EDITOR-TOMOYO-DIG.md`決定62の
+    /// 「マウスで操作できるようにした」の表の5）。
     pub fn input_key_hints(&self) -> Vec<KeyHint> {
         let mut hints = Vec::new();
         if !self.enter_submits {
             hints.push(KeyHint::press("Enter=改行", KeyCode::Enter));
         }
         hints.push(KeyHint::shown("PageUp/PageDown=スクロール"));
-        // 写せる選択があるあいだは、同じキーが写す（`app::select`。効く操作を案内する、B-32）。
-        let ctrl_c = if self.has_copyable_selection() {
-            "Ctrl-C=コピー"
-        } else {
-            "Ctrl-C=終了"
-        };
-        hints.push(KeyHint::press_key(
-            ctrl_c,
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-        ));
+        if self.has_copyable_selection() {
+            hints.push(KeyHint::press_key(
+                "Ctrl-C=コピー",
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ));
+        } else if self.esc_would_count() {
+            hints.push(KeyHint::press_twice("Esc×2=終了", KeyCode::Esc));
+        }
         hints
     }
 
@@ -243,17 +247,26 @@ impl AppState {
         self.turn_in_flight || self.busy_progress.as_ref().is_some_and(|b| b.is_running())
     }
 
-    /// キー入力を処理し、engineアクター/InteractiveGateへ伝えるべきアクションを返す。
-    ///
-    /// 選んでいる文章があれば、`Ctrl+C`はそれを写し、`Esc`はそれを外すだけにする（承認ダイアログ・レビューパネルが
-    /// 開いていても先に。`app::select`のモジュールdoc）。入力欄にキーボードで選択を作ったら、マウスの選択は外す
-    /// （2つの選択を同時に持たない）。
+    /// キー入力を処理し、engineアクター/InteractiveGateへ伝えるべきアクションを返す（いまの時刻で。[`Self::on_key_at`]）。
     pub fn on_key(&mut self, key: KeyEvent) -> Option<Action> {
+        self.on_key_at(key, Instant::now())
+    }
+
+    /// [`Self::on_key`]の本体。`now`はキーを押した時刻（`Esc`の二度押しを数える。試験は時刻を作って渡す）。
+    ///
+    /// `Ctrl+C`はいつも選択が受ける——選んでいれば写し、選んでいなければ終了の仕方を知らせる（終了はしない）。選んでいる
+    /// 文章があれば`Esc`はそれを外すだけにする（承認ダイアログ・レビューパネルが開いていても先に。`app::select`の
+    /// モジュールdoc）。入力欄にキーボードで選択を作ったら、マウスの選択は外す（2つの選択を同時に持たない）。
+    pub(crate) fn on_key_at(&mut self, key: KeyEvent, now: Instant) -> Option<Action> {
+        // `Esc`の二度押しの1回目は、この押下が何もしていない`Esc`だったときだけ残る（`app::quit`）。ここで取り出して
+        // 数え直した状態にし、数える1か所（`count_quiet_esc`）だけが戻す——`Esc`以外のキーも、他の働きをした`Esc`も、
+        // 経路ごとに書き足さなくても数え直しになる。
+        let first_esc = std::mem::take(&mut self.double_esc);
         if let Some(handled) = self.on_selection_key(key) {
             return handled;
         }
         let before = self.selection_range();
-        let action = self.on_key_after_selection(key);
+        let action = self.on_key_after_selection(key, first_esc, now);
         let after = self.selection_range();
         if after.is_some() && after != before {
             self.selection.clear();
@@ -261,8 +274,14 @@ impl AppState {
         action
     }
 
-    /// [`Self::on_key`]の本体（選択が受けなかったキー）。
-    fn on_key_after_selection(&mut self, key: KeyEvent) -> Option<Action> {
+    /// [`Self::on_key_at`]の本体（選択が受けなかったキー）。`first_esc`は、このキーが何もしていない`Esc`だったときにだけ
+    /// 数える二度押しの1回目。
+    fn on_key_after_selection(
+        &mut self,
+        key: KeyEvent,
+        first_esc: harness_term::double_esc::DoubleEsc,
+        now: Instant,
+    ) -> Option<Action> {
         // 承認モーダルは自分でキーを解釈する（確認の一段・穴の選択・枠のスクロールがあるので、
         // 「決定キー以外は捨てる」では足りない）。ここに残るのは**応答への写像**だけである
         // （審査パネルと同じ分け方。`app::approval`のモジュールdoc参照）。
@@ -294,11 +313,8 @@ impl AppState {
             };
         }
 
+        // `Ctrl+C`はここへ来ない（いつも選択が受ける。`on_selection_key`）——終了には使わない（`app::quit`）。
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-                Some(Action::Quit)
-            }
             // ツールカード/thinkingブロックの折り畳み⇔展開トグル（Claude Code CLIのCtrl+O相当）。
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_fold();
@@ -332,9 +348,11 @@ impl AppState {
                 self.scroll_page(-1);
                 None
             }
-            // モーダル非表示時のEscはターン単位のキャンセル（設計書§リッチTUI「Escで
-            // CancellationToken発火」）。Ctrl-Cはプロセス終了のまま維持する。
-            KeyCode::Esc => Some(Action::Cancel),
+            // モーダル非表示時のEscは、止めるものが走っていればそれを止める（設計書§リッチTUI「Escで
+            // CancellationToken発火」）。止めた`Esc`は二度押しに数えない（`first_esc`は捨てたまま）。
+            KeyCode::Esc if self.can_cancel() => Some(Action::Cancel),
+            // 何も走っていなければ、二度押しの1回目・2回目として数える（`app::quit`）。
+            KeyCode::Esc => self.count_quiet_esc(first_esc, now),
             // 送信キーはAlt+Enter・Shift+Enterの両方。VS Code統合ターミナル（xterm.js）は
             // Shift修飾を落として素のEnterとして届けるため、そちらでは自然に改行のままになる
             // （＝SHIFT修飾が実際に届くかどうか自体が端末の自動検出になっている）。
