@@ -18,7 +18,7 @@
 //! 1. **綴りの判定**（[`encoded_switch`]）。PowerShell が `-EncodedCommand` として受け付ける
 //!    省略形を1箇所で決める。T-09の検出（`harness-engine`の`looks_like_allowlist_bypass`が呼ぶ
 //!    [`line_has_encoded_switch`]）と、承認画面の解読が**同じこの関数**を通る——綴りの一覧を2箇所に
-//!    持つと静かにずれる（`B-05`。[BUG-222](../../../docs/bugs/BUG-222.md)）
+//!    持つと静かにずれる（`B-13`。[BUG-222](../../../docs/bugs/BUG-222.md)）
 //! 2. **解読**（[`decode_shell_line`]・[`decode_program_args`]）。段ごとに[`DecodedLayer`]を返す
 //!
 //! # 照合には使わない
@@ -101,7 +101,7 @@ pub fn is_powershell(program: &str) -> bool {
 
 /// 1つの引数が、符号化された値を取る PowerShell のスイッチか（モジュールdocの表）。
 ///
-/// **T-09の検出と承認画面の解読が、同じこの関数で綴りを決める**（`B-05`）。
+/// **T-09の検出と承認画面の解読が、同じこの関数で綴りを決める**（`B-13`）。
 pub fn encoded_switch(arg: &str) -> Option<EncodedSource> {
     let name = switch_name(arg)?;
     // `-ec`・`-ea`は頭文字の略で、接頭辞ではないので名指しする。`-e`は PowerShell が

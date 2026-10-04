@@ -623,7 +623,7 @@ impl PermissionGate for PermissionArbiter {
 /// 3. **PowerShell の符号化スイッチ**（[`harness_tools::encoded_command::line_has_encoded_switch`]）。
 ///    `-EncodedCommand`には PowerShell が受け付ける省略形が多数ある（`-e`・`-ec`・`--enc`・`/enc`・
 ///    ダッシュ記号・前後の空白）ので、部分一致では足りない。**綴りの表は解読する側と共有する**——
-///    2箇所に持つと静かにずれる（`B-05`）。`grep -e foo`のような別のコマンドの`-e`を拾わないよう、
+///    2箇所に持つと静かにずれる（`B-13`）。`grep -e foo`のような別のコマンドの`-e`を拾わないよう、
 ///    向こうは PowerShell の起動に続く引数としてだけ見る（[BUG-222](../../../docs/bugs/BUG-222.md)）
 fn looks_like_allowlist_bypass(command: &str) -> bool {
     const MARKERS: &[&str] = &[
