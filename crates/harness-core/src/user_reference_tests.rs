@@ -233,3 +233,68 @@ fn the_closest_user_value_wins() {
     assert_eq!(repairs[0].differences, 1);
     assert_eq!(repairs[0].user_value, b);
 }
+
+/// **実測そのものを固定する。** 2026-10-04、ローカルの`qwen3.6-35b`が308文字の base64 を書き写し、
+/// **1文字消して1文字書き換えた**（307文字。似ている度合い99.5%）。
+///
+/// 値は会話の記録（`<workspace>\.harness\sessions\session-*.jsonl`）からそのまま写した。
+/// **この形を「長さが同じ」という条件で弾いていた**ので、違いの数え方を足し引き込み
+/// （レーベンシュタイン距離）へ変えた。書き換えだけを数えると、消えた1文字より後ろが全部ずれて
+/// 「281文字違う」に見える。
+#[test]
+fn the_measured_transcription_slip_is_repaired() {
+    const USER_VALUE: &str = "cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAQQBCADMAQQBIAE0AQQBhAEEAQQBnAEEAQwAwAEEATABRAEIAbABBAEcANABBAFkAdwBBAGcAQQBHAE0AQQBkAHcAQgBDAEEARABVAEEAUQBRAEIASQBBAEUAMABBAFEAUQBCAGsAQQBFAEUAQQBRAGcAQgBzAEEARQBFAEEAUgB3AEEAdwBBAEUARQBBAFkAUQBCAFIAQQBFAEkAQQBkAFEAQgBCAEEARQBjAEEAVwBRAEIAQgBBAEcASQBBAGQAdwBCAEIAQQBEADAAQQA=";
+    // モデルが書いたもの: 113文字目の`Q`が消え、129文字目の`A`が`Q`になっている。
+    const WRITTEN: &str = "cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAQQBCADMAQQBIAE0AQQBhAEEAQQBnAEEAQwAwAEEATABRAEIAbABBAEcANABBAFkAdwBBAGcAQQBHAE0AQBkAHcAQgBDAEEARQBVAEEAUQBRAEIASQBBAEUAMABBAFEAUQBCAGsAQQBFAEUAQQBRAGcAQgBzAEEARQBFAEEAUgB3AEEAdwBBAEUARQBBAFkAUQBCAFIAQQBFAEkAQQBkAFEAQgBCAEEARQBjAEEAVwBRAEIAQgBBAEcASQBBAGQAdwBCAEIAQQBEADAAQQA=";
+
+    assert_eq!(USER_VALUE.chars().count(), 308);
+    assert_eq!(WRITTEN.chars().count(), 307);
+
+    let value = USER_VALUE.to_string();
+    let input = json!({ "command": format!("pwsh --enc {WRITTEN}") });
+    let (out, repairs) = repair(&input, std::slice::from_ref(&value));
+    assert_eq!(
+        out,
+        json!({ "command": format!("pwsh --enc {USER_VALUE}") })
+    );
+    assert_eq!(repairs.len(), 1);
+    assert_eq!(repairs[0].differences, 2, "1文字消して1文字書き換え＝2回");
+}
+
+/// **値の前後にモデルが付けた飾りは残す。** 直すのは語まるごとではなく、語の中で値に当たる部分だけ。
+///
+/// 語まるごとを比べていた頃は、`payload=<値>`を「値に8文字足したもの」と読んで`payload=`を剥がしていた
+/// （通しの試験`the_harness_substitutes_the_value_so_the_model_never_transcribes_it`が赤になって見つかった）。
+#[test]
+fn decoration_around_the_value_survives_the_repair() {
+    let value = blob('a');
+    let one = std::slice::from_ref(&value);
+    let mut slipped: Vec<char> = value.chars().collect();
+    slipped[100] = 'Z';
+    let slipped: String = slipped.into_iter().collect();
+
+    for (before, after) in [("payload=", ""), ("--enc=", ""), ("\"", "\""), ("(", ")")] {
+        // (1) 飾り付きで正しく書けている語は、1文字も変えない。
+        let input = json!({ "command": format!("{before}{value}{after}") });
+        assert_eq!(
+            repair(&input, one),
+            (input.clone(), vec![]),
+            "{before}|{after}"
+        );
+
+        // (2) 飾り付きで損じた語は、**値の部分だけ**が直る。
+        let input = json!({ "command": format!("{before}{slipped}{after}") });
+        let (out, repairs) = repair(&input, one);
+        assert_eq!(
+            out,
+            json!({ "command": format!("{before}{value}{after}") }),
+            "{before}|{after}"
+        );
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(
+            repairs[0].written, slipped,
+            "直した部分は値に当たるところだけ"
+        );
+        assert_eq!(repairs[0].differences, 1);
+    }
+}
