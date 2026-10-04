@@ -1,5 +1,5 @@
-//! Ollaya（選択肢を選ぶ判定モデルのサーバ）への接続。承認画面の危険度判定に使う
-//! （`harness_core::risk_check`）。
+//! Ollaya（問いに確率や点数で答える判定モデルのサーバ）への接続。承認画面の危険度判定に使う
+//! （問いの文と聞き方は`harness_core::decision`）。
 //!
 //! # なぜ`LlmProvider`ではないのか
 //!
@@ -9,10 +9,12 @@
 //!
 //! # 呼び方
 //!
-//! `POST {base_url}/api/decide`、本文は`{"model":…,"preset":"agent","state":"<コマンド1行>"}`。
-//! 返りの`answers.risk.score`（0〜2）だけを読む。**同じ応答の`action`・`destructive`は使わない**——
-//! 実測で`mimikatz`は destructive が「無」でも最も危険な部類で、`action`の確率は揺れる
-//! （同じ入力が ask と block に割れた）が、`risk`の数値は2群にきれいに割れた。
+//! `POST {base_url}/api/decide`、本文は`{"model":…,"state":{…},"questions":{"<id>":{type・instructions・criteria}}}`。
+//! **問いはその場で渡す**——Ollaya の設定（preset）を登録しないので、使う側のマシンの Ollaya に手を入れずに済む。
+//! 返りの`answers.<id>`と`state_truncated`を[`Answers`]へ入れて返し、どの欄を読むかは問いの側（`decision::questions`）が決める。
+//!
+//! 以前は組み込みの`agent`設定で聞き、`answers.risk.score`だけを読んでいた。同じ応答の`action`・`destructive`は
+//! 使わなかった（実測で`mimikatz`は destructive が「無」でも最も危険な部類で、`action`の確率は揺れた）。
 //!
 //! # 待ちの上限
 //!
@@ -23,15 +25,14 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use harness_core::{RiskCheck, RiskCheckError, RiskVerdict};
+use harness_core::{Answers, DecisionModel, Question, RiskCheckError};
 use serde::Deserialize;
+use serde_json::Value;
 
 /// 接続を諦める時間。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// 応答全体を諦める時間（モデルの初回の読み込み込み）。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// Ollaya の判定設定の名前。コマンドを判定する設定（`GET /api/presets`の`agent`）。
-const PRESET: &str = "agent";
 
 /// Ollaya の判定クライアント。
 pub struct DecideClient {
@@ -70,37 +71,33 @@ impl DecideClient {
 
 #[derive(Deserialize)]
 struct DecideResponse {
-    answers: Answers,
+    answers: serde_json::Map<String, Value>,
+    #[serde(default)]
+    state_truncated: bool,
 }
 
-#[derive(Deserialize)]
-struct Answers {
-    risk: RiskAnswer,
-}
-
-#[derive(Deserialize)]
-struct RiskAnswer {
-    score: f64,
-}
-
-/// 応答の本文から危険度を取り出す。**純関数**（HTTP を伴わない試験のために切ってある）。
-pub fn parse_risk(body: &str) -> Result<RiskVerdict, RiskCheckError> {
+/// 応答の本文から答えを取り出す。**純関数**（HTTP を伴わない試験のために切ってある）。
+/// 欄が足りるかは読む側（`decision::questions::read_*`）が見て、足りなければ`Err`にする。
+pub fn parse_answers(body: &str) -> Result<Answers, RiskCheckError> {
     let parsed: DecideResponse = serde_json::from_str(body).map_err(|e| {
-        RiskCheckError(format!(
-            "判定モデルの応答を読めなかった（answers.risk.score が無い）: {e}"
-        ))
+        RiskCheckError(format!("判定モデルの応答を読めなかった（answers が無い）: {e}"))
     })?;
-    RiskVerdict::from_score(parsed.answers.risk.score as f32)
+    Ok(Answers::new(Value::Object(parsed.answers), parsed.state_truncated))
+}
+
+/// 送る本文。問いは`id`を鍵にした1つのオブジェクトにする（Ollaya の`questions`の形）。
+fn request_body(model: &str, state: &Value, questions: &[Question]) -> Value {
+    let questions: serde_json::Map<String, Value> = questions
+        .iter()
+        .map(|q| (q.id.to_string(), q.spec.clone()))
+        .collect();
+    serde_json::json!({ "model": model, "state": state, "questions": questions })
 }
 
 #[async_trait]
-impl RiskCheck for DecideClient {
-    async fn assess(&self, command_line: &str) -> Result<RiskVerdict, RiskCheckError> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "preset": PRESET,
-            "state": command_line,
-        });
+impl DecisionModel for DecideClient {
+    async fn decide(&self, state: &Value, questions: &[Question]) -> Result<Answers, RiskCheckError> {
+        let body = request_body(&self.model, state, questions);
         let response = self
             .http
             .post(&self.url)
@@ -122,7 +119,7 @@ impl RiskCheck for DecideClient {
                 "判定モデルがエラーを返した（HTTP {status}）: {head}"
             )));
         }
-        parse_risk(&text)
+        parse_answers(&text)
     }
 }
 

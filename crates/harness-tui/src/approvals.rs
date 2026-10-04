@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use harness_core::{
     DecodeOutcome, DecodedLayer, EncodedSource, LlmProvider, PermissionSubject, ProgramRule,
-    RiskCheck, RiskLevel, RiskVerdict, ShellRule,
+    DecisionModel, RiskLevel, RiskVerdict, ShellRule,
 };
 use harness_engine::approval_ledger::{ApprovalStore, RecordedRule};
 use harness_engine::approval_summary::{summarize_for_approval, SummaryLanguage, SummaryPiece};
@@ -38,7 +38,7 @@ pub struct ApprovalSummary {
 /// 承認画面の危険度判定（外の判定モデル。`harness_core::risk_check`）をどこへ聞くか。`harness-cli`が起動時に決める。
 /// **これが無ければ（設定で切った・作れなかった）、承認画面も要約も今までと同じ**である。
 pub struct ApprovalRisk {
-    pub check: Arc<dyn RiskCheck>,
+    pub check: Arc<dyn DecisionModel>,
     /// 画面に出す出どころ（サーバ／モデル）。コマンドがどこへ出たのかが分かるように。
     pub label: String,
 }
@@ -472,7 +472,7 @@ pub(crate) fn start_risk(
             biased;
             // キャンセルされたときは何も送らない（承認画面はもう別のものを見ている）。
             _ = token.cancelled() => return,
-            result = check.assess(&line) => result,
+            result = harness_core::assess_command_risk(&*check, &line) => result,
         };
         match result {
             Ok(verdict) => {
@@ -520,7 +520,7 @@ impl RiskWarmUp {
         let check = risk.check.clone();
         tokio::spawn(async move {
             // 固定の無害な1行。**ユーザーの入力もコマンドも送らない。**
-            let _ = check.assess("echo").await;
+            let _ = harness_core::assess_command_risk(&*check, "echo").await;
         });
         true
     }

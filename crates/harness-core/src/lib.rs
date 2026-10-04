@@ -12,6 +12,7 @@ pub mod permission_subject;
 pub mod program_rule;
 pub mod prompt;
 pub mod provider;
+pub mod decision;
 pub mod risk_check;
 pub mod schema;
 pub mod text;
@@ -46,7 +47,11 @@ pub use provider::{
     BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities, ProviderError,
     Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,
 };
-pub use risk_check::{RiskCheck, RiskCheckError, RiskLevel, RiskVerdict};
+pub use decision::{
+    assess_command_risk, assess_source_risk, command_context_state, command_state, context_questions,
+    source_state, Answers, DecisionModel, Likelihood, Question, MAX_SOURCE_CHARS,
+};
+pub use risk_check::{RiskCheckError, RiskLevel, RiskVerdict};
 pub use schema::{apply_schema_strategy, unwrap_forced_tool_stream, SchemaStrategy};
 pub use text::truncate_head_tail;
 pub use tool::{

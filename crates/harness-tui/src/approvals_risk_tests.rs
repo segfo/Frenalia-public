@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use harness_core::{
-    CommandSubject, PermissionSubject, ProgramSubject, ReadScopeConfig, RiskCheck, RiskCheckError,
-    RiskLevel, RiskVerdict,
+    assess_command_risk, Answers, CommandSubject, DecisionModel, PermissionSubject, ProgramSubject,
+    Question, ReadScopeConfig, RiskCheckError, RiskLevel, RiskVerdict,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -21,7 +21,7 @@ use crate::app::{TranscriptItem, WaitClock};
 
 const DANGEROUS_LINE: &str = "rm C:\\Windows\\System32\\calc.exe";
 
-/// 決まった結果を返す判定部品。`delay`の間は返さない。呼ばれた行と回数を控える。
+/// 決まった危険度を返す判定モデル。`delay`の間は返さない。呼ばれた行（`state.command`）と回数を控える。
 struct FakeRisk {
     reply: Result<f32, String>,
     delay: Duration,
@@ -49,13 +49,21 @@ impl FakeRisk {
 }
 
 #[async_trait]
-impl RiskCheck for FakeRisk {
-    async fn assess(&self, command_line: &str) -> Result<RiskVerdict, RiskCheckError> {
+impl DecisionModel for FakeRisk {
+    async fn decide(
+        &self,
+        state: &serde_json::Value,
+        _questions: &[Question],
+    ) -> Result<Answers, RiskCheckError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.lines.lock().unwrap().push(command_line.to_string());
+        let line = state["command"].as_str().unwrap_or_default().to_string();
+        self.lines.lock().unwrap().push(line);
         tokio::time::sleep(self.delay).await;
         match &self.reply {
-            Ok(score) => RiskVerdict::from_score(*score),
+            Ok(score) => Ok(Answers::new(
+                serde_json::json!({ "risk": { "score": score } }),
+                false,
+            )),
             Err(reason) => Err(RiskCheckError(reason.clone())),
         }
     }
@@ -264,7 +272,7 @@ async fn a_slow_check_does_not_hold_the_summary_past_the_wait() {
     let started = Instant::now();
     let check = slow.clone();
     tokio::spawn(async move {
-        if let Ok(v) = check.assess("x").await {
+        if let Ok(v) = assess_command_risk(&*check, "x").await {
             let _ = tx.send(v);
         }
     });
@@ -286,7 +294,7 @@ async fn a_slow_check_does_not_hold_the_summary_past_the_wait() {
     let (tx, rx) = oneshot::channel();
     let check = quick.clone();
     tokio::spawn(async move {
-        let _ = tx.send(check.assess("x").await.unwrap());
+        let _ = tx.send(assess_command_risk(&*check, "x").await.unwrap());
     });
     let outcome = wait_for_verdict(
         RiskGate::Pending(rx),
