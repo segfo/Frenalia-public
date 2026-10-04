@@ -710,6 +710,19 @@ const DEFAULT_PROJECT_SETTINGS: &str = r#"{
 }
 "#;
 
+/// ユーザ層の`settings.json`の雛形（無ければ起動時に書く。[`ensure_user_settings_file`]）。
+///
+/// **書いても動きが変わらない値だけ**を置く——どれも省略時と同じ値（要約は作る・判定モデルは使わない）。
+/// 開いた人が「どこに何を書けばよいか」を見つけられるようにするためのもので、既定を変えるためのものではない。
+/// **送り先やモデル名は書かない**——書くと、ハーネス側の既定が変わっても、このファイルの古い値に縛られる。
+const DEFAULT_USER_SETTINGS: &str = r#"{
+  "approval": {
+    "summarize": true,
+    "use_judge_model": false
+  }
+}
+"#;
+
 /// `directories::ProjectDirs`の設定ディレクトリ配下`settings.json`（Windowsは`%APPDATA%`、
 /// mac/LinuxはXDG準拠、§設定とシークレット「ユーザ（`directories`: Windows `%APPDATA%`／
 /// mac/Linux XDG）」）。
@@ -799,10 +812,25 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
 }
 
 pub fn ensure_project_settings_file(project_root: &Path) {
-    let path = project_settings_path(project_root);
-    if path.exists() {
-        return;
+    ensure_settings_file_at(&project_settings_path(project_root), DEFAULT_PROJECT_SETTINGS);
+}
+
+/// ユーザ層の`settings.json`（Windowsは`%APPDATA%\harness\config\settings.json`）が無ければ、雛形
+/// （[`DEFAULT_USER_SETTINGS`]）を書く。**既にあれば触らない。** 作れなくても起動は止めない（警告だけ）。
+///
+/// **起動の処理（`harness-cli`）からだけ呼ぶ。** [`Settings::load`]からは呼ばない——読む関数は試験からも呼ばれ、
+/// そこに入れると試験のたびにこのマシンの本物の設定の置き場へ書いてしまう。
+pub fn ensure_user_settings_file() {
+    if let Some(path) = user_settings_path() {
+        ensure_settings_file_at(&path, DEFAULT_USER_SETTINGS);
     }
+}
+
+/// `path`が無ければ`template`を書く。**既にあれば何もしない。**
+///
+/// 「在るか確かめてから書く」と、その間に別のプロセス（同時に起動した2つ目のハーネス）が書いた中身を上書きし得る。
+/// だから**既にあれば失敗する開き方**（`create_new`）で作り、在ったら黙って降りる（`B-18`: 確認と作成を不可分に）。
+fn ensure_settings_file_at(path: &Path, template: &str) {
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             eprintln!(
@@ -812,9 +840,24 @@ pub fn ensure_project_settings_file(project_root: &Path) {
             return;
         }
     }
-    if let Err(e) = std::fs::write(&path, DEFAULT_PROJECT_SETTINGS) {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path);
+    let mut file = match file {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return,
+        Err(e) => {
+            eprintln!(
+                "warning: could not create default settings file {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    if let Err(e) = std::io::Write::write_all(&mut file, template.as_bytes()) {
         eprintln!(
-            "warning: could not create default settings file {}: {e}",
+            "warning: could not write default settings file {}: {e}",
             path.display()
         );
     }
@@ -1562,6 +1605,43 @@ mod tests {
         clamp_project_approval(&serde_json::json!({}), &mut merged);
         let settings: Settings = serde_json::from_value(merged).unwrap();
         assert!(settings.approval.is_none());
+    }
+
+    /// 雛形のファイルは、無ければ書き、**既にあれば中身に触らない**。置き場のフォルダが無ければ作る。
+    #[test]
+    fn a_settings_file_is_written_only_when_it_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config").join("settings.json");
+        ensure_settings_file_at(&path, DEFAULT_USER_SETTINGS);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_USER_SETTINGS);
+
+        std::fs::write(&path, r#"{"approval": {"use_judge_model": true}}"#).unwrap();
+        ensure_settings_file_at(&path, DEFAULT_USER_SETTINGS);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"approval": {"use_judge_model": true}}"#,
+            "既にあるユーザーの設定を上書きした"
+        );
+    }
+
+    /// **ユーザ層の雛形は、書いても動きが変わらない**——雛形を読んだ設定と、ユーザ層の設定が無いときとで、
+    /// 承認画面の要約と判定モデルの扱いが同じになる。送り先とモデル名は書いていない（既定に縛らない）。
+    #[test]
+    fn the_user_settings_template_changes_nothing() {
+        let template: serde_json::Value = serde_json::from_str(DEFAULT_USER_SETTINGS).unwrap();
+        let approval = serde_json::from_value::<Settings>(template)
+            .unwrap()
+            .approval
+            .unwrap();
+        // 省略時の扱い（要約は作る・判定モデルは使わない）と同じ値。
+        assert!(approval.summarize.unwrap_or(true));
+        assert!(!approval.use_judge_model.unwrap_or(false));
+        assert_eq!(approval.summarize, Some(true));
+        assert_eq!(approval.use_judge_model, Some(false));
+        assert_eq!(approval.judge_model_url, None, "送り先を雛形に書くと既定に縛られる");
+        assert_eq!(approval.judge_model, None, "モデル名を雛形に書くと既定に縛られる");
+        assert_eq!(approval.summary_provider, None);
+        assert_eq!(approval.summary_model, None);
     }
 
     /// **以前の名前（`risk_check`・`risk_base_url`・`risk_model`）で書いた設定も効く。** この節は知らない項目を黙って
