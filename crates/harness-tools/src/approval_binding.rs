@@ -30,14 +30,6 @@ pub const MAX_PREVIEW_BYTES: usize = 256 * 1024;
 /// `run_shell`の1行から縛る語の数の上限。超える行は「確かめられない」として扱う。
 const MAX_SHELL_TOKENS: usize = 256;
 
-/// 隣の名前一覧も縛る、スクリプトの拡張子（`run_shell`の字面の語に使う。`run_program`の
-/// インタプリタの引数は拡張子に関わらず全部縛る）。
-const SCRIPT_EXTENSIONS: &[&str] = &[
-    "py", "pyw", "js", "mjs", "cjs", "ts", "mts", "cts", "ps1", "psm1", "psd1", "sh", "bash",
-    "zsh", "rb", "pl", "pm", "php", "bat", "cmd", "vbs", "vbe", "jse", "wsf", "hta", "lua", "exe",
-    "dll",
-];
-
 /// 子プロセスが実際に読むのと同じ見え方でワークスペースを読む口。
 pub struct ChildView {
     fs: SandboxFs,
@@ -222,7 +214,12 @@ pub fn bind_shell_line(view: &ChildView, cwd: &Path, line: &str) -> ShellBinding
         return out;
     }
     for token in tokens {
-        match bind_path(view, cwd, &token, has_script_extension(&token)) {
+        match bind_path(
+            view,
+            cwd,
+            &token,
+            harness_core::has_script_extension(&token),
+        ) {
             PathBinding::File(f, p) => push_unique(&mut out.files, &mut out.previews, f, p),
             PathBinding::Unverifiable => out.unverifiable = true,
             PathBinding::Directory | PathBinding::Missing | PathBinding::Outside => {}
@@ -329,13 +326,6 @@ fn alternate_stream_base(rel: &str) -> Option<&str> {
         // `dir/base` を指す部分文字列（`rel`の先頭から`base`の末尾まで）。
         &rel[..dir.len() + 1 + base.len()]
     })
-}
-
-fn has_script_extension(token: &str) -> bool {
-    Path::new(token)
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| SCRIPT_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// 行を語へ割る（[`bind_shell_line`]のdoc）。

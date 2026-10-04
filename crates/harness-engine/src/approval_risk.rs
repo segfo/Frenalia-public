@@ -54,13 +54,6 @@ pub const MAX_DECODED_TO_ASK: usize = 4;
 /// 縛ったファイルのうち、判定モデルへ中身の危険度を聞く数の上限（長さに比例して遅い。4,000字で約12秒）。
 pub const MAX_FILES_TO_ASK: usize = 3;
 
-/// `run_shell`の行に字面で出たファイルのうち、機械の判定で中身を読むもの（スクリプトの拡張子）。
-/// `run_program`でコードを走らせるときは、縛ったファイルを拡張子に関わらず読む。
-const SCRIPT_EXTENSIONS: &[&str] = &[
-    "ps1", "psm1", "psd1", "bat", "cmd", "sh", "bash", "zsh", "py", "js", "mjs", "cjs", "ts", "rb",
-    "pl", "php", "vbs", "wsf",
-];
-
 /// 画面に出す危険度の段階。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -485,15 +478,14 @@ fn decoded_texts(subject: &PermissionSubject) -> Vec<&str> {
 
 /// 縛ったファイルをコードとして機械の判定に掛けるか。`run_program`でコードを走らせるなら全部、
 /// `run_shell`ならスクリプトの拡張子のものだけ（`cat notes.txt`のメモに書いた`rm -rf /`を拾わない）。
+///
+/// **拡張子の一覧は`harness_core::SCRIPT_EXTENSIONS`の1つだけを見る。** 以前はここと
+/// `harness_tools::approval_binding`が別々の一覧を持っていて中身がずれており、`deploy.pyw`のような
+/// ファイルは**中身を読んでハッシュで縛り判定モデルへも送るのに、機械の被害判定だけ掛からない**
+/// 状態だった（2026-10-04）。
 fn is_code(subject: &PermissionSubject, preview: &FilePreview) -> bool {
-    if matches!(subject, PermissionSubject::Program(p) if p.runs_code) {
-        return true;
-    }
-    let ext = preview
-        .rel_path
-        .rsplit_once('.')
-        .map(|(_, e)| e.to_ascii_lowercase());
-    ext.is_some_and(|e| SCRIPT_EXTENSIONS.contains(&e.as_str()))
+    matches!(subject, PermissionSubject::Program(p) if p.runs_code)
+        || harness_core::has_script_extension(&preview.rel_path)
 }
 
 #[cfg(test)]

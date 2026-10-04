@@ -37,7 +37,9 @@ pub use decision::{
     MAX_SOURCE_CHARS,
 };
 pub use event::{discarded_marker, AgentEvent, DegenerateKind, CANCELLED_REASON};
-pub use interpreter::{is_interpreter_program, INTERPRETER_PROGRAMS};
+pub use interpreter::{
+    has_script_extension, is_interpreter_program, INTERPRETER_PROGRAMS, SCRIPT_EXTENSIONS,
+};
 pub use message::{ContentBlock, Message, Role};
 pub use net_policy::{
     domain_match, is_ip_literal, normalize_domain_pattern, validate_domain_pattern, DomainPolicy,

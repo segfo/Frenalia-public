@@ -160,7 +160,10 @@ fn a_located_payload_is_decoded_by_the_harness_and_judged() {
         encoding: PayloadEncoding::CharCodes,
     }]);
     let out = run_with(&shell(&line), &[], Some(&model), Some(&locator));
-    assert_eq!(locator.lines.lock().unwrap().as_slice(), std::slice::from_ref(&line));
+    assert_eq!(
+        locator.lines.lock().unwrap().as_slice(),
+        std::slice::from_ref(&line)
+    );
     assert!(
         matches!(&out.extra_decoded[0].outcome, DecodeOutcome::Text { text, .. } if text == r"Remove-Item C:\Windows\x"),
         "{:?}",
@@ -459,6 +462,53 @@ fn the_machine_judgement_reads_bound_scripts_but_not_notes() {
     );
     let notes = run(&with_preview("cat notes.txt", "notes.txt", memo), &[], None);
     assert!(notes.reasons.is_empty(), "{:?}", notes.reasons);
+}
+
+/// **拡張子の一覧がずれていた分も、いまは機械の判定が掛かる。**
+///
+/// 以前は承認でファイルを縛る側（`harness-tools`）と、中身へ機械の被害判定を掛ける側（ここ）が
+/// 別々の一覧を持っていて中身がずれており、`.pyw`のようなファイルは**中身を読んでハッシュで縛り
+/// 判定モデルへも送るのに、機械の被害判定だけ掛からない**状態だった（2026-10-04）。
+/// ずれていた10種のうち、スクリプトとして中身が意味を持つものをここで固定する。
+#[test]
+fn the_extensions_that_used_to_be_missing_now_get_the_machine_judgement() {
+    let script = "import shutil
+shutil.rmtree('C:/Windows/System32')
+";
+    for ext in ["pyw", "mts", "cts", "pm", "vbe", "jse", "hta", "lua"] {
+        let path = format!("clean.{ext}");
+        let out = run(
+            &with_preview(&format!("python {path}"), &path, script),
+            &[],
+            None,
+        );
+        assert!(
+            out.reasons.iter().any(
+                |r| matches!(r, RiskReason::Damage { origin: Origin::File { path: p }, .. } if *p == path)
+            ),
+            "{ext}: {:?}",
+            out.reasons
+        );
+    }
+    // `run_program`でコードを走らせる側は、もともと拡張子を問わず全部読む（対照）。
+    let mut program = ProgramSubject::plain("python", vec!["clean.pyw".into()]);
+    program.previews.push(FilePreview {
+        rel_path: "clean.pyw".into(),
+        text: script.into(),
+        truncated: false,
+    });
+    let out = run(&PermissionSubject::Program(program), &[], None);
+    assert!(
+        out.reasons.iter().any(|r| matches!(
+            r,
+            RiskReason::Damage {
+                origin: Origin::File { .. },
+                ..
+            }
+        )),
+        "{:?}",
+        out.reasons
+    );
 }
 
 /// 判定モデルが落ちていたら、機械の判定だけで決め、理由を1つだけ注記する。機械の判定の「高」は残る。
