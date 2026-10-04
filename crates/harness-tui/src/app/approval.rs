@@ -211,7 +211,8 @@ fn decoded_layer_lines(layer: &DecodedLayer) -> Vec<ApprovalLine> {
             "base64 として読めない（変数や式なら、中身は実行時に決まる）".to_string()
         }
         DecodeOutcome::NotText => {
-            "base64 は読めたが文字にならない（圧縮・暗号化された中身かもしれない）".to_string()
+            "base64 は読めたが文字として成り立たない（長さが半端・圧縮や暗号化された中身など）"
+                .to_string()
         }
         DecodeOutcome::NotLiteral => {
             "引数が文字列そのものではない（中身は実行時に決まる）".to_string()

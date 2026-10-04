@@ -322,7 +322,21 @@ impl Decoder {
 pub(crate) fn as_text(bytes: &[u8], source: EncodedSource) -> Option<(TextEncoding, String)> {
     match source {
         EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => {
-            Some((TextEncoding::Utf16Le, utf16le_lossy(bytes)))
+            // **長さが偶数のものだけ**を文字として見せる。UTF-16LE は1文字2バイトなので、
+            // 奇数バイトは `-EncodedCommand` の値として成り立たない（PowerShell が書く値は必ず偶数）。
+            //
+            // これが無いと、綴りの後ろに**たまたま base64 として読める短い語**が続いただけで、
+            // 文字化けが解読の結果として画面に出る。実測（2026-10-04）: モデルが
+            // `pwsh --enc pwsh --enc <塊>` という行を組み立て、1つ目の `--enc` の引数`pwsh`が
+            // 3バイトへ解読されて、意味の無い1文字が「1段目」として出た。
+            //
+            // **見るのは長さだけで、中身では判断しない。** 「文字に見えない」で落とすと、
+            // 制御文字や対にならない代用符号を混ぜるだけで中身を見せずに承認させられる
+            // （`control_characters_do_not_hide_an_encoded_command`が固定している）。
+            bytes
+                .len()
+                .is_multiple_of(2)
+                .then(|| (TextEncoding::Utf16Le, utf16le_lossy(bytes)))
         }
         // LLM が場所を示した中身・機械で見つけた塊も、後ろのコードがどう読むかは分からないので
         // `FromBase64String`と同じ読み方。

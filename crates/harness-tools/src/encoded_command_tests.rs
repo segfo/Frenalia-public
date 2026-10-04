@@ -314,8 +314,33 @@ fn material_that_is_not_a_literal_is_reported_as_such() {
     assert_eq!(layers[0].outcome, DecodeOutcome::NotText);
 }
 
+/// 綴りの後ろに**たまたま base64 として読める短い語**が続いただけのときは、文字化けを段として出さない。
+///
+/// UTF-16LE は1文字2バイトなので、**奇数バイトは `-EncodedCommand` の値として成り立たない**。
+/// 実測（2026-10-04）: モデルが `pwsh --enc pwsh --enc <塊>` という行を組み立て、1つ目の `--enc` の
+/// 引数 `pwsh` が3バイトへ解読されて、意味の無い1文字が「1段目」として画面に出た。
+#[test]
+fn a_switch_followed_by_a_short_word_is_not_shown_as_text() {
+    // `pwsh` は base64 として読めて3バイトになる（奇数）。
+    assert_eq!(base64_decode("pwsh").map(|b| b.len()), Some(3));
+
+    let blob = enc16("systeminfo");
+    let layers = decode_shell_line(&format!("pwsh --enc pwsh --enc {blob}"));
+
+    // 1つ目の `--enc` は「文字として成り立たない」。文字化けを出さない。
+    assert_eq!(layers[0].outcome, DecodeOutcome::NotText, "{layers:?}");
+    // 2つ目はこれまでどおり読める。
+    assert!(
+        layers.iter().any(
+            |l| matches!(&l.outcome, DecodeOutcome::Text { text, .. } if text == "systeminfo")
+        ),
+        "{layers:?}"
+    );
+}
+
 /// `-EncodedCommand`は PowerShell が必ず UTF-16LE として読むので、制御文字を混ぜても**その読み方のまま
 /// 出す**。「文字に見えない」で隠すと、制御文字を足すだけで中身を見せずに承認させられる。
+/// **長さが偶数かどうかしか見ない**のはこのためである（中身では判断しない）。
 #[test]
 fn control_characters_do_not_hide_an_encoded_command() {
     let code = format!("Write-Output '{}'; systeminfo", "\u{7}".repeat(64));
