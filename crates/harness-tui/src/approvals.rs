@@ -16,10 +16,10 @@ use harness_core::{
     DecisionModel, DecodeOutcome, DecodedLayer, EncodedSource, LlmProvider, PermissionSubject,
     ProgramRule, RiskLevel, ShellRule,
 };
-use harness_engine::approval_risk::{self, RiskOutcome};
-use harness_engine::encoded_span::SpanLocator;
 use harness_engine::approval_ledger::{ApprovalStore, RecordedRule};
+use harness_engine::approval_risk::{self, RiskOutcome};
 use harness_engine::approval_summary::{summarize_for_approval, SummaryLanguage, SummaryPiece};
+use harness_engine::encoded_span::SpanLocator;
 use harness_engine::Remembered;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;

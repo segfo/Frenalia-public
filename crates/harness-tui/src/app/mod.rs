@@ -188,8 +188,7 @@ pub struct AppState {
     /// セッション中だけ覚える）。同じ材料を2回判定しない。**判定モデルが答えなかった回は覚えない**——覚えると、
     /// 判定モデルが戻っても同じ材料を聞き直さない。要約の使い回し（`approvals::SummaryCache`）と別に持つ——
     /// 要約の鍵に入れる危険度を、要約を起こす**前**に知るため。
-    pub risk_seen:
-        std::collections::HashMap<String, harness_engine::approval_risk::RiskOutcome>,
+    pub risk_seen: std::collections::HashMap<String, harness_engine::approval_risk::RiskOutcome>,
     /// 判定モデルを使えなかったことを、このセッションで既に1回書いたか（毎回の承認で繰り返さない）。
     pub risk_unavailable_noted: bool,
     /// このプロセスで実際に走ったコマンドの流れ（承認画面の「これまでの流れと合わせた危険度」）。

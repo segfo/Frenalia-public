@@ -30,9 +30,7 @@ pub use app::{
     Action, AppState, BusyEnd, BusyProgress, CommitSelection, MemoryCommand, PartialFile,
     ReviewPanelState, ReviewRow, ReviewTarget, SlashCommand,
 };
-pub use app::{
-    ApprovalStage, PermissionView, PreviousCopy, RiskView, SummaryState, SummaryWait,
-};
+pub use app::{ApprovalStage, PermissionView, PreviousCopy, RiskView, SummaryState, SummaryWait};
 pub use approvals::{ApprovalRisk, ApprovalSummary};
 
 /// 承認画面を1枚描く（`examples/approval-frames.rs`のための入口）。
@@ -85,6 +83,40 @@ pub enum RunOutcome {
 
 const TICK: Duration = Duration::from_millis(33);
 
+/// このイベントを受けたとき、**描き直しを次の[`TICK`]へ回してよい**か。
+///
+/// # なぜ回すのか
+///
+/// **ペーストは1文字ずつのキーとして届く**（Windowsのcrosstermは端末のコンソールからキーの記録を読むので、
+/// ペーストをまとめた1つのイベント（bracketed paste）は来ない）。描画ループは1イベントごとに全画面を描くので、
+/// 400文字を貼ると400回描くことになり、描いている間に端末の入力バッファが溢れて**文字が落ちる**
+/// （2026-10-04、ユーザーが長いbase64を貼ったら中ほどの9文字が消え、解読した中身が壊れた）。
+/// 文字キーの描き直しを[`TICK`]へ回すと、貼っている間の描画は毎秒30回までに収まり、読み出しが追いつく。
+///
+/// # 回すのは普通の文字キーだけ
+///
+/// 画面に出す文字が1つ増えるだけで、**押せる場所の登録も遡れる上限も変わらない**ものに限る。
+/// それ以外（Enter・カーソル移動・PageUp/PageDownのスクロール・修飾キー付き・マウス・リサイズ）は今までどおり
+/// その場で描く——描いて初めて分かることを次の描画まで持ち越すと、スクロールの上限が効かずに端で空回りし
+/// （[BUG-076](../../../docs/bugs/BUG-076.md)）、マウスは前の画面の場所で当たる（[`app::pointer`]のモジュールdoc）。
+///
+/// # 限界
+///
+/// 文字を打ってから画面に出るまで最大[`TICK`]（33ms）遅れる。**落とすのではなく遅らせるだけ**で、
+/// 次の描画には全部出る。
+fn defers_redraw(event: &crossterm::event::Event) -> bool {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+    match event {
+        Event::Key(key) => {
+            matches!(key.code, KeyCode::Char(_))
+                && key.kind == KeyEventKind::Press
+                // 修飾キー付き（Ctrl+C・Alt+Enter等）は文字を足すのではなく機能を呼ぶ。Shiftは大文字なので文字のまま。
+                && (key.modifiers - KeyModifiers::SHIFT).is_empty()
+        }
+        _ => false,
+    }
+}
+
 /// ステータスバーへ出す「いま何を待たされているか」。走っていなければ`None`
 /// （ステータスバーから表示が消える）。
 ///
@@ -104,6 +136,10 @@ fn poll_wait_state() -> Option<harness_core::tool::WaitState> {
 #[cfg(test)]
 #[path = "review_flow_tests.rs"]
 mod review_flow_tests;
+
+#[cfg(test)]
+#[path = "redraw_tests.rs"]
+mod redraw_tests;
 
 /// 会話TUIがログを置くディレクトリ（`<workspace>/.harness/logs`）。[`init_file_logging`]へ渡す置き場と、
 /// [`run`]が標準エラーを預かる置き場（[BUG-206](../../../docs/bugs/BUG-206.md)）は同じで、綴りはここだけが持つ（B-05）。
@@ -713,6 +749,8 @@ pub async fn run(
     let mut relaunch_into: Option<PathBuf> = None;
 
     loop {
+        // この回で画面を描き直すか。**普通の文字キーだけは描かずに次のイベントを読む**（[`defers_redraw`]）。
+        let mut draw_now = true;
         tokio::select! {
             ev = engine.events_rx.recv() => {
                 match ev {
@@ -830,10 +868,16 @@ pub async fn run(
                 // 描くことになる。それ以外は1イベントごとに必ず描き直す——マウスの当たり判定は直前に描いた
                 // 画面の登録で引く（`app::pointer`）ので、描かずに次のイベントを読むと古い画面の場所で当たる。
                 let action = match ev {
-                    Some(Ok(event)) => match app.handle_event(event) {
-                        app::Step::Unchanged => continue,
-                        app::Step::Handled(action) => action,
-                    },
+                    Some(Ok(event)) => {
+                        // **文字キーは1つずつ描き直さない**（[`defers_redraw`]）。ペーストは1文字ずつのキーとして
+                        // 届くので、1文字ごとに全画面を描くと読み出しが追いつかず、端末の入力バッファから
+                        // 文字が落ちる（ユーザーが長いbase64を貼って、中ほどの9文字が消えた）。
+                        draw_now = !defers_redraw(&event);
+                        match app.handle_event(event) {
+                            app::Step::Unchanged => continue,
+                            app::Step::Handled(action) => action,
+                        }
+                    }
                     _ => None,
                 };
                 if let Some(action) = action {
@@ -1254,9 +1298,11 @@ pub async fn run(
         // 描いた直後に状態そのものを切り詰める——表示側だけで止めると、先頭に着いた後も
         // ホイールを回した分だけ`scroll_offset`が伸び、同じ回数下へ回すまで画面が動かない。
         // 押せる場所・送れる枠の登録と、一覧の表示を始める位置も同じく描いて初めて分かる（`app::DrawFeedback`）。
-        let mut feedback = app::DrawFeedback::default();
-        term.draw(|f| feedback = ui::render(f, &app))?;
-        app.apply_draw_feedback(feedback);
+        if draw_now {
+            let mut feedback = app::DrawFeedback::default();
+            term.draw(|f| feedback = ui::render(f, &app))?;
+            app.apply_draw_feedback(feedback);
+        }
         // モーダルが閉じた（応答した・拒否した）。要約はもう誰も読まないので落とす（B-23）。
         if app.pending_permission.is_none() {
             if let Some(token) = summary_cancel.take() {
