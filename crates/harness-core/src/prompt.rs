@@ -167,6 +167,7 @@ pub fn render(facts: &EnvironmentFacts) -> String {
         Some(line) => lines.push(line),
         None => lines.push(render_staging(staging, *shell_sees_staged_writes)),
     }
+    lines.push(render_user_reference());
     lines.push(render_git_hardening());
     lines.push(render_read_scope(read_scope));
     lines.extend(render_shell_tier(shell_tier));
@@ -182,6 +183,25 @@ pub fn render(facts: &EnvironmentFacts) -> String {
     }
 
     lines.join("\n")
+}
+
+/// ユーザーが書いた長い値を**書き写さずに参照する**書き方（[`crate::user_reference`]）。
+///
+/// # なぜ出すのか
+///
+/// モデルは長い値を書き写すと間違える。実測（2026-10-04、ローカルの`qwen3.6-35b`・4回）では308文字の base64 を
+/// 4回とも写し損じ、1文字違った値は`systeminfo`ではなく`sDsteminfo`を走らせる命令になっていた。
+/// **書き写させないこと**だけが直し方なので、代わりの書き方をここで伝える。
+fn render_user_reference() -> String {
+    format!(
+        "ユーザーの文に{}文字以上の長い値（符号化された塊・ハッシュ・鍵）があるとき、\
+         **その値をコマンドへ書き写さないでください**。代わりに{}と書くと、ハーネスが\
+         ユーザーの文からその値を取り出して差し込みます（番号は、その文に出てくる長い値の1つ目が1、2つ目が2）。\
+         書き写すと1文字でも違えば別のものが走ります。差し込めない番号を書くと、その綴りがそのまま残り、\
+         承認画面に出ます。",
+        crate::user_reference::MIN_REFERENCE_CHARS,
+        crate::user_reference::SYNTAX_EXAMPLE,
+    )
 }
 
 /// [段階6e] 遷移MAC（プロセス生成の許否）についての**1行だけ**
@@ -738,6 +758,28 @@ mod tests {
         ctx.staging.mode = staging_mode;
         ctx.shell_tier = ShellTierSelection::direct(tier);
         EnvironmentFacts::from_tool_ctx(&ctx)
+    }
+
+    /// **長い値を書き写さない決まりを、どのTierでもモデルへ伝える。** 伝えないと、モデルは書き写して
+    /// 1文字間違える（実測: 2026-10-04、308文字の base64 を4回とも写し損じた）。
+    #[test]
+    fn every_tier_tells_the_model_not_to_transcribe_long_values() {
+        for tier in [
+            ShellTier::Tier0,
+            ShellTier::Tier1,
+            ShellTier::Tier2a,
+            ShellTier::Tier3,
+        ] {
+            let rendered = render(&facts_for(tier, StagingMode::Live));
+            assert!(
+                rendered.contains(crate::user_reference::SYNTAX_EXAMPLE),
+                "{tier:?}: 参照の書き方を伝えていない"
+            );
+            assert!(
+                rendered.contains("書き写さないでください"),
+                "{tier:?}: 書き写すなと伝えていない"
+            );
+        }
     }
 
     /// **[BUG-168]** 書込の捕まえ方の宣言は**ちょうど1つ**である。

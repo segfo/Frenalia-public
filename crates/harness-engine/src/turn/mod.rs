@@ -302,6 +302,10 @@ impl<'a> TurnExecutor<'a> {
             sanitize::completion_request(&mut base_req);
         }
 
+        // ユーザーが書いた長い値（モデルに書き写させず、ハーネスが差し込む。`harness_core::user_reference`）。
+        // **この回の会話の文から1回だけ取り出す**——ツール呼び出しごとに数え直すと、途中で番号の意味が変わる。
+        let references = harness_core::user_reference_values(&base_req.messages);
+
         let mut ladder: Option<ladder::Ladder> = None;
         // 現在の段。`None`は「素の1回目」（梯子はまだ登っていない）。
         let mut rung: Option<ladder::Rung> = None;
@@ -369,7 +373,7 @@ impl<'a> TurnExecutor<'a> {
                         w.record_clean();
                     }
                     return self
-                        .complete(content, malformed, stop_reason, usage)
+                        .complete(content, malformed, stop_reason, usage, &references)
                         .await
                         .map(RawTurnResult::Completed);
                 }
@@ -512,6 +516,7 @@ impl<'a> TurnExecutor<'a> {
         malformed: std::collections::HashMap<String, MalformedToolInput>,
         stop_reason: StopReason,
         usage: Usage,
+        references: &[String],
     ) -> Result<RawTurn, EngineError> {
         if self.is_tier3() {
             sanitize::content_blocks(&mut content);
@@ -526,7 +531,9 @@ impl<'a> TurnExecutor<'a> {
             .collect::<Vec<_>>()
             .join("");
 
-        let (tool_calls, cancelled_mid_tool) = self.execute_tool_calls(&content, &malformed).await;
+        let (tool_calls, cancelled_mid_tool) = self
+            .execute_tool_calls(&content, &malformed, references)
+            .await;
 
         Ok(RawTurn {
             content,
@@ -544,6 +551,7 @@ impl<'a> TurnExecutor<'a> {
         &self,
         content: &[ContentBlock],
         malformed: &std::collections::HashMap<String, MalformedToolInput>,
+        references: &[String],
     ) -> (Vec<CompletedToolCall>, bool) {
         let mut tool_calls = Vec::new();
         let mut cancelled_mid_tool = false;
@@ -572,6 +580,11 @@ impl<'a> TurnExecutor<'a> {
                 });
                 continue;
             }
+
+            // **ユーザーの文の値を差し込むのはここ1か所だけ**（`harness_core::user_reference`）。危険度の判定・
+            // 承認画面の材料・実際の実行・画面のカード、どれもこの後ろにあるので、**同じ文字列**を見る
+            // （D-101「判定器が見る材料」と、走るものを食い違わせない）。
+            let input = &harness_core::substitute_user_references(input, references);
 
             emit(
                 self.events,

@@ -4,6 +4,7 @@
 pub mod cognition;
 pub mod command_history;
 pub mod config_injection;
+pub mod decision;
 pub mod event;
 pub mod git;
 pub mod interpreter;
@@ -13,11 +14,11 @@ pub mod permission_subject;
 pub mod program_rule;
 pub mod prompt;
 pub mod provider;
-pub mod decision;
 pub mod risk_check;
 pub mod schema;
 pub mod text;
 pub mod tool;
+pub mod user_reference;
 pub mod wire_log;
 
 /// `tool.rs`の待機理由機構（`WaitReason`/`WaitReasons`/`WaitState`）のテスト。
@@ -29,6 +30,11 @@ mod tool_tests;
 pub use cognition::{CognitionLevel, Phase, TokenBudget};
 pub use command_history::CommandHistory;
 pub use config_injection::{is_config_injection_path, is_git_internal_path};
+pub use decision::{
+    assess_command_risk, assess_source_risk, command_context_state, command_state,
+    context_questions, source_state, Answers, DecisionModel, Likelihood, Question,
+    MAX_SOURCE_CHARS,
+};
 pub use event::{discarded_marker, AgentEvent, DegenerateKind, CANCELLED_REASON};
 pub use interpreter::{is_interpreter_program, INTERPRETER_PROGRAMS};
 pub use message::{ContentBlock, Message, Role};
@@ -49,10 +55,6 @@ pub use provider::{
     BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities, ProviderError,
     Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,
 };
-pub use decision::{
-    assess_command_risk, assess_source_risk, command_context_state, command_state, context_questions,
-    source_state, Answers, DecisionModel, Likelihood, Question, MAX_SOURCE_CHARS,
-};
 pub use risk_check::{RiskCheckError, RiskLevel, RiskVerdict};
 pub use schema::{apply_schema_strategy, unwrap_forced_tool_stream, SchemaStrategy};
 pub use text::truncate_head_tail;
@@ -62,4 +64,7 @@ pub use tool::{
     RunnableProgramFact, SandboxChoice, ShellTier, ShellTierSelection, StagingConfig, StagingMode,
     TlsInspection, Tool, ToolCtx, ToolError, ToolOutput, ToolResult, ToolSpec, ToolUse,
     TransitionFacts, VmShellExecutor, WaitReason, WaitReasons, WaitState,
+};
+pub use user_reference::{
+    substitute as substitute_user_references, values_in as user_reference_values,
 };

@@ -112,7 +112,6 @@ impl std::fmt::Display for RiskCheckError {
 
 impl std::error::Error for RiskCheckError {}
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
