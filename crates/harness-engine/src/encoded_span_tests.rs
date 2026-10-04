@@ -46,10 +46,12 @@ impl LlmProvider for Replying {
     }
 }
 
-/// **抜き出すのは正規表現エンジンで、LLM は取り出し方だけを書く。** 丸括弧の中が返る。
+/// **探すのも抜き出すのもハーネス。LLM は短い目印と符号化の種類だけを言う。**
+///
+/// 目印の直後から、その符号化で使われる文字が続くかぎりを取る。
 #[test]
-fn the_regex_engine_extracts_what_the_pattern_points_at() {
-    let body = r#"[{"pattern": "echo ([A-Za-z0-9+/=]+)", "encoding": "base64"}]"#;
+fn the_harness_extracts_what_the_landmark_points_at() {
+    let body = r#"[{"after": "echo ", "encoding": "base64"}]"#;
     assert_eq!(
         extract_spans(body, LINE),
         vec![LocatedSpan {
@@ -57,73 +59,91 @@ fn the_regex_engine_extracts_what_the_pattern_points_at() {
             encoding: PayloadEncoding::Base64,
         }]
     );
-    // 丸括弧が無い式は、当たった全体を取り出す。
-    let whole = r#"[{"pattern": "cwB5[A-Za-z0-9+/=]+", "encoding": "base64"}]"#;
+    // **符号化が変われば、取る文字の種類も変わる。** 16進は`0-9a-fA-F`だけなので`z`で止まる。
+    let hex_line = "x -bytes 73797374656d696e666fz rest";
+    let hex = r#"[{"after": "-bytes ", "encoding": "hex"}]"#;
     assert_eq!(
-        extract_spans(whole, LINE)[0].text,
-        "cwB5AHMAdABlAG0AaQBuAGYAbwA="
+        extract_spans(hex, hex_line),
+        vec![LocatedSpan {
+            text: "73797374656d696e666f".into(),
+            encoding: PayloadEncoding::Hex,
+        }]
+    );
+    // 同じ行・同じ目印でも、base64 として読めば`z`まで取る（文字の集合が違う）。
+    let b64 = r#"[{"after": "-bytes ", "encoding": "base64"}]"#;
+    assert_eq!(
+        extract_spans(b64, hex_line)[0].text,
+        "73797374656d696e666fz"
     );
 }
 
-/// **LLM が文字列を書き写しても使わない。** 取り出すのは行に当てた結果だけなので、写し間違いが入る余地が無い
-/// （[BUG-224]と同じ根を断つ）。式が当たらなければ何も返さない。
+/// **LLM が文字列を書き写しても使わない。** 取り出すのは行から探した結果だけなので、写し間違いが入る余地が無い
+/// （[BUG-224]と同じ根を断つ）。行に実在しない目印は捨てる。
 #[test]
-fn text_the_model_writes_is_never_used_and_a_miss_yields_nothing() {
-    // `text`欄は見ない（式が無いので何も取り出さない）。
+fn text_the_model_writes_is_never_used_and_a_missing_landmark_yields_nothing() {
+    // `text`欄は見ない（目印が無いので何も取り出さない）。
     let copied = r#"[{"text": "cwB5AHMAdABlAG0AaQBuAGYAbwA=", "encoding": "base64"}]"#;
     assert!(extract_spans(copied, LINE).is_empty());
-    // 当たらない式。
-    let miss = r#"[{"pattern": "pwsh -enc ([A-Za-z0-9+/=]+)", "encoding": "base64"}]"#;
+    // 行に無い目印。
+    let miss = r#"[{"after": "pwsh -enc ", "encoding": "base64"}]"#;
     assert!(extract_spans(miss, LINE).is_empty());
+    // 目印は在るが、その後ろが短すぎる。
+    let short =
+        r#"[{"after": "ForEach-Object { [Convert]::FromBase64String($", "encoding": "base64"}]"#;
+    assert!(extract_spans(short, LINE).is_empty());
 }
 
-/// 前後の説明文・コードの囲みがあっても JSON の配列だけを読む。知らない符号化・欄の欠けたもの・長すぎる式は捨てる。
-/// 読めない返事は「見つからなかった」と同じ（エラーにしない）。
+/// **正規表現は受け取らない。** 式を書かせること自体をやめたので、式の形をした目印は
+/// 「そういう文字列が行に在るか」としてしか見ない（当たらないので何も返らない）。
 #[test]
-fn the_array_is_read_from_a_chatty_reply_and_bad_items_are_dropped() {
-    let body = "Here you go:\n```json\n[{\"pattern\": \"echo (\\\\S+)\", \"encoding\": \"rot13\"}, \
-                {\"pattern\": \"echo ([A-Za-z0-9+/=]+)\", \"encoding\": \"base64\"}, {\"encoding\": \"hex\"}]\n```";
-    let patterns = parse_patterns(body);
-    assert_eq!(patterns.len(), 1, "{patterns:?}");
-    assert_eq!(patterns[0].encoding, PayloadEncoding::Base64);
-
-    assert!(parse_patterns("no json here").is_empty());
-    assert!(parse_patterns("] backwards [").is_empty());
-    assert!(parse_patterns("[]").is_empty());
-    let long = format!(
-        r#"[{{"pattern": "{}", "encoding": "base64"}}]"#,
-        "a".repeat(MAX_PATTERN_CHARS + 1)
-    );
-    assert!(parse_patterns(&long).is_empty(), "長すぎる式を受けた");
-}
-
-/// **組み立てられない式は黙って飛ばす**（モデルが書くので、使えない式が来る）。後戻りの要る書き方（後方参照）も同じ。
-#[test]
-fn a_pattern_that_does_not_build_is_skipped() {
-    for pattern in ["([", "(?<name>", r"(\1)", "*"] {
-        let body = format!(r#"[{{"pattern": "{pattern}", "encoding": "base64"}}]"#);
-        let body = body.replace('\\', "\\\\");
+fn a_regular_expression_is_not_a_landmark() {
+    for pattern in ["echo ([A-Za-z0-9+/=]+)", "cwB5[A-Za-z0-9+/=]+", "([", "*"] {
+        let body = format!(r#"[{{"after": "{pattern}", "encoding": "base64"}}]"#);
         assert!(extract_spans(&body, LINE).is_empty(), "{pattern}");
     }
+}
+
+/// 前後の説明文・コードの囲みがあっても JSON の配列だけを読む。知らない符号化・欄の欠けたもの・
+/// 長すぎる目印は捨てる。読めない返事は「見つからなかった」と同じ（エラーにしない）。
+#[test]
+fn the_array_is_read_from_a_chatty_reply_and_bad_items_are_dropped() {
+    let body = "Here you go:
+```json
+[{\"after\": \"echo \", \"encoding\": \"rot13\"},                 {\"after\": \"echo \", \"encoding\": \"base64\"}, {\"encoding\": \"hex\"}]
+```";
+    let markers = parse_markers(body);
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    assert_eq!(markers[0].encoding, PayloadEncoding::Base64);
+
+    assert!(parse_markers("no json here").is_empty());
+    assert!(parse_markers("] backwards [").is_empty());
+    assert!(parse_markers("[]").is_empty());
+    let long = format!(
+        r#"[{{"after": "{}", "encoding": "base64"}}]"#,
+        "a".repeat(MAX_MARKER_CHARS + 1)
+    );
+    assert!(
+        parse_markers(&long).is_empty(),
+        "長すぎる目印を受けた（目印はモデルが書き写すので、短く保つ）"
+    );
 }
 
 /// 同じ文字列は1回だけ。取り出す数にも上限がある。
 #[test]
 fn duplicates_are_dropped_and_the_count_is_capped() {
-    let line = "a 11 22 33 44 55 66";
-    let body = r#"[{"pattern": "([0-9]{2})", "encoding": "char_codes"},
-                   {"pattern": "([0-9]{2})", "encoding": "hex"}]"#;
+    let line = "x 11111111 y 22222222 y 33333333 y 44444444 y 55555555";
+    let body = r#"[{"after": "y ", "encoding": "hex"}, {"after": "x ", "encoding": "hex"}]"#;
     let spans = extract_spans(body, line);
     assert_eq!(spans.len(), MAX_SPANS);
-    assert_eq!(spans[0].text, "11");
-    assert_eq!(spans[1].text, "22");
+    assert_eq!(spans[0].text, "22222222");
 }
 
-/// 行は固定の指示（system）ではなく、**区切りで囲んだ材料**として送る。固定の指示は「中身を書き写さない」と命じる。
+/// 行は固定の指示（system）ではなく、**区切りで囲んだ材料**として送る。
+/// 固定の指示は「中身を書き写すな、正規表現を書くな」と命じる。
 #[tokio::test]
 async fn the_line_goes_into_the_fenced_material_not_into_the_instructions() {
     let provider = Arc::new(Replying {
-        body: r#"[{"pattern": "echo ([A-Za-z0-9+/=]+)", "encoding": "base64"}]"#.into(),
+        body: r#"[{"after": "echo ", "encoding": "base64"}]"#.into(),
         seen: Mutex::new(Vec::new()),
     });
     let locator = LlmSpanLocator::new(provider.clone(), "m".into(), false);
@@ -140,6 +160,12 @@ async fn the_line_goes_into_the_fenced_material_not_into_the_instructions() {
     assert!(req.system[0]
         .text
         .contains("Never copy, quote or decode the data itself"));
+    assert!(
+        req.system[0]
+            .text
+            .contains("never write a regular expression"),
+        "式を書かせない指示が落ちている"
+    );
     let ContentBlock::Text(user) = &req.messages[0].content[0] else {
         panic!("本文が文字でない");
     };

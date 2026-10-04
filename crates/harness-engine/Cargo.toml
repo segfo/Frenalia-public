@@ -14,7 +14,6 @@ harness-change-ledger = { version = "0.1.0", path = "../harness-change-ledger" }
 harness-tools = { version = "0.1.0", path = "../harness-tools" }
 # 解読する箇所を LLM が正規表現で表し、**抜き出しはこのエンジンがやる**（`encoded_span`）。
 # 後戻りの無い照合（線形時間）なので、モデルが書いた式でも時間が爆発しない。
-regex = "1"
 # 差分用の写しの置き場（`%LOCALAPPDATA%\harness\data`。台帳の`%APPDATA%`とは別で、
 # スクリプトの中身をローミングで他の機械へ運ばない）。
 directories = "6"
