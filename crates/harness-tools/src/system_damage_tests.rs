@@ -407,3 +407,16 @@ fn two_behaviours_are_kept_on_purpose() {
         "三重引用符の中を読まなくなっている: {found:?}"
     );
 }
+
+/// **見つけたものが書かれている行を引ける。** 長いスクリプトでは、先頭から順に出しても
+/// 当たった行まで届かないので、承認画面がその行を直接見せるために使う。
+#[test]
+fn a_finding_can_point_at_the_line_it_came_from() {
+    let script = "import shutil\nimport sys\n\nif cleanup:\n    shutil.rmtree(\"C:/Windows/Temp\")\nprint(1)\n";
+    let found = assess_line(script);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].line_in(script), Some(5));
+
+    // 見つからないときは`None`（嘘の行番号を返さない）。
+    assert_eq!(found[0].line_in("print(1)\n"), None);
+}

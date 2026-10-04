@@ -590,3 +590,53 @@ fn reasons_are_written_with_fixed_wording() {
     assert_eq!(Severity::NeedsReview.label_ja(), "要確認");
     assert_eq!(Severity::NeedsReview.summary_hint(), None);
 }
+
+/// **縛れたスクリプトの中身は、モデルが「読まない」と言っても必ず判定する。**
+///
+/// 実測（2026-10-04）: `powershell -EncodedCommand <塊>` を解読して出てきた `uv run test.py` の
+/// `test.py` は縛れて中身も手元にあったのに、**中身の判定が一度も走らず「要確認」のままだった**。
+/// モデルが見るのはコマンドの行だけなので、行からファイルが見えない形では「読まない」と答える。
+/// **縛れたかどうかはハーネスが知っている事実で、モデルに聞くことではない。**
+#[test]
+fn a_bound_script_is_judged_even_when_the_model_says_it_reads_no_source() {
+    let mut model = FakeModel::quiet();
+    model.reads_source = 0.1; // 「ソースコードは読まない」
+    model.source = 1.8; // ただし中身は危険
+    let out = run(
+        &with_preview(
+            "powershell -EncodedCommand AAAA",
+            "test.py",
+            "import shutil\nshutil.rmtree(x)\n",
+        ),
+        &[],
+        Some(&model),
+    );
+    assert!(
+        out.reasons.iter().any(
+            |r| matches!(r, RiskReason::Model { origin: Origin::File { path }, .. } if path == "test.py")
+        ),
+        "縛れたスクリプトの中身が判定されていない: {:?}",
+        out.reasons
+    );
+    assert!(model
+        .calls()
+        .iter()
+        .any(|(state, ids)| ids == &vec!["source_risk"] && state["path"] == "test.py"));
+
+    // 対照: コードでないファイル（メモ）は、モデルが「読む」と言っても判定へ送らない。
+    let mut reading = FakeModel::quiet();
+    reading.reads_source = 0.9;
+    reading.source = 1.8;
+    run(
+        &with_preview("cat notes.txt", "notes.txt", "rm -rf /"),
+        &[],
+        Some(&reading),
+    );
+    assert!(
+        !reading
+            .calls()
+            .iter()
+            .any(|(_, ids)| ids == &vec!["source_risk"]),
+        "メモの中身を判定へ送っている"
+    );
+}

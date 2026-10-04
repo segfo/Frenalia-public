@@ -721,3 +721,80 @@ async fn the_commands_that_ran_reach_the_sequence_question() {
     );
     assert_eq!(contexts[0]["command"], "pwsh -File a.ps1");
 }
+
+/// **被害判定が当たった行とその周りを、その場で見せる**（D-121）。
+///
+/// 長いスクリプトでは、先頭から順に出しても当たった行まで届かない。実測（2026-10-04）: 解読して
+/// 出てきた `uv run test.py` の `test.py` は縛れていたのに、画面には名前とハッシュしか出ておらず、
+/// 中身は `[v]` を押さないと見えなかった。
+#[test]
+fn the_lines_a_finding_points_at_are_shown_in_place() {
+    let script: String = (1..=40)
+        .map(|n| match n {
+            30 => "    shutil.rmtree(\"C:/Windows/System32\")\n".to_string(),
+            _ => format!("line_{n} = {n}\n"),
+        })
+        .collect();
+    let mut c = CommandSubject::line_only("python clean.py");
+    c.files.push(harness_core::BoundFile {
+        rel_path: "clean.py".into(),
+        sha256: "a".repeat(64),
+        dir_listing_sha256: None,
+    });
+    c.previews.push(harness_core::FilePreview {
+        rel_path: "clean.py".into(),
+        text: script,
+        truncated: false,
+    });
+    let subject = PermissionSubject::Command(c);
+    let outcome = harness_engine::approval_risk::machine(&subject).unwrap();
+    assert_eq!(outcome.severity(), Severity::High, "{outcome:?}");
+
+    let mut app = app_with(subject);
+    app.pending_permission.as_mut().unwrap().assessment =
+        Some(crate::app::RiskView::done(outcome, None));
+
+    let body = body_texts(&app);
+    // 当たった行そのものが出る。
+    assert!(
+        body.iter()
+            .any(|l| l.contains("shutil.rmtree") && l.contains("30")),
+        "当たった行が出ていない:\n{body:#?}"
+    );
+    // 周りの行も出る（前後2行）。
+    assert!(body.iter().any(|l| l.contains("line_28")), "{body:#?}");
+    assert!(body.iter().any(|l| l.contains("line_32")), "{body:#?}");
+    // 全文は出さない（残りは `[v]` で見る）。
+    assert!(!body.iter().any(|l| l.contains("line_1 ")), "{body:#?}");
+    assert!(
+        body.iter()
+            .any(|l| l.contains("全40行") && l.contains("[v]")),
+        "残りの見方を案内していない:\n{body:#?}"
+    );
+}
+
+/// 対照: **当たっていないファイルの中身は、その場では出さない**（画面が中身で埋まらない）。
+#[test]
+fn an_unflagged_file_shows_only_its_name_and_hash() {
+    let mut c = CommandSubject::line_only("python ok.py");
+    c.files.push(harness_core::BoundFile {
+        rel_path: "ok.py".into(),
+        sha256: "b".repeat(64),
+        dir_listing_sha256: None,
+    });
+    c.previews.push(harness_core::FilePreview {
+        rel_path: "ok.py".into(),
+        text: "print(1)\nprint(2)\n".into(),
+        truncated: false,
+    });
+    let subject = PermissionSubject::Command(c);
+    let outcome = harness_engine::approval_risk::machine(&subject).unwrap();
+    assert_eq!(outcome.severity(), Severity::NeedsReview);
+
+    let mut app = app_with(subject);
+    app.pending_permission.as_mut().unwrap().assessment =
+        Some(crate::app::RiskView::done(outcome, None));
+
+    let body = body_texts(&app);
+    assert!(!body.iter().any(|l| l.contains("print(1)")), "{body:#?}");
+}

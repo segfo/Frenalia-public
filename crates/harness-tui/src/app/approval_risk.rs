@@ -5,7 +5,9 @@
 
 use std::time::Instant;
 
-use harness_engine::approval_risk::{RiskBasis, RiskNote, RiskOutcome, Severity};
+use harness_engine::approval_risk::{
+    Origin, RiskBasis, RiskNote, RiskOutcome, RiskReason, Severity,
+};
 
 use super::{ApprovalLine, LineStyle, PermissionView, WaitClock};
 use crate::app::spinner_glyph;
@@ -38,6 +40,23 @@ impl RiskView {
             waiting: Some(since),
             source: Some(source),
         }
+    }
+
+    /// `rel_path`のファイルの中身に当たった、機械の被害判定だけを引く（D-121）。
+    ///
+    /// 承認画面が「危険な処理に当たった行」をその場で見せるために使う。判定モデルの分は含めない
+    /// ——点数には行が無いので、指す先が無い。
+    pub fn flagged_in<'a>(
+        &'a self,
+        rel_path: &'a str,
+    ) -> impl Iterator<Item = &'a harness_tools::system_damage::DamageFinding> + 'a {
+        self.outcome.reasons.iter().filter_map(move |r| match r {
+            RiskReason::Damage {
+                finding,
+                origin: Origin::File { path },
+            } if path == rel_path => Some(finding),
+            _ => None,
+        })
     }
 
     pub fn severity(&self) -> Severity {

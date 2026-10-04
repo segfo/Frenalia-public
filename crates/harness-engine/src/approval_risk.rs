@@ -368,7 +368,6 @@ pub async fn assess(
         }
         Err(e) => out.note_model_error(e.to_string()),
     }
-    let mut reads_source = false;
     let mut undecoded = None;
     match context {
         Ok(answers) => {
@@ -386,8 +385,9 @@ pub async fn assess(
                     undecoded = Some(decode.probability);
                 }
             }
+            // 「ソースコードを読むか」の答えは**注記にだけ使う**。中身を判定するかどうかの
+            // 分かれ目には使わない——縛れたかどうかはハーネスが知っている事実だから（下の③）。
             if let Ok(source) = questions::read_reads_source(&answers) {
-                reads_source = source.yes;
                 if source.yes && previews(subject).is_empty() {
                     out.notes.push(RiskNote::UnboundSource {
                         probability: source.probability,
@@ -422,29 +422,40 @@ pub async fn assess(
     let extra = out.extra_decoded.clone();
     model_on_decoded(&mut out, &extra, model).await;
 
-    // ③ 縛ったファイルの中身（コードを走らせるときだけ）。
-    let runs_code = matches!(subject, PermissionSubject::Program(p) if p.runs_code);
-    if runs_code || reads_source {
-        for preview in previews(subject).iter().take(MAX_FILES_TO_ASK) {
-            match assess_source_risk(model, &preview.rel_path, &preview.text).await {
-                Ok((verdict, cut)) => {
-                    out.basis = RiskBasis::WithModel;
-                    if verdict.level == RiskLevel::Danger {
-                        out.push_reason(RiskReason::Model {
-                            verdict,
-                            origin: Origin::File {
-                                path: preview.rel_path.clone(),
-                            },
-                        });
-                    }
-                    if cut || preview.truncated {
-                        out.notes.push(RiskNote::FileCut {
+    // ③ 縛ったファイルの中身。**コードとして縛れたものは、必ず聞く。**
+    //
+    // 以前は「このコマンドはソースコードを読むか」という判定モデルの答えが「はい」のときだけ聞いていた。
+    // ところが**モデルが見るのはコマンドの行だけ**なので、`powershell -EncodedCommand <塊>` のように
+    // 行からはファイルが見えない形では「読まない」と答える。実測（2026-10-04）: 解読して出てきた
+    // `uv run test.py` の `test.py` は縛れて中身も手元にあるのに、**中身の判定が一度も走らず
+    // 「要確認」のままだった**。
+    //
+    // **縛れたかどうかはハーネスが知っている事実で、モデルに聞くことではない**（`plans/DESIGN-COGNITION.md`
+    // §0 の分業）。どれをコードとみなすかは機械の判定と同じ `is_code` を通す——判定の条件を2つ持つと、
+    // 片方だけ直されて静かにずれる（`B-05`）。
+    for preview in previews(subject)
+        .iter()
+        .filter(|p| is_code(subject, p))
+        .take(MAX_FILES_TO_ASK)
+    {
+        match assess_source_risk(model, &preview.rel_path, &preview.text).await {
+            Ok((verdict, cut)) => {
+                out.basis = RiskBasis::WithModel;
+                if verdict.level == RiskLevel::Danger {
+                    out.push_reason(RiskReason::Model {
+                        verdict,
+                        origin: Origin::File {
                             path: preview.rel_path.clone(),
-                        });
-                    }
+                        },
+                    });
                 }
-                Err(e) => out.note_model_error(e.to_string()),
+                if cut || preview.truncated {
+                    out.notes.push(RiskNote::FileCut {
+                        path: preview.rel_path.clone(),
+                    });
+                }
             }
+            Err(e) => out.note_model_error(e.to_string()),
         }
     }
     Some(out)

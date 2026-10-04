@@ -82,6 +82,26 @@ pub struct DamageFinding {
 }
 
 impl DamageFinding {
+    /// この見つけたものが書かれている行を`text`から探す（**1始まり**の行番号）。
+    ///
+    /// **字面で探し直すだけである。** 語に割る処理（`shell_line::tokenize`）は位置を持たないので、
+    /// 位置を通して運ぶより、`command`と`target`の両方を含む最初の行を探す方が安い。
+    ///
+    /// 承認画面が「危険な処理に当たった行」をその場で見せるために使う——長いスクリプトでは、
+    /// **先頭から順に出しても当たった行まで届かない**。
+    ///
+    /// 見つからなければ`None`（環境変数の書き方を揃えてから割っているので、`${env:X}`のような
+    /// 書き方では字面が一致しないことがある）。
+    pub fn line_in(&self, text: &str) -> Option<usize> {
+        let command = self.command.to_lowercase();
+        text.lines()
+            .position(|line| {
+                let lower = line.to_lowercase();
+                lower.contains(&command) && line.contains(&self.target)
+            })
+            .map(|i| i + 1)
+    }
+
     /// 危険度「高」に当たるか。ユーザーのアプリデータを**書き換える**だけのものは当たらない
     /// （消すものは当たる）——設定ファイルを1つ書き換えるのは日常の作業でも起きるから。
     pub fn is_high(&self) -> bool {

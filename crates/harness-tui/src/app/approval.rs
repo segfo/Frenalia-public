@@ -53,6 +53,12 @@ pub enum ApprovalStage {
 }
 
 /// 開いている枠。
+/// 承認画面へその場で出す、被害判定が当たった行の数の上限（1ファイルあたり）。
+const FLAGGED_LINES_TO_SHOW: usize = 3;
+
+/// 当たった行の前後に添える行数。
+const FLAGGED_CONTEXT: usize = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalPane {
     None,
@@ -655,6 +661,68 @@ impl PermissionView {
                     escape_for_display(&f.rel_path),
                     &f.sha256[..f.sha256.len().min(HASH_DIGEST_CHARS)]
                 ),
+            ));
+            out.extend(self.flagged_lines_of(&f.rel_path));
+        }
+        out
+    }
+
+    /// 縛ったファイルのうち、**機械の被害判定が当たった行とその前後**（D-121）。
+    ///
+    /// 当たっていないファイルは何も出さない——全文は`[v]`で見られる。長いスクリプトでは
+    /// **先頭から順に出しても当たった行まで届かない**ので、当たった行を直接見せる。
+    fn flagged_lines_of(&self, rel_path: &str) -> Vec<ApprovalLine> {
+        let Some(text) = self
+            .previews()
+            .iter()
+            .find(|p| p.rel_path == rel_path)
+            .map(|p| p.text.as_str())
+        else {
+            return Vec::new();
+        };
+        let Some(view) = self.assessment.as_ref() else {
+            return Vec::new();
+        };
+        // この file に当たった被害判定だけを集め、行番号で並べて重なりをまとめる。
+        let mut wanted: Vec<usize> = view
+            .flagged_in(rel_path)
+            .filter_map(|finding| finding.line_in(text))
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::new();
+        let mut shown: Option<usize> = None;
+        for at in wanted.iter().take(FLAGGED_LINES_TO_SHOW) {
+            let from = at.saturating_sub(FLAGGED_CONTEXT).max(1);
+            let to = (at + FLAGGED_CONTEXT).min(lines.len());
+            if shown.is_some_and(|last| from > last + 1) {
+                out.push(ApprovalLine::new(LineStyle::Dim, "      …"));
+            }
+            for n in from..=to {
+                if shown.is_some_and(|last| n <= last) {
+                    continue;
+                }
+                // 当たった行は目立たせ、周りは控えめに出す。
+                let style = match n == *at {
+                    true => LineStyle::Warn,
+                    false => LineStyle::Dim,
+                };
+                out.push(ApprovalLine::new(
+                    style,
+                    format!("    {n:>4}  {}", escape_for_display(lines[n - 1])),
+                ));
+                shown = Some(n);
+            }
+        }
+        if shown.is_some_and(|last| last < lines.len()) {
+            out.push(ApprovalLine::new(
+                LineStyle::Dim,
+                format!("      …（全{}行。[v] で全文）", lines.len()),
             ));
         }
         out
