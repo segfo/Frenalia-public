@@ -301,3 +301,109 @@ fn the_same_finding_is_reported_once() {
     let found = assess_line(r#"cmd /c "del C:\Windows\x" & del C:\Windows\x"#);
     assert_eq!(found.len(), 1, "{found:?}");
 }
+
+// --- 複数行のスクリプトの読み方（D-119） ---
+
+/// **コメントに書いただけの危険な処理は拾わない。**
+///
+/// 読み飛ばさないと、コメントの中の `=` や `{}` で文が切り直されて、コメントの中身をコードとして読む。
+/// 実測（2026-10-04）: `# cleanup = os.remove("C:/Windows/x")` の1行だけで「高」が出ていた。
+#[test]
+fn a_dangerous_line_written_only_in_a_comment_is_not_flagged() {
+    let alarms = false_alarms(&[
+        // `#`（Python・シェル・PowerShell）。`=` があると、直す前は文が切り直されて拾っていた。
+        "# cleanup = os.remove(\"C:/Windows/x\")\nprint(1)\n",
+        "# rm -rf /etc\necho hi\n",
+        "echo hi  # shutil.rmtree(\"C:/Windows\")\n",
+        // `//`（JavaScript・TypeScript）。
+        "// fs.rmSync(\"C:/Windows\", {recursive: true})\nconsole.log(1)\n",
+        // PowerShell の囲みコメント。
+        "<# Remove-Item -Recurse C:/Windows/System32 #>\nWrite-Host hi\n",
+        // 閉じない囲みコメントは、そこから先を全部読み飛ばす。
+        "<# Remove-Item -Recurse C:/Windows/System32\n",
+    ]);
+    assert!(alarms.is_empty(), "{alarms:?}");
+}
+
+/// **コメントの印は語の途中では始まらない。** 始まるとしてしまうと、`--color=#fff` や `http://x` の
+/// 後ろが全部コメントになり、**そこに書かれた危険な処理が見えなくなる**。
+#[test]
+fn a_comment_mark_inside_a_word_does_not_hide_the_rest_of_the_line() {
+    let misses = misses(&[
+        ("npm run build --color=#fff; rm -rf /etc", System, Delete),
+        ("curl http://x.example/a; rm -rf /etc", System, Delete),
+        ("Remove-Item C:/Windows/System32/a#b", System, Delete),
+    ]);
+    assert!(misses.is_empty(), "{misses:?}");
+}
+
+/// **括弧が開いている間は、改行で文を切らない。** 切ると、改行して書いた引数を見落とす。
+///
+/// 実測（2026-10-04）: `shutil.rmtree(`⏎`  "C:/Windows/System32"`⏎`)` が0件だった。
+#[test]
+fn a_statement_continued_inside_brackets_is_read_as_one() {
+    let misses = misses(&[
+        (
+            "shutil.rmtree(\n    \"C:/Windows/System32\"\n)\n",
+            System,
+            Delete,
+        ),
+        (
+            "fs.rmSync(\n  \"C:/Windows\",\n  { recursive: true }\n)\n",
+            System,
+            Delete,
+        ),
+        // 入れ子（丸括弧の中の丸括弧・角括弧）でも1つの文として読む。
+        (
+            "shutil.rmtree(
+  os.path.join(
+    \"C:/Windows\",
+    [\"System32\"][0]
+  )
+)
+",
+            System,
+            Delete,
+        ),
+    ]);
+    assert!(misses.is_empty(), "{misses:?}");
+}
+
+/// **閉じない括弧でテキストの残り全部が1つの文にならない。** 上限の行数で諦めて、普通に切り直す。
+#[test]
+fn an_unclosed_bracket_gives_up_after_the_line_limit() {
+    // `(` を開いたまま、上限を超える行数を置く。最後の行の `cd` が最初の文へ混ざらないこと。
+    let filler = "x\n".repeat(crate::shell_line::MAX_CONTINUED_LINES as usize + 5);
+    let text = format!("echo (\n{filler}rm -rf /etc\n");
+    let found = assess_line(&text);
+    // 最後の `rm -rf /etc` は、文として切り直された後でも拾える。
+    assert!(
+        found
+            .iter()
+            .any(|f| f.place == System && f.action == Delete),
+        "{found:?}"
+    );
+}
+
+/// **意図して直していないもの（2つ）。** 直すと実際の動きから離れるか、判定を避ける道ができる。
+#[test]
+fn two_behaviours_are_kept_on_purpose() {
+    // (1) `cd` の効きは次の文へ持ち越す——スクリプトでは本当にそう動く。
+    let found = assess_line("cd C:/Windows\nrm -rf System32\n");
+    assert!(
+        found
+            .iter()
+            .any(|f| f.place == System && f.action == Delete),
+        "cd の持ち越しが消えている: {found:?}"
+    );
+
+    // (2) 三重引用符の中も、引用符の中として読み直す。読み直さない形にすると、
+    //     `exec(\"\"\"…\"\"\")` のように文字列へ入れるだけで判定を避けられる。
+    let found = assess_line("exec(\"\"\"\nshutil.rmtree(\"C:/Windows\")\n\"\"\")\n");
+    assert!(
+        found
+            .iter()
+            .any(|f| f.place == System && f.action == Delete),
+        "三重引用符の中を読まなくなっている: {found:?}"
+    );
+}
