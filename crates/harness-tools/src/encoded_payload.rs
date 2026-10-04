@@ -60,6 +60,7 @@ pub fn decode_located(line: &str, spans: &[LocatedSpan]) -> Vec<DecodedLayer> {
             depth: 1,
             source,
             outcome,
+            in_file: None,
         });
         layers.extend(nested);
         if stop {

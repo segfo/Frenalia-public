@@ -276,6 +276,7 @@ fn a_file_named_only_inside_a_decoded_layer_is_bound() {
             encoding: harness_core::TextEncoding::Utf16Le,
             text: "uv run test.py".to_string(),
         },
+        in_file: None,
     }];
     let out = bind_everything(&view, dir.path(), line, &decoded);
     assert_eq!(
@@ -405,4 +406,55 @@ fn changing_a_nested_script_changes_the_bound_hashes() {
 
     assert_ne!(before, after, "入れ子のファイルの中身が指紋に効いていない");
     assert_eq!(before[0], after[0], "a.py は変えていない");
+}
+
+/// **縛ったファイルの中に書かれた符号化された塊も解読する**（D-122）。
+///
+/// 実測（2026-10-04、ユーザーの画面）: `uv run test.py` の `test.py` が
+///
+/// ```text
+/// import os
+/// print("hello")
+/// os.remove("pwsh --enc <塊>")
+/// ```
+///
+/// で、**その塊を2段解くと `rm C:\Windows\System32\calc.exe` だった**。機械の被害判定は
+/// `os.remove` の引数を見るが、引数は符号化された文字列そのものなのでシステムの場所には当たらない
+/// ——**判定は正しく、解読が1段足りなかった**。
+#[test]
+fn an_encoded_payload_written_inside_a_bound_file_is_decoded() {
+    let dir = ws();
+    let body = "import os\nprint(\"hello\")\nos.remove(\"pwsh --enc cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAZwBCAHQAQQBDAEEAQQBRAHcAQQA2AEEARgB3AEEAVgB3AEIAcABBAEcANABBAFoAQQBCAHYAQQBIAGMAQQBjAHcAQgBjAEEARgBNAEEAZQBRAEIAegBBAEgAUQBBAFoAUQBCAHQAQQBEAE0AQQBNAGcAQgBjAEEARwBNAEEAWQBRAEIAcwBBAEcATQBBAEwAZwBCAGwAQQBIAGcAQQBaAFEAQQA9AA==\")";
+    std::fs::write(dir.path().join("test.py"), body).unwrap();
+    let view = ChildView::real(dir.path()).unwrap();
+
+    let b = bind_everything(&view, dir.path(), "uv run test.py", &[]);
+    let layers = decode_in_files(&b.previews, true);
+
+    // 2段解けて、どちらも「test.py の中で見つけた」と分かる。
+    assert_eq!(layers.len(), 2, "{layers:?}");
+    assert!(layers
+        .iter()
+        .all(|l| l.in_file.as_deref() == Some("test.py")));
+    let last = match &layers[1].outcome {
+        harness_core::DecodeOutcome::Text { text, .. } => text.as_str(),
+        other => panic!("文字として読めていない: {other:?}"),
+    };
+    assert_eq!(last, r"rm C:\Windows\System32\calc.exe");
+}
+
+/// 対照: **拡張子がスクリプトでないファイルの中身は解読しない**（`run_shell` のとき）。
+/// メモに貼られた base64 を解いて見せ始めると、画面が関係ない中身で埋まる。
+#[test]
+fn a_memo_is_not_decoded_for_run_shell() {
+    let dir = ws();
+    let body = "pwsh --enc cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAZwBCAHQAQQBDAEEAQQBRAHcAQQA2AEEARgB3AEEAVgB3AEIAcABBAEcANABBAFoAQQBCAHYAQQBIAGMAQQBjAHcAQgBjAEEARgBNAEEAZQBRAEIAegBBAEgAUQBBAFoAUQBCAHQAQQBEAE0AQQBNAGcAQgBjAEEARwBNAEEAWQBRAEIAcwBBAEcATQBBAEwAZwBCAGwAQQBIAGcAQQBaAFEAQQA9AA==";
+    std::fs::write(dir.path().join("notes.txt"), body).unwrap();
+    let view = ChildView::real(dir.path()).unwrap();
+
+    let b = bind_everything(&view, dir.path(), "cat notes.txt", &[]);
+    assert_eq!(b.previews.len(), 1, "縛れていない");
+    assert!(decode_in_files(&b.previews, true).is_empty());
+    // コードを走らせる呼び出し（`run_program`）では、拡張子で絞らず解読する。
+    assert!(!decode_in_files(&b.previews, false).is_empty());
 }

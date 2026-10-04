@@ -198,6 +198,12 @@ fn decoded_layer_lines(layer: &DecodedLayer) -> Vec<ApprovalLine> {
             encoding.name()
         ),
     };
+    // **どのファイルの中で見つけたかを言う**（D-122）。「3段目の中」とだけ言われても、
+    // 人はどこを見ればよいか分からない。
+    let head = match &layer.in_file {
+        Some(path) => format!("{head}（{} の中）", escape_for_display(path)),
+        None => head,
+    };
     let reason = match &layer.outcome {
         DecodeOutcome::Text { encoding, text } => {
             let mut out = vec![ApprovalLine::new(

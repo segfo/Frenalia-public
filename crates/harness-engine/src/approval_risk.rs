@@ -298,12 +298,17 @@ fn add_damage(out: &mut RiskOutcome, findings: Vec<DamageFinding>, origin: Origi
 fn damage_in_decoded(out: &mut RiskOutcome, layers: &[DecodedLayer]) {
     for layer in layers {
         if let DecodeOutcome::Text { text, .. } = &layer.outcome {
-            add_damage(
-                out,
-                system_damage::assess_line(text),
-                Origin::Decoded { depth: layer.depth },
-            );
+            add_damage(out, system_damage::assess_line(text), origin_of(layer));
         }
+    }
+}
+
+/// その段をどこで見つけたか。ファイルの中で見つけた段は、**そのファイルの名前で言う**（D-122）
+/// ——「3段目の中」とだけ言われても、人はどこを見ればよいか分からない。
+fn origin_of(layer: &DecodedLayer) -> Origin {
+    match &layer.in_file {
+        Some(path) => Origin::File { path: path.clone() },
+        None => Origin::Decoded { depth: layer.depth },
     }
 }
 

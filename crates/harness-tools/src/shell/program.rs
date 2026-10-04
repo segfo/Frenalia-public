@@ -316,6 +316,11 @@ fn program_subject(
     binding.absorb(nested);
     // ここで確かめ切れなかったものは、恒久承認しない（`run_program`は`one_shot_only`が同じ役）。
     subject.one_shot_only |= binding.unverifiable;
+    // 縛ったファイルの中身に入っている符号化された塊も解読する（D-122）。コードを走らせる
+    // 呼び出しなので、拡張子で絞らず全部見る。
+    subject
+        .decoded
+        .extend(approval_binding::decode_in_files(&binding.previews, false));
     subject.files = binding.files;
     subject.previews = binding.previews;
     subject

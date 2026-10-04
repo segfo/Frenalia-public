@@ -272,3 +272,60 @@ async fn an_executable_inside_the_workspace_runs_code_and_is_bound() {
         [exe]
     );
 }
+
+/// **`run_shell`・`run_program` の材料に、縛ったファイルの中身を解読した段が入っている**（D-122）。
+///
+/// 解読する関数が在ることと、**それが材料の組み立てへ配線されていること**は別の事実である
+/// （`bug-pattern-rules` B-06）。配線を外しても、解読そのものの試験は緑のままだった。
+///
+/// 使う形は実測（2026-10-04、ユーザーの画面）と同じ——`test.py` の中に
+/// `os.remove("pwsh --enc <塊>")` と書かれており、その塊を2段解くと
+/// `rm C:\Windows\System32\calc.exe` になる。
+#[tokio::test]
+async fn the_subject_carries_layers_decoded_from_inside_a_bound_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = "import os\nprint(\"hello\")\nos.remove(\"pwsh --enc cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAZwBCAHQAQQBDAEEAQQBRAHcAQQA2AEEARgB3AEEAVgB3AEIAcABBAEcANABBAFoAQQBCAHYAQQBIAGMAQQBjAHcAQgBjAEEARgBNAEEAZQBRAEIAegBBAEgAUQBBAFoAUQBCAHQAQQBEAE0AQQBNAGcAQgBjAEEARwBNAEEAWQBRAEIAcwBBAEcATQBBAEwAZwBCAGwAQQBIAGcAQQBaAFEAQQA9AA==\")";
+    std::fs::write(dir.path().join("test.py"), body).unwrap();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let reg = ToolRegistry::with_builtin_tools();
+
+    for (name, input) in [
+        (
+            "run_shell",
+            serde_json::json!({ "command": "uv run test.py" }),
+        ),
+        (
+            "run_program",
+            serde_json::json!({ "program": "python", "args": ["test.py"] }),
+        ),
+    ] {
+        let subject = reg
+            .get(name)
+            .unwrap()
+            .permission_subject(&input, &ctx)
+            .await
+            .unwrap();
+        let decoded = match &subject {
+            PermissionSubject::Command(c) => &c.decoded,
+            PermissionSubject::Program(p) => &p.decoded,
+            other => panic!("{name}: {other:?}"),
+        };
+        let texts: Vec<&str> = decoded
+            .iter()
+            .filter_map(|l| match &l.outcome {
+                harness_core::DecodeOutcome::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&r"rm C:\Windows\System32\calc.exe"),
+            "{name}: ファイルの中の塊が解読されていない: {texts:?}"
+        );
+        assert!(
+            decoded
+                .iter()
+                .any(|l| l.in_file.as_deref() == Some("test.py")),
+            "{name}: どのファイルの中で見つけたかが残っていない"
+        );
+    }
+}

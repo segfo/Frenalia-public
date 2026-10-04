@@ -44,6 +44,9 @@ pub const MAX_NESTED_FILES: usize = 10;
 /// 解読した段のうち、ファイルを探す段の数の上限（D-120）。
 pub const MAX_LAYERS_TO_BIND: usize = 8;
 
+/// 縛ったファイルの中身から解読する段の数の上限（全ファイル合わせて。D-122）。
+pub const MAX_FILE_LAYERS: usize = 16;
+
 /// 子プロセスが実際に読むのと同じ見え方でワークスペースを読む口。
 pub struct ChildView {
     fs: SandboxFs,
@@ -273,6 +276,52 @@ pub fn bind_everything(
     out.absorb(bind_decoded(view, cwd, decoded));
     let nested = bind_nested(view, cwd, &out);
     out.absorb(nested);
+    out
+}
+
+/// 縛ったファイルの**中身に入っている符号化された塊**を解読する（D-122）。
+///
+/// # 何のためにあるのか
+///
+/// 行を解読してファイルを縛れるようにした（D-120）が、**そのファイルの中に符号化された塊が
+/// 書いてあると、そこから先は見えない**。実測（2026-10-04）: `uv run test.py` の `test.py` が
+///
+/// ```text
+/// import os
+/// print("hello")
+/// os.remove("pwsh --enc <塊>")
+/// ```
+///
+/// で、**その塊を2段解くと `rm C:\Windows\System32\calc.exe` だった**。
+/// 機械の被害判定は `os.remove` の引数を見るが、引数は符号化された文字列そのものなので
+/// システムの場所には当たらない——**判定は正しく、解読が1段足りなかった**。
+///
+/// 解読に使うのは行と同じ関数（[`crate::encoded_command::decode_shell_line`]）で、
+/// 承認画面に出る段と同じ解き方である。見つけた段には**どのファイルの中で見つけたか**を書いておく
+/// （`DecodedLayer::in_file`）ので、画面も危険度の理由も「test.py の中」と言える。
+///
+/// # ここが守らないもの
+///
+/// - 見るのは`code_only`が真なら**スクリプトの拡張子を持つファイルだけ**（`run_shell`）。
+///   偽ならすべて（`run_program`でコードを走らせるとき）
+/// - 全部合わせて[`MAX_FILE_LAYERS`]段まで。超えた分は見ない
+pub fn decode_in_files(
+    previews: &[FilePreview],
+    code_only: bool,
+) -> Vec<harness_core::DecodedLayer> {
+    let mut out = Vec::new();
+    for preview in previews {
+        if code_only && !harness_core::has_script_extension(&preview.rel_path) {
+            continue;
+        }
+        for mut layer in crate::encoded_command::decode_shell_line(&preview.text) {
+            if out.len() >= MAX_FILE_LAYERS {
+                return out;
+            }
+            layer.in_file = Some(preview.rel_path.clone());
+            out.push(layer);
+        }
+    }
     out
 }
 

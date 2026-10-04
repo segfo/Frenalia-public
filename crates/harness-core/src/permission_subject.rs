@@ -65,6 +65,15 @@ pub struct DecodedLayer {
     /// どの書き方から取り出したか。
     pub source: EncodedSource,
     pub outcome: DecodeOutcome,
+    /// **縛ったファイルの中で見つけたとき**、そのファイルのワークスペース内の相対パス（D-122）。
+    /// コマンドの行そのものから見つけたときは`None`。
+    ///
+    /// 実測（2026-10-04）: `uv run test.py` の `test.py` の中に
+    /// `os.remove("pwsh --enc <塊>")` と書かれており、**その塊を解くと
+    /// `rm C:\Windows\System32\calc.exe` だった**。行だけを解いていては届かない。
+    /// 画面と危険度の理由が「どのファイルの中か」を言えるように、ここで持つ。
+    #[serde(default)]
+    pub in_file: Option<String>,
 }
 
 /// 符号化された中身を、どの書き方から取り出したか。

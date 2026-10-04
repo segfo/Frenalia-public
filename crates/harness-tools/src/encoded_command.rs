@@ -273,6 +273,7 @@ impl Decoder {
                 depth,
                 source: f.source,
                 outcome,
+                in_file: None,
             });
             if !next.is_empty() {
                 self.walk(next, depth + 1);
@@ -285,6 +286,7 @@ impl Decoder {
             depth,
             source,
             outcome,
+            in_file: None,
         });
         self.stopped = true;
     }

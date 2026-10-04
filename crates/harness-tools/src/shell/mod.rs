@@ -406,6 +406,13 @@ impl Tool for RunShellTool {
                     ..Default::default()
                 },
             };
+            // 縛ったファイルの中身に入っている符号化された塊も解読する（D-122）。
+            // 行だけを解いていては、`os.remove("pwsh --enc <塊>")` の中までは届かない。
+            let mut decoded = decoded;
+            decoded.extend(crate::approval_binding::decode_in_files(
+                &binding.previews,
+                true,
+            ));
             PermissionSubject::Command(CommandSubject {
                 line,
                 files: binding.files,

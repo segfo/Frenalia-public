@@ -104,6 +104,7 @@ fn with_decoded(line: &str, text: &str) -> PermissionSubject {
             encoding: TextEncoding::Utf16Le,
             text: text.into(),
         },
+        in_file: None,
     });
     PermissionSubject::Command(c)
 }
