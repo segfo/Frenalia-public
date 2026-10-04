@@ -15,7 +15,8 @@
 //!    ・危険度だけ                  → コマンドの危険度
 //!    ・流れと一緒に4問              → 解読が要るか・ファイルからコードを読むか・流れと合わせた危険度
 //! ③ 必要なときだけ追加で聞く
-//!    ・解読できた各段の中身の危険度
+//!    ・「解読が要る」と出たのに機械の解読が何も取れていなければ、LLM に場所を選ばせてハーネスが解読する（encoded_span）
+//!    ・解読できた各段（機械の解読・LLM が場所を示したもの）の中身を、機械の判定と判定モデルに通す
 //!    ・ファイルからコードを読む（または run_program でコードを走らせる）なら、縛ったファイルの中身の危険度
 //! ④ どれか1つでも高なら「高」、それ以外は「要確認」
 //! ```
@@ -34,7 +35,8 @@
 //! - 判定モデルが拾えないものがある（`plans/risk-judge-spike/RESULTS.md` §1）——流れの危険は陽性6組のうち2組、
 //!   ソースコードは埋もれた1行を見落とす。機械の判定は字面に出ない場所を読めない
 //! - 判定モデルへ送るソースコードは先頭[`harness_core::MAX_SOURCE_CHARS`]字だけ。機械の判定はファイル全体を見る
-//! - 解読が要りそうなのに機械の解読が何も取れなかったときは、今は注記を出すだけである
+//! - 解読が要りそうなのに、機械の解読も LLM が示した箇所の解読も何も取れなかったときは、注記を出すだけである
+//!   （LLM が場所を示さなかった・示した文字列が行に無かった・示された符号化として読めなかった）
 
 use futures::future::join;
 use harness_core::decision::questions;
@@ -44,6 +46,8 @@ use harness_core::{
     RiskVerdict,
 };
 use harness_tools::system_damage::{self, DamageFinding};
+
+use crate::encoded_span::SpanLocator;
 
 /// 解読できた段のうち、判定モデルへ危険度を聞く数の上限（段ごとに1回の呼び出し、約1秒）。
 pub const MAX_DECODED_TO_ASK: usize = 4;
@@ -191,6 +195,9 @@ pub struct RiskOutcome {
     pub reasons: Vec<RiskReason>,
     pub notes: Vec<RiskNote>,
     pub basis: RiskBasis,
+    /// LLM が場所を示し、ハーネスが解読した段（[`crate::encoded_span`]）。承認画面と要約に、
+    /// 機械の解読（材料の`decoded`）と並べて出す。**表示と要約・判定のためだけで、照合に使わない。**
+    pub extra_decoded: Vec<DecodedLayer>,
 }
 
 impl RiskOutcome {
@@ -260,55 +267,91 @@ pub fn machine(subject: &PermissionSubject) -> Option<RiskOutcome> {
         reasons: Vec::new(),
         notes: Vec::new(),
         basis: RiskBasis::MachineOnly,
-    };
-    let add = |findings: Vec<DamageFinding>, origin: Origin, out: &mut RiskOutcome| {
-        for finding in findings.into_iter().filter(DamageFinding::is_high) {
-            out.push_reason(RiskReason::Damage {
-                finding,
-                origin: origin.clone(),
-            });
-        }
+        extra_decoded: Vec::new(),
     };
     match subject {
-        PermissionSubject::Command(c) => add(
+        PermissionSubject::Command(c) => add_damage(
+            &mut out,
             system_damage::assess_line(&c.line),
             Origin::Command,
-            &mut out,
         ),
-        PermissionSubject::Program(p) => add(
+        PermissionSubject::Program(p) => add_damage(
+            &mut out,
             system_damage::assess_program(&p.program, &p.args),
             Origin::Command,
-            &mut out,
         ),
         PermissionSubject::WritePath(_) | PermissionSubject::Text(_) => return None,
     }
-    for layer in decoded_layers(subject) {
-        if let DecodeOutcome::Text { text, .. } = &layer.outcome {
-            add(
-                system_damage::assess_line(text),
-                Origin::Decoded { depth: layer.depth },
-                &mut out,
-            );
-        }
-    }
+    damage_in_decoded(&mut out, decoded_layers(subject));
     for preview in previews(subject).iter().filter(|p| is_code(subject, p)) {
-        add(
+        add_damage(
+            &mut out,
             system_damage::assess_line(&preview.text),
             Origin::File {
                 path: preview.rel_path.clone(),
             },
-            &mut out,
         );
     }
     Some(out)
 }
 
+/// 機械の判定のうち「高」に当たるものを理由へ足す。
+fn add_damage(out: &mut RiskOutcome, findings: Vec<DamageFinding>, origin: Origin) {
+    for finding in findings.into_iter().filter(DamageFinding::is_high) {
+        out.push_reason(RiskReason::Damage {
+            finding,
+            origin: origin.clone(),
+        });
+    }
+}
+
+/// 解読できた段の中身に、機械の判定を掛ける。
+fn damage_in_decoded(out: &mut RiskOutcome, layers: &[DecodedLayer]) {
+    for layer in layers {
+        if let DecodeOutcome::Text { text, .. } = &layer.outcome {
+            add_damage(
+                out,
+                system_damage::assess_line(text),
+                Origin::Decoded { depth: layer.depth },
+            );
+        }
+    }
+}
+
+/// 解読できた段の中身の危険度を判定モデルに聞く（上限[`MAX_DECODED_TO_ASK`]段）。
+async fn model_on_decoded(
+    out: &mut RiskOutcome,
+    layers: &[DecodedLayer],
+    model: &dyn DecisionModel,
+) {
+    let texts = layers.iter().filter_map(|layer| match &layer.outcome {
+        DecodeOutcome::Text { text, .. } => Some((layer.depth, text)),
+        _ => None,
+    });
+    for (depth, text) in texts.take(MAX_DECODED_TO_ASK) {
+        match assess_command_risk(model, text).await {
+            Ok(verdict) => {
+                out.basis = RiskBasis::WithModel;
+                if verdict.level == RiskLevel::Danger {
+                    out.push_reason(RiskReason::Model {
+                        verdict,
+                        origin: Origin::Decoded { depth },
+                    });
+                }
+            }
+            Err(e) => out.note_model_error(e.to_string()),
+        }
+    }
+}
+
 /// ①〜④を全部行う。`model`が`None`（判定モデルを使わない設定）なら①だけ。`history`はこのセッションで
-/// 既に走らせたコマンド（古い順）。判定しない材料は`None`。
+/// 既に走らせたコマンド（古い順）。`locator`は解読する箇所を選ばせる LLM（要約と同じもの。`None`なら選ばせない）。
+/// 判定しない材料は`None`。
 pub async fn assess(
     subject: &PermissionSubject,
     history: &[String],
     model: Option<&dyn DecisionModel>,
+    locator: Option<&dyn SpanLocator>,
 ) -> Option<RiskOutcome> {
     let mut out = machine(subject)?;
     let Some(model) = model else {
@@ -337,6 +380,7 @@ pub async fn assess(
         Err(e) => out.note_model_error(e.to_string()),
     }
     let mut reads_source = false;
+    let mut undecoded = None;
     match context {
         Ok(answers) => {
             out.basis = RiskBasis::WithModel;
@@ -350,9 +394,7 @@ pub async fn assess(
             }
             if let Ok(decode) = questions::read_needs_decoding(&answers) {
                 if decode.yes && decoded_texts(subject).is_empty() {
-                    out.notes.push(RiskNote::UndecodedPayload {
-                        probability: decode.probability,
-                    });
+                    undecoded = Some(decode.probability);
                 }
             }
             if let Ok(source) = questions::read_reads_source(&answers) {
@@ -367,24 +409,29 @@ pub async fn assess(
         Err(e) => out.note_model_error(e.to_string()),
     }
 
-    // ③ 解読できた段の中身。
-    for layer in decoded_layers(subject).iter().take(MAX_DECODED_TO_ASK) {
-        let DecodeOutcome::Text { text, .. } = &layer.outcome else {
-            continue;
+    // ③ 解読が要るのに機械の解読が何も取れていなければ、LLM に場所を選ばせてハーネスが解読する。
+    if let Some(probability) = undecoded {
+        let located = match locator {
+            Some(locator) => match locator.locate(&line).await {
+                Ok(spans) => harness_tools::encoded_payload::decode_located(&line, &spans),
+                Err(_) => Vec::new(),
+            },
+            None => Vec::new(),
         };
-        match assess_command_risk(model, text).await {
-            Ok(verdict) => {
-                out.basis = RiskBasis::WithModel;
-                if verdict.level == RiskLevel::Danger {
-                    out.push_reason(RiskReason::Model {
-                        verdict,
-                        origin: Origin::Decoded { depth: layer.depth },
-                    });
-                }
-            }
-            Err(e) => out.note_model_error(e.to_string()),
+        if !located
+            .iter()
+            .any(|l| matches!(l.outcome, DecodeOutcome::Text { .. }))
+        {
+            out.notes.push(RiskNote::UndecodedPayload { probability });
         }
+        damage_in_decoded(&mut out, &located);
+        out.extra_decoded = located;
     }
+
+    // ③ 解読できた段の中身（機械の解読と、LLM が場所を示したもの）。
+    model_on_decoded(&mut out, decoded_layers(subject), model).await;
+    let extra = out.extra_decoded.clone();
+    model_on_decoded(&mut out, &extra, model).await;
 
     // ③ 縛ったファイルの中身（コードを走らせるときだけ）。
     let runs_code = matches!(subject, PermissionSubject::Program(p) if p.runs_code);

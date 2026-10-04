@@ -25,6 +25,8 @@ mod dial;
 /// PowerShell が符号化して受け取るコード（`-EncodedCommand`等）の綴りの判定と解読。
 /// **T-09の検出（`harness-engine`）と承認画面の表示が同じ綴りの表を見るための公開**である（B-13）。
 pub mod encoded_command;
+/// LLM が場所を示した符号化された文字列を、ハーネスが機械的に解読する（承認画面の表示と危険度の判定のため）。
+pub mod encoded_payload;
 pub mod fake_dns;
 mod shell_line;
 /// コマンドの行がシステムへ被害を与える場所（ドライブの根・Windows のフォルダ・AppData）を消す・書き換えるかの

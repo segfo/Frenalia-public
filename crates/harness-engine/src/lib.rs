@@ -15,6 +15,7 @@ pub mod approval_risk;
 pub mod approval_summary;
 pub mod compaction;
 pub mod degeneracy;
+pub mod encoded_span;
 pub mod permission;
 mod sanitize;
 pub mod session;

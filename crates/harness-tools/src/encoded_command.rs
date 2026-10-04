@@ -217,6 +217,17 @@ fn decode_found(found: Vec<Found>) -> Vec<DecodedLayer> {
     decoder.layers
 }
 
+/// 既に解読した中身`text`の中をさらに読む（`depth`段目から）。LLM が場所を示して解読した中身の2段目以降
+/// （[`crate::encoded_payload`]）。`decoded_bytes`はそれまでに解読した量（上限の勘定を引き継ぐ）。
+pub(crate) fn decode_nested(text: &str, depth: u32, decoded_bytes: usize) -> Vec<DecodedLayer> {
+    let mut decoder = Decoder {
+        decoded_bytes,
+        ..Decoder::default()
+    };
+    decoder.walk(scan_text(text), depth);
+    decoder.layers
+}
+
 /// 解読の進み具合（上限の勘定を1箇所に持つ）。
 #[derive(Default)]
 struct Decoder {
@@ -308,12 +319,13 @@ impl Decoder {
 ///   制御文字を混ぜるだけで「文字にならない」と表示させて中身を隠せる
 /// - **`FromBase64String`の結果は、後ろのコードがどう読むか次第**（UTF-8・UTF-16LE・圧縮・実行ファイル）
 ///   なので、厳密に読めて文字に見える方のうち、ASCII の割合が高い方を採る。どちらも文字に見えなければ`None`
-fn as_text(bytes: &[u8], source: EncodedSource) -> Option<(TextEncoding, String)> {
+pub(crate) fn as_text(bytes: &[u8], source: EncodedSource) -> Option<(TextEncoding, String)> {
     match source {
         EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => {
             Some((TextEncoding::Utf16Le, utf16le_lossy(bytes)))
         }
-        EncodedSource::FromBase64String => {
+        // LLM が場所を示した中身も、後ろのコードがどう読むかは分からないので`FromBase64String`と同じ読み方。
+        EncodedSource::FromBase64String | EncodedSource::LocatedByModel(_) => {
             let utf8 = std::str::from_utf8(bytes).ok().map(str::to_string);
             let utf16 = bytes
                 .len()
@@ -519,7 +531,7 @@ fn call_argument(tokens: &[Token], i: usize) -> (Value, usize) {
 ///
 /// **詰め物を欠くものも読む。** PowerShell はそれを断るが、ここは表示のためなので広い側へ倒す
 /// （読めたものを隠さない）。
-fn base64_decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(text: &str) -> Option<Vec<u8>> {
     fn value(c: u8) -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => (c - b'A') as u32,

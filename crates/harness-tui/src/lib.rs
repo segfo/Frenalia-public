@@ -449,7 +449,7 @@ pub async fn run(
     tier3_warm: bool,
     // 承認画面の要約（D-100）。`None`なら作らない（設定で切った・プロバイダを作れなかった）。
     approval_summary: Option<ApprovalSummary>,
-    // 承認画面の危険度判定（外の判定モデル）。`None`なら使わない＝承認画面も要約も今までと同じ。
+    // 承認画面の危険度判定（外の判定モデル）。`None`なら使わない＝危険度は機械の判定だけで出す。
     approval_risk: Option<ApprovalRisk>,
 ) -> io::Result<RunOutcome> {
     // [BUG-206] 画面の動作中に、どの部品が標準エラーへ書いても画面を崩さないよう預かり、tickごとに
@@ -534,6 +534,17 @@ pub async fn run(
     let read_scope_for_summary = harness_sandbox::ReadScope::open(&ctx.read_scope);
     // Tier3ではホストの絶対パスをモデルへ見せない（`harness_engine::sanitize`と同じ扱い）。
     let redact_host_paths_in_summary = ctx.shell_tier.tier == harness_core::ShellTier::Tier3;
+    // 解読する箇所を選ばせる LLM は、要約と同じプロバイダとモデル・同じ伏字化で組む（D-100 の追記）。
+    let approval_risk = approval_risk.map(|mut risk| {
+        risk.locator = approval_summary.as_ref().map(|summary| {
+            Arc::new(harness_engine::encoded_span::LlmSpanLocator::new(
+                summary.provider.clone(),
+                summary.model.clone(),
+                redact_host_paths_in_summary,
+            )) as Arc<dyn harness_engine::encoded_span::SpanLocator>
+        });
+        risk
+    });
     // 要約の言語の倒し先（ユーザーの文から決まらないとき。`SummaryLanguage::for_user`）。
     let display_language = harness_term::ui_language_id()
         .and_then(harness_engine::approval_summary::SummaryLanguage::from_windows_langid);

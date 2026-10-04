@@ -4,7 +4,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use harness_core::{
     Answers, CommandSubject, DecisionModel, DecodeOutcome, DecodedLayer, EncodedSource,
-    FilePreview, PermissionSubject, ProgramSubject, Question, RiskCheckError, TextEncoding,
+    FilePreview, LocatedSpan, PayloadEncoding, PermissionSubject, ProgramSubject, Question,
+    RiskCheckError, TextEncoding,
 };
 use serde_json::{json, Value};
 
@@ -108,8 +109,121 @@ fn with_decoded(line: &str, text: &str) -> PermissionSubject {
 }
 
 fn run(subject: &PermissionSubject, history: &[String], model: Option<&FakeModel>) -> RiskOutcome {
+    run_with(subject, history, model, None)
+}
+
+fn run_with(
+    subject: &PermissionSubject,
+    history: &[String],
+    model: Option<&FakeModel>,
+    locator: Option<&FakeLocator>,
+) -> RiskOutcome {
     let model = model.map(|m| m as &dyn DecisionModel);
-    futures::executor::block_on(assess(subject, history, model)).expect("判定する材料")
+    let locator = locator.map(|l| l as &dyn SpanLocator);
+    futures::executor::block_on(assess(subject, history, model, locator)).expect("判定する材料")
+}
+
+/// 決まった箇所を答える、場所を選ばせる部品。呼ばれた行を控える。
+struct FakeLocator {
+    spans: Vec<LocatedSpan>,
+    lines: std::sync::Mutex<Vec<String>>,
+}
+
+impl FakeLocator {
+    fn answering(spans: Vec<LocatedSpan>) -> Self {
+        Self {
+            spans,
+            lines: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl SpanLocator for FakeLocator {
+    async fn locate(&self, line: &str) -> Result<Vec<LocatedSpan>, String> {
+        self.lines.lock().unwrap().push(line.to_string());
+        Ok(self.spans.clone())
+    }
+}
+
+/// 「解読が要る」と出て機械の解読が何も取れていなければ、LLM に場所を選ばせてハーネスが解読し、
+/// **解読した中身を機械の判定にも判定モデルにも通す**。注記は出さない（解読できたので）。
+#[test]
+fn a_located_payload_is_decoded_by_the_harness_and_judged() {
+    let codes =
+        "82,101,109,111,118,101,45,73,116,101,109,32,67,58,92,87,105,110,100,111,119,115,92,120";
+    let line = format!("iex ([char[]]({codes}) -join '')");
+    let mut model = FakeModel::quiet().with_risk(r"Remove-Item C:\Windows\x", 1.9);
+    model.needs_decoding = 0.9;
+    let locator = FakeLocator::answering(vec![LocatedSpan {
+        text: codes.to_string(),
+        encoding: PayloadEncoding::CharCodes,
+    }]);
+    let out = run_with(&shell(&line), &[], Some(&model), Some(&locator));
+    assert_eq!(locator.lines.lock().unwrap().as_slice(), std::slice::from_ref(&line));
+    assert!(
+        matches!(&out.extra_decoded[0].outcome, DecodeOutcome::Text { text, .. } if text == r"Remove-Item C:\Windows\x"),
+        "{:?}",
+        out.extra_decoded
+    );
+    assert!(
+        out.reasons.iter().any(|r| matches!(
+            r,
+            RiskReason::Damage {
+                origin: Origin::Decoded { depth: 1 },
+                ..
+            }
+        )),
+        "{:?}",
+        out.reasons
+    );
+    assert!(
+        out.reasons.iter().any(|r| matches!(
+            r,
+            RiskReason::Model {
+                origin: Origin::Decoded { depth: 1 },
+                ..
+            }
+        )),
+        "{:?}",
+        out.reasons
+    );
+    assert!(!out
+        .notes
+        .iter()
+        .any(|n| matches!(n, RiskNote::UndecodedPayload { .. })));
+}
+
+/// LLM が示した箇所が行に無い・何も示さないときは、何も解読せず注記を残す。
+/// 機械の解読が既に取れているとき・解読が要らないと出たときは、LLM を呼ばない。
+#[test]
+fn the_locator_is_used_only_when_needed_and_its_misses_are_noted() {
+    let mut wants = FakeModel::quiet();
+    wants.needs_decoding = 0.9;
+    let invented = FakeLocator::answering(vec![LocatedSpan {
+        text: "R2V0LURhdGU=".into(),
+        encoding: PayloadEncoding::Base64,
+    }]);
+    let out = run_with(&shell("iex $x"), &[], Some(&wants), Some(&invented));
+    assert!(out.extra_decoded.is_empty(), "行に無い文字列を解読した");
+    assert!(out
+        .notes
+        .iter()
+        .any(|n| matches!(n, RiskNote::UndecodedPayload { .. })));
+
+    let unused = FakeLocator::answering(Vec::new());
+    run_with(
+        &with_decoded("pwsh -enc AAAA", "Get-Date"),
+        &[],
+        Some(&wants),
+        Some(&unused),
+    );
+    let quiet = FakeModel::quiet();
+    run_with(&shell("ls"), &[], Some(&quiet), Some(&unused));
+    assert!(
+        unused.lines.lock().unwrap().is_empty(),
+        "要らないのに LLM を呼んだ"
+    );
 }
 
 /// **判定モデルが無くても、機械の判定でシステムの場所を消す行は「高」になる。** 対照: 普通の行は「要確認」。

@@ -169,15 +169,24 @@ impl ApprovalLine {
 /// （`approvals.rs`の`decoded_pieces`）も同じ形で網羅している。
 fn decoded_layer_lines(layer: &DecodedLayer) -> Vec<ApprovalLine> {
     let indent = "  ".repeat(layer.depth as usize);
-    let place = match layer.source {
-        EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => "の値",
-        EncodedSource::FromBase64String => "の引数",
+    let head = match layer.source {
+        EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => format!(
+            "{indent}{}段目: {} の値",
+            layer.depth,
+            layer.source.spelling()
+        ),
+        EncodedSource::FromBase64String => format!(
+            "{indent}{}段目: {} の引数",
+            layer.depth,
+            layer.source.spelling()
+        ),
+        // LLM が場所を示し、ハーネスが解読した（`harness_engine::encoded_span`）。示したのが LLM であることを隠さない。
+        EncodedSource::LocatedByModel(encoding) => format!(
+            "{indent}{}段目: LLM が場所を示した {} の文字列（解読はハーネス）",
+            layer.depth,
+            encoding.name()
+        ),
     };
-    let head = format!(
-        "{indent}{}段目: {} {place}",
-        layer.depth,
-        layer.source.spelling()
-    );
     let reason = match &layer.outcome {
         DecodeOutcome::Text { encoding, text } => {
             let mut out = vec![ApprovalLine::new(
@@ -213,6 +222,7 @@ fn decoded_layer_lines(layer: &DecodedLayer) -> Vec<ApprovalLine> {
         DecodeOutcome::CountLimit { max_layers } => {
             format!("符号化された箇所が多すぎるので{max_layers}個で止めた（ここから先は解読していない）")
         }
+        DecodeOutcome::Unreadable => "示された符号化として読めない".to_string(),
     };
     vec![ApprovalLine::new(
         LineStyle::Warn,
@@ -592,15 +602,20 @@ impl PermissionView {
     /// 解読できなかったこと・上限で止めたことも1行として出す（黙って落とすと、見る人には
     /// 「符号化された中身は無かった」と区別がつかない）。
     fn decoded_lines(&self) -> Vec<ApprovalLine> {
+        // 機械の解読（材料の`decoded`）と、LLM が場所を示してハーネスが解読した段（危険度の判定の結果）を並べる。
+        let located: &[DecodedLayer] = self
+            .assessment
+            .as_ref()
+            .map_or(&[], |a| a.outcome.extra_decoded.as_slice());
         let decoded = self.decoded();
-        if decoded.is_empty() {
+        if decoded.is_empty() && located.is_empty() {
             return Vec::new();
         }
         let mut out = vec![ApprovalLine::new(
             LineStyle::Heading,
             "符号化された中身（ハーネスが機械的に解読した。照合には使わない）",
         )];
-        out.extend(decoded.iter().flat_map(decoded_layer_lines));
+        out.extend(decoded.iter().chain(located).flat_map(decoded_layer_lines));
         out
     }
 

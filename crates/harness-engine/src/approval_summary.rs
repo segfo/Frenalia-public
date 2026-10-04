@@ -208,7 +208,7 @@ fn fenced_prompt(pieces: &[SummaryPiece]) -> String {
 }
 
 /// 区切りに使う綴り。推測できてはいけないので乱数から作る。
-fn nonce() -> String {
+pub(crate) fn nonce() -> String {
     // 会話の要約と違い、ここは1回きりの呼び出しなので、暗号論的な強さは要らない
     // （必要なのは「中身を書いた側が事前に知り得ない」ことだけ）。
     let a = std::time::SystemTime::now()

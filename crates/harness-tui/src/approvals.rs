@@ -17,6 +17,7 @@ use harness_core::{
     ProgramRule, RiskLevel, ShellRule,
 };
 use harness_engine::approval_risk::{self, RiskOutcome};
+use harness_engine::encoded_span::SpanLocator;
 use harness_engine::approval_ledger::{ApprovalStore, RecordedRule};
 use harness_engine::approval_summary::{summarize_for_approval, SummaryLanguage, SummaryPiece};
 use harness_engine::Remembered;
@@ -42,6 +43,9 @@ pub struct ApprovalRisk {
     pub check: Arc<dyn DecisionModel>,
     /// 画面に出す出どころ（サーバ／モデル）。コマンドがどこへ出たのかが分かるように。
     pub label: String,
+    /// 解読する箇所を選ばせる LLM（`harness_engine::encoded_span`）。**要約と同じプロバイダとモデル**で、
+    /// 起動時に要約の設定から組む（`harness_tui::run`）。要約を作らない設定なら`None`（選ばせない）。
+    pub locator: Option<Arc<dyn SpanLocator>>,
 }
 
 /// 要約を起こす前に、危険度の判定を待つ上限。**判定モデルを使うときは、危険度を先に出してから要約する**
@@ -311,15 +315,23 @@ fn decoded_pieces(decoded: &[DecodedLayer]) -> Vec<SummaryPiece> {
     decoded
         .iter()
         .map(|layer| {
-            let place = match layer.source {
-                EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => "value",
-                EncodedSource::FromBase64String => "argument",
+            let head = match layer.source {
+                EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => format!(
+                    "encoded payload, layer {} (the value of {})",
+                    layer.depth,
+                    layer.source.spelling()
+                ),
+                EncodedSource::FromBase64String => format!(
+                    "encoded payload, layer {} (the argument of {})",
+                    layer.depth,
+                    layer.source.spelling()
+                ),
+                EncodedSource::LocatedByModel(encoding) => format!(
+                    "encoded payload, layer {} (a {} string that a model pointed at)",
+                    layer.depth,
+                    encoding.name()
+                ),
             };
-            let head = format!(
-                "encoded payload, layer {} (the {place} of {})",
-                layer.depth,
-                layer.source.spelling()
-            );
             let not_decoded = |why: String| SummaryPiece {
                 label: format!("{head}, which the harness did not decode"),
                 text: why,
@@ -350,6 +362,9 @@ fn decoded_pieces(decoded: &[DecodedLayer]) -> Vec<SummaryPiece> {
                 DecodeOutcome::CountLimit { max_layers } => not_decoded(format!(
                     "More than {max_layers} encoded payloads; the harness stopped decoding here."
                 )),
+                DecodeOutcome::Unreadable => not_decoded(
+                    "It does not decode as the encoding the model named.".to_string(),
+                ),
             }
         })
         .collect()
@@ -482,6 +497,7 @@ pub(crate) fn start_risk(
     let history = history.to_vec();
     let (tx, rx) = oneshot::channel();
     let check = risk.check.clone();
+    let locator = risk.locator.clone();
     let background = background.clone();
     let token = cancel.clone();
     tokio::spawn(async move {
@@ -489,7 +505,7 @@ pub(crate) fn start_risk(
             biased;
             // キャンセルされたときは何も送らない（承認画面はもう別のものを見ている）。
             _ = token.cancelled() => return,
-            outcome = approval_risk::assess(&subject, &history, Some(&*check)) => outcome,
+            outcome = approval_risk::assess(&subject, &history, Some(&*check), locator.as_deref()) => outcome,
         };
         let Some(outcome) = outcome else {
             return;
@@ -566,7 +582,15 @@ pub(crate) fn start_summary(
     display_language: Option<SummaryLanguage>,
     risk: Option<RiskGate>,
 ) -> Option<CancellationToken> {
-    let pieces = summary_pieces(app, read_scope);
+    let mut pieces = summary_pieces(app, read_scope);
+    // 判定が決まっていれば、LLM が場所を示してハーネスが解読した段も材料に入れる（待っているなら届いてから足す）。
+    let extra_added = match &risk {
+        Some(RiskGate::Ready(outcome)) => {
+            pieces.extend(decoded_pieces(&outcome.extra_decoded));
+            true
+        }
+        _ => false,
+    };
     if pieces.is_empty() {
         return None;
     }
@@ -625,12 +649,19 @@ pub(crate) fn start_summary(
         });
     };
     tokio::spawn(async move {
-        // 判定を待つ（上限あり）。間に合えば要約へ危険度の一言を足し、間に合わなければ今までと同じ要求で起こす。
+        let mut pieces = pieces;
+        // 判定を待つ（上限あり）。間に合えば要約へ危険度の一言と、LLM が場所を示して解読した段を足し、
+        // 間に合わなければ今までと同じ要求で起こす。
         let hint = match risk {
             None => None,
             Some(gate) => match wait_for_verdict(gate, RISK_WAIT_FOR_SUMMARY, &token).await {
                 GateOutcome::Cancelled => return,
-                GateOutcome::Verdict(outcome) => outcome.severity().summary_hint(),
+                GateOutcome::Verdict(outcome) => {
+                    if !extra_added {
+                        pieces.extend(decoded_pieces(&outcome.extra_decoded));
+                    }
+                    outcome.severity().summary_hint()
+                }
                 GateOutcome::Missing => None,
             },
         };

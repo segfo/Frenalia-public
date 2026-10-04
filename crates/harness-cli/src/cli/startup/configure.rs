@@ -374,12 +374,14 @@ fn resolve_approval_risk(settings: &harness_config::Settings) -> Option<harness_
             Some(harness_tui::ApprovalRisk {
                 check: std::sync::Arc::new(client),
                 label,
+                // 要約と同じ LLM から`harness_tui::run`が組む（要約の設定はそちらへ渡る）。
+                locator: None,
             })
         }
         Err(reason) => {
             eprintln!(
                 "note: could not set up approval.risk_check ({reason}); \
-                 the approval screen is shown without a risk rating"
+                 the approval screen rates risk with the built-in checks only"
             );
             None
         }

@@ -76,6 +76,56 @@ pub enum EncodedSource {
     EncodedArguments,
     /// `[Convert]::FromBase64String('…')`の文字列リテラル。
     FromBase64String,
+    /// 機械の解読が何も取れなかった行で、**LLM が「ここが符号化された中身」と場所を示した**文字列
+    /// （`harness_engine::encoded_span`）。**解読はハーネスがする**——LLM には解読した文字列を書かせない
+    /// （[BUG-224]: LLM に解かせると中身を取り違えた）。示された文字列が行の中にそのまま在るものだけを解読する。
+    LocatedByModel(PayloadEncoding),
+}
+
+/// LLM が示した符号化の種類（[`EncodedSource::LocatedByModel`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PayloadEncoding {
+    Base64,
+    /// 16進（`4765742D…`・`0x47 0x65`・`\x47\x65`）。
+    Hex,
+    /// 10進の文字コードの並び（`115,121,115`・`[char]105+[char]101`）。
+    CharCodes,
+    /// gzip で圧縮して base64 にしたもの。
+    GzipBase64,
+    /// deflate（ヘッダ無し）で圧縮して base64 にしたもの。
+    DeflateBase64,
+}
+
+impl PayloadEncoding {
+    /// LLM に答えさせる綴り（`encoded_span`の固定の指示と同じ表）。知らない綴りは`None`。
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "base64" => PayloadEncoding::Base64,
+            "hex" => PayloadEncoding::Hex,
+            "char_codes" => PayloadEncoding::CharCodes,
+            "gzip_base64" => PayloadEncoding::GzipBase64,
+            "deflate_base64" => PayloadEncoding::DeflateBase64,
+            _ => return None,
+        })
+    }
+
+    /// 画面と要約に出す名前。
+    pub fn name(self) -> &'static str {
+        match self {
+            PayloadEncoding::Base64 => "base64",
+            PayloadEncoding::Hex => "hex",
+            PayloadEncoding::CharCodes => "char codes",
+            PayloadEncoding::GzipBase64 => "gzip+base64",
+            PayloadEncoding::DeflateBase64 => "deflate+base64",
+        }
+    }
+}
+
+/// LLM が示した、行の中の符号化された文字列とその種類。**表示と要約・危険度の判定のためだけで、照合に使わない。**
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocatedSpan {
+    pub text: String,
+    pub encoding: PayloadEncoding,
 }
 
 impl EncodedSource {
@@ -85,6 +135,7 @@ impl EncodedSource {
             EncodedSource::EncodedCommand => "-EncodedCommand",
             EncodedSource::EncodedArguments => "-EncodedArguments",
             EncodedSource::FromBase64String => "[Convert]::FromBase64String",
+            EncodedSource::LocatedByModel(_) => "(located by the model)",
         }
     }
 }
@@ -112,6 +163,8 @@ pub enum DecodeOutcome {
     SizeLimit { max_bytes: usize },
     /// 段の数の上限で止めた（これ以降は探していない）。
     CountLimit { max_layers: usize },
+    /// LLM が示した符号化として読めなかった（[`EncodedSource::LocatedByModel`]だけに出る）。
+    Unreadable,
 }
 
 /// 文字として読んだときの符号化。
@@ -119,6 +172,8 @@ pub enum DecodeOutcome {
 pub enum TextEncoding {
     Utf16Le,
     Utf8,
+    /// 文字コードの並びを、そのまま文字にした（[`PayloadEncoding::CharCodes`]）。
+    CharCodes,
 }
 
 impl TextEncoding {
@@ -126,6 +181,7 @@ impl TextEncoding {
         match self {
             TextEncoding::Utf16Le => "UTF-16LE",
             TextEncoding::Utf8 => "UTF-8",
+            TextEncoding::CharCodes => "char codes",
         }
     }
 }
