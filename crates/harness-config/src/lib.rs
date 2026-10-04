@@ -97,8 +97,11 @@ pub struct ApprovalSettings {
     pub summary_base_url: Option<String>,
     /// 要約に使うモデル。省略時は会話と同じ。
     pub summary_model: Option<String>,
-    /// 承認画面で、外の判定モデル（Ollaya の`agent`設定）に`run_shell`のコマンドの危険度を聞くか。
-    /// **省略時は偽**。聞くと、コマンドの1行が`risk_base_url`へ出る。判定は補助で、通す・止めるは決めない。
+    /// 承認画面で、外の判定モデル（Ollaya）に危険度を聞くか（`harness_engine::approval_risk`）。
+    /// **省略時は偽**——偽でも機械の被害判定は動き、承認画面には「危険度: 要確認／高」が出る。
+    /// 聞くと、`risk_base_url`へ出るのは: `run_shell`の行・`run_program`のプログラムと引数・このセッションで走った
+    /// コマンドの流れ（20件まで）・ハーネスが解読した中身・コードとして読まれる縛ったファイルの先頭4,000字。
+    /// 判定は補助で、通す・止めるは決めない。
     pub risk_check: Option<bool>,
     /// 判定モデルのサーバ。省略時は`http://127.0.0.1:11435`。
     pub risk_base_url: Option<String>,
