@@ -233,11 +233,7 @@ impl RiskOutcome {
 /// 判定モデルへ送るコマンドの行。`run_shell`は行そのもの、`run_program`は人が読む1行（[`harness_core::ProgramSubject::describe`]）。
 /// 判定しない材料（書込先・その他）は`None`。
 pub fn subject_line(subject: &PermissionSubject) -> Option<String> {
-    match subject {
-        PermissionSubject::Command(c) => Some(c.line.clone()),
-        PermissionSubject::Program(p) => Some(p.describe()),
-        PermissionSubject::WritePath(_) | PermissionSubject::Text(_) => None,
-    }
+    subject.command_line()
 }
 
 /// 同じ判定を2回しないための鍵。**判定に使う材料そのもの**（行・流れ・縛ったファイルの中身・解読した中身）で作る。

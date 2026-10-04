@@ -206,6 +206,19 @@ pub struct CommandSubject {
     pub decoded: Vec<DecodedLayer>,
 }
 
+impl PermissionSubject {
+    /// 人が読むコマンドの1行。`run_shell`は行そのもの、`run_program`は[`ProgramSubject::describe`]。
+    /// コマンドでない材料（書込先・その他）は`None`。承認画面の危険度の判定と、流れの記録（[`crate::CommandHistory`]）が
+    /// 同じこれを使う。
+    pub fn command_line(&self) -> Option<String> {
+        match self {
+            PermissionSubject::Command(c) => Some(c.line.clone()),
+            PermissionSubject::Program(p) => Some(p.describe()),
+            PermissionSubject::WritePath(_) | PermissionSubject::Text(_) => None,
+        }
+    }
+}
+
 impl CommandSubject {
     /// ファイルを縛らない材料（テストや、中身で縛る必要の無い経路）。
     pub fn line_only(line: impl Into<String>) -> Self {

@@ -192,6 +192,10 @@ pub struct AppState {
         std::collections::HashMap<String, harness_engine::approval_risk::RiskOutcome>,
     /// 判定モデルを使えなかったことを、このセッションで既に1回書いたか（毎回の承認で繰り返さない）。
     pub risk_unavailable_noted: bool,
+    /// このプロセスで実際に走ったコマンドの流れ（承認画面の「これまでの流れと合わせた危険度」）。
+    /// エンジンの`ToolStarted`で覚える。**`/clear`・セッションの切替でも消さない**——流れの危険は、会話ではなく
+    /// このマシンで実際に起きたことに掛かるから（取ってきたファイルは会話を消しても残っている）。
+    pub command_history: harness_core::CommandHistory,
     pub provider_label: String,
     /// 今のワークスペースのルート（承認画面が「記録はこのワークスペースだけ」を見せるのに使う）。
     /// 起動時に`harness_tui::run`が入れる（`AppState`自身はファイルを触らない）。
@@ -324,6 +328,7 @@ impl AppState {
             pending_permission: None,
             risk_seen: std::collections::HashMap::new(),
             risk_unavailable_noted: false,
+            command_history: harness_core::CommandHistory::default(),
             provider_label,
             workspace_root: String::new(),
             model,

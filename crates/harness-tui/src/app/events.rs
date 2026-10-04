@@ -99,7 +99,11 @@ impl AppState {
                     self.workspace_root.clone(),
                 ));
             }
-            AgentEvent::ToolStarted { .. } => {}
+            AgentEvent::ToolStarted { name, subject, .. } => {
+                if let Some(subject) = subject {
+                    self.command_history.record(&name, &subject);
+                }
+            }
             // [BUG-082フォローアップ] `run_shell`等が背景条件（D-54のworkspace ACL伝播ジョブ等）
             // で待たされている理由をツールカードへ映す。空文字列は「待機理由が無くなった」の
             // 合図（`call_with_wait_reasons`のdoc参照、`harness-engine`）——直前の理由を

@@ -1653,7 +1653,11 @@ mod tests {
                 AgentEvent::ToolCallProposed { id, .. } => {
                     tool_events.push(("ToolCallProposed", id))
                 }
-                AgentEvent::ToolStarted { id, .. } => tool_events.push(("ToolStarted", id)),
+                AgentEvent::ToolStarted { id, subject, .. } => {
+                    // 会話画面が「実際に走ったコマンドの流れ」を覚えるのに使う材料が載っている。
+                    assert!(subject.is_some(), "走らせたツールの材料が載っていない");
+                    tool_events.push(("ToolStarted", id))
+                }
                 AgentEvent::ToolFinished { id, .. } => tool_events.push(("ToolFinished", id)),
                 _ => {}
             }

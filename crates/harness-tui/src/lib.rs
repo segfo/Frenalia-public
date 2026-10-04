@@ -769,7 +769,6 @@ pub async fn run(
                             let token = tokio_util::sync::CancellationToken::new();
                             let risk_gate = approvals::start_risk(
                                 approval_risk.as_ref(),
-                                &[],
                                 &background_tx,
                                 &mut app,
                                 &token,

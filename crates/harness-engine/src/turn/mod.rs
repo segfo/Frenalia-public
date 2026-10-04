@@ -715,6 +715,7 @@ impl<'a> TurnExecutor<'a> {
             AgentEvent::ToolStarted {
                 id: id.to_string(),
                 name: name.to_string(),
+                subject: Some(subject.clone()),
             },
         );
         let output = self.call_with_wait_reasons(id, tool, input).await;

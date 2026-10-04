@@ -39,6 +39,13 @@ pub enum AgentEvent {
     ToolStarted {
         id: String,
         name: String,
+        /// 判定器が見た材料（D-101）。会話画面が「実際に走ったコマンドの流れ」を覚えるのに使う
+        /// （[`crate::CommandHistory`]。承認画面の流れの危険度）。
+        ///
+        /// **標準出力の契約（`--output-format jsonl`）には載せない**（`serde(skip)`）——材料には縛ったファイルの
+        /// 中身まで入るので、載せると出力の形が変わるうえ、ファイルの中身を書き出してしまう（`B-24`）。
+        #[serde(skip)]
+        subject: Option<crate::PermissionSubject>,
     },
     ToolProgress {
         id: String,

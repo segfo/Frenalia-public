@@ -462,15 +462,18 @@ async fn wait_for_verdict(
 /// `run_program`の起動で、書込先・その他の材料は判定しない（`None`）。
 ///
 /// **開いた時点で機械の判定を画面へ出す**（すぐ終わる）。`risk`（判定モデル）があれば背景で全部を判定し、届いたら
-/// 置き換える。`history`はこのセッションで既に走らせたコマンド（古い順）。返り値の`RiskGate`は要約を起こす側が受け取る。
-/// `cancel`は承認要求が移る・閉じるときに落とす。
+/// 置き換える。返り値の`RiskGate`は要約を起こす側が受け取る。`cancel`は承認要求が移る・閉じるときに落とす。
+///
+/// **流れ（このプロセスで実際に走ったコマンド）は引数で受けず、`app.command_history`から自分で読む**——呼ぶ側に
+/// 渡し忘れる余地を残さない（`bug-pattern-rules` B-06 の「選ぶ自由を奪う」）。
 pub(crate) fn start_risk(
     risk: Option<&ApprovalRisk>,
-    history: &[String],
     background: &UnboundedSender<BackgroundEvent>,
     app: &mut AppState,
     cancel: &CancellationToken,
 ) -> Option<RiskGate> {
+    let history = app.command_history.entries();
+    let history = history.as_slice();
     let view = app.pending_permission.as_ref()?;
     let machine = approval_risk::machine(&view.subject)?;
     let Some(risk) = risk else {
