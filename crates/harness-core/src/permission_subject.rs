@@ -65,6 +65,15 @@ pub struct DecodedLayer {
     /// どの書き方から取り出したか。
     pub source: EncodedSource,
     pub outcome: DecodeOutcome,
+    /// **縛ったファイルの中で見つけたとき**、そのファイルのワークスペース内の相対パス（D-122）。
+    /// コマンドの行そのものから見つけたときは`None`。
+    ///
+    /// 実測（2026-10-04）: `uv run test.py` の `test.py` の中に
+    /// `os.remove("pwsh --enc <塊>")` と書かれており、**その塊を解くと
+    /// `rm C:\Windows\System32\calc.exe` だった**。行だけを解いていては届かない。
+    /// 画面と危険度の理由が「どのファイルの中か」を言えるように、ここで持つ。
+    #[serde(default)]
+    pub in_file: Option<String>,
 }
 
 /// 符号化された中身を、どの書き方から取り出したか。
@@ -76,6 +85,67 @@ pub enum EncodedSource {
     EncodedArguments,
     /// `[Convert]::FromBase64String('…')`の文字列リテラル。
     FromBase64String,
+    /// **行の中にそのまま置かれた base64 の塊**（場所を問わずハーネスが見つけた）。
+    ///
+    /// `-EncodedCommand`の値や`FromBase64String('…')`の引数のように決まった置き場所に無くても、
+    /// `echo <base64> | ForEach-Object { … FromBase64String($_) }`のように**変数を経由して渡す形**があるので、
+    /// 字面に出ている塊は置き場所に関わらず読む。読めたときだけ1段として残す（読めなければ何も出さない——
+    /// 符号化だと名乗っていないものを「解読できなかった」と並べても、見る人の手がかりにならない）。
+    BareBase64,
+    /// 機械の解読が何も取れなかった行で、**LLM が「ここが符号化された中身」と場所を示した**文字列
+    /// （`harness_engine::encoded_span`）。**解読はハーネスがする**——LLM には解読した文字列を書かせない
+    /// （[BUG-224]: LLM に解かせると中身を取り違えた）。示された文字列が行の中にそのまま在るものだけを解読する。
+    LocatedByModel(PayloadEncoding),
+}
+
+/// LLM が示した符号化の種類（[`EncodedSource::LocatedByModel`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PayloadEncoding {
+    Base64,
+    /// RFC 4648 の base32（`A`〜`Z`と`2`〜`7`、詰め物は`=`）。
+    Base32,
+    /// 16進（`4765742D…`・`0x47 0x65`・`\x47\x65`）。
+    Hex,
+    /// 10進の文字コードの並び（`115,121,115`・`[char]105+[char]101`）。
+    CharCodes,
+    /// gzip で圧縮して base64 にしたもの。
+    GzipBase64,
+    /// deflate（ヘッダ無し）で圧縮して base64 にしたもの。
+    DeflateBase64,
+}
+
+impl PayloadEncoding {
+    /// LLM に答えさせる綴り（`encoded_span`の固定の指示と同じ表）。知らない綴りは`None`。
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "base64" => PayloadEncoding::Base64,
+            "base32" => PayloadEncoding::Base32,
+            "hex" => PayloadEncoding::Hex,
+            "char_codes" => PayloadEncoding::CharCodes,
+            "gzip_base64" => PayloadEncoding::GzipBase64,
+            "deflate_base64" => PayloadEncoding::DeflateBase64,
+            _ => return None,
+        })
+    }
+
+    /// 画面と要約に出す名前。
+    pub fn name(self) -> &'static str {
+        match self {
+            PayloadEncoding::Base64 => "base64",
+            PayloadEncoding::Base32 => "base32",
+            PayloadEncoding::Hex => "hex",
+            PayloadEncoding::CharCodes => "char codes",
+            PayloadEncoding::GzipBase64 => "gzip+base64",
+            PayloadEncoding::DeflateBase64 => "deflate+base64",
+        }
+    }
+}
+
+/// LLM が示した、行の中の符号化された文字列とその種類。**表示と要約・危険度の判定のためだけで、照合に使わない。**
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocatedSpan {
+    pub text: String,
+    pub encoding: PayloadEncoding,
 }
 
 impl EncodedSource {
@@ -85,6 +155,8 @@ impl EncodedSource {
             EncodedSource::EncodedCommand => "-EncodedCommand",
             EncodedSource::EncodedArguments => "-EncodedArguments",
             EncodedSource::FromBase64String => "[Convert]::FromBase64String",
+            EncodedSource::BareBase64 => "base64",
+            EncodedSource::LocatedByModel(_) => "(located by the model)",
         }
     }
 }
@@ -102,7 +174,10 @@ pub enum DecodeOutcome {
     MissingValue,
     /// 値が base64 として読めない（PowerShell も受け付けない形。変数や式なら実行時に決まる）。
     NotBase64,
-    /// base64 は読めたが、UTF-8 でも UTF-16LE でも文字にならない（圧縮・暗号化・実行ファイルなど）。
+    /// base64 は読めたが、UTF-8 でも UTF-16LE でも文字として成り立たない。
+    ///
+    /// 圧縮・暗号化・実行ファイルのほか、**長さが半端**（UTF-16LE なのに奇数バイト）もここに入る
+    /// ——綴りの後ろにたまたま base64 として読める短い語が続いただけ、という形がこれである。
     NotText,
     /// `FromBase64String`の引数が文字列リテラルではない（実行時に決まる）。
     NotLiteral,
@@ -112,6 +187,8 @@ pub enum DecodeOutcome {
     SizeLimit { max_bytes: usize },
     /// 段の数の上限で止めた（これ以降は探していない）。
     CountLimit { max_layers: usize },
+    /// LLM が示した符号化として読めなかった（[`EncodedSource::LocatedByModel`]だけに出る）。
+    Unreadable,
 }
 
 /// 文字として読んだときの符号化。
@@ -119,6 +196,8 @@ pub enum DecodeOutcome {
 pub enum TextEncoding {
     Utf16Le,
     Utf8,
+    /// 文字コードの並びを、そのまま文字にした（[`PayloadEncoding::CharCodes`]）。
+    CharCodes,
 }
 
 impl TextEncoding {
@@ -126,6 +205,7 @@ impl TextEncoding {
         match self {
             TextEncoding::Utf16Le => "UTF-16LE",
             TextEncoding::Utf8 => "UTF-8",
+            TextEncoding::CharCodes => "char codes",
         }
     }
 }
@@ -135,7 +215,14 @@ impl TextEncoding {
 pub struct CommandSubject {
     /// モデルが書いた行そのもの。
     pub line: String,
-    /// 行に字面で現れたワークスペース内のファイル（`rel_path`昇順・重複なし）。
+    /// 承認に縛ったワークスペース内のファイル（`rel_path`昇順・重複なし）。
+    ///
+    /// 入るのは3種類ある（D-120）。**行に字面で現れたもの**、**ハーネスが解読した各段に現れたもの**
+    /// （`pwsh --enc <塊>`を解いて出た`uv run test.py`の`test.py`）、そして**縛ったファイルの中身から
+    /// 名指しされた入れ子のスクリプト**である。
+    ///
+    /// **この欄は記録との照合に効く。** 中身のハッシュが一致しなければ自動承認が外れるので、
+    /// 入れ子のスクリプトの中身が変わっても承認画面が出る。
     #[serde(default)]
     pub files: Vec<BoundFile>,
     /// 行に、存在するのに中身を確かめられないファイルが現れた。記録との照合では当たらない。
@@ -148,6 +235,19 @@ pub struct CommandSubject {
     /// 解読したもの（表示と要約のため、照合に使わない）。
     #[serde(default)]
     pub decoded: Vec<DecodedLayer>,
+}
+
+impl PermissionSubject {
+    /// 人が読むコマンドの1行。`run_shell`は行そのもの、`run_program`は[`ProgramSubject::describe`]。
+    /// コマンドでない材料（書込先・その他）は`None`。承認画面の危険度の判定と、流れの記録（[`crate::CommandHistory`]）が
+    /// 同じこれを使う。
+    pub fn command_line(&self) -> Option<String> {
+        match self {
+            PermissionSubject::Command(c) => Some(c.line.clone()),
+            PermissionSubject::Program(p) => Some(p.describe()),
+            PermissionSubject::WritePath(_) | PermissionSubject::Text(_) => None,
+        }
+    }
 }
 
 impl CommandSubject {

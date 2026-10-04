@@ -167,6 +167,7 @@ pub fn render(facts: &EnvironmentFacts) -> String {
         Some(line) => lines.push(line),
         None => lines.push(render_staging(staging, *shell_sees_staged_writes)),
     }
+    lines.push(render_user_reference());
     lines.push(render_git_hardening());
     lines.push(render_read_scope(read_scope));
     lines.extend(render_shell_tier(shell_tier));
@@ -182,6 +183,25 @@ pub fn render(facts: &EnvironmentFacts) -> String {
     }
 
     lines.join("\n")
+}
+
+/// 長い値を**書き写さずに番号で指す**書き方（[`crate::user_reference`]・[`crate::value_store`]）。
+///
+/// # なぜ出すのか
+///
+/// モデルは長い値を書き写すと間違える。実測（2026-10-04、ローカルの`qwen3.6-35b`・5回）では308文字の base64 を
+/// 5回とも書き写し、2回損じた（1文字消して1文字書き換え／2か所まとめて64文字落ち）。
+/// **書き写させないこと**だけが直し方なので、代わりの書き方をここで伝える。
+///
+/// あわせて「中身を確かめるために自分で解読するコマンドを組み立てない」も伝える——実測では、
+/// 頼まれた`pwsh --enc`ではなく`[System.Text.Encoding]::Unicode.GetString(...)`を自分で組み立て、
+/// その過程で値を損じていた。**ハーネスは承認画面で段ごとに解読して人に見せているので、二度手間である。**
+fn render_user_reference() -> String {
+    format!(
+        "{}文字以上の長い値（符号化された塊・ハッシュ・鍵）は、**コマンドの中へ書き写さないでください**。         代わりに{}と書くと、ハーネスが中身へ置き換えます（番号はハーネスが別の段で一覧にして渡します）。         **損じた書き写しは実行されません**——ハーネスが照合して断り、理由を返します。         差し込めない番号を書くと、その綴りがそのまま残り、承認画面に出ます。         符号化された中身を確かめるために、自分で解読するコマンドを組み立てる必要はありません——         ハーネスが段ごとに解読して承認画面で人に見せます。",
+        crate::user_reference::MIN_REFERENCE_CHARS,
+        crate::user_reference::SYNTAX_EXAMPLE,
+    )
 }
 
 /// [段階6e] 遷移MAC（プロセス生成の許否）についての**1行だけ**
@@ -738,6 +758,28 @@ mod tests {
         ctx.staging.mode = staging_mode;
         ctx.shell_tier = ShellTierSelection::direct(tier);
         EnvironmentFacts::from_tool_ctx(&ctx)
+    }
+
+    /// **長い値を書き写さない決まりを、どのTierでもモデルへ伝える。** 伝えないと、モデルは書き写して
+    /// 1文字間違える（実測: 2026-10-04、308文字の base64 を4回とも写し損じた）。
+    #[test]
+    fn every_tier_tells_the_model_not_to_transcribe_long_values() {
+        for tier in [
+            ShellTier::Tier0,
+            ShellTier::Tier1,
+            ShellTier::Tier2a,
+            ShellTier::Tier3,
+        ] {
+            let rendered = render(&facts_for(tier, StagingMode::Live));
+            assert!(
+                rendered.contains(crate::user_reference::SYNTAX_EXAMPLE),
+                "{tier:?}: 参照の書き方を伝えていない"
+            );
+            assert!(
+                rendered.contains("書き写さないでください"),
+                "{tier:?}: 書き写すなと伝えていない"
+            );
+        }
     }
 
     /// **[BUG-168]** 書込の捕まえ方の宣言は**ちょうど1つ**である。

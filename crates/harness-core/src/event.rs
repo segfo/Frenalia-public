@@ -39,6 +39,13 @@ pub enum AgentEvent {
     ToolStarted {
         id: String,
         name: String,
+        /// 判定器が見た材料（D-101）。会話画面が「実際に走ったコマンドの流れ」を覚えるのに使う
+        /// （[`crate::CommandHistory`]。承認画面の流れの危険度）。
+        ///
+        /// **標準出力の契約（`--output-format jsonl`）には載せない**（`serde(skip)`）——材料には縛ったファイルの
+        /// 中身まで入るので、載せると出力の形が変わるうえ、ファイルの中身を書き出してしまう（`B-24`）。
+        #[serde(skip)]
+        subject: Option<crate::PermissionSubject>,
     },
     ToolProgress {
         id: String,
@@ -212,6 +219,20 @@ pub enum AgentEvent {
         /// 通知付きで再送するか。`false`は「再送は済み。この本文をそのまま答えとして受け入れる」
         /// ——モデルがツール呼び出しの書き方を説明していただけのケースで答えを失わないため。
         retrying: bool,
+    },
+    /// モデルが**参照の書き方を使わず**、ユーザーの文の長い値を書き写した
+    /// （`crate::user_reference`、D-115）。
+    ///
+    /// モデルは決まりを守らないことがある（実測: 2026-10-04、決まりを伝えた状態でも書き写した）。
+    /// 書き写しは1文字違うだけで別のものが走るので、**損じていたらそのツール呼び出しを実行しない**。
+    /// 一字一句同じだったときも知らせる——**決まりが守られていない回数が、ここに現れる**。
+    UserValueTranscribed {
+        /// ユーザーの値の長さ（文字）。
+        value_chars: usize,
+        /// 違いの回数（文字を足す・消す・書き換える回数の合計）。**0なら一字一句同じ。**
+        differences: usize,
+        /// そのツール呼び出しの実行を断ったか（違いがあったときだけ`true`）。
+        refused: bool,
     },
     Error {
         message: String,

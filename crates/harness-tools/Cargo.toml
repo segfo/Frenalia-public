@@ -7,6 +7,8 @@ edition.workspace = true
 async-trait = "0.1"
 bytes = "1"
 cap-std = "4.0.2"
+# LLM が場所を示した gzip・deflate＋base64 の中身を解読する（`encoded_payload`）。harness-review と同じ版。
+flate2 = "1"
 futures-util = "0.3"
 globset = "0.4"
 grep-matcher = "0.1"

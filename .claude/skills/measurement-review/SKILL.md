@@ -29,6 +29,7 @@ description: >
 | `plans/net-spike/RESULTS.md` | ネットワーク出口制御の粒度、SSHブローカー | `1`〜 と `N1`〜（分流の記号） |
 | `plans/e2e/RESULTS.md` | Tier2a E2Eの実施記録（回帰の実行結果・実機確認） | 日付見出し |
 | `plans/vm-spike/RESULTS.md`・`projfs-spike`・`go-hook-spike` | Tier3・ProjFS・Goフックの実現性 | 各書の形 |
+| `plans/risk-judge-spike/RESULTS.md` | 承認画面の危険度判定（外の判定モデル Ollaya）の問い・聞き方・境目の値・所要 | `1`〜（`## 1.` `### 1.3` の形） |
 | `plans/handoff/<topic>/*.md` | 分流セッションが測った分（合流前の一次記録） | `T-N`・`U-N` |
 
 **新しい測定をどこへ書くかは、機構ではなく「その記録が既に持っている軸」で決める。**

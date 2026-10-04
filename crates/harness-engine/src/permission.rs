@@ -341,7 +341,11 @@ impl PermissionArbiter {
             }
             // D-99・D-103: コードを走らせる`run_program`（インタプリタ・ワークスペース内の実行ファイル）は、
             // 中身で縛った記録と一致するときだけ通し、それ以外は`accept-all`でも聞く。
-            PermissionSubject::Program(p) if p.runs_code => {
+            // コードを走らせる呼び出し、および**引数にファイルを縛った呼び出し**（`uv run eb.py`等）は、
+            // ここで早期に判定を返し、下の AcceptAll 自動許可に落とさない（D-102/D-123 の関所）。
+            // 記録に無ければ聞く——全自動モードでも、中身を確かめていない危険なファイルは自動で通さない。
+            // `git log` のようにファイルを縛っていない呼び出し（`files` 空）は従来どおり下へ流れる。
+            PermissionSubject::Program(p) if p.runs_code || !p.files.is_empty() => {
                 return if self.program_rules.iter().any(|r| r.matches(p, &workspace)) {
                     Classification::Allow
                 } else {
@@ -491,7 +495,9 @@ impl PermissionArbiter {
     /// （D-104）。ワークスペースのルートを作業ディレクトリとして字面・引数を引き、実ファイルを読む。
     /// 確かめられないもの（読めないファイル・ファイルでない引数）を含む規則は足さずに`Err(理由)`。
     pub fn add_rule(&mut self, rule: AllowRule) -> Result<(), String> {
-        use harness_tools::approval_binding::{bind_program_args, bind_shell_line, ChildView};
+        use harness_tools::approval_binding::{
+            bind_program_args, bind_program_file_args, bind_shell_line, ChildView,
+        };
 
         let workspace = self.workspace_root.to_string_lossy().into_owned();
         match rule {
@@ -519,7 +525,34 @@ impl PermissionArbiter {
                 r.workspace = Some(harness_core::fold_path_for_rule(&workspace));
                 self.program_rules.push(r);
             }
-            AllowRule::Program(r) => self.program_rules.push(r),
+            AllowRule::Program(mut r) => {
+                // 非インタプリタのツール（`uv`・`git`等）でも、引数に名指しされた実在ファイルは
+                // 中身で縛る（D-123。`run_shell`と同じ寛容さ）。穴（Hole）は空語になり縛られない
+                // ——穴をファイルの位置に置いた規則は`files`空のまま記録され、実呼び出し（中身を縛る）と
+                // 一致しないので毎回聞かれる（中身を確かめない自動承認の穴を作らない）。
+                let view = ChildView::real(&self.workspace_root)?;
+                let args: Vec<String> = r
+                    .args
+                    .iter()
+                    .map(|a| match a {
+                        ArgPattern::Exact(v) => v.clone(),
+                        ArgPattern::Hole => String::new(),
+                    })
+                    .collect();
+                let binding = bind_program_file_args(&view, &self.workspace_root, &args);
+                if binding.unverifiable {
+                    return Err(format!(
+                        "{} names a file inside the workspace whose contents cannot be read, so \
+                         the rule cannot be bound to it",
+                        r.program
+                    ));
+                }
+                r.files = binding.files;
+                if !r.files.is_empty() {
+                    r.workspace = Some(harness_core::fold_path_for_rule(&workspace));
+                }
+                self.program_rules.push(r);
+            }
             AllowRule::Shell(mut r) => {
                 let view = ChildView::real(&self.workspace_root)?;
                 let binding = bind_shell_line(&view, &self.workspace_root, &r.line);
@@ -623,7 +656,7 @@ impl PermissionGate for PermissionArbiter {
 /// 3. **PowerShell の符号化スイッチ**（[`harness_tools::encoded_command::line_has_encoded_switch`]）。
 ///    `-EncodedCommand`には PowerShell が受け付ける省略形が多数ある（`-e`・`-ec`・`--enc`・`/enc`・
 ///    ダッシュ記号・前後の空白）ので、部分一致では足りない。**綴りの表は解読する側と共有する**——
-///    2箇所に持つと静かにずれる（`B-05`）。`grep -e foo`のような別のコマンドの`-e`を拾わないよう、
+///    2箇所に持つと静かにずれる（`B-13`）。`grep -e foo`のような別のコマンドの`-e`を拾わないよう、
 ///    向こうは PowerShell の起動に続く引数としてだけ見る（[BUG-222](../../../docs/bugs/BUG-222.md)）
 fn looks_like_allowlist_bypass(command: &str) -> bool {
     const MARKERS: &[&str] = &[
@@ -1539,7 +1572,10 @@ mod tests {
     /// `run_program`の規則は引数の配列で照合し、穴には`-`で始まる値が当たらない。
     #[test]
     fn a_program_rule_from_the_command_line_matches_by_argument_array() {
-        let mut arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], "/workspace");
+        // `git`は非インタプリタだが、`add_rule`は引数の実在ファイルを縛るために実在する
+        // ワークスペースを開く（D-123）。`git log`にファイルは無いので`files`は空のまま。
+        let ws = tempfile::tempdir().unwrap();
+        let mut arbiter = PermissionArbiter::new(PermissionMode::Default, vec![], ws.path());
         arbiter
             .add_rule(parse_allowlist_rule(r#"run_program:["git","log","-n",null]"#).unwrap())
             .unwrap();
@@ -1619,6 +1655,28 @@ mod tests {
         assert_eq!(
             run_program_classification(PermissionMode::Default, git),
             Classification::Prompt
+        );
+    }
+
+    /// D-123: 非インタプリタのツールでも、**引数にファイルを縛った呼び出しは全自動モードでも聞く**
+    /// （記録に無ければ自動で通さない）。ファイルを縛っていない呼び出し（`git log`）は従来どおり通る。
+    #[test]
+    fn run_program_with_a_bound_file_prompts_even_in_accept_all() {
+        let mut uv = ProgramSubject::plain("uv", vec!["run".into(), "eb.py".into()]);
+        uv.files = vec![harness_core::BoundFile {
+            rel_path: "eb.py".into(),
+            sha256: "a".into(),
+            dir_listing_sha256: None,
+        }];
+        assert_eq!(
+            run_program_classification(PermissionMode::AcceptAll, PermissionSubject::Program(uv)),
+            Classification::Prompt,
+            "a bound file is not auto-approved in accept-all unless it is recorded"
+        );
+        // 対照: ファイルを縛っていない呼び出しは全自動モードのとおり通る（巻き添えなし）。
+        assert_eq!(
+            run_program_classification(PermissionMode::AcceptAll, prog("git", &["log"])),
+            Classification::Allow
         );
     }
 

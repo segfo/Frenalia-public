@@ -2,7 +2,9 @@
 //! `plans/DESIGN.md` §全体アーキテクチャ 参照。
 
 pub mod cognition;
+pub mod command_history;
 pub mod config_injection;
+pub mod decision;
 pub mod event;
 pub mod git;
 pub mod interpreter;
@@ -16,6 +18,8 @@ pub mod risk_check;
 pub mod schema;
 pub mod text;
 pub mod tool;
+pub mod user_reference;
+pub mod value_store;
 pub mod wire_log;
 
 /// `tool.rs`の待機理由機構（`WaitReason`/`WaitReasons`/`WaitState`）のテスト。
@@ -25,9 +29,17 @@ pub mod wire_log;
 mod tool_tests;
 
 pub use cognition::{CognitionLevel, Phase, TokenBudget};
+pub use command_history::CommandHistory;
 pub use config_injection::{is_config_injection_path, is_git_internal_path};
+pub use decision::{
+    assess_command_risk, assess_source_risk, command_context_state, command_state,
+    context_questions, source_state, Answers, DecisionModel, Likelihood, Question,
+    MAX_SOURCE_CHARS,
+};
 pub use event::{discarded_marker, AgentEvent, DegenerateKind, CANCELLED_REASON};
-pub use interpreter::{is_interpreter_program, INTERPRETER_PROGRAMS};
+pub use interpreter::{
+    has_script_extension, is_interpreter_program, INTERPRETER_PROGRAMS, SCRIPT_EXTENSIONS,
+};
 pub use message::{ContentBlock, Message, Role};
 pub use net_policy::{
     domain_match, is_ip_literal, normalize_domain_pattern, validate_domain_pattern, DomainPolicy,
@@ -35,7 +47,7 @@ pub use net_policy::{
 };
 pub use permission_subject::{
     BoundFile, CommandSubject, DecodeOutcome, DecodedLayer, EncodedSource, FilePreview,
-    PermissionSubject, ProgramSubject, TextEncoding,
+    LocatedSpan, PayloadEncoding, PermissionSubject, ProgramSubject, TextEncoding,
 };
 pub use program_rule::{
     escape_for_display, fold_path_for_rule, hole_accepts, is_format_char, ArgPattern, ProgramRule,
@@ -46,7 +58,7 @@ pub use provider::{
     BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities, ProviderError,
     Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,
 };
-pub use risk_check::{RiskCheck, RiskCheckError, RiskLevel, RiskVerdict};
+pub use risk_check::{RiskCheckError, RiskLevel, RiskVerdict};
 pub use schema::{apply_schema_strategy, unwrap_forced_tool_stream, SchemaStrategy};
 pub use text::truncate_head_tail;
 pub use tool::{
@@ -56,3 +68,8 @@ pub use tool::{
     TlsInspection, Tool, ToolCtx, ToolError, ToolOutput, ToolResult, ToolSpec, ToolUse,
     TransitionFacts, VmShellExecutor, WaitReason, WaitReasons, WaitState,
 };
+pub use user_reference::{
+    review as review_user_references, substitute as substitute_user_references,
+    values_in as user_reference_values, Transcription as UserValueTranscription,
+};
+pub use value_store::{from_messages as value_store_for, ValueStore};

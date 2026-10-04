@@ -180,9 +180,16 @@ fn spellings_powershell_rejects_and_other_commands_are_not_touched() {
         "pwsh -ex Bypass -c Get-Date".to_string(),
         "Select-String -Pattern enc -Path notes.txt".to_string(),
     ] {
+        // **符号化スイッチとしては読まない。** 行の中に置かれた塊として読むのは構わない（置き場所を問わない
+        // 読み取り。`BareBase64`）——確かめたいのは「別のコマンドの`-e`を PowerShell のスイッチと取り違えない」
+        // ことである（[BUG-222]の対照）。
+        let sources: Vec<EncodedSource> = decode_shell_line(&line)
+            .into_iter()
+            .map(|l| l.source)
+            .collect();
         assert!(
-            decode_shell_line(&line).is_empty(),
-            "decoded something in {line}"
+            sources.iter().all(|s| *s == EncodedSource::BareBase64),
+            "スイッチとして読んだ: {line} -> {sources:?}"
         );
         assert!(!line_has_encoded_switch(&line), "{line}");
     }
@@ -307,8 +314,33 @@ fn material_that_is_not_a_literal_is_reported_as_such() {
     assert_eq!(layers[0].outcome, DecodeOutcome::NotText);
 }
 
+/// 綴りの後ろに**たまたま base64 として読める短い語**が続いただけのときは、文字化けを段として出さない。
+///
+/// UTF-16LE は1文字2バイトなので、**奇数バイトは `-EncodedCommand` の値として成り立たない**。
+/// 実測（2026-10-04）: モデルが `pwsh --enc pwsh --enc <塊>` という行を組み立て、1つ目の `--enc` の
+/// 引数 `pwsh` が3バイトへ解読されて、意味の無い1文字が「1段目」として画面に出た。
+#[test]
+fn a_switch_followed_by_a_short_word_is_not_shown_as_text() {
+    // `pwsh` は base64 として読めて3バイトになる（奇数）。
+    assert_eq!(base64_decode("pwsh").map(|b| b.len()), Some(3));
+
+    let blob = enc16("systeminfo");
+    let layers = decode_shell_line(&format!("pwsh --enc pwsh --enc {blob}"));
+
+    // 1つ目の `--enc` は「文字として成り立たない」。文字化けを出さない。
+    assert_eq!(layers[0].outcome, DecodeOutcome::NotText, "{layers:?}");
+    // 2つ目はこれまでどおり読める。
+    assert!(
+        layers.iter().any(
+            |l| matches!(&l.outcome, DecodeOutcome::Text { text, .. } if text == "systeminfo")
+        ),
+        "{layers:?}"
+    );
+}
+
 /// `-EncodedCommand`は PowerShell が必ず UTF-16LE として読むので、制御文字を混ぜても**その読み方のまま
 /// 出す**。「文字に見えない」で隠すと、制御文字を足すだけで中身を見せずに承認させられる。
+/// **長さが偶数かどうかしか見ない**のはこのためである（中身では判断しない）。
 #[test]
 fn control_characters_do_not_hide_an_encoded_command() {
     let code = format!("Write-Output '{}'; systeminfo", "\u{7}".repeat(64));
@@ -411,9 +443,14 @@ fn program_arguments_are_decoded_only_for_powershell() {
     let (_, _, text) = single(&layers);
     assert_eq!(text, "systeminfo");
 
-    // 対照: 別のプログラムの`-e`は見ない。
-    assert!(decode_program_args("grep", &args(&["-e", &blob])).is_empty());
-    assert!(decode_program_args("python", &args(&["-e", &blob])).is_empty());
+    // 対照: 別のプログラムの`-e`は符号化スイッチとして見ない（引数に置かれた塊としてなら読む）。
+    for program in ["grep", "python"] {
+        let layers = decode_program_args(program, &args(&["-e", &blob]));
+        assert!(
+            layers.iter().all(|l| l.source == EncodedSource::BareBase64),
+            "{program}: スイッチとして読んだ: {layers:?}"
+        );
+    }
 
     // その場のコードの中の`FromBase64String`も見る（引数の中身を行として読む）。
     let code = format!(
@@ -467,4 +504,98 @@ fn the_switch_table_is_shared_by_detection_and_decoding() {
     ] {
         assert_eq!(encoded_switch(arg), expected, "{arg:?}");
     }
+}
+
+/// 試験の入力を作る: 文字列を UTF-16LE の base64 にする（PowerShell の`-EncodedCommand`が受け取る形）。
+fn base64_utf16(text: &str) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().fold(0u32, |acc, b| (acc << 8) | *b as u32) << (8 * (3 - chunk.len()));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// **置き場所を問わず、行の中に置かれた base64 の塊を機械で読む。**
+///
+/// 2026-10-04、ユーザーの画面で `echo <base64> | ForEach-Object { … FromBase64String($_) }` が出た——
+/// `FromBase64String`の引数が変数なので決まった置き場所の読み取りでは拾えず、解読が LLM の指し示し頼りになっていた。
+#[test]
+fn a_base64_blob_sitting_anywhere_in_the_line_is_decoded() {
+    let inner = base64_utf16("systeminfo");
+    let line = format!(
+        "echo {inner} | ForEach-Object {{ [System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($_)) }}"
+    );
+    let layers = decode_shell_line(&line);
+    assert!(
+        layers.iter().any(|l| matches!(
+            (&l.source, &l.outcome),
+            (EncodedSource::BareBase64, DecodeOutcome::Text { text, .. }) if text == "systeminfo"
+        )),
+        "{layers:?}"
+    );
+}
+
+/// 決まった置き場所で読めた塊は、**同じものを2回出さない**（`-EncodedCommand`の値を、置き場所を問わない読み取りが
+/// もう1段として重ねない）。
+#[test]
+fn a_blob_found_at_a_known_place_is_not_reported_twice() {
+    let line = format!("pwsh -enc {}", base64_utf16("systeminfo"));
+    let layers = decode_shell_line(&line);
+    assert_eq!(layers.len(), 1, "{layers:?}");
+    assert_eq!(layers[0].source, EncodedSource::EncodedCommand);
+}
+
+/// **符号化と名乗っていない塊は、読めたときだけ出す。** 普通のコマンド・長い識別子・読めない塊では1段も出さない
+/// （出すと、承認画面が意味の無い段で埋まる）。
+#[test]
+fn ordinary_lines_do_not_produce_bare_base64_layers() {
+    for line in [
+        "git status",
+        "ls -la C:\\Users\\segfo\\Documents",
+        "Get-ChildItem | ForEach-Object { $_.FullName }",
+        // base64 の文字だけでできた長い語（4の倍数）。解読しても文字にならないので出さない。
+        "Invoke-SomethingVeryLongIdentifierHere",
+        // 4の倍数でない塊は見ない。
+        "echo cwB5AHMAdABlAG0AaQBuAGYAbwA",
+        // 短い塊は見ない。
+        "echo cwB5AHMA",
+    ] {
+        assert!(
+            decode_shell_line(line).is_empty(),
+            "{line}: {:?}",
+            decode_shell_line(line)
+        );
+    }
+}
+
+/// 置き場所を問わない読み取りでも、**解読した中身の中をさらに読む**（段が重なる）。
+#[test]
+fn a_bare_blob_is_read_again_for_the_next_layer() {
+    let inner = base64_utf16("systeminfo");
+    let outer = base64_utf16(&format!("pwsh --enc {inner}"));
+    let layers = decode_shell_line(&format!("echo {outer} | ForEach-Object {{ $_ }}"));
+    let texts: Vec<(u32, String)> = layers
+        .iter()
+        .filter_map(|l| match &l.outcome {
+            DecodeOutcome::Text { text, .. } => Some((l.depth, text.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            (1, format!("pwsh --enc {inner}")),
+            (2, "systeminfo".to_string())
+        ],
+        "{layers:?}"
+    );
 }

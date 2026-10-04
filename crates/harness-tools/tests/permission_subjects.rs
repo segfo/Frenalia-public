@@ -133,6 +133,53 @@ async fn write_paths_are_normalized_like_the_write_itself() {
     assert_eq!(s, PermissionSubject::WritePath(abs.into()));
 }
 
+/// インタプリタでないツール（`uv`等）でも、引数に名指しされた実在ファイルを中身で縛る（D-123）。
+/// `uv run eb.py` の `eb.py` は、`uv` が「コードを走らせるツール」の一覧に無くても承認材料に入る。
+/// サブコマンド `run` はファイルでないので咎めず、恒久承認できる（`one_shot_only` は立たない）。
+#[tokio::test]
+async fn a_non_interpreter_call_binds_its_named_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("eb.py"), "import socket  # exploit").unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "rm -rf /").unwrap();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let reg = ToolRegistry::with_builtin_tools();
+    let tool = reg.get("run_program").unwrap();
+
+    let s = tool
+        .permission_subject(
+            &serde_json::json!({ "program": "uv", "args": ["run", "eb.py"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let PermissionSubject::Program(p) = s else {
+        panic!("expected a Program subject")
+    };
+    assert!(!p.runs_code, "uv is not an interpreter");
+    assert!(
+        !p.one_shot_only,
+        "the subcommand `run` is not a file, so it is not held against permanent approval"
+    );
+    assert_eq!(p.files.len(), 1, "{:?}", p.files);
+    assert_eq!(p.files[0].rel_path, "eb.py");
+    assert_eq!(p.previews[0].text, "import socket  # exploit");
+
+    // 拡張子がスクリプトでないファイルも、承認材料としては縛る（判定モデルは全ファイルを見る）。
+    // 機械の被害判定を拡張子で絞るのは、縛りではなく危険度の計算の側（`approval_risk`）。
+    let s = tool
+        .permission_subject(
+            &serde_json::json!({ "program": "uv", "args": ["run", "notes.txt"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let PermissionSubject::Program(p) = s else {
+        panic!("expected a Program subject")
+    };
+    assert_eq!(p.files.len(), 1, "{:?}", p.files);
+    assert_eq!(p.files[0].rel_path, "notes.txt");
+}
+
 /// 何を起動するか読めない `run_program` の入力は、材料の段階で止まる（判定器まで届かない）。
 /// 以前は判定器が入力から `program` を探し、読めなければ聞く側へ倒していた。
 #[tokio::test]
@@ -271,4 +318,61 @@ async fn an_executable_inside_the_workspace_runs_code_and_is_bound() {
             .collect::<Vec<_>>(),
         [exe]
     );
+}
+
+/// **`run_shell`・`run_program` の材料に、縛ったファイルの中身を解読した段が入っている**（D-122）。
+///
+/// 解読する関数が在ることと、**それが材料の組み立てへ配線されていること**は別の事実である
+/// （`bug-pattern-rules` B-06）。配線を外しても、解読そのものの試験は緑のままだった。
+///
+/// 使う形は実測（2026-10-04、ユーザーの画面）と同じ——`test.py` の中に
+/// `os.remove("pwsh --enc <塊>")` と書かれており、その塊を2段解くと
+/// `rm C:\Windows\System32\calc.exe` になる。
+#[tokio::test]
+async fn the_subject_carries_layers_decoded_from_inside_a_bound_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = "import os\nprint(\"hello\")\nos.remove(\"pwsh --enc cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAZwBCAHQAQQBDAEEAQQBRAHcAQQA2AEEARgB3AEEAVgB3AEIAcABBAEcANABBAFoAQQBCAHYAQQBIAGMAQQBjAHcAQgBjAEEARgBNAEEAZQBRAEIAegBBAEgAUQBBAFoAUQBCAHQAQQBEAE0AQQBNAGcAQgBjAEEARwBNAEEAWQBRAEIAcwBBAEcATQBBAEwAZwBCAGwAQQBIAGcAQQBaAFEAQQA9AA==\")";
+    std::fs::write(dir.path().join("test.py"), body).unwrap();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let reg = ToolRegistry::with_builtin_tools();
+
+    for (name, input) in [
+        (
+            "run_shell",
+            serde_json::json!({ "command": "uv run test.py" }),
+        ),
+        (
+            "run_program",
+            serde_json::json!({ "program": "python", "args": ["test.py"] }),
+        ),
+    ] {
+        let subject = reg
+            .get(name)
+            .unwrap()
+            .permission_subject(&input, &ctx)
+            .await
+            .unwrap();
+        let decoded = match &subject {
+            PermissionSubject::Command(c) => &c.decoded,
+            PermissionSubject::Program(p) => &p.decoded,
+            other => panic!("{name}: {other:?}"),
+        };
+        let texts: Vec<&str> = decoded
+            .iter()
+            .filter_map(|l| match &l.outcome {
+                harness_core::DecodeOutcome::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.contains(&r"rm C:\Windows\System32\calc.exe"),
+            "{name}: ファイルの中の塊が解読されていない: {texts:?}"
+        );
+        assert!(
+            decoded
+                .iter()
+                .any(|l| l.in_file.as_deref() == Some("test.py")),
+            "{name}: どのファイルの中で見つけたかが残っていない"
+        );
+    }
 }

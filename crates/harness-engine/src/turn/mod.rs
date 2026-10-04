@@ -130,6 +130,9 @@ pub enum ToolCallDecision {
     InvalidInput,
     /// 先行するツールの実行中にキャンセルされ、この呼び出しには手を付けていない。
     CancelledBeforeStart,
+    /// ユーザーの文の長い値を**損じたまま書き写していた**（D-115）。判定にも実行にも進んでいない
+    /// ——壊れた写しは別のものを実行する命令なので、承認を聞く前に断る。
+    TranscribedValue,
 }
 
 /// 1件のツール呼び出しと、その顛末。`output`は**履歴へ積むそのもの**
@@ -302,6 +305,12 @@ impl<'a> TurnExecutor<'a> {
             sanitize::completion_request(&mut base_req);
         }
 
+        // ハーネスが持っている値（モデルに書き写させず、番号で指させる。`harness_core::value_store`）。
+        // **この回の会話の文から1回だけ組む**——ツール呼び出しごとに数え直すと、途中で番号の意味が変わる。
+        // 組み立ては`value_store_for`の1か所だけを通す。ここと`build_request`（モデルへ一覧を見せる段）が
+        // 同じ関数を同じ`messages`で呼ぶので、**モデルが見た番号と差し込まれる値が食い違わない**。
+        let values = crate::value_store_for(&base_req.messages);
+
         let mut ladder: Option<ladder::Ladder> = None;
         // 現在の段。`None`は「素の1回目」（梯子はまだ登っていない）。
         let mut rung: Option<ladder::Rung> = None;
@@ -369,7 +378,7 @@ impl<'a> TurnExecutor<'a> {
                         w.record_clean();
                     }
                     return self
-                        .complete(content, malformed, stop_reason, usage)
+                        .complete(content, malformed, stop_reason, usage, &values)
                         .await
                         .map(RawTurnResult::Completed);
                 }
@@ -512,6 +521,7 @@ impl<'a> TurnExecutor<'a> {
         malformed: std::collections::HashMap<String, MalformedToolInput>,
         stop_reason: StopReason,
         usage: Usage,
+        values: &harness_core::ValueStore,
     ) -> Result<RawTurn, EngineError> {
         if self.is_tier3() {
             sanitize::content_blocks(&mut content);
@@ -526,7 +536,8 @@ impl<'a> TurnExecutor<'a> {
             .collect::<Vec<_>>()
             .join("");
 
-        let (tool_calls, cancelled_mid_tool) = self.execute_tool_calls(&content, &malformed).await;
+        let (tool_calls, cancelled_mid_tool) =
+            self.execute_tool_calls(&content, &malformed, values).await;
 
         Ok(RawTurn {
             content,
@@ -544,6 +555,7 @@ impl<'a> TurnExecutor<'a> {
         &self,
         content: &[ContentBlock],
         malformed: &std::collections::HashMap<String, MalformedToolInput>,
+        values: &harness_core::ValueStore,
     ) -> (Vec<CompletedToolCall>, bool) {
         let mut tool_calls = Vec::new();
         let mut cancelled_mid_tool = false;
@@ -572,6 +584,46 @@ impl<'a> TurnExecutor<'a> {
                 });
                 continue;
             }
+
+            // モデルが参照の書き方を使わず**書き写していないか**を先に見る（D-115）。
+            // **差し込みより前**に見る——差し込んだ後では、`{{user:1}}`と正しく書いた呼び出しにも
+            // 値が入っているので、書き写したものと区別できなくなる。
+            let references = values.texts();
+            let transcriptions = harness_core::review_user_references(input, &references);
+            let damaged = transcriptions.iter().find(|t| !t.is_exact());
+            for t in &transcriptions {
+                emit(
+                    self.events,
+                    AgentEvent::UserValueTranscribed {
+                        value_chars: t.value_chars,
+                        differences: t.differences,
+                        refused: damaged.is_some(),
+                    },
+                );
+            }
+            if let Some(damaged) = damaged {
+                // **走らせない。** 壊れた写しは別のものを実行する命令なので、人に承認を聞く意味も無い。
+                // 断った理由はツールの結果としてモデルへ返し、番号で書き直させる。
+                tool_calls.push(CompletedToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    output: ToolOutput {
+                        // **一覧をそのまま渡して、どれを指すかはモデルに選ばせる**
+                        // （ハーネスは「どれに近いか」までしか言えない。`Transcription::refusal_ja`）。
+                        content: damaged.refusal_ja(&values.render().unwrap_or_default()),
+                        is_error: true,
+                    },
+                    decision: ToolCallDecision::TranscribedValue,
+                    subject: None,
+                });
+                continue;
+            }
+
+            // **ユーザーの文の値を差し込むのはここ1か所だけ**（`harness_core::user_reference`）。危険度の判定・
+            // 承認画面の材料・実際の実行・画面のカード、どれもこの後ろにあるので、**同じ文字列**を見る
+            // （D-101「判定器が見る材料」と、走るものを食い違わせない）。
+            let input = &harness_core::substitute_user_references(input, &references);
 
             emit(
                 self.events,
@@ -715,6 +767,7 @@ impl<'a> TurnExecutor<'a> {
             AgentEvent::ToolStarted {
                 id: id.to_string(),
                 name: name.to_string(),
+                subject: Some(subject.clone()),
             },
         );
         let output = self.call_with_wait_reasons(id, tool, input).await;

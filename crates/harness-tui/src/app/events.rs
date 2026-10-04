@@ -99,7 +99,29 @@ impl AppState {
                     self.workspace_root.clone(),
                 ));
             }
-            AgentEvent::ToolStarted { .. } => {}
+            // モデルが参照の書き方を使わず値を書き写した（D-115）。**黙らせない**——一字一句同じでも、
+            // 決まりが守られていない事実は残す（損じたときに断ったことは、なおさら見えないと困る）。
+            AgentEvent::UserValueTranscribed {
+                value_chars,
+                differences,
+                refused,
+            } => {
+                let line = if refused {
+                    format!(
+                        "[参照] モデルがあなたの{value_chars}文字の値を書き写し、{differences}文字分違っていたので実行しなかった（番号で書き直すよう伝えた）"
+                    )
+                } else {
+                    format!(
+                        "[参照] モデルがあなたの{value_chars}文字の値を書き写した（一字一句同じだったのでそのまま実行する）"
+                    )
+                };
+                self.transcript.push(TranscriptItem::Info(line));
+            }
+            AgentEvent::ToolStarted { name, subject, .. } => {
+                if let Some(subject) = subject {
+                    self.command_history.record(&name, &subject);
+                }
+            }
             // [BUG-082フォローアップ] `run_shell`等が背景条件（D-54のworkspace ACL伝播ジョブ等）
             // で待たされている理由をツールカードへ映す。空文字列は「待機理由が無くなった」の
             // 合図（`call_with_wait_reasons`のdoc参照、`harness-engine`）——直前の理由を

@@ -251,3 +251,210 @@ fn plain_options_have_no_attached_value() {
         assert!(!is_plain_option(attached), "{attached}");
     }
 }
+
+// --- 入れ子のスクリプトを追う（D-120） ---
+
+/// 符号化された中身を解読して出てきたファイルも縛る。
+///
+/// 実測（2026-10-04）: `pwsh --enc <塊>` を解読すると3段目が `uv run test.py` になるのに、
+/// **`test.py` の中身は読まれておらず、ハッシュでも縛っていなかった**。
+#[test]
+fn a_file_named_only_inside_a_decoded_layer_is_bound() {
+    let dir = ws();
+    std::fs::write(dir.path().join("test.py"), "import os\nos.remove('x')\n").unwrap();
+    let view = ChildView::real(dir.path()).unwrap();
+
+    // 行そのものには `test.py` が出てこない。
+    let line = "pwsh --enc <塊>";
+    assert!(bind_shell_line(&view, dir.path(), line).files.is_empty());
+
+    // 解読した段に出てくる。
+    let decoded = vec![harness_core::DecodedLayer {
+        depth: 1,
+        source: harness_core::EncodedSource::EncodedCommand,
+        outcome: harness_core::DecodeOutcome::Text {
+            encoding: harness_core::TextEncoding::Utf16Le,
+            text: "uv run test.py".to_string(),
+        },
+        in_file: None,
+    }];
+    let out = bind_everything(&view, dir.path(), line, &decoded);
+    assert_eq!(
+        out.files
+            .iter()
+            .map(|f| f.rel_path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["test.py"]
+    );
+    assert!(out.previews[0].text.contains("os.remove"));
+    assert!(!out.unverifiable);
+}
+
+/// 縛ったファイルの**中身**から、さらに入れ子のスクリプトを追う。**中身を見る回数の上限で止める。**
+///
+/// `a.py` は行に字面で出ているので第0段。そこから中身を3回見て `b.py` `c.py` `d.py` まで入り、
+/// その先の `e.py` は入らない。
+#[test]
+fn nested_scripts_are_followed_up_to_the_depth_limit() {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.py"), "run('b.py')").unwrap();
+    std::fs::write(dir.path().join("b.py"), "run('c.py')").unwrap();
+    std::fs::write(dir.path().join("c.py"), "run('d.py')").unwrap();
+    std::fs::write(dir.path().join("d.py"), "run('e.py')").unwrap();
+    std::fs::write(dir.path().join("e.py"), "print(1)").unwrap();
+    let view = ChildView::real(dir.path()).unwrap();
+
+    let out = bind_everything(&view, dir.path(), "python a.py", &[]);
+    let bound: Vec<&str> = out.files.iter().map(|f| f.rel_path.as_str()).collect();
+    assert_eq!(MAX_NEST_DEPTH, 3);
+    assert_eq!(
+        bound,
+        vec!["a.py", "b.py", "c.py", "d.py"],
+        "中身を見る回数が上限と合っていない"
+    );
+}
+
+/// 同じファイルを二度追わない（輪になっていても止まる）。
+#[test]
+fn a_cycle_between_scripts_terminates() {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.py"), "run('b.py')").unwrap();
+    std::fs::write(dir.path().join("b.py"), "run('a.py')").unwrap();
+    let view = ChildView::real(dir.path()).unwrap();
+
+    let out = bind_everything(&view, dir.path(), "python a.py", &[]);
+    let bound: Vec<&str> = out.files.iter().map(|f| f.rel_path.as_str()).collect();
+    assert_eq!(bound, vec!["a.py", "b.py"]);
+}
+
+/// **普通の長さのスクリプトを名指ししても「確かめられない」にならない。**
+///
+/// 第1段から先で全部の語を見ると`MAX_SHELL_TOKENS`（256）を超えて`unverifiable`が立ち、
+/// **スクリプトを名指しするコマンドが二度と自動承認されなくなる**。だから拡張子で絞っている。
+#[test]
+fn an_ordinary_script_does_not_make_the_call_unverifiable() {
+    let dir = ws();
+    let long: String = (0..400).map(|i| format!("value_{i} = {i}\n")).collect();
+    assert!(
+        shell_tokens(&long).len() > MAX_SHELL_TOKENS,
+        "対照が効いていない: 語が上限を超えていない"
+    );
+    std::fs::write(dir.path().join("long.py"), &long).unwrap();
+    let view = ChildView::real(dir.path()).unwrap();
+
+    let out = bind_everything(&view, dir.path(), "python long.py", &[]);
+    assert!(!out.unverifiable, "{out:?}");
+    assert_eq!(out.files.len(), 1);
+}
+
+/// 第1段から先は**スクリプトの拡張子を持つ語だけ**を見る（メモは追わない）。
+#[test]
+fn only_script_extensions_are_followed_from_inside_a_file() {
+    let dir = ws();
+    std::fs::write(dir.path().join("notes.txt"), "hello").unwrap();
+    std::fs::write(dir.path().join("helper.ps1"), "Write-Host 1").unwrap();
+    std::fs::write(
+        dir.path().join("a.py"),
+        "open('notes.txt')\nrun('helper.ps1')\n",
+    )
+    .unwrap();
+    let view = ChildView::real(dir.path()).unwrap();
+
+    let out = bind_everything(&view, dir.path(), "python a.py", &[]);
+    let bound: Vec<&str> = out.files.iter().map(|f| f.rel_path.as_str()).collect();
+    assert_eq!(bound, vec!["a.py", "helper.ps1"], "notes.txt を追っている");
+    // 対照: **行に字面で出れば**メモも縛る（第0段は拡張子で絞らない）。
+    let out = bind_everything(&view, dir.path(), "cat notes.txt", &[]);
+    assert_eq!(
+        out.files
+            .iter()
+            .map(|f| f.rel_path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["notes.txt"]
+    );
+}
+
+/// 数の上限を超えたら「確かめられない」を立てる（黙って止めない）。
+#[test]
+fn passing_the_file_limit_marks_the_call_unverifiable() {
+    let dir = ws();
+    let names: Vec<String> = (0..MAX_NESTED_FILES + 3)
+        .map(|i| format!("s{i}.py"))
+        .collect();
+    for name in &names {
+        std::fs::write(dir.path().join(name), "print(1)").unwrap();
+    }
+    let calls: String = names.iter().map(|n| format!("run('{n}')\n")).collect();
+    std::fs::write(dir.path().join("root.py"), &calls).unwrap();
+    let view = ChildView::real(dir.path()).unwrap();
+
+    let out = bind_everything(&view, dir.path(), "python root.py", &[]);
+    assert!(out.unverifiable, "{out:?}");
+}
+
+/// **縛ると自動承認にも効く。** 入れ子のファイルの中身が変われば、縛った指紋が変わる。
+#[test]
+fn changing_a_nested_script_changes_the_bound_hashes() {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.py"), "run('b.py')").unwrap();
+    std::fs::write(dir.path().join("b.py"), "print(1)").unwrap();
+    let view = ChildView::real(dir.path()).unwrap();
+
+    let before = bind_everything(&view, dir.path(), "python a.py", &[]).files;
+    std::fs::write(dir.path().join("b.py"), "print(2)").unwrap();
+    let after = bind_everything(&view, dir.path(), "python a.py", &[]).files;
+
+    assert_ne!(before, after, "入れ子のファイルの中身が指紋に効いていない");
+    assert_eq!(before[0], after[0], "a.py は変えていない");
+}
+
+/// **縛ったファイルの中に書かれた符号化された塊も解読する**（D-122）。
+///
+/// 実測（2026-10-04、ユーザーの画面）: `uv run test.py` の `test.py` が
+///
+/// ```text
+/// import os
+/// print("hello")
+/// os.remove("pwsh --enc <塊>")
+/// ```
+///
+/// で、**その塊を2段解くと `rm C:\Windows\System32\calc.exe` だった**。機械の被害判定は
+/// `os.remove` の引数を見るが、引数は符号化された文字列そのものなのでシステムの場所には当たらない
+/// ——**判定は正しく、解読が1段足りなかった**。
+#[test]
+fn an_encoded_payload_written_inside_a_bound_file_is_decoded() {
+    let dir = ws();
+    let body = "import os\nprint(\"hello\")\nos.remove(\"pwsh --enc cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAZwBCAHQAQQBDAEEAQQBRAHcAQQA2AEEARgB3AEEAVgB3AEIAcABBAEcANABBAFoAQQBCAHYAQQBIAGMAQQBjAHcAQgBjAEEARgBNAEEAZQBRAEIAegBBAEgAUQBBAFoAUQBCAHQAQQBEAE0AQQBNAGcAQgBjAEEARwBNAEEAWQBRAEIAcwBBAEcATQBBAEwAZwBCAGwAQQBIAGcAQQBaAFEAQQA9AA==\")";
+    std::fs::write(dir.path().join("test.py"), body).unwrap();
+    let view = ChildView::real(dir.path()).unwrap();
+
+    let b = bind_everything(&view, dir.path(), "uv run test.py", &[]);
+    let layers = decode_in_files(&b.previews, true);
+
+    // 2段解けて、どちらも「test.py の中で見つけた」と分かる。
+    assert_eq!(layers.len(), 2, "{layers:?}");
+    assert!(layers
+        .iter()
+        .all(|l| l.in_file.as_deref() == Some("test.py")));
+    let last = match &layers[1].outcome {
+        harness_core::DecodeOutcome::Text { text, .. } => text.as_str(),
+        other => panic!("文字として読めていない: {other:?}"),
+    };
+    assert_eq!(last, r"rm C:\Windows\System32\calc.exe");
+}
+
+/// 対照: **拡張子がスクリプトでないファイルの中身は解読しない**（`run_shell` のとき）。
+/// メモに貼られた base64 を解いて見せ始めると、画面が関係ない中身で埋まる。
+#[test]
+fn a_memo_is_not_decoded_for_run_shell() {
+    let dir = ws();
+    let body = "pwsh --enc cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAZwBCAHQAQQBDAEEAQQBRAHcAQQA2AEEARgB3AEEAVgB3AEIAcABBAEcANABBAFoAQQBCAHYAQQBIAGMAQQBjAHcAQgBjAEEARgBNAEEAZQBRAEIAegBBAEgAUQBBAFoAUQBCAHQAQQBEAE0AQQBNAGcAQgBjAEEARwBNAEEAWQBRAEIAcwBBAEcATQBBAEwAZwBCAGwAQQBIAGcAQQBaAFEAQQA9AA==";
+    std::fs::write(dir.path().join("notes.txt"), body).unwrap();
+    let view = ChildView::real(dir.path()).unwrap();
+
+    let b = bind_everything(&view, dir.path(), "cat notes.txt", &[]);
+    assert_eq!(b.previews.len(), 1, "縛れていない");
+    assert!(decode_in_files(&b.previews, true).is_empty());
+    // コードを走らせる呼び出し（`run_program`）では、拡張子で絞らず解読する。
+    assert!(!decode_in_files(&b.previews, false).is_empty());
+}

@@ -13,17 +13,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use harness_core::{
-    DecodeOutcome, DecodedLayer, EncodedSource, LlmProvider, PermissionSubject, ProgramRule,
-    RiskCheck, RiskLevel, RiskVerdict, ShellRule,
+    DecisionModel, DecodeOutcome, DecodedLayer, EncodedSource, LlmProvider, PermissionSubject,
+    ProgramRule, RiskLevel, ShellRule,
 };
 use harness_engine::approval_ledger::{ApprovalStore, RecordedRule};
+use harness_engine::approval_risk::{self, RiskOutcome};
 use harness_engine::approval_summary::{summarize_for_approval, SummaryLanguage, SummaryPiece};
+use harness_engine::encoded_span::SpanLocator;
 use harness_engine::Remembered;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-use crate::app::{AppState, PreviousCopy, SummaryState, SummaryWait, TranscriptItem};
+use crate::app::{AppState, PreviousCopy, RiskView, SummaryState, SummaryWait, TranscriptItem};
 use crate::engine::EngineHandle;
 
 /// 承認画面の要約（D-100）をどこで作るか。`harness-cli`が起動時に決める。
@@ -35,18 +37,28 @@ pub struct ApprovalSummary {
     pub label: String,
 }
 
-/// 承認画面の危険度判定（外の判定モデル。`harness_core::risk_check`）をどこへ聞くか。`harness-cli`が起動時に決める。
-/// **これが無ければ（設定で切った・作れなかった）、承認画面も要約も今までと同じ**である。
+/// 承認画面の危険度判定に使う判定モデル（Ollaya。`harness_core::decision`）をどこへ聞くか。`harness-cli`が起動時に決める。
+/// **これが無ければ（設定で切った・作れなかった）、危険度は機械の判定だけで出す**（`harness_engine::approval_risk`）。
 pub struct ApprovalRisk {
-    pub check: Arc<dyn RiskCheck>,
+    pub check: Arc<dyn DecisionModel>,
     /// 画面に出す出どころ（サーバ／モデル）。コマンドがどこへ出たのかが分かるように。
     pub label: String,
+    /// 解読する箇所を選ばせる LLM（`harness_engine::encoded_span`）。**要約と同じプロバイダとモデル**で、
+    /// 起動時に要約の設定から組む（`harness_tui::run`）。要約を作らない設定なら`None`（選ばせない）。
+    pub locator: Option<Arc<dyn SpanLocator>>,
+    /// 判定モデル（Ollaya）が使えないときに聞く、重い LLM フォールバック判定（D-125。3段目の機械判定の
+    /// 手前）。`approval.use_llm_fallback`が真なら入る。**本実装が入るまではモック**（判定しない）。
+    /// `None`なら Ollaya が使えないとき機械判定へ直行する。
+    pub fallback: Option<Arc<dyn harness_engine::approval_risk::FallbackJudge>>,
 }
 
-/// 要約を起こす前に、危険度の判定を待つ上限。**超えても失敗にはしない**——要約は危険度なしで先に起こし、
+/// 要約を起こす前に、危険度の判定を待つ上限。**判定モデルを使うときは、危険度を先に出してから要約する**
+/// （ユーザーの指示。要約に危険の一言を入れるため）。**超えても失敗にはしない**——要約は危険度なしで起こし、
 /// 判定はその後に届いても承認画面の色と見出しには反映する（要約に一言が入らないだけ）。
-/// 判定モデルの初回の読み込みに約10秒かかる実測があり、その場合はここを超える。
-pub(crate) const RISK_WAIT_FOR_SUMMARY: Duration = Duration::from_secs(5);
+///
+/// 判定は2回の問い合わせ（約3秒）＋解読した段（1段約1秒）＋縛ったファイル（4,000字で約12秒）で、
+/// 多いと10秒を超える（`plans/risk-judge-spike/RESULTS.md` §1）。判定モデルの初回の読み込みにも約10秒かかる。
+pub(crate) const RISK_WAIT_FOR_SUMMARY: Duration = Duration::from_secs(30);
 
 /// 判定モデルを温めておく間隔の下限。同じ間隔の中では2度呼ばない。
 const RISK_WARM_EVERY: Duration = Duration::from_secs(60);
@@ -71,13 +83,14 @@ pub(crate) enum BackgroundEvent {
         key: String,
         result: Result<String, String>,
     },
-    /// 危険度の判定が届いた。`request`は承認要求のid、`line`は判定したコマンド行（同じ行を2回判定しないために覚える）。
+    /// 判定モデルまで使った危険度が届いた。`request`は承認要求のid、`key`は判定に使った材料の鍵
+    /// （同じ材料を2回判定しないために覚える。`approval_risk::cache_key`）。
     RiskReady {
         request: String,
-        line: String,
-        verdict: RiskVerdict,
+        key: String,
+        outcome: RiskOutcome,
     },
-    /// 危険度の判定を得られなかった（`reason`は記録へ1回だけ書く。承認画面は今までどおり）。
+    /// 判定モデルを使えなかった（`reason`は記録へ1回だけ書く。危険度は機械の判定だけで出している）。
     RiskUnavailable { reason: String },
 }
 
@@ -130,26 +143,31 @@ pub(crate) fn on_background(
         }
         BackgroundEvent::RiskReady {
             request,
-            line,
-            verdict,
+            key,
+            outcome,
         } => {
-            // 同じ行は2回判定しない。承認要求が移っていても覚える（次に同じ行が来たとき即座に使える）。
-            app.risk_seen.insert(line, verdict);
-            if let Some(view) = app
+            // 同じ材料は2回判定しない。承認要求が移っていても覚える（次に同じ材料が来たとき即座に使える）。
+            // **判定モデルが答えなかった回は覚えない**——覚えると、判定モデルが戻っても聞き直さない。
+            if outcome.model_error().is_none() {
+                app.risk_seen.insert(key, outcome.clone());
+            }
+            if let Some(assessment) = app
                 .pending_permission
                 .as_mut()
                 .filter(|view| view.id == request)
+                .and_then(|view| view.assessment.as_mut())
             {
-                view.verdict = Some(verdict);
+                assessment.outcome = outcome;
+                assessment.waiting = None;
             }
         }
         BackgroundEvent::RiskUnavailable { reason } => {
-            // 承認画面は今までどおりで、書くのは会話の記録にセッションにつき1回だけ。
+            // 危険度は機械の判定だけで出していて、書くのは会話の記録にセッションにつき1回だけ。
             // **毎回の承認で繰り返さない**（判定モデルを止めている間、承認のたびに出るのを避ける）。
             if !app.risk_unavailable_noted {
                 app.risk_unavailable_noted = true;
                 app.transcript.push(TranscriptItem::Info(format!(
-                    "承認画面の危険度判定を使えなかった（{reason}）。承認画面はこれまでどおり。\
+                    "承認画面の判定モデルを使えなかった（{reason}）。危険度は機械の判定だけで出す。\
                      このセッションでは以後知らせない"
                 )));
             }
@@ -301,15 +319,27 @@ fn decoded_pieces(decoded: &[DecodedLayer]) -> Vec<SummaryPiece> {
     decoded
         .iter()
         .map(|layer| {
-            let place = match layer.source {
-                EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => "value",
-                EncodedSource::FromBase64String => "argument",
+            let head = match layer.source {
+                EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => format!(
+                    "encoded payload, layer {} (the value of {})",
+                    layer.depth,
+                    layer.source.spelling()
+                ),
+                EncodedSource::FromBase64String => format!(
+                    "encoded payload, layer {} (the argument of {})",
+                    layer.depth,
+                    layer.source.spelling()
+                ),
+                EncodedSource::BareBase64 => format!(
+                    "encoded payload, layer {} (a base64 string sitting in the command line)",
+                    layer.depth
+                ),
+                EncodedSource::LocatedByModel(encoding) => format!(
+                    "encoded payload, layer {} (a {} string that a model pointed at)",
+                    layer.depth,
+                    encoding.name()
+                ),
             };
-            let head = format!(
-                "encoded payload, layer {} (the {place} of {})",
-                layer.depth,
-                layer.source.spelling()
-            );
             let not_decoded = |why: String| SummaryPiece {
                 label: format!("{head}, which the harness did not decode"),
                 text: why,
@@ -340,6 +370,9 @@ fn decoded_pieces(decoded: &[DecodedLayer]) -> Vec<SummaryPiece> {
                 DecodeOutcome::CountLimit { max_layers } => not_decoded(format!(
                     "More than {max_layers} encoded payloads; the harness stopped decoding here."
                 )),
+                DecodeOutcome::Unreadable => not_decoded(
+                    "It does not decode as the encoding the model named.".to_string(),
+                ),
             }
         })
         .collect()
@@ -386,7 +419,7 @@ pub(crate) fn summary_key(
     key
 }
 
-/// 要約の鍵に入れる危険度の綴り。**要約へ一言を渡す段階（注意以上）だけを区別する**——低い・判定なしは
+/// 要約の鍵に入れる危険度の綴り。**要約へ一言を渡す段階（危険）だけを区別する**——低い・判定なしは
 /// 今までと同じ要求なので、同じ鍵（空）になる。
 fn risk_key(risk: Option<RiskLevel>) -> &'static str {
     match risk {
@@ -395,17 +428,12 @@ fn risk_key(risk: Option<RiskLevel>) -> &'static str {
     }
 }
 
-/// 要約へ危険度を渡す段階。危険だけ（低いは渡さない。[`RiskLevel::summary_instruction`]）。
-fn summary_hint(verdict: RiskVerdict) -> Option<RiskLevel> {
-    verdict.level.is_elevated().then_some(verdict.level)
-}
-
 /// 危険度の判定の、要約を起こす側から見た状態。
 pub(crate) enum RiskGate {
-    /// 判定済み（同じ行を前に判定していた）。
-    Ready(RiskVerdict),
-    /// 判定を背景で走らせている。届けば受け取れ、届かずに終われば（失敗・キャンセル）送り手が落ちる。
-    Pending(oneshot::Receiver<RiskVerdict>),
+    /// 決まっている（機械の判定だけの設定・前に同じ材料を判定していた）。
+    Ready(RiskOutcome),
+    /// 判定モデルまで使う判定を背景で走らせている。届けば受け取れ、届かずに終われば（キャンセル）送り手が落ちる。
+    Pending(oneshot::Receiver<RiskOutcome>),
 }
 
 /// 判定を待った結果。
@@ -413,8 +441,8 @@ enum GateOutcome {
     /// 待っている間に承認要求が移った（要約を起こさず降りる）。
     Cancelled,
     /// 判定が間に合った。
-    Verdict(RiskVerdict),
-    /// 間に合わなかった・失敗した（要約は危険度なしで起こす＝今までと同じ）。
+    Verdict(RiskOutcome),
+    /// 間に合わなかった（要約は危険度なしで起こす）。
     Missing,
 }
 
@@ -425,12 +453,12 @@ async fn wait_for_verdict(
     cancel: &CancellationToken,
 ) -> GateOutcome {
     match gate {
-        RiskGate::Ready(verdict) => GateOutcome::Verdict(verdict),
+        RiskGate::Ready(outcome) => GateOutcome::Verdict(outcome),
         RiskGate::Pending(rx) => tokio::select! {
             biased;
             _ = cancel.cancelled() => GateOutcome::Cancelled,
             result = tokio::time::timeout(wait, rx) => match result {
-                Ok(Ok(verdict)) => GateOutcome::Verdict(verdict),
+                Ok(Ok(outcome)) => GateOutcome::Verdict(outcome),
                 // 時間切れ・送り手が落ちた（判定の失敗）。
                 _ => GateOutcome::Missing,
             },
@@ -438,60 +466,83 @@ async fn wait_for_verdict(
     }
 }
 
-/// 危険度の判定を起こす。対象は`run_shell`のコマンド行だけ（ほかの材料は判定しない）。
+/// 危険度の判定を起こす（D-100 の追記。組み立ては`harness_engine::approval_risk`）。対象は`run_shell`の行と
+/// `run_program`の起動で、書込先・その他の材料は判定しない（`None`）。
 ///
-/// **判定が無い・遅い・落ちているときの承認画面は今までと同じ**——ここは画面へ足すだけで、
-/// 何も待たせず、何も止めない。返り値の`RiskGate`は要約を起こす側が受け取る。
-/// `cancel`は承認要求が移る・閉じるときに落とす。
+/// **開いた時点で機械の判定を画面へ出す**（すぐ終わる）。`risk`（判定モデル）があれば背景で全部を判定し、届いたら
+/// 置き換える。返り値の`RiskGate`は要約を起こす側が受け取る。`cancel`は承認要求が移る・閉じるときに落とす。
+///
+/// **流れ（このプロセスで実際に走ったコマンド）は引数で受けず、`app.command_history`から自分で読む**——呼ぶ側に
+/// 渡し忘れる余地を残さない（`bug-pattern-rules` B-06 の「選ぶ自由を奪う」）。
 pub(crate) fn start_risk(
-    risk: &ApprovalRisk,
+    risk: Option<&ApprovalRisk>,
     background: &UnboundedSender<BackgroundEvent>,
     app: &mut AppState,
     cancel: &CancellationToken,
 ) -> Option<RiskGate> {
-    let view = app.pending_permission.as_mut()?;
-    let PermissionSubject::Command(command) = &view.subject else {
-        return None;
+    let history = app.command_history.entries();
+    let history = history.as_slice();
+    let view = app.pending_permission.as_ref()?;
+    let mut machine = approval_risk::machine(&view.subject)?;
+    let Some(risk) = risk else {
+        // 判定モデルを使わない設定。機械の判定で決まり（待つものは無い）。難読化は解析できないので
+        // 危険側へ倒す（D-124 ルール1。`assess`のモデル未設定の経路と同じ扱い）。
+        machine.apply_fail_closed(&view.subject);
+        let view = app.pending_permission.as_mut()?;
+        view.assessment = Some(RiskView::done(machine.clone(), None));
+        return Some(RiskGate::Ready(machine));
     };
-    let line = command.line.clone();
-    let request = view.id.clone();
-    view.verdict_source = Some(risk.label.clone());
-    if let Some(known) = app.risk_seen.get(&line).copied() {
-        // 同じ行を前に判定していた。聞き直さず、すぐ画面へ出す。
-        if let Some(view) = app.pending_permission.as_mut() {
-            view.verdict = Some(known);
-        }
+    let key = approval_risk::cache_key(&view.subject, history)?;
+    if let Some(known) = app.risk_seen.get(&key).cloned() {
+        // 同じ材料を前に判定していた。聞き直さず、すぐ画面へ出す。
+        let view = app.pending_permission.as_mut()?;
+        view.assessment = Some(RiskView::done(known.clone(), Some(risk.label.clone())));
         return Some(RiskGate::Ready(known));
     }
+    let view = app.pending_permission.as_mut()?;
+    view.assessment = Some(RiskView::waiting(
+        machine,
+        risk.label.clone(),
+        Instant::now(),
+    ));
+    let subject = view.subject.clone();
+    let request = view.id.clone();
+    let history = history.to_vec();
     let (tx, rx) = oneshot::channel();
     let check = risk.check.clone();
+    let locator = risk.locator.clone();
+    let fallback = risk.fallback.clone();
     let background = background.clone();
     let token = cancel.clone();
     tokio::spawn(async move {
-        let result = tokio::select! {
+        let outcome = tokio::select! {
             biased;
             // キャンセルされたときは何も送らない（承認画面はもう別のものを見ている）。
             _ = token.cancelled() => return,
-            result = check.assess(&line) => result,
+            outcome = approval_risk::assess(
+                &subject,
+                &history,
+                Some(&*check),
+                locator.as_deref(),
+                fallback.as_deref(),
+            ) => outcome,
         };
-        match result {
-            Ok(verdict) => {
-                // 要約を待たせている側へ（間に合えば要約にも入る）、画面へ（いつ届いても色になる）。
-                let _ = tx.send(verdict);
-                let _ = background.send(BackgroundEvent::RiskReady {
-                    request,
-                    line,
-                    verdict,
-                });
-            }
-            Err(e) => {
-                // `tx`を落とす（待っている要約が「判定なし」で進む）。画面へはセッションにつき1回だけ知らせる。
-                drop(tx);
-                let _ = background.send(BackgroundEvent::RiskUnavailable {
-                    reason: e.to_string(),
-                });
-            }
+        let Some(outcome) = outcome else {
+            return;
+        };
+        if let Some(reason) = outcome.model_error() {
+            // 画面へはセッションにつき1回だけ知らせる（危険度は機械の判定だけで出ている）。
+            let _ = background.send(BackgroundEvent::RiskUnavailable {
+                reason: reason.to_string(),
+            });
         }
+        // 要約を待たせている側へ（間に合えば要約にも入る）、画面へ（いつ届いても色になる）。
+        let _ = tx.send(outcome.clone());
+        let _ = background.send(BackgroundEvent::RiskReady {
+            request,
+            key,
+            outcome,
+        });
     });
     Some(RiskGate::Pending(rx))
 }
@@ -520,7 +571,7 @@ impl RiskWarmUp {
         let check = risk.check.clone();
         tokio::spawn(async move {
             // 固定の無害な1行。**ユーザーの入力もコマンドも送らない。**
-            let _ = check.assess("echo").await;
+            let _ = harness_core::assess_command_risk(&*check, "echo").await;
         });
         true
     }
@@ -551,7 +602,15 @@ pub(crate) fn start_summary(
     display_language: Option<SummaryLanguage>,
     risk: Option<RiskGate>,
 ) -> Option<CancellationToken> {
-    let pieces = summary_pieces(app, read_scope);
+    let mut pieces = summary_pieces(app, read_scope);
+    // 判定が決まっていれば、LLM が場所を示してハーネスが解読した段も材料に入れる（待っているなら届いてから足す）。
+    let extra_added = match &risk {
+        Some(RiskGate::Ready(outcome)) => {
+            pieces.extend(decoded_pieces(&outcome.extra_decoded));
+            true
+        }
+        _ => false,
+    };
     if pieces.is_empty() {
         return None;
     }
@@ -559,7 +618,7 @@ pub(crate) fn start_summary(
     // 判定済み（前に同じ行を判定していた）か、判定を使わない構成なら、その段階を鍵に入れて今すぐ使い回しを見る。
     let pending = matches!(risk, Some(RiskGate::Pending(_)));
     let known = match &risk {
-        Some(RiskGate::Ready(verdict)) => summary_hint(*verdict),
+        Some(RiskGate::Ready(outcome)) => outcome.severity().summary_hint(),
         _ => None,
     };
     let key = summary_key(&pieces, language, known);
@@ -610,12 +669,19 @@ pub(crate) fn start_summary(
         });
     };
     tokio::spawn(async move {
-        // 判定を待つ（上限あり）。間に合えば要約へ危険度の一言を足し、間に合わなければ今までと同じ要求で起こす。
+        let mut pieces = pieces;
+        // 判定を待つ（上限あり）。間に合えば要約へ危険度の一言と、LLM が場所を示して解読した段を足し、
+        // 間に合わなければ今までと同じ要求で起こす。
         let hint = match risk {
             None => None,
             Some(gate) => match wait_for_verdict(gate, RISK_WAIT_FOR_SUMMARY, &token).await {
                 GateOutcome::Cancelled => return,
-                GateOutcome::Verdict(verdict) => summary_hint(verdict),
+                GateOutcome::Verdict(outcome) => {
+                    if !extra_added {
+                        pieces.extend(decoded_pieces(&outcome.extra_decoded));
+                    }
+                    outcome.severity().summary_hint()
+                }
                 GateOutcome::Missing => None,
             },
         };

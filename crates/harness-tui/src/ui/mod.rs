@@ -36,8 +36,10 @@ const MAX_INPUT_VISIBLE_LINES: u16 = 6;
 pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
     // 複数行入力（既定でEnterが改行を挿入するようになったため）にあわせ、入力欄の高さを
     // 行数に応じて`MAX_INPUT_VISIBLE_LINES`まで自動で伸ばす（それ以上は内部スクロール）。
-    let input_line_count = app.input.split('\n').count() as u16;
-    let input_height = input_line_count.clamp(1, MAX_INPUT_VISIBLE_LINES) + 2; // +2=枠線
+    // **行数は折り返した後で数える**（[`input_rows`]）——長い1行も幅で折り返して全部見えるようにしたので、
+    // `\n`の数で数えると高さが足りず、貼った値の続きが見えないままになる。
+    let input_rows = input_rows(&app.input, input_text_width(f.area().width, app) as usize);
+    let input_height = (input_rows.len() as u16).clamp(1, MAX_INPUT_VISIBLE_LINES) + 2; // +2=枠線
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -54,7 +56,14 @@ pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
         ..DrawFeedback::default()
     };
     render_status(f, root[1], app);
-    let input = render_input_row(f, root[2], app, &mut targets, &mut feedback.input_buttons);
+    let input = render_input_row(
+        f,
+        root[2],
+        app,
+        &input_rows,
+        &mut targets,
+        &mut feedback.input_buttons,
+    );
 
     if let Some(pending) = &app.pending_permission {
         behind_overlay(&mut targets, f.area(), root[0]);
@@ -93,7 +102,7 @@ pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
         // 視認性を優先する。
         //
         // 置くのは入力欄の枠の中（右のボタンを除いた幅）。行全体で数えると、長い行のカーソルがボタンの上へ出る。
-        set_input_cursor(f, input, app);
+        set_input_cursor(f, input, app, &input_rows);
     }
 
     feedback.targets = targets;
@@ -249,21 +258,63 @@ pub fn render_prep_screen(
         .render(f, rect);
 }
 
-/// `input_cursor`（先頭からの文字数）が何行目（0始まり、`\n`の数）にあるか。
-fn input_cursor_line(input: &str, cursor: usize) -> usize {
-    input.chars().take(cursor).filter(|&c| c == '\n').count()
+/// 入力欄の画面1行分。`input`の文字インデックスの範囲（半開区間）。
+///
+/// **折り返した結果の1行**であって、`\n`で区切った1行ではない。入力欄の高さ・描く行・カーソルの置き場所の
+/// 3つが同じこれを見る——別々に数えると、折り返した行数と描いた行数がずれて、カーソルが文字と違う場所に出る（`B-05`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputRow {
+    /// この行が持つ文字の範囲（半開区間）。
+    range: std::ops::Range<usize>,
+    /// 行の終わりが**改行か入力の末尾**か（`false`は幅で折り返した継ぎ目）。カーソルがちょうど行末に居るとき、
+    /// どちらの行に置くかがこれで決まる（[`input_cursor_row`]）。
+    hard: bool,
 }
 
-/// `input_cursor`が属する行の開始文字インデックス（直前の`\n`の直後、無ければ0）。
-fn input_current_line_start(input: &str, cursor: usize) -> usize {
-    input
-        .chars()
-        .take(cursor)
-        .enumerate()
-        .filter(|&(_, c)| c == '\n')
-        .last()
-        .map(|(i, _)| i + 1)
-        .unwrap_or(0)
+/// `input`を、幅`width`桁の入力欄に収まる画面1行ずつへ割る（[`InputRow`]）。
+///
+/// - `\n`で切ったうえで、**`width`桁を超える行は文字の途中でも折り返す**（2026-10-04、ユーザーの指示。
+///   長いbase64を貼ると幅のぶんしか見えず、残りが入っていないように見えた）。語の切れ目では折り返さない
+///   ——コマンドの行には空白が無いことがあり、空白で折ると貼った値がどこで切れたのか読めなくなる
+/// - 全角文字は2桁として数える（画面の見た目に合わせる。[`set_input_cursor`]のIMEの位置も同じ数え方）
+/// - 空の行・空の入力も**1行として残す**（0行にすると入力欄が消える）
+fn input_rows(input: &str, width: usize) -> Vec<InputRow> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut at = 0usize; // 見ている文字のインデックス
+    for line in input.split('\n') {
+        let mut start = at; // いま組んでいる画面1行の、先頭の文字インデックス
+        let mut used = 0usize; // いま組んでいる画面1行が使った桁数
+        for c in line.chars() {
+            let w = UnicodeWidthStr::width(c.to_string().as_str()).max(1);
+            if used + w > width && at > start {
+                rows.push(InputRow {
+                    range: start..at,
+                    hard: false, // 幅で折り返した継ぎ目
+                });
+                start = at;
+                used = 0;
+            }
+            used += w;
+            at += 1;
+        }
+        rows.push(InputRow {
+            range: start..at,
+            hard: true, // 改行か入力の末尾
+        });
+        at += 1; // `\n`の分
+    }
+    rows
+}
+
+/// `cursor`（先頭からの文字数）が何行目（[`input_rows`]の何番目）にあるか。
+///
+/// 行末にちょうど居るときの置き場所は、行の終わり方で変わる。**折り返した継ぎ目なら次の行の先頭**
+/// （次に打つ文字が出る場所と同じ）、**改行・入力の末尾ならその行の末尾**（改行の手前に居るので、次の行へ送らない）。
+fn input_cursor_row(rows: &[InputRow], cursor: usize) -> usize {
+    rows.iter()
+        .position(|row| cursor < row.range.end || (cursor == row.range.end && row.hard))
+        .unwrap_or(rows.len().saturating_sub(1))
 }
 
 /// カーソル行が常に表示範囲(`visible`行分)に収まるような表示開始行を計算する。
@@ -275,15 +326,19 @@ fn input_scroll_start(cursor_line: usize, visible: usize) -> usize {
     }
 }
 
-/// `input`を`\n`で分割し、各行を選択ハイライト（あれば）付きで`Line`に変換する。
+/// `input`を[`input_rows`]で割った画面1行ずつにし、各行を選択ハイライト（あれば）付きで`Line`に変換する。
 /// `Frame`非依存の純粋関数（`diff.rs`と同様、単体テストしやすくするため描画から分離する）。
 /// `selection`はバッファ全体を通した文字インデックスの`(start, end)`（半開区間）。
-fn build_input_lines(input: &str, selection: Option<(usize, usize)>) -> Vec<Line<'static>> {
+fn build_input_lines(
+    input: &str,
+    selection: Option<(usize, usize)>,
+    rows: &[InputRow],
+) -> Vec<Line<'static>> {
+    let chars: Vec<char> = input.chars().collect();
     let mut lines = Vec::new();
-    let mut line_start = 0usize;
-    for line_str in input.split('\n') {
-        let line_len = line_str.chars().count();
-        let line_end = line_start + line_len;
+    for row in rows {
+        let (line_start, line_end) = (row.range.start, row.range.end.min(chars.len()));
+        let line_str: String = chars[line_start..line_end].iter().collect();
         let local_selection = selection.and_then(|(sel_start, sel_end)| {
             let s = sel_start.max(line_start);
             let e = sel_end.min(line_end);
@@ -313,23 +368,22 @@ fn build_input_lines(input: &str, selection: Option<(usize, usize)>) -> Vec<Line
             None => Line::from(line_str.to_string()),
         };
         lines.push(line);
-        line_start = line_end + 1; // `\n`の分1つ進める
     }
     lines
 }
 
-fn set_input_cursor(f: &mut Frame, area: Rect, app: &AppState) {
+fn set_input_cursor(f: &mut Frame, area: Rect, app: &AppState, rows: &[InputRow]) {
     let visible = area.height.saturating_sub(2).max(1) as usize;
-    let cursor_line = input_cursor_line(&app.input, app.input_cursor);
+    let cursor_line = input_cursor_row(rows, app.input_cursor);
     let scroll_start = input_scroll_start(cursor_line, visible);
-    let line_start = input_current_line_start(&app.input, app.input_cursor);
+    let line_start = rows.get(cursor_line).map_or(0, |row| row.range.start);
     // 枠線ぶん+1、カーソル行の行頭からカーソルまでの表示幅ぶん右へ（全角文字は2セル分として
     // IME側の位置計算と一致させる。§リッチTUI「入力ボックス」）。
     let prefix: String = app
         .input
         .chars()
         .skip(line_start)
-        .take(app.input_cursor - line_start)
+        .take(app.input_cursor.saturating_sub(line_start))
         .collect();
     let col_width = UnicodeWidthStr::width(prefix.as_str()) as u16;
     let row = (cursor_line - scroll_start) as u16;
@@ -697,21 +751,19 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
 ///   （置かないときは入力欄が行の幅いっぱい。キーは今までどおり効く）。
 ///
 /// 描いたボタン（押せないものも）は`drawn`へ文言と矩形を入れる（`DrawFeedback::input_buttons`）。
-fn render_input_row(
-    f: &mut Frame,
-    area: Rect,
-    app: &AppState,
-    targets: &mut Targets,
-    drawn: &mut Vec<(&'static str, Rect)>,
-) -> Rect {
+/// 入力欄の右のボタンを、描く形（`harness_term::button::Framed`）と押したときの動きに組む。
+///
+/// **折り返しの幅を測る[`input_text_width`]と、実際に描く[`render_input_row`]が同じこれを通る**——別々に組むと、
+/// 測った幅と描いた幅がずれて、折り返しの位置が1桁狂う（`B-05`）。押したときの動き（押せないボタンは`None`）も
+/// ここで作る——**見た目を選ぶ名前と登録する値を同じこれから取る**（別々に組むと、押されている形が登録した値と
+/// 違う名前に付く。`app::pointer`のモジュールdoc）。
+fn input_framed(app: &AppState) -> (Vec<Option<Click>>, Vec<harness_term::button::Framed<'_>>) {
     let buttons = app.input_buttons();
-    // 押したときの動き（押せないボタンは`None`）。**見た目を選ぶ名前と登録する値を同じこれから取る**——別々に組むと、
-    // 押されている形が登録した値と違う名前に付く（`app::pointer`のモジュールdoc）。
     let clicks: Vec<Option<Click>> = buttons
         .iter()
         .map(|b| b.key.map(Click::InputButton))
         .collect();
-    let framed: Vec<harness_term::button::Framed> = buttons
+    let framed = buttons
         .iter()
         .zip(&clicks)
         .map(|(b, click)| harness_term::button::Framed {
@@ -720,8 +772,32 @@ fn render_input_row(
             look: app.press.look(click.as_ref()),
         })
         .collect();
+    (clicks, framed)
+}
+
+/// 入力欄の中に文字を置ける幅（枠線を除く）。端末の幅`total`から、右のボタンが取る分を引く。
+///
+/// **ボタンの置き方は高さに依らない**（`place_framed`は高さが`FRAMED_HEIGHT`以上かだけを見る）ので、入力欄の高さが
+/// 決まる前にこれで測れる——高さは折り返した行数から決まるので、先に幅が要る。
+fn input_text_width(total: u16, app: &AppState) -> u16 {
+    let (_, framed) = input_framed(app);
+    let probe = Rect::new(0, 0, total, harness_term::button::FRAMED_HEIGHT);
+    let (input, _) = harness_term::button::place_framed(probe, &framed, MIN_INPUT_WIDTH);
+    input.width.saturating_sub(2) // 枠線
+}
+
+fn render_input_row(
+    f: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    rows: &[InputRow],
+    targets: &mut Targets,
+    drawn: &mut Vec<(&'static str, Rect)>,
+) -> Rect {
+    let buttons = app.input_buttons();
+    let (clicks, framed) = input_framed(app);
     let (input, row) = harness_term::button::place_framed(area, &framed, MIN_INPUT_WIDTH);
-    render_input(f, input, app, targets);
+    render_input(f, input, app, rows, targets);
     if let Some(row) = row {
         for ((button, click), rect) in buttons.iter().zip(clicks).zip(row.draw(f, BUTTON_COLOR)) {
             if let Some(click) = click {
@@ -739,16 +815,22 @@ fn render_input_row(
 /// 登録する（9064b30から。区切りと括弧は押せない）。送信と中断は右のボタンにあるので見出しには無い
 /// ——同じ操作を2か所に並べない（ポリシーエディタの確認ダイアログが`y=書く`を見出しからボタンへ移したのと同じ）。
 /// 項目の途中では切らない（[`input_title`]）。
-fn render_input(f: &mut Frame, area: Rect, app: &AppState, targets: &mut Targets) {
+fn render_input(
+    f: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    rows: &[InputRow],
+    targets: &mut Targets,
+) {
     let hints = app.input_key_hints();
     let top = harness_term::row::top_edge(area);
     let (title, at) = input_title(&hints, top.width);
     let block = Block::default().borders(Borders::ALL);
 
     let visible = area.height.saturating_sub(2).max(1) as usize;
-    let cursor_line = input_cursor_line(&app.input, app.input_cursor);
+    let cursor_line = input_cursor_row(rows, app.input_cursor);
     let scroll_start = input_scroll_start(cursor_line, visible);
-    let visible_lines: Vec<Line> = build_input_lines(&app.input, app.selection_range())
+    let visible_lines: Vec<Line> = build_input_lines(&app.input, app.selection_range(), rows)
         .into_iter()
         .skip(scroll_start)
         .take(visible)
@@ -867,11 +949,21 @@ mod tests {
         assert_eq!(elide_middle("abcdef", 2).chars().count(), 2);
     }
 
+    /// 折り返さない幅（十分広い）での行割り。既存の試験が`\n`だけで割っていた頃と同じ結果になる幅を使う。
+    fn unwrapped(input: &str) -> Vec<InputRow> {
+        input_rows(input, 1_000)
+    }
+
+    /// 行の範囲だけを取り出す（行の終わり方は`the_cursor_sits_at_the_start_of_the_next_row_at_a_wrap`が見る）。
+    fn ranges(rows: &[InputRow]) -> Vec<std::ops::Range<usize>> {
+        rows.iter().map(|r| r.range.clone()).collect()
+    }
+
     #[test]
     fn build_input_lines_splits_on_newlines_and_highlights_selection_within_a_line() {
         let input = "hello\nworld";
         // グローバル文字インデックス(1, 4) = "hello"内の"ell"。
-        let lines = build_input_lines(input, Some((1, 4)));
+        let lines = build_input_lines(input, Some((1, 4)), &unwrapped(input));
         assert_eq!(
             line_texts(&lines),
             vec!["hello".to_string(), "world".to_string()]
@@ -897,7 +989,7 @@ mod tests {
         // どちらの行にも属さないため、1行目は"de"(ローカル3..5)、2行目は"f"(ローカル0..1)
         // がそれぞれハイライトされる。
         let input = "abcde\nfghij";
-        let lines = build_input_lines(input, Some((3, 7)));
+        let lines = build_input_lines(input, Some((3, 7)), &unwrapped(input));
 
         // before/selected/afterの3スパン固定（未選択部分が空文字列でも省略されない）。
         assert_eq!(lines[0].spans.len(), 3);
@@ -921,7 +1013,7 @@ mod tests {
 
     #[test]
     fn build_input_lines_without_selection_produces_one_span_per_line() {
-        let lines = build_input_lines("a\nb\nc", None);
+        let lines = build_input_lines("a\nb\nc", None, &unwrapped("a\nb\nc"));
         assert_eq!(
             line_texts(&lines),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
@@ -934,15 +1026,79 @@ mod tests {
     #[test]
     fn input_cursor_line_and_current_line_start_track_newlines() {
         let input = "ab\ncd\nef";
-        assert_eq!(input_cursor_line(input, 0), 0);
-        assert_eq!(input_cursor_line(input, 2), 0); // "ab"の直後、まだ0行目
-        assert_eq!(input_cursor_line(input, 3), 1); // "\n"を跨いだ
-        assert_eq!(input_cursor_line(input, 8), 2);
+        let rows = unwrapped(input);
+        assert_eq!(ranges(&rows), vec![0..2, 3..5, 6..8]);
+        assert_eq!(input_cursor_row(&rows, 0), 0);
+        assert_eq!(input_cursor_row(&rows, 2), 0); // "ab"の直後、まだ0行目
+        assert_eq!(input_cursor_row(&rows, 3), 1); // "\n"を跨いだ
+        assert_eq!(input_cursor_row(&rows, 8), 2);
 
-        assert_eq!(input_current_line_start(input, 0), 0);
-        assert_eq!(input_current_line_start(input, 2), 0);
-        assert_eq!(input_current_line_start(input, 3), 3);
-        assert_eq!(input_current_line_start(input, 8), 6);
+        // カーソル行の先頭（`set_input_cursor`が桁を数える起点）。
+        let start = |cursor| rows[input_cursor_row(&rows, cursor)].range.start;
+        assert_eq!(start(0), 0);
+        assert_eq!(start(2), 0);
+        assert_eq!(start(3), 3);
+        assert_eq!(start(8), 6);
+    }
+
+    /// **長い1行は幅で折り返す**（2026-10-04、ユーザーの指示）。`\n`の無い入力でも、幅のぶんで画面の行が増える。
+    #[test]
+    fn a_long_line_is_wrapped_at_the_width() {
+        let input = "abcdefghij"; // 10文字
+        assert_eq!(ranges(&input_rows(input, 4)), vec![0..4, 4..8, 8..10]);
+        assert_eq!(
+            ranges(&input_rows(input, 10)),
+            vec![0..10],
+            "ちょうど収まる幅では折り返さない"
+        );
+        assert_eq!(ranges(&input_rows(input, 1_000)), vec![0..10]);
+        // `\n`で切ったうえで、長い行だけを折り返す（短い行はそのまま）。
+        assert_eq!(
+            ranges(&input_rows("ab\ncdefg\nh", 3)),
+            vec![0..2, 3..6, 6..8, 9..10]
+        );
+    }
+
+    /// **空の行・空の入力も1行として残す**（0行にすると入力欄が消える）。
+    #[test]
+    fn empty_input_and_empty_lines_still_take_one_row() {
+        assert_eq!(ranges(&input_rows("", 10)), vec![0..0]);
+        assert_eq!(ranges(&input_rows("\n", 10)), vec![0..0, 1..1]);
+        assert_eq!(ranges(&input_rows("a\n\nb", 10)), vec![0..1, 2..2, 3..4]);
+        // 幅0でもパニックせず、1桁として割る。
+        assert_eq!(ranges(&input_rows("ab", 0)), vec![0..1, 1..2]);
+    }
+
+    /// 全角文字は2桁として数える（画面の見た目に合わせる）。桁の途中では割らない。
+    #[test]
+    fn full_width_characters_count_as_two_columns() {
+        assert_eq!(ranges(&input_rows("あいう", 4)), vec![0..2, 2..3]);
+        assert_eq!(ranges(&input_rows("あaい", 3)), vec![0..2, 2..3]);
+    }
+
+    /// 折り返した継ぎ目にカーソルがあるときは、**次の行の先頭**にする（次に打つ文字が出る場所と同じ）。
+    /// 入力の末尾では最後の行に残る。
+    #[test]
+    fn the_cursor_sits_at_the_start_of_the_next_row_at_a_wrap() {
+        let rows = input_rows("abcdefghij", 4); // [0..4, 4..8, 8..10]
+        assert_eq!(input_cursor_row(&rows, 3), 0);
+        assert_eq!(input_cursor_row(&rows, 4), 1, "継ぎ目は次の行の先頭");
+        assert_eq!(input_cursor_row(&rows, 8), 2);
+        assert_eq!(input_cursor_row(&rows, 10), 2, "末尾は最後の行");
+    }
+
+    /// 折り返した行にも選択のハイライトが掛かる（行をまたぐ選択は、各行の内側だけを塗る）。
+    #[test]
+    fn a_selection_is_highlighted_across_wrapped_rows() {
+        let input = "abcdefgh";
+        let rows = input_rows(input, 4); // [0..4, 4..8]
+        let lines = build_input_lines(input, Some((2, 6)), &rows);
+        assert_eq!(
+            line_texts(&lines),
+            vec!["abcd".to_string(), "efgh".to_string()]
+        );
+        assert_eq!(lines[0].spans[1].content, "cd");
+        assert_eq!(lines[1].spans[1].content, "ef");
     }
 
     #[test]

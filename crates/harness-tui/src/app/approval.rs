@@ -23,11 +23,16 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent};
 use harness_core::{
     escape_for_display, hole_accepts, DecodeOutcome, DecodedLayer, EncodedSource,
-    PermissionSubject, RiskClass, RiskLevel, RiskVerdict,
+    PermissionSubject, RiskClass, RiskLevel,
 };
 use harness_sandbox::textdiff::{diff_hunks, DiffKind};
 
 use super::pointer::KeyHint;
+use harness_engine::approval_risk::Severity;
+
+#[path = "approval_risk.rs"]
+mod risk;
+pub use risk::RiskView;
 
 /// モーダルを出してからこの時間の入力は捨てる（D-106）。
 pub const MODAL_INPUT_GRACE: Duration = Duration::from_millis(300);
@@ -48,6 +53,12 @@ pub enum ApprovalStage {
 }
 
 /// 開いている枠。
+/// 承認画面へその場で出す、被害判定が当たった行の数の上限（1ファイルあたり）。
+const FLAGGED_LINES_TO_SHOW: usize = 3;
+
+/// 当たった行の前後に添える行数。
+const FLAGGED_CONTEXT: usize = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalPane {
     None,
@@ -164,15 +175,35 @@ impl ApprovalLine {
 /// （`approvals.rs`の`decoded_pieces`）も同じ形で網羅している。
 fn decoded_layer_lines(layer: &DecodedLayer) -> Vec<ApprovalLine> {
     let indent = "  ".repeat(layer.depth as usize);
-    let place = match layer.source {
-        EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => "の値",
-        EncodedSource::FromBase64String => "の引数",
+    let head = match layer.source {
+        EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => format!(
+            "{indent}{}段目: {} の値",
+            layer.depth,
+            layer.source.spelling()
+        ),
+        EncodedSource::FromBase64String => format!(
+            "{indent}{}段目: {} の引数",
+            layer.depth,
+            layer.source.spelling()
+        ),
+        // 置き場所が手がかりでないので、どこで見つけたかではなく「行の中に置かれていた」と出す。
+        EncodedSource::BareBase64 => format!(
+            "{indent}{}段目: 行の中に置かれた base64 の文字列",
+            layer.depth
+        ),
+        // LLM が場所を示し、ハーネスが解読した（`harness_engine::encoded_span`）。示したのが LLM であることを隠さない。
+        EncodedSource::LocatedByModel(encoding) => format!(
+            "{indent}{}段目: LLM が場所を示した {} の文字列（解読はハーネス）",
+            layer.depth,
+            encoding.name()
+        ),
     };
-    let head = format!(
-        "{indent}{}段目: {} {place}",
-        layer.depth,
-        layer.source.spelling()
-    );
+    // **どのファイルの中で見つけたかを言う**（D-122）。「3段目の中」とだけ言われても、
+    // 人はどこを見ればよいか分からない。
+    let head = match &layer.in_file {
+        Some(path) => format!("{head}（{} の中）", escape_for_display(path)),
+        None => head,
+    };
     let reason = match &layer.outcome {
         DecodeOutcome::Text { encoding, text } => {
             let mut out = vec![ApprovalLine::new(
@@ -192,7 +223,8 @@ fn decoded_layer_lines(layer: &DecodedLayer) -> Vec<ApprovalLine> {
             "base64 として読めない（変数や式なら、中身は実行時に決まる）".to_string()
         }
         DecodeOutcome::NotText => {
-            "base64 は読めたが文字にならない（圧縮・暗号化された中身かもしれない）".to_string()
+            "base64 は読めたが文字として成り立たない（長さが半端・圧縮や暗号化された中身など）"
+                .to_string()
         }
         DecodeOutcome::NotLiteral => {
             "引数が文字列そのものではない（中身は実行時に決まる）".to_string()
@@ -208,6 +240,7 @@ fn decoded_layer_lines(layer: &DecodedLayer) -> Vec<ApprovalLine> {
         DecodeOutcome::CountLimit { max_layers } => {
             format!("符号化された箇所が多すぎるので{max_layers}個で止めた（ここから先は解読していない）")
         }
+        DecodeOutcome::Unreadable => "示された符号化として読めない".to_string(),
     };
     vec![ApprovalLine::new(
         LineStyle::Warn,
@@ -250,11 +283,9 @@ pub struct PermissionView {
     pub summary: SummaryState,
     /// 要約の出どころ（プロバイダ／モデル）。**どこへ中身が出たのかを画面に残す。**
     pub summary_source: Option<String>,
-    /// 外の判定モデルが返した危険度。**判定モデルが無い・遅れている・落ちているときは`None`で、
-    /// そのときの画面は今までと同じ**（判定が間に合ったときだけ、色・見出し・1行が足される）。
-    pub verdict: Option<RiskVerdict>,
-    /// 判定モデルの出どころ（サーバ／モデル）。`verdict`の1行に添える。
-    pub verdict_source: Option<String>,
+    /// 危険度（`危険度: 要確認／高`の行。D-100 の追記）。判定しない材料（書込先・その他）は`None`。
+    /// 開いた時点で機械の判定が入り、判定モデルを使う設定ならその結果が届いたところで置き換わる。
+    pub assessment: Option<RiskView>,
 }
 
 impl PermissionView {
@@ -288,41 +319,17 @@ impl PermissionView {
             previous: None,
             summary: SummaryState::Off,
             summary_source: None,
-            verdict: None,
-            verdict_source: None,
+            assessment: None,
         }
     }
 
-    /// 枠の見出しと、危険のときの危険度（枠の色に使う）。**判定が無い・低いときは今までと同じ
+    /// 枠の見出しと、危険度が高いときの段階（枠の色に使う）。**要確認・判定しない材料は今までと同じ
     /// 「承認が必要です」**で、安全だとも書かない。
     pub fn title(&self) -> (&'static str, Option<RiskLevel>) {
-        match self.verdict.map(|v| v.level) {
-            Some(RiskLevel::Danger) => ("危険なコマンド — 承認が必要です", Some(RiskLevel::Danger)),
+        match self.assessment.as_ref().map(RiskView::severity) {
+            Some(Severity::High) => ("危険なコマンド — 承認が必要です", Some(RiskLevel::Danger)),
             _ => ("承認が必要です", None),
         }
-    }
-
-    /// 危険度の1行（危険のときだけ。低い・判定なしは何も足さない）。
-    fn verdict_lines(&self) -> Vec<ApprovalLine> {
-        let Some(verdict) = self.verdict else {
-            return Vec::new();
-        };
-        let style = match verdict.level {
-            RiskLevel::Danger => LineStyle::Danger,
-            RiskLevel::Low => return Vec::new(),
-        };
-        let source = match &self.verdict_source {
-            Some(src) => format!("判定モデル: {src}"),
-            None => "判定モデル".to_string(),
-        };
-        vec![ApprovalLine::new(
-            style,
-            format!(
-                "危険度 {:.2} / 2: {}（{source}。参考であり、安全の保証ではない）",
-                verdict.score,
-                verdict.level.reason_ja()
-            ),
-        )]
     }
 
     /// 恒久的に承認できるか。**確かめられないものを含む呼び出しは覚えない**ので、
@@ -330,7 +337,9 @@ impl PermissionView {
     pub fn can_remember(&self) -> bool {
         match &self.subject {
             PermissionSubject::Command(c) => !c.unverifiable,
-            PermissionSubject::Program(p) => !(p.runs_code && p.one_shot_only),
+            // 確かめられないものを含む呼び出しは覚えない。非 runs_code でも、引数のファイルが
+            // 読めなければ`one_shot_only`が立つ（D-123）ので、`runs_code`に関わらず見る。
+            PermissionSubject::Program(p) => !p.one_shot_only,
             other => other.rule_text().is_some(),
         }
     }
@@ -346,11 +355,26 @@ impl PermissionView {
 
     /// 穴にできる引数の位置（D-105）。コードを走らせる呼び出しには開けられない。
     /// 今の値が穴に当たらない引数（`-n`・空・`"`を含む等）は、開けても二度と当たらないので候補にしない。
+    ///
+    /// **中身を縛ったファイルの位置も候補にしない**（D-123）。そこに穴を開けると規則は`files`空で
+    /// 記録され、実呼び出し（中身を縛る）と`files`不一致で二度と当たらない——同じく「押せるのに
+    /// 何も起きない」になるため。
     pub fn hole_candidates(&self) -> Vec<usize> {
         match &self.subject {
-            PermissionSubject::Program(p) if !p.runs_code => (0..p.args.len())
-                .filter(|&i| hole_accepts(&p.args[i]))
-                .collect(),
+            PermissionSubject::Program(p) if !p.runs_code => {
+                let bound: std::collections::HashSet<&str> = p
+                    .files
+                    .iter()
+                    .filter_map(|f| f.rel_path.rsplit(['/', '\\']).next())
+                    .collect();
+                (0..p.args.len())
+                    .filter(|&i| hole_accepts(&p.args[i]))
+                    .filter(|&i| {
+                        let base = p.args[i].rsplit(['/', '\\']).next().unwrap_or(&p.args[i]);
+                        !bound.contains(base)
+                    })
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -542,12 +566,11 @@ impl PermissionView {
             LineStyle::Heading,
             format!("{}（{:?}）", self.tool, self.risk),
         )];
-        out.extend(self.verdict_lines());
         match &self.subject {
             PermissionSubject::Command(c) => {
                 out.push(ApprovalLine::new(
                     LineStyle::Normal,
-                    escape_for_display(&c.line),
+                    format!("実行対象のコマンド: {}", escape_for_display(&c.line)),
                 ));
                 if c.unverifiable {
                     out.push(ApprovalLine::new(
@@ -556,6 +579,7 @@ impl PermissionView {
                          恒久的には承認できない。",
                     ));
                 }
+                out.extend(self.risk_lines(clock));
             }
             PermissionSubject::Program(p) => {
                 out.push(ApprovalLine::new(
@@ -582,13 +606,17 @@ impl PermissionView {
                 if p.args.is_empty() {
                     out.push(ApprovalLine::new(LineStyle::Dim, "  （引数なし）"));
                 }
-                if p.runs_code && p.one_shot_only {
-                    out.push(ApprovalLine::new(
-                        LineStyle::Warn,
+                if p.one_shot_only {
+                    let reason = if p.runs_code {
                         "この呼び出しはコードを走らせるが、引数を中身で縛れない\
-                         （その場のコード・ディレクトリ・ワークスペース外など）。一度だけ許可できる。",
-                    ));
+                         （その場のコード・ディレクトリ・ワークスペース外など）。一度だけ許可できる。"
+                    } else {
+                        "この呼び出しは引数のファイルの中身を確かめられない\
+                         （読めないファイルなど）。一度だけ許可できる。"
+                    };
+                    out.push(ApprovalLine::new(LineStyle::Warn, reason));
                 }
+                out.extend(self.risk_lines(clock));
             }
             PermissionSubject::WritePath(path) => out.push(ApprovalLine::new(
                 LineStyle::Normal,
@@ -612,15 +640,20 @@ impl PermissionView {
     /// 解読できなかったこと・上限で止めたことも1行として出す（黙って落とすと、見る人には
     /// 「符号化された中身は無かった」と区別がつかない）。
     fn decoded_lines(&self) -> Vec<ApprovalLine> {
+        // 機械の解読（材料の`decoded`）と、LLM が場所を示してハーネスが解読した段（危険度の判定の結果）を並べる。
+        let located: &[DecodedLayer] = self
+            .assessment
+            .as_ref()
+            .map_or(&[], |a| a.outcome.extra_decoded.as_slice());
         let decoded = self.decoded();
-        if decoded.is_empty() {
+        if decoded.is_empty() && located.is_empty() {
             return Vec::new();
         }
         let mut out = vec![ApprovalLine::new(
             LineStyle::Heading,
             "符号化された中身（ハーネスが機械的に解読した。照合には使わない）",
         )];
-        out.extend(decoded.iter().flat_map(decoded_layer_lines));
+        out.extend(decoded.iter().chain(located).flat_map(decoded_layer_lines));
         out
     }
 
@@ -654,6 +687,68 @@ impl PermissionView {
                     escape_for_display(&f.rel_path),
                     &f.sha256[..f.sha256.len().min(HASH_DIGEST_CHARS)]
                 ),
+            ));
+            out.extend(self.flagged_lines_of(&f.rel_path));
+        }
+        out
+    }
+
+    /// 縛ったファイルのうち、**機械の被害判定が当たった行とその前後**（D-121）。
+    ///
+    /// 当たっていないファイルは何も出さない——全文は`[v]`で見られる。長いスクリプトでは
+    /// **先頭から順に出しても当たった行まで届かない**ので、当たった行を直接見せる。
+    fn flagged_lines_of(&self, rel_path: &str) -> Vec<ApprovalLine> {
+        let Some(text) = self
+            .previews()
+            .iter()
+            .find(|p| p.rel_path == rel_path)
+            .map(|p| p.text.as_str())
+        else {
+            return Vec::new();
+        };
+        let Some(view) = self.assessment.as_ref() else {
+            return Vec::new();
+        };
+        // この file に当たった被害判定だけを集め、行番号で並べて重なりをまとめる。
+        let mut wanted: Vec<usize> = view
+            .flagged_in(rel_path)
+            .filter_map(|finding| finding.line_in(text))
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::new();
+        let mut shown: Option<usize> = None;
+        for at in wanted.iter().take(FLAGGED_LINES_TO_SHOW) {
+            let from = at.saturating_sub(FLAGGED_CONTEXT).max(1);
+            let to = (at + FLAGGED_CONTEXT).min(lines.len());
+            if shown.is_some_and(|last| from > last + 1) {
+                out.push(ApprovalLine::new(LineStyle::Dim, "      …"));
+            }
+            for n in from..=to {
+                if shown.is_some_and(|last| n <= last) {
+                    continue;
+                }
+                // 当たった行は目立たせ、周りは控えめに出す。
+                let style = match n == *at {
+                    true => LineStyle::Warn,
+                    false => LineStyle::Dim,
+                };
+                out.push(ApprovalLine::new(
+                    style,
+                    format!("    {n:>4}  {}", escape_for_display(lines[n - 1])),
+                ));
+                shown = Some(n);
+            }
+        }
+        if shown.is_some_and(|last| last < lines.len()) {
+            out.push(ApprovalLine::new(
+                LineStyle::Dim,
+                format!("      …（全{}行。[v] で全文）", lines.len()),
             ));
         }
         out

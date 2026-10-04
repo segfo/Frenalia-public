@@ -281,35 +281,56 @@ fn program_subject(
         ..ProgramSubject::plain(program, args)
     };
     subject.one_shot_only = false;
-    if !runs_code {
-        return subject;
-    }
     let Ok(view) = ChildView::for_ctx(ctx) else {
         subject.one_shot_only = true;
         return subject;
     };
-    let binding = approval_binding::bind_program_args(&view, cwd, &subject.args);
+    // 縛り方は呼び出しの種類で2つに分かれる。
+    //
+    // - **コードを走らせる呼び出し**（インタプリタ・ワークスペース内の実行ファイル）: 引数を厳格に
+    //   縛る（D-104。ファイルでない走行コードがあれば恒久承認しない）。
+    // - **それ以外のツール**（`uv`・`git`等）: 字面に名指しされた実在ファイルだけを縛る（D-123。
+    //   `run_shell`と同じ寛容さ）。名前の一覧に無いツールでも、引数の`eb.py`の中身を承認材料にする。
+    let mut binding = if runs_code {
+        let args_binding = approval_binding::bind_program_args(&view, cwd, &subject.args);
+        subject.one_shot_only = args_binding.one_shot_only;
+        let mut binding = approval_binding::ShellBinding {
+            files: args_binding.files,
+            previews: args_binding.previews,
+            unverifiable: false,
+        };
+        if in_workspace {
+            // ワークスペース内の実行ファイルは、実体そのものも縛る（D-103）。
+            match resolved
+                .as_deref()
+                .and_then(|r| approval_binding::bind_executable(&view, r))
+            {
+                Some(PathBinding::File(f, p)) => binding.absorb(approval_binding::ShellBinding {
+                    files: vec![f],
+                    previews: vec![p],
+                    unverifiable: false,
+                }),
+                _ => subject.one_shot_only = true,
+            }
+        }
+        binding
+    } else {
+        approval_binding::bind_program_file_args(&view, cwd, &subject.args)
+    };
+    // 解読した各段と、縛ったファイルの中身からも入れ子のスクリプトを縛る（D-120）。
+    // `run_shell`と**同じ関数**を通す——片方だけ直されて静かにずれるのを防ぐ（B-05）。
+    binding.absorb(approval_binding::bind_decoded(&view, cwd, &subject.decoded));
+    let nested = approval_binding::bind_nested(&view, cwd, &binding);
+    binding.absorb(nested);
+    // ここで確かめ切れなかったものは、恒久承認しない（`run_program`は`one_shot_only`が同じ役）。
+    subject.one_shot_only |= binding.unverifiable;
+    // 縛ったファイルの中身に入っている符号化された塊も解読する（D-122）。コードを走らせる
+    // 呼び出しは拡張子で絞らず全部見る。それ以外のツールは`run_shell`と同じく拡張子で絞る（D-123）。
+    subject
+        .decoded
+        .extend(approval_binding::decode_in_files(&binding.previews, !runs_code));
     subject.files = binding.files;
     subject.previews = binding.previews;
-    subject.one_shot_only = binding.one_shot_only;
-    if in_workspace {
-        // ワークスペース内の実行ファイルは、実体そのものも縛る（D-103）。
-        match resolved
-            .as_deref()
-            .and_then(|r| approval_binding::bind_executable(&view, r))
-        {
-            Some(PathBinding::File(f, p)) => {
-                if let Err(pos) = subject
-                    .files
-                    .binary_search_by(|x| x.rel_path.cmp(&f.rel_path))
-                {
-                    subject.files.insert(pos, f);
-                    subject.previews.insert(pos, p);
-                }
-            }
-            _ => subject.one_shot_only = true,
-        }
-    }
     subject
 }
 

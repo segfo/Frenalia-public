@@ -1877,3 +1877,36 @@ fn ending_a_busy_that_never_started_is_a_no_op() {
     app.end_busy(BusyEnd::Finished);
     assert!(app.transcript.is_empty());
 }
+
+/// **モデルが値を書き写したら、断ったときも走らせたときも会話の記録に1行残る**（D-115）。
+/// 断ったことが見えないと、人は「なぜ動かないのか」が分からない。
+#[test]
+fn a_transcribed_user_value_leaves_a_line_in_the_transcript() {
+    // 損じていたので断った。
+    let mut app = AppState::new("p".into(), "m".into());
+    app.apply(AgentEvent::UserValueTranscribed {
+        value_chars: 308,
+        differences: 64,
+        refused: true,
+    });
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Info(l)
+            if l.contains("308") && l.contains("64") && l.contains("実行しなかった")),
+        "{:?}",
+        app.transcript[0]
+    );
+
+    // 一字一句同じだったので走らせた。**こちらも黙らせない。**
+    let mut app = AppState::new("p".into(), "m".into());
+    app.apply(AgentEvent::UserValueTranscribed {
+        value_chars: 308,
+        differences: 0,
+        refused: false,
+    });
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Info(l)
+            if l.contains("308") && l.contains("書き写した") && !l.contains("実行しなかった")),
+        "{:?}",
+        app.transcript[0]
+    );
+}

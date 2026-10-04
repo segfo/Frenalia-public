@@ -1423,7 +1423,8 @@ fn cursor_after_draw(app: &mut AppState, width: u16, height: u16) -> (Screen, Op
 }
 
 /// **端末のカーソル（IMEの位置合わせ）は、右にボタンを置いて狭くなった入力欄の中に置く**——打った文字の直後
-/// （全角は2桁）。入力欄より長い行では入力欄の最後の桁に留まり、ボタンの上へ出ない。複数行では最後の行。
+/// （全角は2桁）。入力欄より長い行は**折り返して**、カーソルは折り返した最後の行の文字の直後に置く
+/// （2026-10-04、ユーザーの指示で折り返すようにした。以前は右端に留まっていた）。複数行では最後の行。
 #[test]
 fn the_ime_cursor_stays_inside_the_narrowed_input_box() {
     let mut app = running_app();
@@ -1438,9 +1439,22 @@ fn the_ime_cursor_stays_inside_the_narrowed_input_box() {
     let input = input_box(&screen);
     let send = framed_button(&screen, "送信");
     let (cx, cy) = cursor.expect("カーソルが出ていない");
-    assert_eq!(cx, input.right() - 2, "入力欄の最後の桁に無い");
+    let text_width = input.width - 2; // 枠線を除いた、文字を置ける幅
+    assert!(
+        input.height > 3,
+        "折り返したのに入力欄が1行のまま: {input:?}"
+    );
+    assert_eq!(
+        cx,
+        input.x + 1 + 150 % text_width,
+        "折り返した最後の行の、文字の直後に無い"
+    );
     assert!(cx < send.x, "カーソルがボタンの上に出た");
-    assert_eq!(cy, input.y + 1);
+    assert_eq!(
+        cy,
+        input.bottom() - 2,
+        "折り返した最後の行（入力欄の一番下の行）に無い"
+    );
 
     let mut app = running_app();
     type_text(&mut app, "ab");

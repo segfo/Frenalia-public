@@ -126,6 +126,8 @@ pub(super) fn stage_parse_args() -> Result<ParsedArgs, ExitCode> {
     };
     let workspace_root = normalize_workspace_root(&workspace_root);
     harness_config::ensure_project_settings_file(&workspace_root);
+    // ユーザ層の設定ファイルも、無ければ雛形を書く（初回起動。書いても動きは変わらない値だけ）。
+    harness_config::ensure_user_settings_file();
 
     // `apply`/`changes`/`discard`サブコマンドはプロバイダ資格情報を一切必要としないため、
     // 他のあらゆる検証より前に処理して即終了する（§非対話モード、プロンプトは一切送らない）。

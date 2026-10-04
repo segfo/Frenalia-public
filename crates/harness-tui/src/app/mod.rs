@@ -84,7 +84,7 @@ mod stderr;
 pub use approval::MODAL_INPUT_GRACE;
 pub use approval::{
     ApprovalCommand, ApprovalLine, ApprovalStage, LineStyle, PermissionView, PreviousCopy,
-    SummaryState, SummaryWait, WaitClock,
+    RiskView, SummaryState, SummaryWait, WaitClock,
 };
 use commands::parse_slash_command;
 pub use commands::{Action, FsStageCommand, MemoryCommand, SlashCommand};
@@ -184,12 +184,17 @@ pub struct AppState {
     /// Undo単位にまとめる（1文字ずつUndoすると使いづらいため）ためのフラグ。
     input_last_edit_was_insert: bool,
     pub pending_permission: Option<PermissionView>,
-    /// 外の判定モデルが判定済みのコマンド（行→危険度。セッション中だけ覚える）。同じ行を2回判定しない。
-    /// 要約の使い回し（`approvals::SummaryCache`）と別に持つ——要約の鍵に入れる危険度を、要約を
-    /// 起こす**前**に知るため。
-    pub risk_seen: std::collections::HashMap<String, harness_core::RiskVerdict>,
+    /// 判定モデルまで使って判定済みの危険度（判定に使った材料の鍵→結果。`harness_engine::approval_risk::cache_key`。
+    /// セッション中だけ覚える）。同じ材料を2回判定しない。**判定モデルが答えなかった回は覚えない**——覚えると、
+    /// 判定モデルが戻っても同じ材料を聞き直さない。要約の使い回し（`approvals::SummaryCache`）と別に持つ——
+    /// 要約の鍵に入れる危険度を、要約を起こす**前**に知るため。
+    pub risk_seen: std::collections::HashMap<String, harness_engine::approval_risk::RiskOutcome>,
     /// 判定モデルを使えなかったことを、このセッションで既に1回書いたか（毎回の承認で繰り返さない）。
     pub risk_unavailable_noted: bool,
+    /// このプロセスで実際に走ったコマンドの流れ（承認画面の「これまでの流れと合わせた危険度」）。
+    /// エンジンの`ToolStarted`で覚える。**`/clear`・セッションの切替でも消さない**——流れの危険は、会話ではなく
+    /// このマシンで実際に起きたことに掛かるから（取ってきたファイルは会話を消しても残っている）。
+    pub command_history: harness_core::CommandHistory,
     pub provider_label: String,
     /// 今のワークスペースのルート（承認画面が「記録はこのワークスペースだけ」を見せるのに使う）。
     /// 起動時に`harness_tui::run`が入れる（`AppState`自身はファイルを触らない）。
@@ -322,6 +327,7 @@ impl AppState {
             pending_permission: None,
             risk_seen: std::collections::HashMap::new(),
             risk_unavailable_noted: false,
+            command_history: harness_core::CommandHistory::default(),
             provider_label,
             workspace_root: String::new(),
             model,
