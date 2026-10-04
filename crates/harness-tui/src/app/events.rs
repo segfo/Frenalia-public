@@ -99,6 +99,13 @@ impl AppState {
                     self.workspace_root.clone(),
                 ));
             }
+            // ハーネスがモデルの書き写しを直した（D-114）。**直したことを黙らせない**——承認画面に
+            // 出ているものが頼んだものと同じかを、人がここで確かめられるようにする。
+            AgentEvent::UserValueRepaired { chars, differences } => {
+                self.transcript.push(TranscriptItem::Info(format!(
+                    "[参照] モデルが書き写した{chars}文字の値を、あなたが書いた値へ直した                     （{differences}文字違っていた）"
+                )));
+            }
             AgentEvent::ToolStarted { name, subject, .. } => {
                 if let Some(subject) = subject {
                     self.command_history.record(&name, &subject);

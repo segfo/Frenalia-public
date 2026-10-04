@@ -21,6 +21,13 @@
 //! 差し込みは**判定の材料を作るより前**に1か所で行う（`harness_engine::turn`）。だから承認画面に出る文字列・
 //! 判定器が照合する文字列・実際に走る文字列は同じものである（D-101「判定器が見る材料」を崩さない）。
 //!
+//! # 参照を使わずに書き写したときは、ハーネスが直す
+//!
+//! モデルは決まりを守らないことがある（実測: 2026-10-04、決まりを伝えた状態でも`qwen3.6-35b`は書き写した）。
+//! そこで、**モデルが書いた長い値がユーザーの文の値とほぼ同じなら、ユーザーの値へ差し替える**（[`repair`]）。
+//! 「ほぼ同じ」は、長さが同じで違う文字が[`MAX_REPAIR_RATIO`]以下のときだけである——**書き写しの損じだけを直し、
+//! 別物を直さない**。直したことは呼び出し側へ返して承認画面に出す（黙って書き換えない）。
+//!
 //! # ここが守らないもの
 //!
 //! - **差し込めなかったときは、書いた綴りがそのまま残る**（勝手に消さない）。承認画面にも`{{user:1}}`が見えるので、
@@ -33,6 +40,12 @@
 use serde_json::Value;
 
 use crate::{Message, Role};
+
+/// 書き写しの損じとして直してよい、違う文字の割合の上限。
+///
+/// **これを超える違いは直さない**——モデルが意図して別の値を書いた可能性があるから。308文字のうち1文字（0.3%）が
+/// 実測の損じで、64文字短いもの（長さ違い）は直さない（長さが同じものだけを見る）。
+pub const MAX_REPAIR_RATIO: f32 = 0.05;
 
 /// 参照できる「長い値」とみなす最短の長さ（文字）。空白を含まない連なりで数える。
 ///
@@ -123,6 +136,95 @@ fn substitute_text(text: &str, values: &[String]) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// モデルが書き写した値を、ユーザーの文の値へ直した記録（承認画面に出す）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repair {
+    /// モデルが書いた値。
+    pub written: String,
+    /// 差し替えたユーザーの値。
+    pub user_value: String,
+    /// 違っていた文字の数。
+    pub differences: usize,
+}
+
+/// ツールの入力の中の**書き写した値**を、ユーザーの文の値へ直す（[`substitute`]の後に通す）。
+///
+/// モデルが書いた長い値（空白を含まない[`MIN_REFERENCE_CHARS`]文字以上）が、ユーザーの文の値と**長さが同じで、
+/// 違う文字が[`MAX_REPAIR_RATIO`]以下**なら差し替える。直した記録を返す（承認画面に出すため）。
+pub fn repair(input: &Value, values: &[String]) -> (Value, Vec<Repair>) {
+    let mut repairs = Vec::new();
+    let out = repair_value(input, values, &mut repairs);
+    (out, repairs)
+}
+
+fn repair_value(input: &Value, values: &[String], repairs: &mut Vec<Repair>) -> Value {
+    match input {
+        Value::String(text) => Value::String(repair_text(text, values, repairs)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| repair_value(v, values, repairs))
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.clone(), repair_value(v, values, repairs)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// 1つの文字列の中の長い語を、ユーザーの値へ直す（空白で割って語ごとに見る）。
+fn repair_text(text: &str, values: &[String], repairs: &mut Vec<Repair>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        // 空白はそのまま写し、語だけを見る（元の空白の並びを崩さない）。
+        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (word, after) = rest.split_at(word_end);
+        match mended(word, values) {
+            Some((value, differences)) => {
+                repairs.push(Repair {
+                    written: word.to_string(),
+                    user_value: value.clone(),
+                    differences,
+                });
+                out.push_str(&value);
+            }
+            None => out.push_str(word),
+        }
+        let space_end = after
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(after.len());
+        out.push_str(&after[..space_end]);
+        rest = &after[space_end..];
+    }
+    out
+}
+
+/// `word`が書き写しの損じなら、直した値と違っていた文字の数。直さないなら`None`。
+fn mended(word: &str, values: &[String]) -> Option<(String, usize)> {
+    let length = word.chars().count();
+    if length < MIN_REFERENCE_CHARS {
+        return None;
+    }
+    values
+        .iter()
+        .filter(|value| value.chars().count() == length && *value != word)
+        .map(|value| {
+            let differences = value
+                .chars()
+                .zip(word.chars())
+                .filter(|(a, b)| a != b)
+                .count();
+            (value.clone(), differences)
+        })
+        .filter(|(_, differences)| (*differences as f32) <= length as f32 * MAX_REPAIR_RATIO)
+        .min_by_key(|(_, differences)| *differences)
 }
 
 #[cfg(test)]

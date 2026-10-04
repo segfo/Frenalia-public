@@ -114,3 +114,122 @@ fn input_without_references_is_untouched() {
     let input = json!({ "command": "git status", "args": ["a", "{{notuser:1}}"], "n": 1 });
     assert_eq!(substitute(&input, &[blob('a')]), input);
 }
+
+/// **参照を使わずに書き写した1文字違いを、ユーザーの値へ直す。**
+///
+/// 実測（2026-10-04）と同じ形: 308文字のうち1文字だけが違う値をモデルが書いた。
+#[test]
+fn a_transcribed_value_with_one_wrong_character_is_repaired() {
+    let value = blob('a');
+    let mut written: Vec<char> = value.chars().collect();
+    written[100] = 'Z';
+    let written: String = written.into_iter().collect();
+
+    let input = json!({ "command": format!("pwsh --enc {written}") });
+    let (out, repairs) = repair(&input, std::slice::from_ref(&value));
+    assert_eq!(out, json!({ "command": format!("pwsh --enc {value}") }));
+    assert_eq!(repairs.len(), 1);
+    assert_eq!(repairs[0].differences, 1);
+    assert_eq!(repairs[0].written, written);
+    assert_eq!(repairs[0].user_value, value);
+}
+
+/// 入れ子（配列・オブジェクト）の中も直し、**空白の並びは崩さない**。
+#[test]
+fn repair_reaches_nested_strings_and_keeps_the_spacing() {
+    let value = blob('a');
+    let written = format!("{}Z", &value[..value.len() - 1]);
+
+    let input = json!({ "program": "pwsh", "args": ["-enc", written], "n": 3 });
+    let (out, repairs) = repair(&input, std::slice::from_ref(&value));
+    assert_eq!(
+        out,
+        json!({ "program": "pwsh", "args": ["-enc", value], "n": 3 })
+    );
+    assert_eq!(repairs.len(), 1);
+
+    // 前後と語の間の空白（連なり・改行・タブ）がそのまま残る。
+    let written = format!("{}Z", &value[..value.len() - 1]);
+    let input = json!({ "command": format!("  a\n\t{written}  b\n") });
+    let (out, _) = repair(&input, std::slice::from_ref(&value));
+    assert_eq!(out, json!({ "command": format!("  a\n\t{value}  b\n") }));
+}
+
+/// **別物は直さない。** 短い語・長さが違う塊・違いが大きい塊は、書いた綴りのまま残す。
+#[test]
+fn values_that_are_not_transcription_slips_are_left_alone() {
+    let value = blob('a');
+    let one = std::slice::from_ref(&value);
+
+    // (1) 短い語（コマンド名・スイッチ）。
+    let input = json!({ "command": "ls -la --force" });
+    assert_eq!(repair(&input, one), (input.clone(), vec![]));
+
+    // (2) 長さが違う（実測の「64文字短い」型。**切り詰めは直さない**——どこが落ちたか決められない）。
+    let short: String = value.chars().take(244).collect();
+    let input = json!({ "command": format!("pwsh --enc {short}") });
+    assert_eq!(repair(&input, one), (input.clone(), vec![]));
+
+    // (3) 長さは同じだが違いが大きい（別の値を書いた）。
+    let other = blob('b');
+    let input = json!({ "command": format!("pwsh --enc {other}") });
+    assert_eq!(repair(&input, one), (input.clone(), vec![]));
+
+    // (4) 完全に一致している（直す必要が無いので知らせない）。
+    let input = json!({ "command": format!("pwsh --enc {value}") });
+    assert_eq!(repair(&input, one), (input.clone(), vec![]));
+
+    // (5) 参照できる値が1つも無い。
+    let written = format!("{}Z", &value[..value.len() - 1]);
+    let input = json!({ "command": format!("pwsh --enc {written}") });
+    assert_eq!(repair(&input, &[]), (input.clone(), vec![]));
+}
+
+/// 違いの上限はちょうど[`MAX_REPAIR_RATIO`]で切る（境目の両側を固定する）。
+#[test]
+fn the_difference_limit_is_fixed_on_both_sides() {
+    let value = blob('a');
+    let length = value.chars().count(); // 308。上限は 308 * 0.05 = 15.4 文字
+    let limit = (length as f32 * MAX_REPAIR_RATIO) as usize; // 15
+
+    for (differences, repaired) in [(limit, true), (limit + 1, false)] {
+        let mut written: Vec<char> = value.chars().collect();
+        for c in written.iter_mut().take(differences) {
+            *c = 'Z';
+        }
+        let written: String = written.into_iter().collect();
+        let input = json!({ "command": format!("pwsh --enc {written}") });
+        let (out, repairs) = repair(&input, std::slice::from_ref(&value));
+        assert_eq!(
+            repairs.len(),
+            usize::from(repaired),
+            "{differences}文字違い"
+        );
+        assert_eq!(
+            out == json!({ "command": format!("pwsh --enc {value}") }),
+            repaired,
+            "{differences}文字違い"
+        );
+    }
+}
+
+/// 候補が2つとも上限の内側に入るときは、**違いがいちばん少ないもの**を選ぶ。
+#[test]
+fn the_closest_user_value_wins() {
+    let a = blob('a');
+    // `b`は`a`と5文字だけ違う値。書き写した塊は`b`と1文字違い（`a`とは6文字違い）。
+    let mut b: Vec<char> = a.chars().collect();
+    for c in b.iter_mut().take(5) {
+        *c = 'b';
+    }
+    let mut written = b.clone();
+    written[100] = 'Z';
+    let (b, written): (String, String) = (b.into_iter().collect(), written.into_iter().collect());
+
+    let input = json!({ "command": format!("pwsh --enc {written}") });
+    let (out, repairs) = repair(&input, &[a, b.clone()]);
+    assert_eq!(out, json!({ "command": format!("pwsh --enc {b}") }));
+    assert_eq!(repairs.len(), 1);
+    assert_eq!(repairs[0].differences, 1);
+    assert_eq!(repairs[0].user_value, b);
+}

@@ -585,6 +585,19 @@ impl<'a> TurnExecutor<'a> {
             // 承認画面の材料・実際の実行・画面のカード、どれもこの後ろにあるので、**同じ文字列**を見る
             // （D-101「判定器が見る材料」と、走るものを食い違わせない）。
             let input = &harness_core::substitute_user_references(input, references);
+            // 参照の書き方を使わずに**書き写した**ときの受け皿（D-114）。モデルが決まりを守らなくても
+            // 走るものが正しくなるよう、ユーザーの文の値とほぼ同じ塊はその値へ直す。
+            let (input, repairs) = harness_core::repair_user_references(input, references);
+            let input = &input;
+            for repair in &repairs {
+                emit(
+                    self.events,
+                    AgentEvent::UserValueRepaired {
+                        chars: repair.user_value.chars().count(),
+                        differences: repair.differences,
+                    },
+                );
+            }
 
             emit(
                 self.events,
