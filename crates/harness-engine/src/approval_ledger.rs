@@ -371,6 +371,10 @@ fn is_valid_rule(rule: &RecordedRule) -> bool {
                 })
                 && !(interpreter && r.has_hole())
                 && !(interpreter && r.workspace.is_none())
+                // ファイルを縛った規則は必ずワークスペースに縛る（D-123。`RunShell`の
+                // `workspace.is_some()`要求と対称）——縛った中身を、別のワークスペースの同名
+                // ファイルと取り違えないため。
+                && (r.files.is_empty() || r.workspace.is_some())
                 && files_ok(&r.files)
         }
         RecordedRule::RunShell(r) => {

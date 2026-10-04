@@ -68,8 +68,10 @@ impl ProgramRule {
                 .collect(),
             resolved: subject.resolved.clone(),
             files: subject.files.clone(),
-            workspace: subject
-                .runs_code
+            // ファイルを縛ったら、作ったときのワークスペースにも縛る（D-104/D-123）。
+            // コードを走らせる呼び出しは常に縛る。ファイルを名指ししたツール（`uv run eb.py`）も縛る。
+            // `git log`のようにファイルを縛らないものは`None`で、どのワークスペースでも当たる。
+            workspace: (subject.runs_code || !subject.files.is_empty())
                 .then(|| fold_path_for_rule(workspace_root)),
         }
     }
@@ -98,17 +100,28 @@ impl ProgramRule {
     /// 縛ったファイルの集合とワークスペースの一致を要求する（D-104）。
     pub fn matches(&self, subject: &ProgramSubject, workspace_root: &str) -> bool {
         let runs_code = subject.runs_code || is_interpreter_program(&self.program);
-        if runs_code {
-            if self.has_hole() || subject.one_shot_only {
-                return false;
-            }
-            if subject.files != self.files {
-                return false;
-            }
-            match &self.workspace {
-                Some(ws) if *ws == fold_path_for_rule(workspace_root) => {}
-                _ => return false,
-            }
+        // 確かめ切れなかった呼び出しは何にも当てない（`run_shell`の`unverifiable`と同じ役）。
+        if subject.one_shot_only {
+            return false;
+        }
+        // 穴（Hole）を持つ規則はコードを走らせる呼び出しに当てない（§4.2。D-104）。
+        if runs_code && self.has_hole() {
+            return false;
+        }
+        // 縛ったファイルの中身を照合する（D-123）。コードを走らせる呼び出しだけでなく、
+        // `uv run eb.py`のようにファイルを名指しするツールも、中身が変われば当たらなくなる。
+        if subject.files != self.files {
+            return false;
+        }
+        // コードを走らせる呼び出し・ファイルを縛った規則は、作ったときのワークスペースの一致を
+        // 要求する（D-104/D-123。同じ中身でも隣が違えば別物）。`git log`のようにファイルを縛って
+        // いない規則は`workspace=None`で、どのワークスペースでも当たる。**要求するのに`None`なら
+        // 当てない**——穴を塞いだまま緩めない。
+        let needs_workspace = runs_code || !self.files.is_empty();
+        match &self.workspace {
+            Some(ws) if *ws == fold_path_for_rule(workspace_root) => {}
+            None if !needs_workspace => {}
+            _ => return false,
         }
         if let Some(resolved) = &self.resolved {
             match &subject.resolved {
@@ -383,6 +396,48 @@ mod tests {
         let mut one_shot = approved.clone();
         one_shot.one_shot_only = true;
         assert!(!r.matches(&one_shot, WS), "an unverifiable argument");
+    }
+
+    /// 非インタプリタのツール（`uv run eb.py`）でも、縛ったファイルの中身で照合する（D-123）。
+    /// 中身・隣の名前一覧・ワークスペースが変われば当たらない。ファイルを縛っていない呼び出し
+    /// （`git log`）はワークスペースに縛られず、どこでも当たる。
+    #[test]
+    fn a_non_interpreter_rule_with_a_bound_file_matches_only_the_same_contents() {
+        let tool_call = |files: Vec<BoundFile>| ProgramSubject {
+            program: "uv".into(),
+            args: vec!["run".into(), "eb.py".into()],
+            resolved: None,
+            runs_code: false,
+            files,
+            one_shot_only: false,
+            previews: Vec::new(),
+            decoded: Vec::new(),
+        };
+        let approved = tool_call(vec![file("eb.py", "a")]);
+        let r = ProgramRule::exact(&approved, WS);
+        assert!(r.workspace.is_some(), "a bound file ties the rule to its workspace");
+        assert!(r.matches(&approved, WS));
+
+        assert!(
+            !r.matches(&tool_call(vec![file("eb.py", "b")]), WS),
+            "content changed"
+        );
+        let mut sibling = file("eb.py", "a");
+        sibling.dir_listing_sha256 = Some("json.py appeared".into());
+        assert!(!r.matches(&tool_call(vec![sibling]), WS), "a sibling appeared");
+        assert!(!r.matches(&tool_call(vec![]), WS), "the file was deleted");
+        assert!(!r.matches(&approved, "C:/other"), "another workspace");
+
+        let mut one_shot = approved.clone();
+        one_shot.one_shot_only = true;
+        assert!(!r.matches(&one_shot, WS), "an unverifiable argument");
+
+        // ファイルを縛っていない非インタプリタ呼び出し（`git log`）は、どのワークスペースでも当たる。
+        let git = subject("git", &["log"]);
+        let git_rule = ProgramRule::exact(&git, WS);
+        assert!(git_rule.workspace.is_none());
+        assert!(git_rule.matches(&git, WS));
+        assert!(git_rule.matches(&git, "C:/other"));
     }
 
     /// 縛りの無い規則（コマンドライン由来）は、コードを走らせる呼び出しには当たらない。

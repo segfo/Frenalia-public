@@ -133,6 +133,53 @@ async fn write_paths_are_normalized_like_the_write_itself() {
     assert_eq!(s, PermissionSubject::WritePath(abs.into()));
 }
 
+/// インタプリタでないツール（`uv`等）でも、引数に名指しされた実在ファイルを中身で縛る（D-123）。
+/// `uv run eb.py` の `eb.py` は、`uv` が「コードを走らせるツール」の一覧に無くても承認材料に入る。
+/// サブコマンド `run` はファイルでないので咎めず、恒久承認できる（`one_shot_only` は立たない）。
+#[tokio::test]
+async fn a_non_interpreter_call_binds_its_named_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("eb.py"), "import socket  # exploit").unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "rm -rf /").unwrap();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let reg = ToolRegistry::with_builtin_tools();
+    let tool = reg.get("run_program").unwrap();
+
+    let s = tool
+        .permission_subject(
+            &serde_json::json!({ "program": "uv", "args": ["run", "eb.py"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let PermissionSubject::Program(p) = s else {
+        panic!("expected a Program subject")
+    };
+    assert!(!p.runs_code, "uv is not an interpreter");
+    assert!(
+        !p.one_shot_only,
+        "the subcommand `run` is not a file, so it is not held against permanent approval"
+    );
+    assert_eq!(p.files.len(), 1, "{:?}", p.files);
+    assert_eq!(p.files[0].rel_path, "eb.py");
+    assert_eq!(p.previews[0].text, "import socket  # exploit");
+
+    // 拡張子がスクリプトでないファイルも、承認材料としては縛る（判定モデルは全ファイルを見る）。
+    // 機械の被害判定を拡張子で絞るのは、縛りではなく危険度の計算の側（`approval_risk`）。
+    let s = tool
+        .permission_subject(
+            &serde_json::json!({ "program": "uv", "args": ["run", "notes.txt"] }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let PermissionSubject::Program(p) = s else {
+        panic!("expected a Program subject")
+    };
+    assert_eq!(p.files.len(), 1, "{:?}", p.files);
+    assert_eq!(p.files[0].rel_path, "notes.txt");
+}
+
 /// 何を起動するか読めない `run_program` の入力は、材料の段階で止まる（判定器まで届かない）。
 /// 以前は判定器が入力から `program` を探し、読めなければ聞く側へ倒していた。
 #[tokio::test]

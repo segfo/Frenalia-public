@@ -244,16 +244,44 @@ pub fn bind_shell_line(view: &ChildView, cwd: &Path, line: &str) -> ShellBinding
         return out;
     }
     for token in tokens {
-        match bind_path(
-            view,
-            cwd,
-            &token,
-            harness_core::has_script_extension(&token),
-        ) {
-            PathBinding::File(f, p) => push_unique(&mut out.files, &mut out.previews, f, p),
-            PathBinding::Unverifiable => out.unverifiable = true,
-            PathBinding::Directory | PathBinding::Missing | PathBinding::Outside => {}
+        bind_token_into(&mut out, view, cwd, &token);
+    }
+    out
+}
+
+/// 1つの語を、ワークスペース内の通常ファイルを指すものなら縛る。`bind_shell_line`（`run_shell`）と
+/// `bind_program_file_args`（`run_program`）が**同じ1判定を通す**ための共通部品。
+///
+/// 片方だけ直されて静かにずれるのを防ぐ（`B-05`）。縛る方向にしか働かない——ディレクトリ・
+/// ワークスペース外・存在しない語は黙って飛ばし、**存在するのに読めない語だけ**`unverifiable`。
+fn bind_token_into(out: &mut ShellBinding, view: &ChildView, cwd: &Path, token: &str) {
+    match bind_path(view, cwd, token, harness_core::has_script_extension(token)) {
+        PathBinding::File(f, p) => push_unique(&mut out.files, &mut out.previews, f, p),
+        PathBinding::Unverifiable => out.unverifiable = true,
+        PathBinding::Directory | PathBinding::Missing | PathBinding::Outside => {}
+    }
+}
+
+/// `run_program`の引数のうち、ワークスペース内の通常ファイルを指すものを縛る（D-123）。
+///
+/// `run_shell`の[`bind_shell_line`]と**同じ寛容さ**——`-`で始まる語（オプション）は飛ばし、
+/// ファイルでない語（`uv run`の`run`のようなサブコマンド）は咎めない。字面に出た実在ファイルだけ縛る。
+///
+/// インタプリタ用の厳格な[`bind_program_args`]とは**別物**である。あちらはハーネスが「走るコードを
+/// 全部縛った」と主張する呼び出し用で、ファイルでない引数があると恒久承認できなくする（D-104。
+/// `node build`が`build.js`を自分の規則で探すため、縛ったつもりのものが縛れていない）。
+/// こちらは「字面に名指しされたファイルだけ」を縛るので、サブコマンドは咎めない。
+pub fn bind_program_file_args(view: &ChildView, cwd: &Path, args: &[String]) -> ShellBinding {
+    let mut out = ShellBinding::default();
+    if args.len() > MAX_SHELL_TOKENS {
+        out.unverifiable = true;
+        return out;
+    }
+    for arg in args {
+        if arg.starts_with('-') {
+            continue;
         }
+        bind_token_into(&mut out, view, cwd, arg);
     }
     out
 }

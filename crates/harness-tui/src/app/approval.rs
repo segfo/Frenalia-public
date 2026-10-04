@@ -337,7 +337,9 @@ impl PermissionView {
     pub fn can_remember(&self) -> bool {
         match &self.subject {
             PermissionSubject::Command(c) => !c.unverifiable,
-            PermissionSubject::Program(p) => !(p.runs_code && p.one_shot_only),
+            // 確かめられないものを含む呼び出しは覚えない。非 runs_code でも、引数のファイルが
+            // 読めなければ`one_shot_only`が立つ（D-123）ので、`runs_code`に関わらず見る。
+            PermissionSubject::Program(p) => !p.one_shot_only,
             other => other.rule_text().is_some(),
         }
     }
@@ -353,11 +355,26 @@ impl PermissionView {
 
     /// 穴にできる引数の位置（D-105）。コードを走らせる呼び出しには開けられない。
     /// 今の値が穴に当たらない引数（`-n`・空・`"`を含む等）は、開けても二度と当たらないので候補にしない。
+    ///
+    /// **中身を縛ったファイルの位置も候補にしない**（D-123）。そこに穴を開けると規則は`files`空で
+    /// 記録され、実呼び出し（中身を縛る）と`files`不一致で二度と当たらない——同じく「押せるのに
+    /// 何も起きない」になるため。
     pub fn hole_candidates(&self) -> Vec<usize> {
         match &self.subject {
-            PermissionSubject::Program(p) if !p.runs_code => (0..p.args.len())
-                .filter(|&i| hole_accepts(&p.args[i]))
-                .collect(),
+            PermissionSubject::Program(p) if !p.runs_code => {
+                let bound: std::collections::HashSet<&str> = p
+                    .files
+                    .iter()
+                    .filter_map(|f| f.rel_path.rsplit(['/', '\\']).next())
+                    .collect();
+                (0..p.args.len())
+                    .filter(|&i| hole_accepts(&p.args[i]))
+                    .filter(|&i| {
+                        let base = p.args[i].rsplit(['/', '\\']).next().unwrap_or(&p.args[i]);
+                        !bound.contains(base)
+                    })
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -589,12 +606,15 @@ impl PermissionView {
                 if p.args.is_empty() {
                     out.push(ApprovalLine::new(LineStyle::Dim, "  （引数なし）"));
                 }
-                if p.runs_code && p.one_shot_only {
-                    out.push(ApprovalLine::new(
-                        LineStyle::Warn,
+                if p.one_shot_only {
+                    let reason = if p.runs_code {
                         "この呼び出しはコードを走らせるが、引数を中身で縛れない\
-                         （その場のコード・ディレクトリ・ワークスペース外など）。一度だけ許可できる。",
-                    ));
+                         （その場のコード・ディレクトリ・ワークスペース外など）。一度だけ許可できる。"
+                    } else {
+                        "この呼び出しは引数のファイルの中身を確かめられない\
+                         （読めないファイルなど）。一度だけ許可できる。"
+                    };
+                    out.push(ApprovalLine::new(LineStyle::Warn, reason));
                 }
                 out.extend(self.risk_lines(clock));
             }

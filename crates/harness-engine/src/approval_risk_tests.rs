@@ -380,8 +380,8 @@ fn an_undecoded_payload_is_noted_only_when_nothing_was_decoded() {
         .any(|n| matches!(n, RiskNote::UndecodedPayload { .. })));
 }
 
-/// ファイルからコードを読むと判定されたら、縛ったファイルの中身の危険度も聞く。読まないと判定されたら聞かない。
-/// `run_program`でコードを走らせるときは、判定に関わらず聞く。
+/// 縛ったファイルの中身は、拡張子に関わらず判定モデルへ送る（D-123）。機械の被害判定（字面）だけ
+/// スクリプトの拡張子に絞る。`run_program`でコードを走らせるときも中身を聞く。
 #[test]
 fn bound_files_are_asked_about_when_code_is_read_from_them() {
     let mut reading = FakeModel::quiet();
@@ -399,19 +399,21 @@ fn bound_files_are_asked_about_when_code_is_read_from_them() {
         "{:?}",
         out.reasons
     );
-    // 対照: 読まないと判定された（`cat notes.txt`）。
-    let mut not_reading = FakeModel::quiet();
-    not_reading.reads_source = 0.2;
-    not_reading.source = 1.8;
+    // 拡張子がスクリプトでないファイル（`cat notes.txt`）も、判定モデルへは送る（D-123。全ファイル）。
+    // 機械の被害判定（字面で`rm -rf /`を探す）はこちらには掛からない——それは`goes_to_machine`が
+    // 拡張子で絞る（下の `the_machine_assessment_...` テスト）。
+    let mut non_script = FakeModel::quiet();
+    non_script.reads_source = 0.2;
+    non_script.source = 1.8;
     run(
         &with_preview("cat notes.txt", "notes.txt", "hello"),
         &[],
-        Some(&not_reading),
+        Some(&non_script),
     );
-    assert!(!not_reading
+    assert!(non_script
         .calls()
         .iter()
-        .any(|(_, ids)| ids == &vec!["source_risk"]));
+        .any(|(state, ids)| ids == &vec!["source_risk"] && state["path"] == "notes.txt"));
     // `run_program`でインタプリタを起こす。
     let mut program = ProgramSubject::plain("python", vec!["build.py".into()]);
     program.previews.push(FilePreview {
@@ -624,20 +626,28 @@ fn a_bound_script_is_judged_even_when_the_model_says_it_reads_no_source() {
         .iter()
         .any(|(state, ids)| ids == &vec!["source_risk"] && state["path"] == "test.py"));
 
-    // 対照: コードでないファイル（メモ）は、モデルが「読む」と言っても判定へ送らない。
-    let mut reading = FakeModel::quiet();
-    reading.reads_source = 0.9;
-    reading.source = 1.8;
-    run(
+    // コードでないファイル（メモ）は判定モデルへは送る（D-123。全ファイル）が、**機械の被害判定
+    // （字面で `rm -rf /` を探す）は掛からない**——拡張子で絞るため。モデルは無害と言う（quiet）ので、
+    // notes.txt から危険の理由が立たないことで、字面の判定が走っていないことを確かめる。
+    let machine_only = FakeModel::quiet();
+    let out = run(
         &with_preview("cat notes.txt", "notes.txt", "rm -rf /"),
         &[],
-        Some(&reading),
+        Some(&machine_only),
     );
     assert!(
-        !reading
+        machine_only
             .calls()
             .iter()
-            .any(|(_, ids)| ids == &vec!["source_risk"]),
-        "メモの中身を判定へ送っている"
+            .any(|(state, ids)| ids == &vec!["source_risk"] && state["path"] == "notes.txt"),
+        "メモも判定モデルへは送る"
+    );
+    assert!(
+        !out.reasons.iter().any(|r| matches!(
+            r,
+            RiskReason::Damage { origin: Origin::File { path }, .. } if path == "notes.txt"
+        )),
+        "メモの字面に機械の被害判定を掛けている: {:?}",
+        out.reasons
     );
 }

@@ -272,7 +272,10 @@ pub fn machine(subject: &PermissionSubject) -> Option<RiskOutcome> {
         PermissionSubject::WritePath(_) | PermissionSubject::Text(_) => return None,
     }
     damage_in_decoded(&mut out, decoded_layers(subject));
-    for preview in previews(subject).iter().filter(|p| is_code(subject, p)) {
+    for preview in previews(subject)
+        .iter()
+        .filter(|p| goes_to_machine(subject, p))
+    {
         add_damage(
             &mut out,
             system_damage::assess_line(&preview.text),
@@ -436,13 +439,16 @@ pub async fn assess(
     // 「要確認」のままだった**。
     //
     // **縛れたかどうかはハーネスが知っている事実で、モデルに聞くことではない**（`plans/DESIGN-COGNITION.md`
-    // §0 の分業）。どれをコードとみなすかは機械の判定と同じ `is_code` を通す——判定の条件を2つ持つと、
-    // 片方だけ直されて静かにずれる（`B-05`）。
-    for preview in previews(subject)
-        .iter()
-        .filter(|p| is_code(subject, p))
-        .take(MAX_FILES_TO_ASK)
-    {
+    // §0 の分業）。
+    //
+    // **判定モデルへは縛れたファイルを全部送る**（D-123／ユーザー決定）。機械の被害判定は字面で
+    // 危険な処理を探すので拡張子のあるコードに絞ってよいが、判定モデルは中身を読んで点数を付けるので、
+    // 拡張子の無いスクリプトや紛れた塊も見せる値がある。ただし1回が高価（長さ比例。4,000字で約10秒）
+    // なので`MAX_FILES_TO_ASK`件まで。**どの件を落とすかで危険を見逃さないよう、スクリプトの拡張子を
+    // 持つものを先に送る**（`zzz.py`が`aaa.txt`に押し出されない）。
+    let mut ordered: Vec<&FilePreview> = previews(subject).iter().collect();
+    ordered.sort_by_key(|p| !harness_core::has_script_extension(&p.rel_path));
+    for preview in ordered.into_iter().take(MAX_FILES_TO_ASK) {
         match assess_source_risk(model, &preview.rel_path, &preview.text).await {
             Ok((verdict, cut)) => {
                 out.basis = RiskBasis::WithModel;
@@ -492,14 +498,19 @@ fn decoded_texts(subject: &PermissionSubject) -> Vec<&str> {
         .collect()
 }
 
-/// 縛ったファイルをコードとして機械の判定に掛けるか。`run_program`でコードを走らせるなら全部、
-/// `run_shell`ならスクリプトの拡張子のものだけ（`cat notes.txt`のメモに書いた`rm -rf /`を拾わない）。
+/// 縛ったファイルに**機械の被害判定**（`system_damage`。字面で危険な処理を探す）を掛けるか。
+/// `run_program`でコードを走らせるなら全部、そうでなければスクリプトの拡張子のものだけ
+/// （`cat notes.txt`のメモに書いた`rm -rf /`を拾わない）。
 ///
-/// **拡張子の一覧は`harness_core::SCRIPT_EXTENSIONS`の1つだけを見る。** 以前はここと
+/// **判定モデル（中身をLLMが点数化）の方は全ファイルに掛ける**（D-123。呼び出し側で絞らず全部送る）。
+/// 機械の判定とモデルの判定で対象が違うのは意図的で、同じ条件の複製ではない——共有するのは
+/// 拡張子の一覧（`harness_core::SCRIPT_EXTENSIONS`）だけで、ここが1つなら静かにずれない（`B-05`）。
+///
+/// **拡張子の一覧は`harness_core::has_script_extension`の1つだけを見る。** 以前はここと
 /// `harness_tools::approval_binding`が別々の一覧を持っていて中身がずれており、`deploy.pyw`のような
 /// ファイルは**中身を読んでハッシュで縛り判定モデルへも送るのに、機械の被害判定だけ掛からない**
 /// 状態だった（2026-10-04）。
-fn is_code(subject: &PermissionSubject, preview: &FilePreview) -> bool {
+fn goes_to_machine(subject: &PermissionSubject, preview: &FilePreview) -> bool {
     matches!(subject, PermissionSubject::Program(p) if p.runs_code)
         || harness_core::has_script_extension(&preview.rel_path)
 }
