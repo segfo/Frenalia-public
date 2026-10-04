@@ -532,6 +532,72 @@ fn a_failed_model_falls_back_to_the_machine_judgement_and_says_so_once() {
     );
 }
 
+/// fail-closed（D-124 ルール1）: 判定モデルを使えないのに難読化された中身があれば、危険側へ倒す。
+/// **確かめられなかっただけで、危険と判明したわけではない**（境界ではない。画面に高を出すだけ）。
+#[test]
+fn obfuscation_without_the_model_is_treated_as_high() {
+    let has_cause = |out: &RiskOutcome| {
+        out.reasons.iter().any(|r| {
+            matches!(
+                r,
+                RiskReason::OpaqueObfuscation(ObfuscationCause::ModelUnavailable)
+            )
+        })
+    };
+    // 判定モデルを使わない設定（model=None）。解読できた中身が無害（Get-Date）でも、難読化そのものが引き金。
+    let out = run(&with_decoded("pwsh -enc AAAA", "Get-Date"), &[], None);
+    assert_eq!(out.severity(), Severity::High);
+    assert!(has_cause(&out), "{:?}", out.reasons);
+
+    // 判定モデルが落ちている（呼び出しが失敗する）ときも同じ。
+    let mut failing = FakeModel::quiet();
+    failing.fail = true;
+    let out = run(&with_decoded("pwsh -enc AAAA", "Get-Date"), &[], Some(&failing));
+    assert_eq!(out.severity(), Severity::High);
+    assert!(has_cause(&out));
+
+    // 対照: 難読化が無ければ、モデルが無くても倒さない。
+    let out = run(&shell("git log"), &[], None);
+    assert_eq!(out.severity(), Severity::NeedsReview);
+    assert!(!has_cause(&out));
+}
+
+/// fail-closed（D-124 ルール2）: 判定モデルが使えても、解読の上限で止まってその先に難読化が残って
+/// いれば危険側へ倒す。底まで解けて普通のコードになった段は、その中身を普通に判定する。
+#[test]
+fn hitting_the_decode_limit_is_treated_as_high_even_with_the_model() {
+    let with_limit = || {
+        let mut c = CommandSubject::line_only("pwsh -enc AAAA");
+        c.decoded.push(DecodedLayer {
+            depth: 4,
+            source: EncodedSource::EncodedCommand,
+            outcome: DecodeOutcome::DepthLimit { max_depth: 4 },
+            in_file: None,
+        });
+        PermissionSubject::Command(c)
+    };
+    let has_cause = |out: &RiskOutcome| {
+        out.reasons.iter().any(|r| {
+            matches!(
+                r,
+                RiskReason::OpaqueObfuscation(ObfuscationCause::DepthLimited)
+            )
+        })
+    };
+    let out = run(&with_limit(), &[], Some(&FakeModel::quiet()));
+    assert_eq!(out.severity(), Severity::High);
+    assert!(has_cause(&out), "{:?}", out.reasons);
+
+    // 対照: 底まで解けた段（Text）で、モデルが無害と言えば倒さない。
+    let out = run(
+        &with_decoded("pwsh -enc AAAA", "Get-Date"),
+        &[],
+        Some(&FakeModel::quiet()),
+    );
+    assert_eq!(out.severity(), Severity::NeedsReview);
+    assert!(!has_cause(&out));
+}
+
 /// 長いファイルは先頭だけ送ったと注記する。
 #[test]
 fn a_cut_file_is_noted() {

@@ -116,6 +116,20 @@ pub enum RiskReason {
     },
     /// 判定モデルの、これまでの流れと合わせた危険度。
     Sequence(RiskVerdict),
+    /// 難読化された中身を安全と確かめられなかった（fail-closed。D-124）。解析しきれないものは
+    /// 危険側へ倒す——**確かめられなかっただけで、危険と判明したわけではない**（境界ではない）。
+    OpaqueObfuscation(ObfuscationCause),
+}
+
+/// 難読化を解析しきれなかった理由（D-124）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObfuscationCause {
+    /// 判定モデル（Ollaya）が使えないのに、難読化された中身がある。機械の判定は字面しか読めないので、
+    /// 解読された中身が安全かを確かめる手段が無い。
+    ModelUnavailable,
+    /// 解読の上限に達し、その先にまだ難読化が残っている（底まで解けていない）。一番下で何が走るかを
+    /// 見ていない。
+    DepthLimited,
 }
 
 impl RiskReason {
@@ -136,6 +150,14 @@ impl RiskReason {
                 verdict.score,
                 verdict.level.reason_ja()
             ),
+            RiskReason::OpaqueObfuscation(cause) => match cause {
+                ObfuscationCause::ModelUnavailable => {
+                    "難読化された中身があるが、判定モデルを使えないので安全と確かめられない".to_string()
+                }
+                ObfuscationCause::DepthLimited => {
+                    "解読の上限に達し、その先にまだ難読化が残っている（底まで解けていない）".to_string()
+                }
+            },
         }
     }
 }
@@ -221,6 +243,61 @@ impl RiskOutcome {
             self.notes.push(RiskNote::ModelUnavailable(reason));
         }
     }
+
+    /// 難読化を解析しきれなかったときは、危険側へ倒す（fail-closed。D-124）。**判定の最後に1回だけ呼ぶ。**
+    ///
+    /// `basis` が確定した後に掛ける——判定モデルが**待ち**の段階（機械の判定だけを先に出している間）では
+    /// 呼ばない。待ちは「使えない」ではないので、ここで倒すと待っている間だけ高に見えてしまう。
+    ///
+    /// - 判定モデルが使えない（機械判定のみ）＋難読化がある → 高（ルール1）
+    /// - 判定モデルが使える＋解読の上限で止まり、その先が残っている → 高（ルール2）
+    ///
+    /// 底まで解けて普通のコードになった段は、その中身を普通に判定する（ここでは倒さない）。
+    /// 許可済みで自動で通る行は承認画面に届かないので、ここも動かない（「許可されている物を除く」）。
+    pub fn apply_fail_closed(&mut self, subject: &PermissionSubject) {
+        match self.basis {
+            RiskBasis::MachineOnly => {
+                if has_obfuscation(subject) {
+                    self.push_reason(RiskReason::OpaqueObfuscation(
+                        ObfuscationCause::ModelUnavailable,
+                    ));
+                }
+            }
+            RiskBasis::WithModel => {
+                if hit_decode_limit(subject) {
+                    self.push_reason(RiskReason::OpaqueObfuscation(ObfuscationCause::DepthLimited));
+                }
+            }
+        }
+    }
+}
+
+/// 難読化された中身がある（ハーネスが符号化された塊を1つでも見つけた）。解読できたか否かは問わない
+/// ——「難読化を使っている」ことが fail-closed の引き金である（D-124 ルール1）。
+fn has_obfuscation(subject: &PermissionSubject) -> bool {
+    decoded_layers(subject).iter().any(|l| {
+        matches!(
+            l.outcome,
+            DecodeOutcome::Text { .. }
+                | DecodeOutcome::NotText
+                | DecodeOutcome::DepthLimit { .. }
+                | DecodeOutcome::SizeLimit { .. }
+                | DecodeOutcome::CountLimit { .. }
+                | DecodeOutcome::Unreadable
+        )
+    })
+}
+
+/// 解読の上限（深さ・大きさ・段数）で止めた段がある＝その先にまだ難読化が残っている（D-124 ルール2）。
+fn hit_decode_limit(subject: &PermissionSubject) -> bool {
+    decoded_layers(subject).iter().any(|l| {
+        matches!(
+            l.outcome,
+            DecodeOutcome::DepthLimit { .. }
+                | DecodeOutcome::SizeLimit { .. }
+                | DecodeOutcome::CountLimit { .. }
+        )
+    })
 }
 
 /// 判定モデルへ送るコマンドの行。`run_shell`は行そのもの、`run_program`は人が読む1行（[`harness_core::ProgramSubject::describe`]）。
@@ -352,6 +429,8 @@ pub async fn assess(
 ) -> Option<RiskOutcome> {
     let mut out = machine(subject)?;
     let Some(model) = model else {
+        // 判定モデルを使わない設定。機械の判定だけで決まる（basis は MachineOnly）。
+        out.apply_fail_closed(subject);
         return Some(out);
     };
     let line = subject_line(subject)?;
@@ -469,6 +548,9 @@ pub async fn assess(
             Err(e) => out.note_model_error(e.to_string()),
         }
     }
+    // 難読化を解析しきれなかったときは危険側へ倒す（D-124）。basis は上で確定している
+    // ——モデルの呼び出しが全部失敗していれば MachineOnly のままなので、ルール1が掛かる。
+    out.apply_fail_closed(subject);
     Some(out)
 }
 

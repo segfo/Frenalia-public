@@ -479,9 +479,11 @@ pub(crate) fn start_risk(
     let history = app.command_history.entries();
     let history = history.as_slice();
     let view = app.pending_permission.as_ref()?;
-    let machine = approval_risk::machine(&view.subject)?;
+    let mut machine = approval_risk::machine(&view.subject)?;
     let Some(risk) = risk else {
-        // 判定モデルを使わない設定。機械の判定で決まり（待つものは無い）。
+        // 判定モデルを使わない設定。機械の判定で決まり（待つものは無い）。難読化は解析できないので
+        // 危険側へ倒す（D-124 ルール1。`assess`のモデル未設定の経路と同じ扱い）。
+        machine.apply_fail_closed(&view.subject);
         let view = app.pending_permission.as_mut()?;
         view.assessment = Some(RiskView::done(machine.clone(), None));
         return Some(RiskGate::Ready(machine));
