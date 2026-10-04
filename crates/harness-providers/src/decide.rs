@@ -80,9 +80,14 @@ struct DecideResponse {
 /// 欄が足りるかは読む側（`decision::questions::read_*`）が見て、足りなければ`Err`にする。
 pub fn parse_answers(body: &str) -> Result<Answers, RiskCheckError> {
     let parsed: DecideResponse = serde_json::from_str(body).map_err(|e| {
-        RiskCheckError(format!("判定モデルの応答を読めなかった（answers が無い）: {e}"))
+        RiskCheckError(format!(
+            "判定モデルの応答を読めなかった（answers が無い）: {e}"
+        ))
     })?;
-    Ok(Answers::new(Value::Object(parsed.answers), parsed.state_truncated))
+    Ok(Answers::new(
+        Value::Object(parsed.answers),
+        parsed.state_truncated,
+    ))
 }
 
 /// 送る本文。問いは`id`を鍵にした1つのオブジェクトにする（Ollaya の`questions`の形）。
@@ -96,7 +101,11 @@ fn request_body(model: &str, state: &Value, questions: &[Question]) -> Value {
 
 #[async_trait]
 impl DecisionModel for DecideClient {
-    async fn decide(&self, state: &Value, questions: &[Question]) -> Result<Answers, RiskCheckError> {
+    async fn decide(
+        &self,
+        state: &Value,
+        questions: &[Question],
+    ) -> Result<Answers, RiskCheckError> {
         let body = request_body(&self.model, state, questions);
         let response = self
             .http

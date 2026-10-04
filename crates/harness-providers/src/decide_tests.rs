@@ -31,7 +31,8 @@ fn a_response_without_answers_is_an_error_and_a_missing_answer_is_too() {
     assert!(parse_answers("not json").is_err());
     assert!(parse_answers("{}").is_err());
     // 別の問いの答えしか無いとき（サーバの形が変わった場合など）、読む側で`Err`になる。黙って「低い」にしない。
-    let other = parse_answers(r#"{"answers":{"category":{"type":"choice","choice":"x"}}}"#).unwrap();
+    let other =
+        parse_answers(r#"{"answers":{"category":{"type":"choice","choice":"x"}}}"#).unwrap();
     assert!(questions::read_command_risk(&other).is_err());
 }
 
@@ -46,8 +47,12 @@ fn a_truncated_state_is_reported() {
 /// `preserve_order`が有効になって並びが変わった——§1.9 の測定を撃ち直し、境目の値を見直してから直すこと。
 #[test]
 fn the_request_body_keys_are_in_name_order_as_measured() {
-    let body = request_body("m", &command_context_state("ls", &[]), &context_questions()).to_string();
-    let at = |key: &str| body.find(&format!("\"{key}\"")).unwrap_or_else(|| panic!("{key}: {body}"));
+    let body =
+        request_body("m", &command_context_state("ls", &[]), &context_questions()).to_string();
+    let at = |key: &str| {
+        body.find(&format!("\"{key}\""))
+            .unwrap_or_else(|| panic!("{key}: {body}"))
+    };
     assert!(at("command") < at("history"), "{body}");
     assert!(at("needs_decoding") < at("reads_source"), "{body}");
     assert!(at("reads_source") < at("risk"), "{body}");
@@ -120,9 +125,15 @@ async fn the_state_and_the_questions_are_what_goes_over_the_wire() {
     let body: serde_json::Value =
         serde_json::from_str(&sent[sent.find("\r\n\r\n").unwrap() + 4..]).expect("本文はJSON");
     assert_eq!(body["model"], "winnow:e4b");
-    assert_eq!(body["state"], serde_json::json!({"command": "rm C:\\Windows\\System32\\calc.exe"}));
+    assert_eq!(
+        body["state"],
+        serde_json::json!({"command": "rm C:\\Windows\\System32\\calc.exe"})
+    );
     assert_eq!(body["questions"]["risk"], questions::command_risk().spec);
-    assert!(body.get("preset").is_none(), "Ollaya の設定（preset）は使わない: {body}");
+    assert!(
+        body.get("preset").is_none(),
+        "Ollaya の設定（preset）は使わない: {body}"
+    );
 }
 
 #[tokio::test]
@@ -185,26 +196,41 @@ async fn live_the_danger_line_separates_the_measured_harmless_lines_from_the_dan
         r"del /s /q C:\Users",
     ];
     for line in harmless {
-        let v = assess_command_risk(&client, line).await.expect("実機の応答");
+        let v = assess_command_risk(&client, line)
+            .await
+            .expect("実機の応答");
         println!("{:>5.2}  {:?}  harmless   {line}", v.score, v.level);
         assert_eq!(v.level, RiskLevel::Low, "無害な行が危険と出た: {line}");
     }
     for line in dangerous {
-        let v = assess_command_risk(&client, line).await.expect("実機の応答");
+        let v = assess_command_risk(&client, line)
+            .await
+            .expect("実機の応答");
         println!("{:>5.2}  {:?}  dangerous  {line}", v.score, v.level);
         assert_eq!(v.level, RiskLevel::Danger, "危険な行が赤にならない: {line}");
     }
     // **越えない危険な行がある**（赤が出ないことは安全を意味しない）。出ないことをここで記録しておく。
-    let v = assess_command_risk(&client, r"rm C:\test.txt").await.expect("実機の応答");
-    println!("{:>5.2}  {:?}  not caught rm C:\\test.txt", v.score, v.level);
+    let v = assess_command_risk(&client, r"rm C:\test.txt")
+        .await
+        .expect("実機の応答");
+    println!(
+        "{:>5.2}  {:?}  not caught rm C:\\test.txt",
+        v.score, v.level
+    );
     // 形2（流れと一緒に4問）で、解読が要るかが分かれる。
-    for (line, expected) in [("pwsh -enc cwB5AHMAdABlAG0AaQBuAGYAbwA=", true), ("ls", false)] {
+    for (line, expected) in [
+        ("pwsh -enc cwB5AHMAdABlAG0AaQBuAGYAbwA=", true),
+        ("ls", false),
+    ] {
         let answers = client
             .decide(&command_context_state(line, &[]), &context_questions())
             .await
             .expect("実機の応答");
         let decode = questions::read_needs_decoding(&answers).unwrap();
-        println!("{:>5.2}  needs_decoding={}  {line}", decode.probability, decode.yes);
+        println!(
+            "{:>5.2}  needs_decoding={}  {line}",
+            decode.probability, decode.yes
+        );
         assert_eq!(decode.yes, expected, "{line}");
     }
 }

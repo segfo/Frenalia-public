@@ -11,6 +11,7 @@
 //! リトライ/リアクティブ圧縮・JSONLセッション永続化（`session`モジュール）を追加した。
 
 pub mod approval_ledger;
+pub mod approval_risk;
 pub mod approval_summary;
 pub mod compaction;
 pub mod degeneracy;

@@ -101,7 +101,11 @@ impl Answers {
 #[async_trait]
 pub trait DecisionModel: Send + Sync {
     /// `state`について`questions`に答える。1回の呼び出しで全部の問いに答えが返る。
-    async fn decide(&self, state: &Value, questions: &[Question]) -> Result<Answers, RiskCheckError>;
+    async fn decide(
+        &self,
+        state: &Value,
+        questions: &[Question],
+    ) -> Result<Answers, RiskCheckError>;
 }
 
 /// コマンドの危険度だけを聞くときの入力（モジュールdocの形1）。

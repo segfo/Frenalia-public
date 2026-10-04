@@ -58,13 +58,21 @@ fn every_way_of_writing_the_windows_folder_is_the_same_place() {
         (r"Remove-Item \\?\C:\Windows\x", System, Delete),
         (r"Remove-Item \Windows\x", System, Delete),
         (r"Remove-Item C:\Temp\..\WINDOWS\x", System, Delete),
-        (r#"Remove-Item "C:\Program Files\App" -Recurse"#, System, Delete),
+        (
+            r#"Remove-Item "C:\Program Files\App" -Recurse"#,
+            System,
+            Delete,
+        ),
         (r"Remove-Item ${env:ProgramFiles(x86)}\App", System, Delete),
         (r"del %ProgramData%\x", System, Delete),
         (r"Remove-Item C:\Users -Recurse", System, Delete),
         ("rm -rf /etc", System, Delete),
         ("sudo rm -rf /usr/lib", System, Delete),
-        (r"Remove-Item (Join-Path $env:windir 'System32\x')", System, Delete),
+        (
+            r"Remove-Item (Join-Path $env:windir 'System32\x')",
+            System,
+            Delete,
+        ),
     ];
     assert_eq!(misses(&cases), Vec::<String>::new());
 }
@@ -74,19 +82,38 @@ fn every_way_of_writing_the_windows_folder_is_the_same_place() {
 fn rewriting_system_places_is_found_too() {
     let cases = [
         (r"cp a.txt C:\Windows\", System, Modify),
-        (r"Copy-Item -Path a -Destination $env:windir", System, Modify),
+        (
+            r"Copy-Item -Path a -Destination $env:windir",
+            System,
+            Modify,
+        ),
         ("cp -r src /etc", System, Modify),
         (r"Move-Item a.dll C:\Windows\System32\a.dll", System, Modify),
         (r"echo x > C:\Windows\x.txt", System, Modify),
-        (r"Set-Content -Path $env:SystemRoot\x -Value 1", System, Modify),
-        (r"icacls C:\Windows\System32 /grant Everyone:F", System, Modify),
+        (
+            r"Set-Content -Path $env:SystemRoot\x -Value 1",
+            System,
+            Modify,
+        ),
+        (
+            r"icacls C:\Windows\System32 /grant Everyone:F",
+            System,
+            Modify,
+        ),
         (r"takeown /f C:\Windows\System32\x", System, Modify),
         (r"Rename-Item C:\Windows\x y", System, Modify),
-        (r"[IO.File]::WriteAllText('C:\Windows\x', 'data')", System, Modify),
+        (
+            r"[IO.File]::WriteAllText('C:\Windows\x', 'data')",
+            System,
+            Modify,
+        ),
     ];
     assert_eq!(misses(&cases), Vec::<String>::new());
     for (line, _, _) in cases {
-        assert!(assess_line(line).iter().all(DamageFinding::is_high), "{line}");
+        assert!(
+            assess_line(line).iter().all(DamageFinding::is_high),
+            "{line}"
+        );
     }
 }
 
@@ -95,8 +122,16 @@ fn rewriting_system_places_is_found_too() {
 fn user_data_is_high_only_when_it_is_deleted() {
     let deleted = [
         (r"del %AppData%\x", UserData, Delete),
-        (r"Remove-Item $env:LOCALAPPDATA\Programs -Recurse", UserData, Delete),
-        (r"Remove-Item C:\Users\bob\AppData\Roaming\x", UserData, Delete),
+        (
+            r"Remove-Item $env:LOCALAPPDATA\Programs -Recurse",
+            UserData,
+            Delete,
+        ),
+        (
+            r"Remove-Item C:\Users\bob\AppData\Roaming\x",
+            UserData,
+            Delete,
+        ),
         (r"Remove-Item ~\AppData -Recurse", UserData, Delete),
         (r"Remove-Item $HOME\AppData\Local\x", UserData, Delete),
         (r"rd /s /q %USERPROFILE%", UserData, Delete),
@@ -104,11 +139,18 @@ fn user_data_is_high_only_when_it_is_deleted() {
     ];
     assert_eq!(misses(&deleted), Vec::<String>::new());
     for (line, _, _) in deleted {
-        assert!(assess_line(line).iter().any(DamageFinding::is_high), "{line}");
+        assert!(
+            assess_line(line).iter().any(DamageFinding::is_high),
+            "{line}"
+        );
     }
     let rewritten = [
         (r"cp a.json %AppData%\app\settings.json", UserData, Modify),
-        (r"Set-Content $env:LOCALAPPDATA\app\x.txt 1", UserData, Modify),
+        (
+            r"Set-Content $env:LOCALAPPDATA\app\x.txt 1",
+            UserData,
+            Modify,
+        ),
         (r"echo x >> %AppData%\x.log", UserData, Modify),
     ];
     assert_eq!(misses(&rewritten), Vec::<String>::new());
@@ -124,16 +166,36 @@ fn user_data_is_high_only_when_it_is_deleted() {
 #[test]
 fn targets_written_elsewhere_in_the_statement_are_followed() {
     let cases = [
-        (r"Get-ChildItem C:\Windows\Temp | Remove-Item -Recurse", System, Delete),
+        (
+            r"Get-ChildItem C:\Windows\Temp | Remove-Item -Recurse",
+            System,
+            Delete,
+        ),
         (r"gci $env:windir | % { Remove-Item $_ }", System, Delete),
         (r"if ($true) { rm C:\Windows\x }", System, Delete),
         (r"cmd /c del C:\Windows\x", System, Delete),
         (r#"cmd /c "del /q C:\Windows\x""#, System, Delete),
-        (r"pwsh -NoProfile -c Remove-Item C:\Windows\x", System, Delete),
-        (r#"pwsh -Command "Remove-Item C:\Windows\x""#, System, Delete),
-        (r#"python -c "import shutil; shutil.rmtree('C:/Windows')""#, System, Delete),
+        (
+            r"pwsh -NoProfile -c Remove-Item C:\Windows\x",
+            System,
+            Delete,
+        ),
+        (
+            r#"pwsh -Command "Remove-Item C:\Windows\x""#,
+            System,
+            Delete,
+        ),
+        (
+            r#"python -c "import shutil; shutil.rmtree('C:/Windows')""#,
+            System,
+            Delete,
+        ),
         ("bash -c 'rm -rf /etc'", System, Delete),
-        (r"[IO.Directory]::Delete('C:\Windows\x', $true)", System, Delete),
+        (
+            r"[IO.Directory]::Delete('C:\Windows\x', $true)",
+            System,
+            Delete,
+        ),
         (r"Get-Date; Remove-Item C:\Windows\x", System, Delete),
         (r"robocopy C:\empty C:\Windows /MIR", System, Delete),
     ];
@@ -145,7 +207,11 @@ fn targets_written_elsewhere_in_the_statement_are_followed() {
 fn the_directory_changed_in_the_line_is_the_base_of_relative_paths() {
     let cases = [
         (r"cd C:\Windows; del x", System, Delete),
-        (r"Set-Location -Path $env:windir; Remove-Item -Recurse System32", System, Delete),
+        (
+            r"Set-Location -Path $env:windir; Remove-Item -Recurse System32",
+            System,
+            Delete,
+        ),
         (r"cd C:\; del /s /q *", DriveRoot, Delete),
         (r"cd %AppData%; rd /s /q app", UserData, Delete),
     ];
@@ -196,14 +262,23 @@ fn run_program_arguments_are_judged_the_same_way() {
     assert!(found("cmd", &["/c", "del", r"C:\Windows\x"])
         .iter()
         .any(|f| f.place == System && f.action == Delete));
-    assert!(found("pwsh", &["-NoProfile", "-Command", r"Remove-Item C:\Windows\x"])
-        .iter()
-        .any(|f| f.place == System && f.action == Delete));
-    assert!(found(r"C:\Windows\System32\robocopy.exe", &[r"C:\empty", r"C:\Windows", "/MIR"])
-        .iter()
-        .any(|f| f.place == System && f.action == Delete));
+    assert!(found(
+        "pwsh",
+        &["-NoProfile", "-Command", r"Remove-Item C:\Windows\x"]
+    )
+    .iter()
+    .any(|f| f.place == System && f.action == Delete));
+    assert!(found(
+        r"C:\Windows\System32\robocopy.exe",
+        &[r"C:\empty", r"C:\Windows", "/MIR"]
+    )
+    .iter()
+    .any(|f| f.place == System && f.action == Delete));
     // 対照: 起動するプログラムが C:\Windows にあっても、それ自体は消す先ではない。
-    assert_eq!(found(r"C:\Windows\System32\cmd.exe", &["/c", "dir"]), Vec::new());
+    assert_eq!(
+        found(r"C:\Windows\System32\cmd.exe", &["/c", "dir"]),
+        Vec::new()
+    );
     assert_eq!(found("git", &["status"]), Vec::new());
     assert_eq!(found("python", &["build.py"]), Vec::new());
 }
@@ -212,7 +287,10 @@ fn run_program_arguments_are_judged_the_same_way() {
 fn the_description_names_the_place_the_target_the_action_and_the_command() {
     let found = assess_line(r"Remove-Item C:\Windows\System32\x");
     assert_eq!(
-        found.iter().map(DamageFinding::describe_ja).collect::<Vec<_>>(),
+        found
+            .iter()
+            .map(DamageFinding::describe_ja)
+            .collect::<Vec<_>>(),
         vec![r"システムの場所（C:\Windows\System32\x）を消すコマンド（Remove-Item）".to_string()]
     );
 }

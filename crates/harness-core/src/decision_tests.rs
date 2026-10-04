@@ -40,7 +40,10 @@ fn the_questions_are_word_for_word_the_ones_that_were_measured() {
 #[test]
 fn the_context_call_sends_the_four_questions_that_were_measured_together() {
     let ids: Vec<&str> = context_questions().iter().map(|q| q.id).collect();
-    assert_eq!(ids, ["risk", "needs_decoding", "reads_source", "sequence_risk"]);
+    assert_eq!(
+        ids,
+        ["risk", "needs_decoding", "reads_source", "sequence_risk"]
+    );
     assert_eq!(command_state("ls"), json!({"command": "ls"}));
     assert_eq!(
         command_context_state("ls", &["git status".to_string()]),
@@ -54,16 +57,26 @@ fn the_measured_values_land_on_the_side_they_were_taken_from() {
     let answers = |id: &str, field: &str, v: f64| Answers::new(json!({ id: { field: v } }), false);
     for (p, yes) in [(0.71, true), (0.94, true), (0.16, false), (0.048, false)] {
         assert_eq!(
-            read_needs_decoding(&answers("needs_decoding", "noul", p)).unwrap().yes,
+            read_needs_decoding(&answers("needs_decoding", "noul", p))
+                .unwrap()
+                .yes,
             yes,
             "needs_decoding {p}"
         );
     }
     // ファイル読み: 重なる範囲がある。0.63（`python build.py`）は拾い、0.48（`cmd /c build.bat`）・0.25
     // （`source venv/bin/activate`）は落とし、0.79（`Get-Content notes.txt`）は拾いすぎる——測ったとおりの限界を固定しておく。
-    for (p, yes) in [(0.63, true), (0.48, false), (0.25, false), (0.79, true), (0.24, false)] {
+    for (p, yes) in [
+        (0.63, true),
+        (0.48, false),
+        (0.25, false),
+        (0.79, true),
+        (0.24, false),
+    ] {
         assert_eq!(
-            read_reads_source(&answers("reads_source", "noul", p)).unwrap().yes,
+            read_reads_source(&answers("reads_source", "noul", p))
+                .unwrap()
+                .yes,
             yes,
             "reads_source {p}"
         );
@@ -75,7 +88,9 @@ fn the_measured_values_land_on_the_side_they_were_taken_from() {
         (0.59, RiskLevel::Low),
     ] {
         assert_eq!(
-            read_sequence_risk(&answers("sequence_risk", "score", s)).unwrap().level,
+            read_sequence_risk(&answers("sequence_risk", "score", s))
+                .unwrap()
+                .level,
             level,
             "sequence_risk {s}"
         );
@@ -87,7 +102,9 @@ fn the_measured_values_land_on_the_side_they_were_taken_from() {
         (0.84, RiskLevel::Low),
     ] {
         assert_eq!(
-            read_source_risk(&answers("source_risk", "score", s)).unwrap().level,
+            read_source_risk(&answers("source_risk", "score", s))
+                .unwrap()
+                .level,
             level,
             "source_risk {s}"
         );
@@ -102,7 +119,10 @@ fn a_missing_or_broken_answer_is_an_error_not_a_low_value() {
     assert!(read_needs_decoding(&empty).is_err());
     let wrong_field = Answers::new(json!({"risk": {"noul": 0.1}}), false);
     assert!(read_command_risk(&wrong_field).is_err());
-    let out_of_range = Answers::new(json!({"needs_decoding": {"noul": 1.5}, "risk": {"score": 2.5}}), false);
+    let out_of_range = Answers::new(
+        json!({"needs_decoding": {"noul": 1.5}, "risk": {"score": 2.5}}),
+        false,
+    );
     assert!(read_needs_decoding(&out_of_range).is_err());
     assert!(read_command_risk(&out_of_range).is_err());
     let not_a_number = Answers::new(json!({"risk": {"score": "high"}}), false);
@@ -135,7 +155,11 @@ struct Recorder {
 
 #[async_trait]
 impl DecisionModel for Recorder {
-    async fn decide(&self, state: &Value, questions: &[Question]) -> Result<Answers, RiskCheckError> {
+    async fn decide(
+        &self,
+        state: &Value,
+        questions: &[Question],
+    ) -> Result<Answers, RiskCheckError> {
         self.seen
             .lock()
             .unwrap()
@@ -157,13 +181,21 @@ async fn single_entry_points() {
     };
     let verdict = assess_command_risk(&model, "rm -rf /").await.unwrap();
     assert_eq!(verdict.level, RiskLevel::Danger);
-    let (source, cut) = assess_source_risk(&model, "a.ps1", "Write-Host 1").await.unwrap();
+    let (source, cut) = assess_source_risk(&model, "a.ps1", "Write-Host 1")
+        .await
+        .unwrap();
     assert_eq!(source.level, RiskLevel::Low);
-    assert!(cut, "判定モデルの側で切り詰められたら、短くても「一部だけ」と返す");
+    assert!(
+        cut,
+        "判定モデルの側で切り詰められたら、短くても「一部だけ」と返す"
+    );
     let seen = model.seen.lock().unwrap();
     assert_eq!(seen[0], (json!({"command": "rm -rf /"}), vec!["risk"]));
     assert_eq!(
         seen[1],
-        (json!({"path": "a.ps1", "code": "Write-Host 1"}), vec!["source_risk"])
+        (
+            json!({"path": "a.ps1", "code": "Write-Host 1"}),
+            vec!["source_risk"]
+        )
     );
 }

@@ -593,16 +593,17 @@ impl Path {
             return None;
         }
         let bytes = text.as_bytes();
-        let (drive, rest, absolute) = if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-            (Some(bytes[0] as char), &text[2..], true)
-        } else if let Some(rest) = text.strip_prefix('\\') {
-            // ドライブを書かない根（`\Windows`）。今のドライブは分からないので、システムのドライブとして読む。
-            (Some('c'), rest, true)
-        } else if text.starts_with('/') {
-            (None, text, true)
-        } else {
-            (None, text, false)
-        };
+        let (drive, rest, absolute) =
+            if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+                (Some(bytes[0] as char), &text[2..], true)
+            } else if let Some(rest) = text.strip_prefix('\\') {
+                // ドライブを書かない根（`\Windows`）。今のドライブは分からないので、システムのドライブとして読む。
+                (Some('c'), rest, true)
+            } else if text.starts_with('/') {
+                (None, text, true)
+            } else {
+                (None, text, false)
+            };
         let mut base = if absolute {
             Path {
                 drive,
@@ -630,8 +631,13 @@ impl Path {
             Some(_) => match parts.as_slice() {
                 [] => Some(DamagePlace::DriveRoot),
                 [only] if is_all(only) => Some(DamagePlace::DriveRoot),
-                ["windows" | "program files" | "program files (x86)" | "programdata" | "boot"
-                | "recovery" | "system volume information", ..] => Some(DamagePlace::System),
+                ["windows"
+                | "program files"
+                | "program files (x86)"
+                | "programdata"
+                | "boot"
+                | "recovery"
+                | "system volume information", ..] => Some(DamagePlace::System),
                 ["users"] => Some(DamagePlace::System),
                 ["users", only] if is_all(only) => Some(DamagePlace::System),
                 ["users", _] => Some(DamagePlace::UserData),
@@ -707,7 +713,10 @@ fn fold_env_references(line: &str) -> String {
         if line[i..].starts_with('%') {
             if let Some(end) = line[i + 1..].find('%') {
                 let name = &line[i + 1..i + 1 + end];
-                if !name.is_empty() && !name.contains(char::is_whitespace) && !name.contains(['\\', '/']) {
+                if !name.is_empty()
+                    && !name.contains(char::is_whitespace)
+                    && !name.contains(['\\', '/'])
+                {
                     out.push('%');
                     out.push_str(&name.replace(['(', ')'], "_"));
                     out.push('%');

@@ -30,7 +30,9 @@ pub use app::{
     Action, AppState, BusyEnd, BusyProgress, CommitSelection, MemoryCommand, PartialFile,
     ReviewPanelState, ReviewRow, ReviewTarget, SlashCommand,
 };
-pub use app::{ApprovalStage, PermissionView, PreviousCopy, SummaryState, SummaryWait};
+pub use app::{
+    ApprovalStage, PermissionView, PreviousCopy, RiskView, SummaryState, SummaryWait,
+};
 pub use approvals::{ApprovalRisk, ApprovalSummary};
 
 /// 承認画面を1枚描く（`examples/approval-frames.rs`のための入口）。
@@ -751,23 +753,19 @@ pub async fn run(
                                 .as_ref()
                                 .map(|v| v.id.clone())
                                 .unwrap_or_default();
-                            // 危険度の判定を先に起こす（要約が結果を待てるように）。判定が無い構成では何も起きない。
-                            let risk_gate = match &approval_risk {
-                                Some(risk) => {
-                                    let token = tokio_util::sync::CancellationToken::new();
-                                    let gate = approvals::start_risk(
-                                        risk,
-                                        &background_tx,
-                                        &mut app,
-                                        &token,
-                                    );
-                                    if gate.is_some() {
-                                        risk_cancel = Some(token);
-                                    }
-                                    gate
-                                }
-                                None => None,
-                            };
+                            // 危険度の判定を先に起こす（要約が結果を待てるように）。機械の判定はいつも出し、
+                            // 判定モデルは設定で有効なときだけ使う。
+                            let token = tokio_util::sync::CancellationToken::new();
+                            let risk_gate = approvals::start_risk(
+                                approval_risk.as_ref(),
+                                &[],
+                                &background_tx,
+                                &mut app,
+                                &token,
+                            );
+                            if risk_gate.is_some() {
+                                risk_cancel = Some(token);
+                            }
                             if let Some(summary) = &approval_summary {
                                 summary_cancel = approvals::start_summary(
                                     summary,
