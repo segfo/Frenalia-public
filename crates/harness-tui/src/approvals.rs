@@ -326,6 +326,10 @@ fn decoded_pieces(decoded: &[DecodedLayer]) -> Vec<SummaryPiece> {
                     layer.depth,
                     layer.source.spelling()
                 ),
+                EncodedSource::BareBase64 => format!(
+                    "encoded payload, layer {} (a base64 string sitting in the command line)",
+                    layer.depth
+                ),
                 EncodedSource::LocatedByModel(encoding) => format!(
                     "encoded payload, layer {} (a {} string that a model pointed at)",
                     layer.depth,

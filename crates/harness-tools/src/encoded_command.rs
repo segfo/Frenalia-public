@@ -324,8 +324,11 @@ pub(crate) fn as_text(bytes: &[u8], source: EncodedSource) -> Option<(TextEncodi
         EncodedSource::EncodedCommand | EncodedSource::EncodedArguments => {
             Some((TextEncoding::Utf16Le, utf16le_lossy(bytes)))
         }
-        // LLM が場所を示した中身も、後ろのコードがどう読むかは分からないので`FromBase64String`と同じ読み方。
-        EncodedSource::FromBase64String | EncodedSource::LocatedByModel(_) => {
+        // LLM が場所を示した中身・機械で見つけた塊も、後ろのコードがどう読むかは分からないので
+        // `FromBase64String`と同じ読み方。
+        EncodedSource::FromBase64String
+        | EncodedSource::LocatedByModel(_)
+        | EncodedSource::BareBase64 => {
             let utf8 = std::str::from_utf8(bytes).ok().map(str::to_string);
             let utf16 = bytes
                 .len()
@@ -399,9 +402,81 @@ enum Value {
     Text(String),
 }
 
-/// 文字列を行として読み、符号化された中身を探す。
+/// 文字列を行として読み、符号化された中身を探す。決まった置き場所（`-EncodedCommand`の値・
+/// `FromBase64String('…')`の引数）を読んだうえで、**置き場所を問わず字面に出ている base64 の塊**も探す
+/// （[`scan_bare_base64`]）。
 fn scan_text(text: &str) -> Vec<Found> {
-    scan(text, false, 0)
+    let mut found = scan(text, false, 0);
+    found.extend(scan_bare_base64(text, &found));
+    found
+}
+
+/// 機械で探す base64 の塊の、最短の長さ（文字）。これより短い塊は見ない。
+const MIN_BARE_BASE64: usize = 16;
+/// 機械で探した塊を「読めた」とみなす、解読した中身のASCIIの割合の下限。
+///
+/// **置き場所が手がかりにならないぶん、中身で絞る。** base64 の文字しか使わない長い語（識別子・ハッシュ）は
+/// 偶然このふるいを通ることがあり、通ると承認画面に意味の無い段が1つ増える。走らせるコードはほぼASCIIなので、
+/// ここで切る。
+const MIN_BARE_ASCII_RATIO: f32 = 0.8;
+
+/// 行の中に**そのまま置かれた base64 の塊**を、場所を問わず探す（`already`に在る値は重ねない）。
+///
+/// 決まった置き場所の読み取りだけでは、`echo <base64> | ForEach-Object { … FromBase64String($_) }`のように
+/// **変数を経由して渡す形**を拾えず、解読が LLM の指し示し（`harness_engine::encoded_span`）頼りになる。
+/// ここは同じ中身を機械だけで拾う。
+///
+/// **読めたものだけを返す**（解読して文字になり、ASCIIが[`MIN_BARE_ASCII_RATIO`]以上）。符号化だと名乗っていない
+/// 塊について「解読できなかった」と並べても手がかりにならないからである。
+fn scan_bare_base64(text: &str, already: &[Found]) -> Vec<Found> {
+    // **詰め物の`=`を外して比べる。** 行を語に割る側は`=`を区切りとして扱うので、決まった置き場所で読んだ値には
+    // 詰め物が付かず、ここで拾う塊には付く。そのまま比べると同じ中身が2段に出る。
+    let same = |a: &str, b: &str| a.trim_end_matches('=') == b.trim_end_matches('=');
+    let seen = |found: &[Found], candidate: &str| {
+        found.iter().any(|f| match &f.value {
+            Value::Text(text) => same(text, candidate),
+            _ => false,
+        })
+    };
+    let mut out = Vec::new();
+    for candidate in base64_runs(text) {
+        if seen(already, &candidate) || seen(&out, &candidate) {
+            continue;
+        }
+        let readable = base64_decode(&candidate)
+            .and_then(|bytes| as_text(&bytes, EncodedSource::BareBase64))
+            .is_some_and(|(_, text)| ascii_ratio(&text) >= MIN_BARE_ASCII_RATIO);
+        if readable {
+            out.push(Found {
+                source: EncodedSource::BareBase64,
+                value: Value::Text(candidate),
+            });
+        }
+    }
+    out
+}
+
+/// `text`の中の、base64 として読みうる塊（長さが[`MIN_BARE_BASE64`]以上で4の倍数のもの）。
+///
+/// **4の倍数だけを見る**——PowerShell も `.NET` も詰め物まで揃った形しか受け付けないし、普通の語を拾う量がここで大きく減る。
+fn base64_runs(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut run = String::new();
+    let push = |run: &mut String, out: &mut Vec<String>| {
+        if run.len() >= MIN_BARE_BASE64 && run.len().is_multiple_of(4) {
+            out.push(run.clone());
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' {
+            run.push(c);
+        } else {
+            push(&mut run, &mut out);
+        }
+    }
+    push(&mut run, &mut out);
+    out
 }
 
 /// `in_powershell`は、行の頭が既に PowerShell の起動の引数の中か（引用符の中を読み直すとき）。

@@ -180,6 +180,11 @@ fn decoded_layer_lines(layer: &DecodedLayer) -> Vec<ApprovalLine> {
             layer.depth,
             layer.source.spelling()
         ),
+        // 置き場所が手がかりでないので、どこで見つけたかではなく「行の中に置かれていた」と出す。
+        EncodedSource::BareBase64 => format!(
+            "{indent}{}段目: 行の中に置かれた base64 の文字列",
+            layer.depth
+        ),
         // LLM が場所を示し、ハーネスが解読した（`harness_engine::encoded_span`）。示したのが LLM であることを隠さない。
         EncodedSource::LocatedByModel(encoding) => format!(
             "{indent}{}段目: LLM が場所を示した {} の文字列（解読はハーネス）",

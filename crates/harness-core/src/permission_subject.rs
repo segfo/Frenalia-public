@@ -76,6 +76,13 @@ pub enum EncodedSource {
     EncodedArguments,
     /// `[Convert]::FromBase64String('…')`の文字列リテラル。
     FromBase64String,
+    /// **行の中にそのまま置かれた base64 の塊**（場所を問わずハーネスが見つけた）。
+    ///
+    /// `-EncodedCommand`の値や`FromBase64String('…')`の引数のように決まった置き場所に無くても、
+    /// `echo <base64> | ForEach-Object { … FromBase64String($_) }`のように**変数を経由して渡す形**があるので、
+    /// 字面に出ている塊は置き場所に関わらず読む。読めたときだけ1段として残す（読めなければ何も出さない——
+    /// 符号化だと名乗っていないものを「解読できなかった」と並べても、見る人の手がかりにならない）。
+    BareBase64,
     /// 機械の解読が何も取れなかった行で、**LLM が「ここが符号化された中身」と場所を示した**文字列
     /// （`harness_engine::encoded_span`）。**解読はハーネスがする**——LLM には解読した文字列を書かせない
     /// （[BUG-224]: LLM に解かせると中身を取り違えた）。示された文字列が行の中にそのまま在るものだけを解読する。
@@ -86,6 +93,8 @@ pub enum EncodedSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PayloadEncoding {
     Base64,
+    /// RFC 4648 の base32（`A`〜`Z`と`2`〜`7`、詰め物は`=`）。
+    Base32,
     /// 16進（`4765742D…`・`0x47 0x65`・`\x47\x65`）。
     Hex,
     /// 10進の文字コードの並び（`115,121,115`・`[char]105+[char]101`）。
@@ -101,6 +110,7 @@ impl PayloadEncoding {
     pub fn parse(name: &str) -> Option<Self> {
         Some(match name.trim().to_ascii_lowercase().as_str() {
             "base64" => PayloadEncoding::Base64,
+            "base32" => PayloadEncoding::Base32,
             "hex" => PayloadEncoding::Hex,
             "char_codes" => PayloadEncoding::CharCodes,
             "gzip_base64" => PayloadEncoding::GzipBase64,
@@ -113,6 +123,7 @@ impl PayloadEncoding {
     pub fn name(self) -> &'static str {
         match self {
             PayloadEncoding::Base64 => "base64",
+            PayloadEncoding::Base32 => "base32",
             PayloadEncoding::Hex => "hex",
             PayloadEncoding::CharCodes => "char codes",
             PayloadEncoding::GzipBase64 => "gzip+base64",
@@ -135,6 +146,7 @@ impl EncodedSource {
             EncodedSource::EncodedCommand => "-EncodedCommand",
             EncodedSource::EncodedArguments => "-EncodedArguments",
             EncodedSource::FromBase64String => "[Convert]::FromBase64String",
+            EncodedSource::BareBase64 => "base64",
             EncodedSource::LocatedByModel(_) => "(located by the model)",
         }
     }

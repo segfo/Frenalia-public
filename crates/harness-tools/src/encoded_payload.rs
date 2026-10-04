@@ -18,7 +18,7 @@
 //!
 //! - **LLM が場所を示さなかったものは解読しない。** 判定モデルも LLM も、攻撃者が書いたかもしれない行を読むので、
 //!   別の場所を指すよう曲げられ得る。そのときは何も解読されないか、無害な部分だけが解読される
-//! - 読める書き方は[`PayloadEncoding`]の5つだけ。XOR・独自の暗号・実行時に組み立てる文字列は読めない
+//! - 読める書き方は[`PayloadEncoding`]のものだけ。XOR・独自の暗号・実行時に組み立てる文字列は読めない
 //! - 解読した中身は**表示と要約・危険度の判定のためだけ**に使い、照合には使わない（[`crate::encoded_command`]と同じ）
 
 use std::io::Read;
@@ -96,6 +96,7 @@ fn decode_payload(text: &str, encoding: PayloadEncoding, budget: usize) -> (Deco
             };
         }
         PayloadEncoding::Base64 => base64_decode(text),
+        PayloadEncoding::Base32 => base32_decode(text),
         PayloadEncoding::Hex => hex(text),
         PayloadEncoding::GzipBase64 => base64_decode(text)
             .and_then(|b| inflate(flate2::read::GzDecoder::new(b.as_slice()), budget)),
@@ -125,6 +126,28 @@ fn decode_payload(text: &str, encoding: PayloadEncoding, budget: usize) -> (Deco
 fn inflate(reader: impl Read, budget: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     reader.take(budget as u64 + 1).read_to_end(&mut out).ok()?;
+    (!out.is_empty()).then_some(out)
+}
+
+/// RFC 4648 の base32（大小を畳み、詰め物の`=`と空白を読み飛ばす）。読めなければ`None`。
+fn base32_decode(text: &str) -> Option<Vec<u8>> {
+    const T: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut out = Vec::new();
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for c in text
+        .bytes()
+        .filter(|c| !c.is_ascii_whitespace() && *c != b'=')
+    {
+        let value = T.iter().position(|t| *t == c.to_ascii_uppercase())? as u32;
+        acc = (acc << 5) | value;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
     (!out.is_empty()).then_some(out)
 }
 

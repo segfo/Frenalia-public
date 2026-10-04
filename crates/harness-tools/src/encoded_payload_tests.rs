@@ -51,6 +51,9 @@ fn every_supported_encoding_is_decoded_by_the_harness() {
     };
     let cases = [
         ("R2V0LURhdGU=", PayloadEncoding::Base64, "Get-Date"),
+        // base32（RFC 4648。`Get-Date`を符号化したもの）。大小は畳む。
+        ("I5SXILKEMF2GK===", PayloadEncoding::Base32, "Get-Date"),
+        ("i5sxilkemf2gk===", PayloadEncoding::Base32, "Get-Date"),
         ("4765742D44617465", PayloadEncoding::Hex, "Get-Date"),
         ("0x47,0x65,0x74", PayloadEncoding::Hex, "Get"),
         (
