@@ -46,10 +46,10 @@ impl DecideClient {
     pub fn new(base_url: &str, model: &str) -> Result<Self, String> {
         let base = base_url.trim().trim_end_matches('/');
         if base.is_empty() {
-            return Err("risk_base_url が空".to_string());
+            return Err("judge_model_url が空".to_string());
         }
         if model.trim().is_empty() {
-            return Err("risk_model が空".to_string());
+            return Err("judge_model が空".to_string());
         }
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)

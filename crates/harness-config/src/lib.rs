@@ -82,11 +82,15 @@ pub struct Settings {
 ///   "summarize": true,
 ///   "summary_provider": "lmstudio",
 ///   "summary_model": "qwen3-8b",
-///   "risk_check": true,
-///   "risk_base_url": "http://127.0.0.1:11435",
-///   "risk_model": "winnow:e4b"
+///   "use_judge_model": true,
+///   "judge_model_url": "http://127.0.0.1:11435",
+///   "judge_model": "winnow:e4b"
 /// }
 /// ```
+///
+/// 判定モデルの3つの欄は、以前の名前（`risk_check`・`risk_base_url`・`risk_model`）でも読む（`serde(alias)`）。
+/// **この節は知らない項目を黙って捨てる**ので、名前だけ変えると、以前の名前で書いた設定が知らせも無く効かなくなる。
+/// 同じ欄を新旧両方の名前で書くと、読み込みのエラーになる（どちらかを黙って選ばない）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ApprovalSettings {
     /// 承認画面で LLM に中身を要約させるか。省略時は真。
@@ -97,16 +101,19 @@ pub struct ApprovalSettings {
     pub summary_base_url: Option<String>,
     /// 要約に使うモデル。省略時は会話と同じ。
     pub summary_model: Option<String>,
-    /// 承認画面で、外の判定モデル（Ollaya）に危険度を聞くか（`harness_engine::approval_risk`）。
+    /// 承認画面の危険度の判定に、外の判定モデル（Ollaya）も使うか（`harness_engine::approval_risk`）。
     /// **省略時は偽**——偽でも機械の被害判定は動き、承認画面には「危険度: 要確認／高」が出る。
-    /// 聞くと、`risk_base_url`へ出るのは: `run_shell`の行・`run_program`のプログラムと引数・このセッションで走った
+    /// 使うと、`judge_model_url`へ出るのは: `run_shell`の行・`run_program`のプログラムと引数・このセッションで走った
     /// コマンドの流れ（20件まで）・ハーネスが解読した中身・コードとして読まれる縛ったファイルの先頭4,000字。
-    /// 判定は補助で、通す・止めるは決めない。
-    pub risk_check: Option<bool>,
-    /// 判定モデルのサーバ。省略時は`http://127.0.0.1:11435`。
-    pub risk_base_url: Option<String>,
-    /// 判定モデル。省略時は`winnow:e4b`。
-    pub risk_model: Option<String>,
+    /// 判定は補助で、通す・止めるは決めない。以前の名前は`risk_check`。
+    #[serde(alias = "risk_check")]
+    pub use_judge_model: Option<bool>,
+    /// 判定モデルのサーバ。省略時は`http://127.0.0.1:11435`。以前の名前は`risk_base_url`。
+    #[serde(alias = "risk_base_url")]
+    pub judge_model_url: Option<String>,
+    /// 判定モデル。省略時は`winnow:e4b`。以前の名前は`risk_model`。
+    #[serde(alias = "risk_model")]
+    pub judge_model: Option<String>,
 }
 
 /// `.harness/settings.json`の`policy`キー（M15.7）。
@@ -1520,18 +1527,18 @@ mod tests {
         assert!(settings.approval.is_none());
     }
 
-    /// 危険度判定の設定も同じ——**コマンドの1行が`risk_base_url`へ出る**ので、プロジェクト層が
+    /// 判定モデルの設定も同じ——**コマンドの行などが`judge_model_url`へ出る**ので、プロジェクト層が
     /// 有効にしたり送り先を書いたりできてはいけない。ユーザ層の値は残る（対照）。
     #[test]
-    fn project_settings_cannot_turn_on_or_redirect_the_risk_check() {
+    fn project_settings_cannot_turn_on_or_redirect_the_judge_model() {
         let user = serde_json::json!({
-            "approval": { "risk_check": true, "risk_base_url": "http://127.0.0.1:11435" }
+            "approval": { "use_judge_model": true, "judge_model_url": "http://127.0.0.1:11435" }
         });
         let mut merged = user.clone();
         deep_merge(
             &mut merged,
             serde_json::json!({
-                "approval": { "risk_base_url": "http://evil.example", "risk_model": "x" }
+                "approval": { "judge_model_url": "http://evil.example", "judge_model": "x" }
             }),
         );
         clamp_project_approval(&user, &mut merged);
@@ -1539,21 +1546,45 @@ mod tests {
             .unwrap()
             .approval
             .unwrap();
-        assert_eq!(approval.risk_check, Some(true));
+        assert_eq!(approval.use_judge_model, Some(true));
         assert_eq!(
-            approval.risk_base_url.as_deref(),
+            approval.judge_model_url.as_deref(),
             Some("http://127.0.0.1:11435")
         );
-        assert_eq!(approval.risk_model, None);
+        assert_eq!(approval.judge_model, None);
 
         // ユーザ層に何も無ければ、プロジェクト層が有効にしても節ごと消える（既定は無効のまま）。
         let mut merged = serde_json::json!({});
         deep_merge(
             &mut merged,
-            serde_json::json!({ "approval": { "risk_check": true } }),
+            serde_json::json!({ "approval": { "use_judge_model": true } }),
         );
         clamp_project_approval(&serde_json::json!({}), &mut merged);
         let settings: Settings = serde_json::from_value(merged).unwrap();
         assert!(settings.approval.is_none());
+    }
+
+    /// **以前の名前（`risk_check`・`risk_base_url`・`risk_model`）で書いた設定も効く。** この節は知らない項目を黙って
+    /// 捨てるので、別名が無いと、以前の名前で有効にしていた人の判定モデルが知らせも無く止まる。
+    /// 新旧両方の名前で同じ欄を書いたら、どちらかを黙って選ばずに読み込みのエラーにする。
+    #[test]
+    fn the_old_names_of_the_judge_model_settings_still_work() {
+        let old: Settings = serde_json::from_value(serde_json::json!({
+            "approval": {
+                "risk_check": true,
+                "risk_base_url": "http://10.0.0.5:11435",
+                "risk_model": "decider:0.8b"
+            }
+        }))
+        .unwrap();
+        let approval = old.approval.unwrap();
+        assert_eq!(approval.use_judge_model, Some(true));
+        assert_eq!(approval.judge_model_url.as_deref(), Some("http://10.0.0.5:11435"));
+        assert_eq!(approval.judge_model.as_deref(), Some("decider:0.8b"));
+
+        let both = serde_json::from_value::<Settings>(serde_json::json!({
+            "approval": { "risk_check": false, "use_judge_model": true }
+        }));
+        assert!(both.is_err(), "新旧両方の名前を黙って受け付けた: {both:?}");
     }
 }
