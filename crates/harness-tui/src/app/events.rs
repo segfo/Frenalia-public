@@ -108,11 +108,11 @@ impl AppState {
             } => {
                 let line = if refused {
                     format!(
-                        "[参照] モデルがあなたの{value_chars}文字の値を書き写し、{differences}文字分                         違っていたので実行しなかった（番号で書き直すよう伝えた）"
+                        "[参照] モデルがあなたの{value_chars}文字の値を書き写し、{differences}文字分違っていたので実行しなかった（番号で書き直すよう伝えた）"
                     )
                 } else {
                     format!(
-                        "[参照] モデルがあなたの{value_chars}文字の値を書き写した                         （一字一句同じだったのでそのまま実行する）"
+                        "[参照] モデルがあなたの{value_chars}文字の値を書き写した（一字一句同じだったのでそのまま実行する）"
                     )
                 };
                 self.transcript.push(TranscriptItem::Info(line));

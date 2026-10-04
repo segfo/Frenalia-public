@@ -79,3 +79,31 @@ fn the_order_is_the_numbering() {
         })
     );
 }
+
+/// **解読した値が「塊」か「コマンド行」かを言う。中身は1文字も出さない。**
+///
+/// 実測（2026-10-04）: `pwsh --enc <塊>` を解読した結果（＝コマンド行1本）をモデルが `--enc` の
+/// 引数として渡し、`pwsh --enc pwsh --enc <塊>` という走らない行を組み立てた。中身を渡さずに
+/// これを防ぐため、**空白を含むかどうかだけ**を伝える。
+#[test]
+fn a_decoded_value_says_whether_it_reads_as_a_command_line() {
+    let mut store = ValueStore::from_user_values(vec![blob('a')]);
+    // コマンド行1本（空白を含む）。
+    store.push_decoded(1, "base64", "pwsh --enc cwB5AHMA".to_string());
+    // 符号化された塊（空白が無い）。
+    store.push_decoded(2, "base64", "cwB5AHMAdABlAG0AaQBuAGYAbwA=".to_string());
+
+    let text = store.render().unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let command_line = lines.iter().find(|l| l.contains("{{val:2}} ")).unwrap();
+    let blob_line = lines.iter().find(|l| l.contains("{{val:3}} ")).unwrap();
+    assert!(
+        command_line.contains("コマンド行1本として読める"),
+        "{command_line}"
+    );
+    assert!(!blob_line.contains("コマンド行"), "{blob_line}");
+
+    // **中身は1文字も出ない**（先頭の語すら出さない——そこから値が漏れる）。
+    assert!(!text.contains("pwsh"), "{text}");
+    assert!(!text.contains("cwB5"), "{text}");
+}

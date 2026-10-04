@@ -143,7 +143,12 @@ impl ValueStore {
             let origin = match &value.origin {
                 Origin::UserMessage => "ユーザーの文から".to_string(),
                 Origin::Decoded { from, encoding } => {
-                    format!("{{{{val:{from}}}}} を {encoding} として解読したもの")
+                    let shape = if reads_as_command_line(&value.text) {
+                        "。空白を含むのでコマンド行1本として読める（符号化された塊ではない）"
+                    } else {
+                        ""
+                    };
+                    format!("{{{{val:{from}}}}} を {encoding} として解読したもの{shape}")
                 }
             };
             out.push_str(&format!(
@@ -153,6 +158,20 @@ impl ValueStore {
         }
         Some(out)
     }
+}
+
+/// 解読した中身が**コマンド行として読めるか**（空白を含む1行以上の文字か）。
+///
+/// **これはモデルが番号の使い方を決めるための手がかりである。** 中身は渡さないので、
+/// `{{val:2}}` が「符号化された塊」なのか「コマンド行1本」なのかがモデルに分からない。
+/// 実測（2026-10-04）では、`pwsh --enc <塊>` を解読した結果（＝コマンド行1本）をモデルが
+/// `--enc` の引数として渡し、**`pwsh --enc pwsh --enc <塊>` という走らない行**を組み立てた。
+///
+/// **中身は1文字も出さない。** 先頭の語を出せばもっと親切になるが、そこから中身が漏れる
+/// （値が「`secretpassword` …」で始まっていたら、その語が一覧に出てしまう）。
+/// モデルが要るのは「塊ではない」という1つの事実だけである。
+fn reads_as_command_line(text: &str) -> bool {
+    text.contains(char::is_whitespace)
 }
 
 /// `messages`から置き場を組む（解読の段は呼び出し側が[`ValueStore::push_decoded`]で足す）。

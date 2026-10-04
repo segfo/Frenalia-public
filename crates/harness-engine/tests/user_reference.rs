@@ -198,9 +198,20 @@ async fn a_damaged_transcription_never_runs() {
     )
     .await;
     assert_eq!(file, None, "壊れた写しでファイルが書かれてはいけない");
-    // モデルへ返るのは、何が違ったかと、次に何を書けばよいか。
+    // モデルへ返るのは、何が違ったかと、**値の一覧そのもの**。どれを指すかはモデルが選ぶ
+    // ——ハーネスは「どれに近いか」までしか言えない（実測で、1つに決めて返したら違う値を指した）。
+    assert!(
+        result.contains("書き写した値は実行しませんでした"),
+        "{result}"
+    );
     assert!(result.contains("{{val:1}}"), "{result}");
-    assert!(result.contains("書き写した値は実行しません"), "{result}");
+    assert!(result.contains("数え直す必要はありません"), "{result}");
+    // 一覧には中身が1文字も入らない。
+    assert!(
+        !result.contains(&value),
+        "一覧に値の中身が入っている:
+{result}"
+    );
     // 断ったことは会話の記録にも残す。
     assert_eq!(transcription_notices(&events), vec![(1, true)]);
 }

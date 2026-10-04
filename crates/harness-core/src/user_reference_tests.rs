@@ -260,20 +260,33 @@ fn the_closest_user_value_wins() {
     assert_eq!(found[0].differences, 1);
 }
 
-/// **断る文は、何が違ったかを数で言い、次に何を書けばよいかを1つだけ示す。**
-/// 曖昧に断ると、モデルは同じ値をもう一度書き写す。
+/// **断る文は一覧をそのまま渡し、どの番号を指すかはモデルに選ばせる。**
+///
+/// ハーネスは「どれに近いか」までしか言えない——実測（2026-10-04）では、ユーザーの値を途中まで
+/// 書き写した語が、その値を解読して得た別の値の方に近く出た。1つに決めて返したところ、モデルは
+/// その番号を素直に使い、`pwsh --enc pwsh --enc …` という走らない行を組み立てた。
+///
+/// **文字を数え直させない**ことも固定する——実測ではモデルが数を合わせようとして手で数え始め、
+/// 1往復をまるごと使った。
 #[test]
-fn the_refusal_tells_the_model_what_to_write() {
+fn the_refusal_hands_over_the_whole_list_and_does_not_pick_for_the_model() {
     let value = blob('a');
     let mut slipped: Vec<char> = value.chars().collect();
     slipped[100] = 'Z';
     let slipped: String = slipped.into_iter().collect();
 
     let found = review(&json!({ "command": slipped }), std::slice::from_ref(&value));
-    let message = found[0].refusal_ja();
+    let mut store = crate::ValueStore::from_user_values(vec![value]);
+    store.push_decoded(1, "base64", "systeminfo".to_string());
+    let menu = store.render().unwrap();
+    let message = found[0].refusal_ja(&menu);
+
+    // 一覧がそのまま入っている（番号を1つに決めていない）。
     assert!(message.contains("{{val:1}}"), "{message}");
-    assert!(message.contains("308"), "{message}");
-    assert!(message.contains('1'), "{message}");
+    assert!(message.contains("{{val:2}}"), "{message}");
+    assert!(message.contains("実行しませんでした"), "{message}");
+    assert!(message.contains("数え直す必要はありません"), "{message}");
+    assert!(message.contains('1'), "違いの回数を言っていない: {message}");
     assert_eq!(found[0].reference(), "{{val:1}}");
 }
 
