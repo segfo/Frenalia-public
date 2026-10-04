@@ -115,101 +115,129 @@ fn input_without_references_is_untouched() {
     assert_eq!(substitute(&input, &[blob('a')]), input);
 }
 
-/// **参照を使わずに書き写した1文字違いを、ユーザーの値へ直す。**
-///
-/// 実測（2026-10-04）と同じ形: 308文字のうち1文字だけが違う値をモデルが書いた。
+// --- 書き写しの審査（D-115。`review`） ---
+
+/// **一字一句同じ写しは走らせるが、黙ってはいない。** 決まりが守られていない回数がここに現れる。
 #[test]
-fn a_transcribed_value_with_one_wrong_character_is_repaired() {
+fn an_exact_transcription_is_reported_but_allowed() {
     let value = blob('a');
-    let mut written: Vec<char> = value.chars().collect();
-    written[100] = 'Z';
-    let written: String = written.into_iter().collect();
-
-    let input = json!({ "command": format!("pwsh --enc {written}") });
-    let (out, repairs) = repair(&input, std::slice::from_ref(&value));
-    assert_eq!(out, json!({ "command": format!("pwsh --enc {value}") }));
-    assert_eq!(repairs.len(), 1);
-    assert_eq!(repairs[0].differences, 1);
-    assert_eq!(repairs[0].written, written);
-    assert_eq!(repairs[0].user_value, value);
-}
-
-/// 入れ子（配列・オブジェクト）の中も直し、**空白の並びは崩さない**。
-#[test]
-fn repair_reaches_nested_strings_and_keeps_the_spacing() {
-    let value = blob('a');
-    let written = format!("{}Z", &value[..value.len() - 1]);
-
-    let input = json!({ "program": "pwsh", "args": ["-enc", written], "n": 3 });
-    let (out, repairs) = repair(&input, std::slice::from_ref(&value));
-    assert_eq!(
-        out,
-        json!({ "program": "pwsh", "args": ["-enc", value], "n": 3 })
+    let found = review(
+        &json!({ "command": format!("pwsh --enc {value}") }),
+        std::slice::from_ref(&value),
     );
-    assert_eq!(repairs.len(), 1);
-
-    // 前後と語の間の空白（連なり・改行・タブ）がそのまま残る。
-    let written = format!("{}Z", &value[..value.len() - 1]);
-    let input = json!({ "command": format!("  a\n\t{written}  b\n") });
-    let (out, _) = repair(&input, std::slice::from_ref(&value));
-    assert_eq!(out, json!({ "command": format!("  a\n\t{value}  b\n") }));
+    assert_eq!(found.len(), 1);
+    assert!(found[0].is_exact());
+    assert_eq!(found[0].differences, 0);
+    assert_eq!(found[0].number, 1);
+    assert_eq!(found[0].value_chars, 308);
 }
 
-/// **別物は直さない。** 短い語・長さが違う塊・違いが大きい塊は、書いた綴りのまま残す。
+/// **参照の書き方を正しく使った呼び出しは、審査に何も引っかからない。**
+///
+/// `review`は差し込みの**前**に通すので、ここには値そのものが無い。差し込んだ後に見ると、
+/// 正しく書いた呼び出しも「書き写した」に見えてしまう。
 #[test]
-fn values_that_are_not_transcription_slips_are_left_alone() {
+fn a_call_that_uses_the_reference_is_not_flagged() {
+    let value = blob('a');
+    let found = review(
+        &json!({ "command": "pwsh --enc {{user:1}}" }),
+        std::slice::from_ref(&value),
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
+/// **実測そのものを固定する。** 2026-10-04、ローカルの`qwen3.6-35b`が同じ308文字を2回書き写し、
+/// 2回とも損じた。値は会話の記録（`<workspace>\.harness\sessions\session-*.jsonl`）から写した。
+///
+/// 1回目は307文字（1文字消して1文字書き換え＝2回違い、0.6%）、2回目は244文字（2か所まとめて
+/// 64文字落ち＝64回違い、20.8%）。**どちらも実行しない。**
+#[test]
+fn both_measured_transcriptions_are_refused() {
+    const USER_VALUE: &str = "cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAQQBCADMAQQBIAE0AQQBhAEEAQQBnAEEAQwAwAEEATABRAEIAbABBAEcANABBAFkAdwBBAGcAQQBHAE0AQQBkAHcAQgBDAEEARABVAEEAUQBRAEIASQBBAEUAMABBAFEAUQBCAGsAQQBFAEUAQQBRAGcAQgBzAEEARQBFAEEAUgB3AEEAdwBBAEUARQBBAFkAUQBCAFIAQQBFAEkAQQBkAFEAQgBCAEEARQBjAEEAVwBRAEIAQgBBAEcASQBBAGQAdwBCAEIAQQBEADAAQQA=";
+    const SLIP_2: &str = "cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAQQBCADMAQQBIAE0AQQBhAEEAQQBnAEEAQwAwAEEATABRAEIAbABBAEcANABBAFkAdwBBAGcAQQBHAE0AQBkAHcAQgBDAEEARQBVAEEAUQBRAEIASQBBAEUAMABBAFEAUQBCAGsAQQBFAEUAQQBRAGcAQgBzAEEARQBFAEEAUgB3AEEAdwBBAEUARQBBAFkAUQBCAFIAQQBFAEkAQQBkAFEAQgBCAEEARQBjAEEAVwBRAEIAQgBBAEcASQBBAGQAdwBCAEIAQQBEADAAQQA=";
+    const SLIP_64: &str = "cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAQQBCADMAQQBIAE0AQQBhAEEAQQBnAEEAQwAwAEEATABRAEIAbABBAEcANABBAFkAdwBBAGcAQQBHAE0AQQBkAHcAQgBDAEEARQBBAEEAUgB3AEEAdwBBAEUARQBBAFkAUQBCAFIAQQBFAEkAQQBkAFEAQgBCAEEARQBjAEEAVwBRAEIAQgBBAEcASQBBAGQAdwBCAEIAQQBEADAAQQA=";
+
+    let value = USER_VALUE.to_string();
+    for (written, differences, chars) in [(SLIP_2, 2, 307), (SLIP_64, 64, 244)] {
+        assert_eq!(written.chars().count(), chars);
+        let found = review(
+            &json!({ "command": format!("pwsh --enc {written}") }),
+            std::slice::from_ref(&value),
+        );
+        assert_eq!(found.len(), 1, "{differences}文字違い");
+        assert!(!found[0].is_exact(), "{differences}文字違い");
+        assert_eq!(found[0].differences, differences);
+        assert_eq!(found[0].number, 1);
+    }
+}
+
+/// 2回目の実測は、値を**別のコマンドの引数として埋め込んだ**形だった。飾りが付いていても見つける。
+#[test]
+fn a_transcription_embedded_in_another_command_is_still_found() {
+    let value = blob('a');
+    let mut slipped: Vec<char> = value.chars().collect();
+    slipped[100] = 'Z';
+    let slipped: String = slipped.into_iter().collect();
+
+    for (before, after) in [("payload=", ""), ("--enc=", ""), ("\"", "\""), ("(", ")")] {
+        let found = review(
+            &json!({ "command": format!("{before}{slipped}{after}") }),
+            std::slice::from_ref(&value),
+        );
+        assert_eq!(found.len(), 1, "{before}|{after}");
+        assert_eq!(found[0].differences, 1, "{before}|{after}");
+        // 飾りは違いに数えない——数えると、短い値では写しを見落とす。
+        assert_eq!(found[0].written_chars, 308, "{before}|{after}");
+    }
+}
+
+/// 入れ子（配列・オブジェクト）の中も審査する。
+#[test]
+fn nested_strings_are_reviewed() {
+    let value = blob('a');
+    let mut slipped: Vec<char> = value.chars().collect();
+    slipped[7] = 'Z';
+    let slipped: String = slipped.into_iter().collect();
+
+    let found = review(
+        &json!({ "program": "pwsh", "args": ["-enc", slipped], "n": 3, "ok": true }),
+        std::slice::from_ref(&value),
+    );
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].differences, 1);
+}
+
+/// **写しでないものは素通りさせる。** 短い語・無関係な長い値・値が1つも無いとき。
+#[test]
+fn things_that_are_not_transcriptions_are_ignored() {
     let value = blob('a');
     let one = std::slice::from_ref(&value);
 
-    // (1) 短い語（コマンド名・スイッチ）。
-    let input = json!({ "command": "ls -la --force" });
-    assert_eq!(repair(&input, one), (input.clone(), vec![]));
-
-    // (2) 長さが違う（実測の「64文字短い」型。**切り詰めは直さない**——どこが落ちたか決められない）。
-    let short: String = value.chars().take(244).collect();
-    let input = json!({ "command": format!("pwsh --enc {short}") });
-    assert_eq!(repair(&input, one), (input.clone(), vec![]));
-
-    // (3) 長さは同じだが違いが大きい（別の値を書いた）。
-    let other = blob('b');
-    let input = json!({ "command": format!("pwsh --enc {other}") });
-    assert_eq!(repair(&input, one), (input.clone(), vec![]));
-
-    // (4) 完全に一致している（直す必要が無いので知らせない）。
-    let input = json!({ "command": format!("pwsh --enc {value}") });
-    assert_eq!(repair(&input, one), (input.clone(), vec![]));
-
-    // (5) 参照できる値が1つも無い。
-    let written = format!("{}Z", &value[..value.len() - 1]);
-    let input = json!({ "command": format!("pwsh --enc {written}") });
-    assert_eq!(repair(&input, &[]), (input.clone(), vec![]));
+    // 短い語（コマンド名・スイッチ）。
+    assert!(review(&json!({ "command": "ls -la --force" }), one).is_empty());
+    // 無関係な長い値（モデルが自分で作ったもの）。
+    assert!(review(&json!({ "command": blob('b') }), one).is_empty());
+    // 参照できる値が1つも無い。
+    assert!(review(&json!({ "command": blob('a') }), &[]).is_empty());
+    // 文字列でない項目。
+    assert!(review(&json!({ "n": 3, "ok": true, "nothing": null }), one).is_empty());
 }
 
-/// 違いの上限はちょうど[`MAX_REPAIR_RATIO`]で切る（境目の両側を固定する）。
+/// 写しとみなす違いの上限は、ちょうど[`MAX_TRANSCRIPTION_RATIO`]で切る（境目の両側を固定する）。
 #[test]
-fn the_difference_limit_is_fixed_on_both_sides() {
+fn the_transcription_limit_is_fixed_on_both_sides() {
     let value = blob('a');
-    let length = value.chars().count(); // 308。上限は 308 * 0.05 = 15.4 文字
-    let limit = (length as f32 * MAX_REPAIR_RATIO) as usize; // 15
+    let length = value.chars().count(); // 308。上限は 308 * 0.5 = 154 回
+    let limit = (length as f32 * MAX_TRANSCRIPTION_RATIO) as usize;
 
-    for (differences, repaired) in [(limit, true), (limit + 1, false)] {
+    for (differences, seen) in [(limit, true), (limit + 1, false)] {
         let mut written: Vec<char> = value.chars().collect();
         for c in written.iter_mut().take(differences) {
             *c = 'Z';
         }
         let written: String = written.into_iter().collect();
-        let input = json!({ "command": format!("pwsh --enc {written}") });
-        let (out, repairs) = repair(&input, std::slice::from_ref(&value));
-        assert_eq!(
-            repairs.len(),
-            usize::from(repaired),
-            "{differences}文字違い"
-        );
-        assert_eq!(
-            out == json!({ "command": format!("pwsh --enc {value}") }),
-            repaired,
-            "{differences}文字違い"
-        );
+        let found = review(&json!({ "command": written }), std::slice::from_ref(&value));
+        assert_eq!(found.len(), usize::from(seen), "{differences}回違い");
     }
 }
 
@@ -226,75 +254,25 @@ fn the_closest_user_value_wins() {
     written[100] = 'Z';
     let (b, written): (String, String) = (b.into_iter().collect(), written.into_iter().collect());
 
-    let input = json!({ "command": format!("pwsh --enc {written}") });
-    let (out, repairs) = repair(&input, &[a, b.clone()]);
-    assert_eq!(out, json!({ "command": format!("pwsh --enc {b}") }));
-    assert_eq!(repairs.len(), 1);
-    assert_eq!(repairs[0].differences, 1);
-    assert_eq!(repairs[0].user_value, b);
+    let found = review(&json!({ "command": written }), &[a, b]);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].number, 2, "`b`の方が近い");
+    assert_eq!(found[0].differences, 1);
 }
 
-/// **実測そのものを固定する。** 2026-10-04、ローカルの`qwen3.6-35b`が308文字の base64 を書き写し、
-/// **1文字消して1文字書き換えた**（307文字。似ている度合い99.5%）。
-///
-/// 値は会話の記録（`<workspace>\.harness\sessions\session-*.jsonl`）からそのまま写した。
-/// **この形を「長さが同じ」という条件で弾いていた**ので、違いの数え方を足し引き込み
-/// （レーベンシュタイン距離）へ変えた。書き換えだけを数えると、消えた1文字より後ろが全部ずれて
-/// 「281文字違う」に見える。
+/// **断る文は、何が違ったかを数で言い、次に何を書けばよいかを1つだけ示す。**
+/// 曖昧に断ると、モデルは同じ値をもう一度書き写す。
 #[test]
-fn the_measured_transcription_slip_is_repaired() {
-    const USER_VALUE: &str = "cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAQQBCADMAQQBIAE0AQQBhAEEAQQBnAEEAQwAwAEEATABRAEIAbABBAEcANABBAFkAdwBBAGcAQQBHAE0AQQBkAHcAQgBDAEEARABVAEEAUQBRAEIASQBBAEUAMABBAFEAUQBCAGsAQQBFAEUAQQBRAGcAQgBzAEEARQBFAEEAUgB3AEEAdwBBAEUARQBBAFkAUQBCAFIAQQBFAEkAQQBkAFEAQgBCAEEARQBjAEEAVwBRAEIAQgBBAEcASQBBAGQAdwBCAEIAQQBEADAAQQA=";
-    // モデルが書いたもの: 113文字目の`Q`が消え、129文字目の`A`が`Q`になっている。
-    const WRITTEN: &str = "cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAQQBCADMAQQBIAE0AQQBhAEEAQQBnAEEAQwAwAEEATABRAEIAbABBAEcANABBAFkAdwBBAGcAQQBHAE0AQBkAHcAQgBDAEEARQBVAEEAUQBRAEIASQBBAEUAMABBAFEAUQBCAGsAQQBFAEUAQQBRAGcAQgBzAEEARQBFAEEAUgB3AEEAdwBBAEUARQBBAFkAUQBCAFIAQQBFAEkAQQBkAFEAQgBCAEEARQBjAEEAVwBRAEIAQgBBAEcASQBBAGQAdwBCAEIAQQBEADAAQQA=";
-
-    assert_eq!(USER_VALUE.chars().count(), 308);
-    assert_eq!(WRITTEN.chars().count(), 307);
-
-    let value = USER_VALUE.to_string();
-    let input = json!({ "command": format!("pwsh --enc {WRITTEN}") });
-    let (out, repairs) = repair(&input, std::slice::from_ref(&value));
-    assert_eq!(
-        out,
-        json!({ "command": format!("pwsh --enc {USER_VALUE}") })
-    );
-    assert_eq!(repairs.len(), 1);
-    assert_eq!(repairs[0].differences, 2, "1文字消して1文字書き換え＝2回");
-}
-
-/// **値の前後にモデルが付けた飾りは残す。** 直すのは語まるごとではなく、語の中で値に当たる部分だけ。
-///
-/// 語まるごとを比べていた頃は、`payload=<値>`を「値に8文字足したもの」と読んで`payload=`を剥がしていた
-/// （通しの試験`the_harness_substitutes_the_value_so_the_model_never_transcribes_it`が赤になって見つかった）。
-#[test]
-fn decoration_around_the_value_survives_the_repair() {
+fn the_refusal_tells_the_model_what_to_write() {
     let value = blob('a');
-    let one = std::slice::from_ref(&value);
     let mut slipped: Vec<char> = value.chars().collect();
     slipped[100] = 'Z';
     let slipped: String = slipped.into_iter().collect();
 
-    for (before, after) in [("payload=", ""), ("--enc=", ""), ("\"", "\""), ("(", ")")] {
-        // (1) 飾り付きで正しく書けている語は、1文字も変えない。
-        let input = json!({ "command": format!("{before}{value}{after}") });
-        assert_eq!(
-            repair(&input, one),
-            (input.clone(), vec![]),
-            "{before}|{after}"
-        );
-
-        // (2) 飾り付きで損じた語は、**値の部分だけ**が直る。
-        let input = json!({ "command": format!("{before}{slipped}{after}") });
-        let (out, repairs) = repair(&input, one);
-        assert_eq!(
-            out,
-            json!({ "command": format!("{before}{value}{after}") }),
-            "{before}|{after}"
-        );
-        assert_eq!(repairs.len(), 1);
-        assert_eq!(
-            repairs[0].written, slipped,
-            "直した部分は値に当たるところだけ"
-        );
-        assert_eq!(repairs[0].differences, 1);
-    }
+    let found = review(&json!({ "command": slipped }), std::slice::from_ref(&value));
+    let message = found[0].refusal_ja();
+    assert!(message.contains("{{user:1}}"), "{message}");
+    assert!(message.contains("308"), "{message}");
+    assert!(message.contains('1'), "{message}");
+    assert_eq!(found[0].reference(), "{{user:1}}");
 }

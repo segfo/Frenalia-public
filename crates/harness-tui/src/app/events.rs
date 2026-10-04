@@ -99,12 +99,23 @@ impl AppState {
                     self.workspace_root.clone(),
                 ));
             }
-            // ハーネスがモデルの書き写しを直した（D-114）。**直したことを黙らせない**——承認画面に
-            // 出ているものが頼んだものと同じかを、人がここで確かめられるようにする。
-            AgentEvent::UserValueRepaired { chars, differences } => {
-                self.transcript.push(TranscriptItem::Info(format!(
-                    "[参照] モデルが書き写した{chars}文字の値を、あなたが書いた値へ直した                     （{differences}文字違っていた）"
-                )));
+            // モデルが参照の書き方を使わず値を書き写した（D-115）。**黙らせない**——一字一句同じでも、
+            // 決まりが守られていない事実は残す（損じたときに断ったことは、なおさら見えないと困る）。
+            AgentEvent::UserValueTranscribed {
+                value_chars,
+                differences,
+                refused,
+            } => {
+                let line = if refused {
+                    format!(
+                        "[参照] モデルがあなたの{value_chars}文字の値を書き写し、{differences}文字分                         違っていたので実行しなかった（番号で書き直すよう伝えた）"
+                    )
+                } else {
+                    format!(
+                        "[参照] モデルがあなたの{value_chars}文字の値を書き写した                         （一字一句同じだったのでそのまま実行する）"
+                    )
+                };
+                self.transcript.push(TranscriptItem::Info(line));
             }
             AgentEvent::ToolStarted { name, subject, .. } => {
                 if let Some(subject) = subject {

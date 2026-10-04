@@ -118,12 +118,17 @@ async fn run_write(
     )
 }
 
-/// 直したことを知らせた回数（`AgentEvent::UserValueRepaired`）。
-fn repair_notices(events: &[AgentEvent]) -> Vec<usize> {
+/// 書き写しを見つけたと知らせた回数（`AgentEvent::UserValueTranscribed`）。
+/// 返るのは`(違いの回数, 実行を断ったか)`。
+fn transcription_notices(events: &[AgentEvent]) -> Vec<(usize, bool)> {
     events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::UserValueRepaired { differences, .. } => Some(*differences),
+            AgentEvent::UserValueTranscribed {
+                differences,
+                refused,
+                ..
+            } => Some((*differences, *refused)),
             _ => None,
         })
         .collect()
@@ -176,32 +181,46 @@ async fn input_without_a_reference_is_untouched() {
     assert_eq!(written.as_deref(), Some("plain text"));
 }
 
-/// **モデルが決まりを破って書き写しても、走るのはユーザーの値そのもの**（D-114）。
+/// **損じた写しは走らせない**（D-115）。ファイルは1バイトも書かれず、モデルには理由が返る。
 ///
-/// 実測（2026-10-04）と同じ形: 参照の書き方を伝えてあるのにモデルは308文字の値を書き写し、
-/// 1文字違っていた。
+/// 実測（2026-10-04）と同じ形: 参照の書き方を伝えてあるのにモデルは308文字の値を書き写した。
 #[tokio::test]
-async fn the_harness_repairs_a_transcribed_value_instead_of_running_the_models_version() {
+async fn a_damaged_transcription_never_runs() {
     let value = long_value();
     let mut written: Vec<char> = value.chars().collect();
     written[7] = 'Z';
     let written: String = written.into_iter().collect();
     assert_ne!(written, value);
 
-    let (file, _, events) = run_write(
+    let (file, result, events) = run_write(
         &format!("これを書いて {value}"),
         serde_json::json!({ "path": "out.txt", "content": written }),
     )
     .await;
-    assert_eq!(file.as_deref(), Some(value.as_str()));
-    // **直したことは必ず知らせる。** 黙って書き換えると、承認画面に出ているものが頼んだものと
-    // 同じかを人が確かめられない。
-    assert_eq!(repair_notices(&events), vec![1]);
+    assert_eq!(file, None, "壊れた写しでファイルが書かれてはいけない");
+    // モデルへ返るのは、何が違ったかと、次に何を書けばよいか。
+    assert!(result.contains("{{user:1}}"), "{result}");
+    assert!(result.contains("書き写した値は実行しません"), "{result}");
+    // 断ったことは会話の記録にも残す。
+    assert_eq!(transcription_notices(&events), vec![(1, true)]);
 }
 
-/// 対照: **別物は直さない。** モデルが意図して違う長い値を書いたら、そのまま走る。
+/// **一字一句同じ写しは走らせる**（走るものは正しいので止める理由が無い）。ただし記録には残す。
 #[tokio::test]
-async fn a_different_long_value_is_not_repaired() {
+async fn an_exact_transcription_runs_but_is_recorded() {
+    let value = long_value();
+    let (file, _, events) = run_write(
+        &format!("これを書いて {value}"),
+        serde_json::json!({ "path": "out.txt", "content": value.clone() }),
+    )
+    .await;
+    assert_eq!(file.as_deref(), Some(value.as_str()));
+    assert_eq!(transcription_notices(&events), vec![(0, false)]);
+}
+
+/// 対照: **別物は止めない。** モデルが自分で作った長い値はそのまま走り、記録にも出ない。
+#[tokio::test]
+async fn a_different_long_value_runs_untouched() {
     let other = "Z".repeat(long_value().chars().count());
     let (file, _, events) = run_write(
         &format!("これを書いて {}", long_value()),
@@ -209,5 +228,5 @@ async fn a_different_long_value_is_not_repaired() {
     )
     .await;
     assert_eq!(file.as_deref(), Some(other.as_str()));
-    assert_eq!(repair_notices(&events), Vec::<usize>::new());
+    assert_eq!(transcription_notices(&events), Vec::new());
 }

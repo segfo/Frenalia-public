@@ -66,6 +66,6 @@ pub use tool::{
     TransitionFacts, VmShellExecutor, WaitReason, WaitReasons, WaitState,
 };
 pub use user_reference::{
-    repair as repair_user_references, substitute as substitute_user_references,
-    values_in as user_reference_values, Repair as UserValueRepair,
+    review as review_user_references, substitute as substitute_user_references,
+    values_in as user_reference_values, Transcription as UserValueTranscription,
 };

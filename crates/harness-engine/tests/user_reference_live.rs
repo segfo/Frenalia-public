@@ -116,7 +116,7 @@ async fn the_command_that_reaches_the_tool_carries_the_users_value_verbatim() {
     println!("loop: {outcome:?}");
 
     let mut proposed: Vec<String> = Vec::new();
-    let mut repairs: Vec<(usize, usize)> = Vec::new();
+    let mut transcriptions: Vec<(usize, bool)> = Vec::new();
     while let Ok(event) = rx.try_recv() {
         match event {
             AgentEvent::ToolCallProposed { name, input, .. } if name == "run_shell" => {
@@ -124,17 +124,18 @@ async fn the_command_that_reaches_the_tool_carries_the_users_value_verbatim() {
                     proposed.push(command.to_string());
                 }
             }
-            AgentEvent::UserValueRepaired { chars, differences } => {
-                repairs.push((chars, differences))
-            }
+            AgentEvent::UserValueTranscribed {
+                differences,
+                refused,
+                ..
+            } => transcriptions.push((differences, refused)),
             _ => {}
         }
     }
 
     // **モデル自身が何を書いたか**は会話の記録の側にある（ハーネスの差し込みはツールへ渡る手前なので、
-    // `ToolCallProposed`からは見分けられない）。どちらの道を通ったかを記録に残す。
-    // **`run_shell`に限らず全部のツール呼び出しを見る。** 実測では、モデルが同じ値を別のツールへも
-    // 渡していて、`run_shell`だけ数えると「直した回数1なのに損じが見当たらない」という読めない記録になった。
+    // `ToolCallProposed`からは見分けられない）。**`run_shell`に限らず全部のツール呼び出しを見る**
+    // ——実測ではモデルが同じ値を`run_program`へも渡しており、片方だけ数えると読めない記録になった。
     let wrote_by_model: Vec<(String, String)> = state
         .messages
         .iter()
@@ -146,43 +147,53 @@ async fn the_command_that_reaches_the_tool_carries_the_users_value_verbatim() {
             _ => None,
         })
         .collect();
+    let refused = transcriptions.iter().filter(|(_, r)| *r).count();
     println!(
-        "model={model} / {:.1}s / run_shell {} 件 / 直した回数 {}",
+        "model={model} / {:.1}s / ツール呼び出し {} 件 / run_shell が実行まで進んだ {} 件 /          書き写し {} 件（うち断った {refused} 件）",
         started.elapsed().as_secs_f32(),
+        wrote_by_model.len(),
         proposed.len(),
-        repairs.len()
+        transcriptions.len(),
     );
     // **呼び出し1件ごとに道を出す。** 1往復の中で道が分かれることがある（実測: 1件目は損じ無し、
-    // 2件目は損じてハーネスが直した）ので、先頭だけを見ると片方を取りこぼす。
-    for (i, (tool, command)) in wrote_by_model.iter().enumerate() {
-        let path = if command.contains(harness_core::user_reference::SYNTAX_EXAMPLE) {
-            "モデルが参照の書き方を使った（ハーネスが差し込んだ）".to_string()
-        } else if command.contains(USER_VALUE) {
-            "モデルが書き写し、損じは無かった".to_string()
+    // 2件目は64文字落ち）ので、先頭だけを見ると片方を取りこぼす。
+    for (i, (tool, written)) in wrote_by_model.iter().enumerate() {
+        let path = if written.contains(harness_core::user_reference::SYNTAX_EXAMPLE) {
+            "モデルが参照の書き方を使った（ハーネスが差し込んだ）"
+        } else if written.contains(USER_VALUE) {
+            "モデルが書き写し、一字一句同じだった"
+        } else if transcriptions.iter().any(|(d, _)| *d > 0) {
+            "モデルが書き写して損じ、ハーネスが実行を断った"
         } else {
-            match repairs
-                .iter()
-                .find(|(chars, _)| *chars == USER_VALUE.chars().count())
-            {
-                Some((_, differences)) => {
-                    format!("モデルが書き写して損じ、ハーネスが直した（違いは{differences}回）")
-                }
-                None => "モデルが別のものを書いた".to_string(),
-            }
+            "モデルが別のものを書いた"
         };
         println!("  {}件目（{tool}）: {path}", i + 1);
     }
 
-    assert!(
-        !proposed.is_empty(),
-        "モデルが run_shell を1度も呼ばなかった（指示の出し方かモデルの問題。\
-         走る値を測れていないので、緑にしない）"
-    );
+    // **測りたい不変条件**: ツールまで進んだ行に、ユーザーの値の壊れた写しが1つも入っていない。
+    //
+    // 値を1つも含まない行（実測では、断られた後にモデルが試した `where pwsh`）は対象外である
+    // ——モデルが別のことをするのは自由で、止めたいのは**壊れた写しが走ること**だけ。
+    // ここで見ているのは判定そのものではなく**配線**（審査が実行より前に掛かっているか）で、
+    // 判定の中身は `harness-core` の単体試験が持つ。
+    let value = USER_VALUE.to_string();
     for command in &proposed {
+        let damaged: Vec<_> = harness_core::user_reference::review(
+            &serde_json::json!({ "command": command }),
+            std::slice::from_ref(&value),
+        )
+        .into_iter()
+        .filter(|t| !t.is_exact())
+        .collect();
         assert!(
-            command.contains(USER_VALUE),
-            "ツールへ渡った行にユーザーの値がそのまま入っていない。\
-             参照の差し込みも、書き写しを直す処理も効かなかった:\n  {command}"
+            damaged.is_empty(),
+            "壊れた写しがツールまで進んだ（審査が実行より前に掛かっていない）: {damaged:?}
+  {command}"
         );
     }
+    // 提案も書き写しも1件も無ければ、この往復では何も測れていない（緑にしない）。
+    assert!(
+        !proposed.is_empty() || !transcriptions.is_empty(),
+        "モデルが run_shell を1度も呼ばず、値を書き写しもしなかった。         指示の出し方かモデルの問題で、走る値を測れていない"
+    );
 }

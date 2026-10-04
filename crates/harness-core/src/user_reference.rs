@@ -21,13 +21,21 @@
 //! 差し込みは**判定の材料を作るより前**に1か所で行う（`harness_engine::turn`）。だから承認画面に出る文字列・
 //! 判定器が照合する文字列・実際に走る文字列は同じものである（D-101「判定器が見る材料」を崩さない）。
 //!
-//! # 参照を使わずに書き写したときは、ハーネスが直す
+//! # 書き写した値は走らせない
 //!
 //! モデルは決まりを守らないことがある（実測: 2026-10-04、決まりを伝えた状態でも`qwen3.6-35b`は書き写した）。
-//! そこで、**モデルが書いた長い値がユーザーの文の値とほぼ同じなら、ユーザーの値へ差し替える**（[`repair`]）。
-//! 「ほぼ同じ」は、**文字を足す・消す・書き換える回数の合計**（レーベンシュタイン距離）が
-//! [`MAX_REPAIR_RATIO`]以下のときだけである——**書き写しの損じだけを直し、別物を直さない**。
-//! 直したことは呼び出し側へ返して承認画面に出す（黙って書き換えない）。
+//! そこで、**モデルが書いた長い値がユーザーの文の値を写したものだと分かったら、損じている限り実行しない**
+//! （[`review`]）。断ったことはツールの結果としてモデルへ返し、番号で書き直させる。
+//!
+//! | モデルが書いたもの | ハーネスの動き |
+//! |---|---|
+//! | ユーザーの値と**一字一句同じ** | そのまま走らせる（会話の記録に1行残す） |
+//! | 値を写したが**損じている** | **走らせない。** ツールの結果でモデルへ理由を返す |
+//! | どの値とも**似ていない** | そのまま走らせる（モデルが自分で作った値） |
+//!
+//! **「損じを直して走らせる」という扱いは採らない**（2026-10-04に一度入れて外した）。直す側に回すと
+//! 「どこからが別物か」の線引きが残り、線の外側——実測では308文字のうち64文字（20.8%）が落ちた形——が
+//! 黙って走る。**断る側に倒すと、壊れた写しが走らないことが機構として成り立つ。**
 //!
 //! # ここが守らないもの
 //!
@@ -42,19 +50,21 @@ use serde_json::Value;
 
 use crate::{Message, Role};
 
-/// 書き写しの損じとして直してよい、違いの割合の上限（ユーザーの値の長さに対して）。
+/// モデルが書いた語を「ユーザーの値を写したもの」とみなす、違いの割合の上限
+/// （ユーザーの値の長さに対して）。
 ///
 /// 違いの数え方は**文字を足す・消す・書き換える回数の合計**（レーベンシュタイン距離）で、
-/// **長さが変わる損じも数えられる**——実測の損じは308文字のうち「1文字消して1文字書き換えた」（2回、0.6%）だった。
+/// **長さが変わる損じも数えられる**。実測（2026-10-04）の2つの損じは2回（0.6%）と64回（20.8%）で、
+/// どちらもこの内側に入る。
 ///
-/// **これを超える違いは直さない**——モデルが意図して別の値を書いた可能性があるから。実測のもう一方の型
-/// （64文字短い＝20%）はここで落ちる。
-pub const MAX_REPAIR_RATIO: f32 = 0.05;
+/// **これを超える違いは写しとみなさない**——モデルが自分で作った別の値として素通りさせる。
+/// 無関係な値がここへ入ることは実質無い: 40文字の16進の値を2つ並べても違いは37回前後（92%）になる。
+pub const MAX_TRANSCRIPTION_RATIO: f32 = 0.5;
 
-/// 直す対象として見る、空白で区切った1語の長さの上限（文字）。
+/// 審査の対象として見る、空白で区切った1語の長さの上限（文字）。
 ///
 /// 探す費用は「語の長さ × 値の長さ」で増えるので、際限なく長い語は見ない。モデルの出力は1回の応答の
-/// 上限で頭打ちになるため、**実際にここへ当たることはほぼ無い**（当たった語は直さずそのまま走る）。
+/// 上限で頭打ちになるため、**実際にここへ当たることはほぼ無い**（当たった語は審査せずそのまま走る）。
 const MAX_SCANNED_WORD_CHARS: usize = 65_536;
 
 /// 参照できる「長い値」とみなす最短の長さ（文字）。空白を含まない連なりで数える。
@@ -148,108 +158,107 @@ fn substitute_text(text: &str, values: &[String]) -> String {
     out
 }
 
-/// モデルが書き写した値を、ユーザーの文の値へ直した記録（承認画面に出す）。
+/// モデルがユーザーの値を**書き写していた**という審査の結果1件（[`review`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Repair {
-    /// モデルが書いた値。
-    pub written: String,
-    /// 差し替えたユーザーの値。
-    pub user_value: String,
-    /// 違っていた文字の数。
+pub struct Transcription {
+    /// 何番目のユーザーの値を写したか（1始まり。`{{user:N}}`のN）。
+    pub number: usize,
+    /// モデルが書いた部分の長さ（文字）。
+    pub written_chars: usize,
+    /// ユーザーの値の長さ（文字）。
+    pub value_chars: usize,
+    /// 違いの回数（足す・消す・書き換えるの合計）。**0なら一字一句同じ。**
     pub differences: usize,
 }
 
-/// ツールの入力の中の**書き写した値**を、ユーザーの文の値へ直す（[`substitute`]の後に通す）。
+impl Transcription {
+    /// 一字一句同じか。`false`なら**そのツール呼び出しを実行してはいけない**。
+    pub fn is_exact(&self) -> bool {
+        self.differences == 0
+    }
+
+    /// 参照の書き方（`{{user:N}}`）。
+    pub fn reference(&self) -> String {
+        format!("{{{{user:{}}}}}", self.number)
+    }
+
+    /// 実行を断ったことを**モデルへ**伝える文（ツールの結果として返す）。
+    ///
+    /// 何が違ったかを数で言い、次に何を書けばよいかを1つだけ示す——曖昧に断ると、モデルは
+    /// 同じ値をもう一度書き写す。
+    pub fn refusal_ja(&self) -> String {
+        let reference = self.reference();
+        format!(
+            "書き写した値は実行しません。あなたが書いた{written}文字の値は、ユーザーが書いた\
+             {value}文字の値と{differences}文字分違います（足す・消す・書き換えるの合計）。\
+             1文字でも違えば別のものが走るので、値を書き写さずに {reference} と書いてください。\
+             ハーネスがユーザーの文からその値を取り出して差し込みます。",
+            written = self.written_chars,
+            value = self.value_chars,
+            differences = self.differences,
+        )
+    }
+}
+
+/// ツールの入力の中に、ユーザーの値を**書き写した**跡が無いかを調べる。
 ///
-/// モデルが書いた長い値（空白を含まない[`MIN_REFERENCE_CHARS`]文字以上）が、ユーザーの文の値と
-/// **[`MAX_REPAIR_RATIO`]以下の違い**しか無いなら差し替える。直した記録を返す（承認画面に出すため）。
-pub fn repair(input: &Value, values: &[String]) -> (Value, Vec<Repair>) {
-    let mut repairs = Vec::new();
-    let out = repair_value(input, values, &mut repairs);
-    (out, repairs)
+/// **[`substitute`]より前に通すこと。** 差し込んだ後では、参照の書き方を正しく使った呼び出しにも
+/// 値が入っているので、「モデルが書き写した」と区別できなくなる。
+///
+/// [`Transcription::is_exact`]が`false`のものが1つでもあれば、呼び出し側は**そのツール呼び出しを
+/// 実行してはいけない**。一字一句同じものは走らせてよい（記録には残す）。
+pub fn review(input: &Value, values: &[String]) -> Vec<Transcription> {
+    let mut found = Vec::new();
+    review_value(input, values, &mut found);
+    found
 }
 
-fn repair_value(input: &Value, values: &[String], repairs: &mut Vec<Repair>) -> Value {
+fn review_value(input: &Value, values: &[String], found: &mut Vec<Transcription>) {
     match input {
-        Value::String(text) => Value::String(repair_text(text, values, repairs)),
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|v| repair_value(v, values, repairs))
-                .collect(),
-        ),
-        Value::Object(fields) => Value::Object(
-            fields
-                .iter()
-                .map(|(k, v)| (k.clone(), repair_value(v, values, repairs)))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-/// 1つの文字列の中の長い語を、ユーザーの値へ直す（空白で割って語ごとに見る）。
-fn repair_text(text: &str, values: &[String], repairs: &mut Vec<Repair>) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while !rest.is_empty() {
-        // 空白はそのまま写し、語だけを見る（元の空白の並びを崩さない）。
-        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let (word, after) = rest.split_at(word_end);
-        match mended(word, values) {
-            Some((repaired, repair)) => {
-                repairs.push(repair);
-                out.push_str(&repaired);
+        Value::String(text) => {
+            for word in text.split_whitespace() {
+                if let Some(t) = transcription_of(word, values) {
+                    found.push(t);
+                }
             }
-            None => out.push_str(word),
         }
-        let space_end = after
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(after.len());
-        out.push_str(&after[..space_end]);
-        rest = &after[space_end..];
+        Value::Array(items) => items.iter().for_each(|v| review_value(v, values, found)),
+        Value::Object(fields) => fields.values().for_each(|v| review_value(v, values, found)),
+        _ => {}
     }
-    out
 }
 
-/// `word`の中でユーザーの値に最も近い部分を差し替えた語と、その記録。直すものが無ければ`None`。
+/// `word`がどのユーザーの値を写したものか。写していないなら`None`。
 ///
 /// **語まるごとを比べてはいけない。** モデルは値の前後に自分で飾りを付ける（`payload=`・引用符・
-/// `--enc=`）ので、まるごと比べると飾りごと値へ置き換わり、**飾りが消えたコマンドが走る**。
-/// 実際に通しの試験が1本これで赤くなった（`payload={{user:1}}`の`payload=`が剥がれた）。
-fn mended(word: &str, values: &[String]) -> Option<(String, Repair)> {
+/// `--enc=`）ので、まるごと比べると飾りの分まで違いに数え、短い値では写しを見落とす。
+/// だから[`closest_region`]で**語の中の、値に当たる部分だけ**を見る。
+fn transcription_of(word: &str, values: &[String]) -> Option<Transcription> {
     let written: Vec<char> = word.chars().collect();
     if written.len() > MAX_SCANNED_WORD_CHARS {
         return None;
     }
-    let mut best: Option<(usize, usize, usize, &String)> = None;
-    for value in values {
+    let mut best: Option<Transcription> = None;
+    for (index, value) in values.iter().enumerate() {
         let user_value: Vec<char> = value.chars().collect();
         // **上限はユーザーの値の長さで決める。** モデルが短く切り詰めても基準が動かない。
-        let limit = (user_value.len() as f32 * MAX_REPAIR_RATIO) as usize;
+        let limit = (user_value.len() as f32 * MAX_TRANSCRIPTION_RATIO) as usize;
         if user_value.len() < MIN_REFERENCE_CHARS || written.len() + limit < user_value.len() {
             continue; // 短すぎて入らない
         }
         let Some((differences, start, end)) = closest_region(&written, &user_value, limit) else {
             continue;
         };
-        // 違いが0＝値がそのまま入っている。直すものは無い（飾りが付いていてもここで落ちる）。
-        if differences > 0 && best.is_none_or(|(d, ..)| differences < d) {
-            best = Some((differences, start, end, value));
+        if best.as_ref().is_none_or(|b| differences < b.differences) {
+            best = Some(Transcription {
+                number: index + 1,
+                written_chars: end - start,
+                value_chars: user_value.len(),
+                differences,
+            });
         }
     }
-    let (differences, start, end, value) = best?;
-    let mut repaired: String = written[..start].iter().collect();
-    repaired.push_str(value);
-    repaired.extend(&written[end..]);
-    Some((
-        repaired,
-        Repair {
-            written: written[start..end].iter().collect(),
-            user_value: value.clone(),
-            differences,
-        },
-    ))
+    best
 }
 
 /// `word`の中で`value`に最も近い部分を探し、`(違いの回数, 始まり, 終わり)`を返す。

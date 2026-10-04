@@ -130,6 +130,9 @@ pub enum ToolCallDecision {
     InvalidInput,
     /// 先行するツールの実行中にキャンセルされ、この呼び出しには手を付けていない。
     CancelledBeforeStart,
+    /// ユーザーの文の長い値を**損じたまま書き写していた**（D-115）。判定にも実行にも進んでいない
+    /// ——壊れた写しは別のものを実行する命令なので、承認を聞く前に断る。
+    TranscribedValue,
 }
 
 /// 1件のツール呼び出しと、その顛末。`output`は**履歴へ積むそのもの**
@@ -581,23 +584,42 @@ impl<'a> TurnExecutor<'a> {
                 continue;
             }
 
+            // モデルが参照の書き方を使わず**書き写していないか**を先に見る（D-115）。
+            // **差し込みより前**に見る——差し込んだ後では、`{{user:1}}`と正しく書いた呼び出しにも
+            // 値が入っているので、書き写したものと区別できなくなる。
+            let transcriptions = harness_core::review_user_references(input, references);
+            let damaged = transcriptions.iter().find(|t| !t.is_exact());
+            for t in &transcriptions {
+                emit(
+                    self.events,
+                    AgentEvent::UserValueTranscribed {
+                        value_chars: t.value_chars,
+                        differences: t.differences,
+                        refused: damaged.is_some(),
+                    },
+                );
+            }
+            if let Some(damaged) = damaged {
+                // **走らせない。** 壊れた写しは別のものを実行する命令なので、人に承認を聞く意味も無い。
+                // 断った理由はツールの結果としてモデルへ返し、番号で書き直させる。
+                tool_calls.push(CompletedToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    output: ToolOutput {
+                        content: damaged.refusal_ja(),
+                        is_error: true,
+                    },
+                    decision: ToolCallDecision::TranscribedValue,
+                    subject: None,
+                });
+                continue;
+            }
+
             // **ユーザーの文の値を差し込むのはここ1か所だけ**（`harness_core::user_reference`）。危険度の判定・
             // 承認画面の材料・実際の実行・画面のカード、どれもこの後ろにあるので、**同じ文字列**を見る
             // （D-101「判定器が見る材料」と、走るものを食い違わせない）。
             let input = &harness_core::substitute_user_references(input, references);
-            // 参照の書き方を使わずに**書き写した**ときの受け皿（D-114）。モデルが決まりを守らなくても
-            // 走るものが正しくなるよう、ユーザーの文の値とほぼ同じ塊はその値へ直す。
-            let (input, repairs) = harness_core::repair_user_references(input, references);
-            let input = &input;
-            for repair in &repairs {
-                emit(
-                    self.events,
-                    AgentEvent::UserValueRepaired {
-                        chars: repair.user_value.chars().count(),
-                        differences: repair.differences,
-                    },
-                );
-            }
 
             emit(
                 self.events,
