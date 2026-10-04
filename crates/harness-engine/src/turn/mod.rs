@@ -309,7 +309,7 @@ impl<'a> TurnExecutor<'a> {
         // **この回の会話の文から1回だけ組む**——ツール呼び出しごとに数え直すと、途中で番号の意味が変わる。
         // 組み立ては`value_store_for`の1か所だけを通す。ここと`build_request`（モデルへ一覧を見せる段）が
         // 同じ関数を同じ`messages`で呼ぶので、**モデルが見た番号と差し込まれる値が食い違わない**。
-        let references = harness_core::value_store_for(&base_req.messages).texts();
+        let references = crate::value_store_for(&base_req.messages).texts();
 
         let mut ladder: Option<ladder::Ladder> = None;
         // 現在の段。`None`は「素の1回目」（梯子はまだ登っていない）。

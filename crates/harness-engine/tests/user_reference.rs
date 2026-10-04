@@ -288,3 +288,42 @@ async fn the_request_carries_the_value_list_without_the_value_itself() {
     // 1つめの塊（環境の事実）は残っている——一覧を足したせいで消していない。
     assert!(system.contains("環境の事実"), "{system}");
 }
+
+/// **ハーネスが機械で解けた段にも番号が付く**（D-116）。モデルは中の層も番号で指せる。
+///
+/// 使う値は実測と同じ二重の形: 308文字の base64 を UTF-16LE として読むと
+/// `pwsh --enc <さらに base64>` になり、その中は `systeminfo` である。
+#[test]
+fn decoded_layers_get_their_own_numbers() {
+    let value = "cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAdwBCADUAQQBIAE0AQQBkAEEAQgBsAEEARwAwAEEAYQBRAEIAdQBBAEcAWQBBAGIAdwBBAD0A";
+    let store = harness_engine::value_store_for(&[harness_core::Message {
+        role: harness_core::Role::User,
+        content: vec![harness_core::ContentBlock::Text(format!(
+            "実行して pwsh --enc {value}"
+        ))],
+    }]);
+
+    let texts = store.texts();
+    assert_eq!(texts[0], value, "1つ目はユーザーが書いた値そのもの");
+    assert!(
+        texts.iter().any(|t| t.contains("pwsh --enc")),
+        "1段目（UTF-16LEとして読んだもの）に番号が付いていない: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t == "systeminfo"),
+        "2段目に番号が付いていない: {texts:?}"
+    );
+
+    // 一覧には**中身が1文字も載らない**。載るのは番号・長さ・出どころだけ。
+    let rendered = store.render().expect("空ではない");
+    assert!(!rendered.contains("systeminfo"), "{rendered}");
+    assert!(!rendered.contains(value), "{rendered}");
+    assert!(rendered.contains("として解読したもの"), "{rendered}");
+
+    // 親の番号が繋がっている（2段目の親は1段目であって、ユーザーの値ではない）。
+    let last = store.len();
+    assert!(matches!(
+        store.get(last).map(|v| v.origin.clone()),
+        Some(harness_core::value_store::Origin::Decoded { from, .. }) if from > 1
+    ));
+}
