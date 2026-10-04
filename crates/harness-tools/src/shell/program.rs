@@ -288,28 +288,36 @@ fn program_subject(
         subject.one_shot_only = true;
         return subject;
     };
-    let binding = approval_binding::bind_program_args(&view, cwd, &subject.args);
-    subject.files = binding.files;
-    subject.previews = binding.previews;
-    subject.one_shot_only = binding.one_shot_only;
+    let args_binding = approval_binding::bind_program_args(&view, cwd, &subject.args);
+    subject.one_shot_only = args_binding.one_shot_only;
+    let mut binding = approval_binding::ShellBinding {
+        files: args_binding.files,
+        previews: args_binding.previews,
+        unverifiable: false,
+    };
     if in_workspace {
         // ワークスペース内の実行ファイルは、実体そのものも縛る（D-103）。
         match resolved
             .as_deref()
             .and_then(|r| approval_binding::bind_executable(&view, r))
         {
-            Some(PathBinding::File(f, p)) => {
-                if let Err(pos) = subject
-                    .files
-                    .binary_search_by(|x| x.rel_path.cmp(&f.rel_path))
-                {
-                    subject.files.insert(pos, f);
-                    subject.previews.insert(pos, p);
-                }
-            }
+            Some(PathBinding::File(f, p)) => binding.absorb(approval_binding::ShellBinding {
+                files: vec![f],
+                previews: vec![p],
+                unverifiable: false,
+            }),
             _ => subject.one_shot_only = true,
         }
     }
+    // 解読した各段と、縛ったファイルの中身からも入れ子のスクリプトを縛る（D-120）。
+    // `run_shell`と**同じ関数**を通す——片方だけ直されて静かにずれるのを防ぐ（B-05）。
+    binding.absorb(approval_binding::bind_decoded(&view, cwd, &subject.decoded));
+    let nested = approval_binding::bind_nested(&view, cwd, &binding);
+    binding.absorb(nested);
+    // ここで確かめ切れなかったものは、恒久承認しない（`run_program`は`one_shot_only`が同じ役）。
+    subject.one_shot_only |= binding.unverifiable;
+    subject.files = binding.files;
+    subject.previews = binding.previews;
     subject
 }
 

@@ -30,6 +30,20 @@ pub const MAX_PREVIEW_BYTES: usize = 256 * 1024;
 /// `run_shell`の1行から縛る語の数の上限。超える行は「確かめられない」として扱う。
 const MAX_SHELL_TOKENS: usize = 256;
 
+/// 縛ったファイルの**中身を見る回数**の上限（D-120）。
+///
+/// 第0段（モデルが書いた行と、ハーネスが解読した各段）はここに数えない。3なら、
+/// 第0段で縛ったファイルの中身 → そこで見つけたファイルの中身 → さらにその中身、までを見る。
+/// `python a.py` で `a.py → b.py → c.py → d.py` と名指しが続くなら `d.py` までが入り、
+/// その先の `e.py` は入らない。
+pub const MAX_NEST_DEPTH: u32 = 3;
+
+/// 第1段から先で新しく縛るファイルの数の上限（D-120）。超えたら「確かめられない」として扱う。
+pub const MAX_NESTED_FILES: usize = 10;
+
+/// 解読した段のうち、ファイルを探す段の数の上限（D-120）。
+pub const MAX_LAYERS_TO_BIND: usize = 8;
+
 /// 子プロセスが実際に読むのと同じ見え方でワークスペースを読む口。
 pub struct ChildView {
     fs: SandboxFs,
@@ -199,6 +213,19 @@ pub struct ShellBinding {
     pub unverifiable: bool,
 }
 
+impl ShellBinding {
+    /// 別の縛り結果を取り込む（同じファイルは1つに、「確かめられない」は片方でも真なら真）。
+    ///
+    /// **重複なしの差し込みはこの1か所を通す。** 以前は`push_unique`と`shell/program.rs`の中へ
+    /// 同じ処理が写されていた（`B-05`——写すと片方だけ直されて静かにずれる）。
+    pub fn absorb(&mut self, other: ShellBinding) {
+        self.unverifiable |= other.unverifiable;
+        for (file, preview) in other.files.into_iter().zip(other.previews) {
+            push_unique(&mut self.files, &mut self.previews, file, preview);
+        }
+    }
+}
+
 /// `run_shell`の行に**字面で**現れる語のうち、ワークスペース内の通常ファイルを指すものを縛る（D-102）。
 ///
 /// 行を空白と`;|&(){}<>,=`で割り、引用符とバッククォートを剥がした語を、`cwd`からのパスとして引く。
@@ -226,6 +253,127 @@ pub fn bind_shell_line(view: &ChildView, cwd: &Path, line: &str) -> ShellBinding
         }
     }
     out
+}
+
+/// 行・解読した各段・入れ子のスクリプトを**全部**縛る（D-120）。承認材料を組む2つの入口
+/// （`run_shell`・`run_program`）がどちらもここを通る。
+///
+/// ```text
+/// 第0段  モデルが書いた行     → 全部の語を見る
+///        解読した各段の中身   → 全部の語を見る（`MAX_LAYERS_TO_BIND`段まで）
+/// 第1段〜 縛ったファイルの中身 → スクリプトの拡張子を持つ語だけ（[`bind_nested`]。[`MAX_NEST_DEPTH`]回まで）
+/// ```
+pub fn bind_everything(
+    view: &ChildView,
+    cwd: &Path,
+    line: &str,
+    decoded: &[harness_core::DecodedLayer],
+) -> ShellBinding {
+    let mut out = bind_shell_line(view, cwd, line);
+    out.absorb(bind_decoded(view, cwd, decoded));
+    let nested = bind_nested(view, cwd, &out);
+    out.absorb(nested);
+    out
+}
+
+/// 解読した各段の中身からもファイルを縛る（第0段の一部。深さを消費しない）。
+///
+/// 解読そのものの深さは別の上限が持っている（`MAX_DECODE_DEPTH`＝4・`MAX_DECODED_LAYERS`＝16）ので、
+/// ここでは**見る段の数**だけを[`MAX_LAYERS_TO_BIND`]で抑える。
+pub fn bind_decoded(
+    view: &ChildView,
+    cwd: &Path,
+    decoded: &[harness_core::DecodedLayer],
+) -> ShellBinding {
+    let mut out = ShellBinding::default();
+    for layer in decoded.iter().take(MAX_LAYERS_TO_BIND) {
+        if let harness_core::DecodeOutcome::Text { text, .. } = &layer.outcome {
+            out.absorb(bind_shell_line(view, cwd, text));
+        }
+    }
+    out
+}
+
+/// 縛ったファイルの**中身**から、さらに入れ子のスクリプトを縛る（D-120）。
+///
+/// # 何のためにあるのか
+///
+/// 承認材料にファイルが入るのは「モデルが書いた行に字面で出た語」を見るときだけだった。だから
+/// `pwsh --enc <塊>` を解読して出てきた `uv run test.py` の `test.py` は、**画面には見えているのに
+/// 中身を読んでおらず、ハッシュでも縛っていなかった**（実測: 2026-10-04）。
+///
+/// ```text
+/// 第0段  モデルが書いた行 ＋ ハーネスが解読した各段 → 全部の語を見る（`bind_shell_line`）
+/// 第1段  第0段で縛ったファイルの中身               → スクリプトの拡張子を持つ語だけ
+/// 第2段  第1段で縛ったファイルの中身               → 同上
+/// 第3段  第2段で縛ったファイルの中身               → 同上。ここで止める（`MAX_NEST_DEPTH`）
+/// ```
+///
+/// # 第1段から先で拡張子を見る理由
+///
+/// ファイルの中身は語が多い。全部の語を`bind_shell_line`へ通すと[`MAX_SHELL_TOKENS`]（256）を
+/// 超えて`unverifiable`が立ち、**スクリプトを名指しするコマンドが二度と自動承認されなくなる**
+/// （普通の100行のPythonファイルでも語は256を超える）。追いたいのは入れ子のスクリプトなので、
+/// 拡張子（`harness_core::has_script_extension`。D-118の一覧）で絞れば目的に足りる。
+///
+/// # 縛ると自動承認にも効く
+///
+/// ここで縛ったファイルは`CommandSubject.files`へ入り、承認の記録へそのまま写される。照合は
+/// 中身のハッシュの完全一致なので、**`test.py`の中身が1バイト変われば自動承認が外れて承認画面が出る**。
+///
+/// # ここが守らないもの
+///
+/// - **LLMが場所を示して解読した分は縛れない。** その解読は承認の分類が終わった後で走るので、
+///   `files`へ入れても照合には届かない（機械の解読の分だけが縛りに効く）
+/// - **第1段から先は拡張子で絞る**ので、拡張子の無いスクリプト（`#!/bin/sh`で始まるファイル等）は追えない
+/// - **変数に入れたファイル名は追えない**（`p = "x.ps1"`の後の`run(p)`）。字面に出ているものだけ
+/// - **上限で止めたら`unverifiable`を立てる**（黙って止めない）。確かめ切れていないので自動承認はしない
+pub fn bind_nested(view: &ChildView, cwd: &Path, seed: &ShellBinding) -> ShellBinding {
+    let mut out = ShellBinding::default();
+    // 次の段で中身を見るファイルの本文。最初は第0段で縛ったもの。
+    let mut frontier: Vec<String> = seed.previews.iter().map(|p| p.text.clone()).collect();
+    let mut seen: Vec<String> = seed.files.iter().map(|f| f.rel_path.clone()).collect();
+
+    for _ in 0..MAX_NEST_DEPTH {
+        if frontier.is_empty() {
+            break;
+        }
+        let mut next = Vec::new();
+        for text in std::mem::take(&mut frontier) {
+            for token in script_tokens(&text) {
+                if out.files.len() >= MAX_NESTED_FILES {
+                    // 確かめ切れていない。自動承認はしない。
+                    out.unverifiable = true;
+                    return out;
+                }
+                match bind_path(view, cwd, &token, true) {
+                    PathBinding::File(f, p) => {
+                        if seen.contains(&f.rel_path) {
+                            continue; // 同じファイルを二度追わない（循環も止まる）
+                        }
+                        seen.push(f.rel_path.clone());
+                        next.push(p.text.clone());
+                        push_unique(&mut out.files, &mut out.previews, f, p);
+                    }
+                    PathBinding::Unverifiable => out.unverifiable = true,
+                    PathBinding::Directory | PathBinding::Missing | PathBinding::Outside => {}
+                }
+            }
+        }
+        frontier = next;
+    }
+    out
+}
+
+/// テキストの中の、**スクリプトの拡張子を持つ語**だけ（第1段から先で使う）。
+///
+/// 割り方は[`shell_tokens`]と同じにして、ここで拡張子で絞る——割り方を別に持つと、片方だけ直されて
+/// 静かにずれる（`B-05`）。
+fn script_tokens(text: &str) -> Vec<String> {
+    shell_tokens(text)
+        .into_iter()
+        .filter(|t| harness_core::has_script_extension(t))
+        .collect()
 }
 
 /// `run_program`の引数を縛った結果（コードを走らせる呼び出しだけ）。

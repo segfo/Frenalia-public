@@ -394,24 +394,23 @@ impl Tool for RunShellTool {
         let line = input.command;
         let ctx = ctx.clone();
         tokio::task::spawn_blocking(move || {
-            let (files, previews, unverifiable) =
-                match crate::approval_binding::ChildView::for_ctx(&ctx) {
-                    Ok(view) => {
-                        let b = crate::approval_binding::bind_shell_line(&view, &cwd, &line);
-                        (b.files, b.previews, b.unverifiable)
-                    }
-                    // 見え方を開けなければ、何も確かめられない。記録と照合しない。
-                    Err(_) => (Vec::new(), Vec::new(), true),
-                };
             // [BUG-224] 行に符号化された中身があれば、ハーネスが機械的に解読して承認画面と要約へ渡す
-            // （§4.4）。**照合には使わない**——`ShellRule::matches`も`same_for_approval`もこの欄を
-            // 見ない。解読は`run_program`と同じ関数を通る（綴りの表を2箇所に持たない、B-05）。
+            // （§4.4）。**解読そのものは照合に使わない**——`ShellRule::matches`も`same_for_approval`も
+            // `decoded`欄を見ない。解読は`run_program`と同じ関数を通る（綴りの表を2箇所に持たない、B-05）。
             let decoded = crate::encoded_command::decode_shell_line(&line);
+            let binding = match crate::approval_binding::ChildView::for_ctx(&ctx) {
+                Ok(view) => crate::approval_binding::bind_everything(&view, &cwd, &line, &decoded),
+                // 見え方を開けなければ、何も確かめられない。記録と照合しない。
+                Err(_) => crate::approval_binding::ShellBinding {
+                    unverifiable: true,
+                    ..Default::default()
+                },
+            };
             PermissionSubject::Command(CommandSubject {
                 line,
-                files,
-                unverifiable,
-                previews,
+                files: binding.files,
+                unverifiable: binding.unverifiable,
+                previews: binding.previews,
                 decoded,
             })
         })
