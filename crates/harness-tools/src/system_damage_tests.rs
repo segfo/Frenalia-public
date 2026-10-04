@@ -1,0 +1,225 @@
+use super::*;
+
+use DamageAction::{Delete, Modify};
+use DamagePlace::{DriveRoot, System, UserData};
+
+/// 行ごとに「期待した組み合わせが見つかったか」を見て、外れた行を全部集める（1行目で止めない）。
+fn misses(cases: &[(&str, DamagePlace, DamageAction)]) -> Vec<String> {
+    cases
+        .iter()
+        .filter_map(|(line, place, action)| {
+            let found = assess_line(line);
+            let hit = found
+                .iter()
+                .any(|f| f.place == *place && f.action == *action);
+            (!hit).then(|| format!("{line} => {found:?}"))
+        })
+        .collect()
+}
+
+/// 何も見つからないはずの行のうち、見つかってしまったもの。
+fn false_alarms(lines: &[&str]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let found = assess_line(line);
+            (!found.is_empty()).then(|| format!("{line} => {found:?}"))
+        })
+        .collect()
+}
+
+#[test]
+fn deleting_the_drive_root_is_found() {
+    let cases = [
+        ("rm -rf /", DriveRoot, Delete),
+        ("rm -rf /*", DriveRoot, Delete),
+        (r"del /s /q C:\*", DriveRoot, Delete),
+        (r"del /s /q C:\*.*", DriveRoot, Delete),
+        (r"Remove-Item C:\ -Recurse -Force", DriveRoot, Delete),
+        (r"rd /s /q \", DriveRoot, Delete),
+        ("format C:", DriveRoot, Delete),
+        (r"Remove-Item $env:SystemDrive\ -Recurse", DriveRoot, Delete),
+    ];
+    assert_eq!(misses(&cases), Vec::<String>::new());
+}
+
+/// ユーザーが挙げた書き方（`%SystemRoot%`・`$Env:SystemRoot`・`%windir%`・`$Env:Windir`）と、
+/// 区切り・大小・前置き・`..`の違いを全部同じ場所として読む（`B-20`: 判定する側が自分で揃える）。
+#[test]
+fn every_way_of_writing_the_windows_folder_is_the_same_place() {
+    let cases = [
+        (r"Remove-Item C:\Windows\System32\x", System, Delete),
+        (r"del %SystemRoot%\System32\x", System, Delete),
+        (r"del %windir%\x", System, Delete),
+        (r"Remove-Item $Env:SystemRoot\System32\x", System, Delete),
+        (r"Remove-Item $Env:Windir\x", System, Delete),
+        (r"Remove-Item ${env:windir}\x", System, Delete),
+        ("rm -rf C:/Windows/System32", System, Delete),
+        (r"Remove-Item \\?\C:\Windows\x", System, Delete),
+        (r"Remove-Item \Windows\x", System, Delete),
+        (r"Remove-Item C:\Temp\..\WINDOWS\x", System, Delete),
+        (r#"Remove-Item "C:\Program Files\App" -Recurse"#, System, Delete),
+        (r"Remove-Item ${env:ProgramFiles(x86)}\App", System, Delete),
+        (r"del %ProgramData%\x", System, Delete),
+        (r"Remove-Item C:\Users -Recurse", System, Delete),
+        ("rm -rf /etc", System, Delete),
+        ("sudo rm -rf /usr/lib", System, Delete),
+        (r"Remove-Item (Join-Path $env:windir 'System32\x')", System, Delete),
+    ];
+    assert_eq!(misses(&cases), Vec::<String>::new());
+}
+
+/// システムの場所は、消すだけでなく書き換えても「高」。
+#[test]
+fn rewriting_system_places_is_found_too() {
+    let cases = [
+        (r"cp a.txt C:\Windows\", System, Modify),
+        (r"Copy-Item -Path a -Destination $env:windir", System, Modify),
+        ("cp -r src /etc", System, Modify),
+        (r"Move-Item a.dll C:\Windows\System32\a.dll", System, Modify),
+        (r"echo x > C:\Windows\x.txt", System, Modify),
+        (r"Set-Content -Path $env:SystemRoot\x -Value 1", System, Modify),
+        (r"icacls C:\Windows\System32 /grant Everyone:F", System, Modify),
+        (r"takeown /f C:\Windows\System32\x", System, Modify),
+        (r"Rename-Item C:\Windows\x y", System, Modify),
+        (r"[IO.File]::WriteAllText('C:\Windows\x', 'data')", System, Modify),
+    ];
+    assert_eq!(misses(&cases), Vec::<String>::new());
+    for (line, _, _) in cases {
+        assert!(assess_line(line).iter().all(DamageFinding::is_high), "{line}");
+    }
+}
+
+/// AppData とプロファイルの根: **消すのは「高」、書き換えるのは見つけるが「高」ではない**。
+#[test]
+fn user_data_is_high_only_when_it_is_deleted() {
+    let deleted = [
+        (r"del %AppData%\x", UserData, Delete),
+        (r"Remove-Item $env:LOCALAPPDATA\Programs -Recurse", UserData, Delete),
+        (r"Remove-Item C:\Users\bob\AppData\Roaming\x", UserData, Delete),
+        (r"Remove-Item ~\AppData -Recurse", UserData, Delete),
+        (r"Remove-Item $HOME\AppData\Local\x", UserData, Delete),
+        (r"rd /s /q %USERPROFILE%", UserData, Delete),
+        (r"Remove-Item C:\Users\bob -Recurse", UserData, Delete),
+    ];
+    assert_eq!(misses(&deleted), Vec::<String>::new());
+    for (line, _, _) in deleted {
+        assert!(assess_line(line).iter().any(DamageFinding::is_high), "{line}");
+    }
+    let rewritten = [
+        (r"cp a.json %AppData%\app\settings.json", UserData, Modify),
+        (r"Set-Content $env:LOCALAPPDATA\app\x.txt 1", UserData, Modify),
+        (r"echo x >> %AppData%\x.log", UserData, Modify),
+    ];
+    assert_eq!(misses(&rewritten), Vec::<String>::new());
+    for (line, _, _) in rewritten {
+        assert!(
+            !assess_line(line).iter().any(DamageFinding::is_high),
+            "{line}: rewriting user data must not be high"
+        );
+    }
+}
+
+/// 消す先がパイプの前・`{ }`の中・別のコマンドの中に書いてある形。
+#[test]
+fn targets_written_elsewhere_in_the_statement_are_followed() {
+    let cases = [
+        (r"Get-ChildItem C:\Windows\Temp | Remove-Item -Recurse", System, Delete),
+        (r"gci $env:windir | % { Remove-Item $_ }", System, Delete),
+        (r"if ($true) { rm C:\Windows\x }", System, Delete),
+        (r"cmd /c del C:\Windows\x", System, Delete),
+        (r#"cmd /c "del /q C:\Windows\x""#, System, Delete),
+        (r"pwsh -NoProfile -c Remove-Item C:\Windows\x", System, Delete),
+        (r#"pwsh -Command "Remove-Item C:\Windows\x""#, System, Delete),
+        (r#"python -c "import shutil; shutil.rmtree('C:/Windows')""#, System, Delete),
+        ("bash -c 'rm -rf /etc'", System, Delete),
+        (r"[IO.Directory]::Delete('C:\Windows\x', $true)", System, Delete),
+        (r"Get-Date; Remove-Item C:\Windows\x", System, Delete),
+        (r"robocopy C:\empty C:\Windows /MIR", System, Delete),
+    ];
+    assert_eq!(misses(&cases), Vec::<String>::new());
+}
+
+/// 同じ行の`cd`・`Set-Location`の行き先が、後ろの相対パスの基準になる。
+#[test]
+fn the_directory_changed_in_the_line_is_the_base_of_relative_paths() {
+    let cases = [
+        (r"cd C:\Windows; del x", System, Delete),
+        (r"Set-Location -Path $env:windir; Remove-Item -Recurse System32", System, Delete),
+        (r"cd C:\; del /s /q *", DriveRoot, Delete),
+        (r"cd %AppData%; rd /s /q app", UserData, Delete),
+    ];
+    assert_eq!(misses(&cases), Vec::<String>::new());
+    // スイッチ（`-Recurse`）は、行き先を基準にしても場所として読まない。
+    let targets: Vec<String> =
+        assess_line(r"Set-Location -Path $env:windir; Remove-Item -Recurse System32")
+            .into_iter()
+            .map(|f| f.target)
+            .collect();
+    assert_eq!(targets, vec!["System32".to_string()]);
+}
+
+/// 対照（`B-35`）: 読むだけ・普通の場所・コマンドの名前を引数に書いただけの行は、何も見つけない。
+/// コピー・移動は書き込み先しか見ない。
+#[test]
+fn reading_or_touching_ordinary_places_finds_nothing() {
+    let lines = [
+        "ls",
+        "git status",
+        r"Get-Content C:\Windows\win.ini",
+        r"Select-String -Path C:\Windows\System32\drivers\etc\hosts -Pattern localhost",
+        "ls /etc",
+        r"cp C:\Windows\win.ini .",
+        r"Copy-Item C:\Windows\System32\drivers\etc\hosts -Destination C:\work\hosts",
+        r"robocopy C:\Windows\Fonts C:\backup\fonts",
+        "echo rm -rf /",
+        r"Write-Output 'Remove-Item'",
+        "git rm src/old.rs",
+        r"Remove-Item .\build -Recurse -Force",
+        "rm -rf node_modules target",
+        r"del C:\Users\bob\Documents\draft.txt",
+        r"Remove-Item C:\work\Windows\x",
+        r"cd C:\work; del x",
+        "del x",
+        r"dir C:\Windows 2>&1 > $null",
+        r"echo x > out.txt",
+        r"Remove-Item $env:TEMP\x -Recurse",
+    ];
+    assert_eq!(false_alarms(&lines), Vec::<String>::new());
+}
+
+/// `run_program`は引数が既に割れている。同じ判定に通る。
+#[test]
+fn run_program_arguments_are_judged_the_same_way() {
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let found = |p: &str, a: &[&str]| assess_program(p, &args(a));
+    assert!(found("cmd", &["/c", "del", r"C:\Windows\x"])
+        .iter()
+        .any(|f| f.place == System && f.action == Delete));
+    assert!(found("pwsh", &["-NoProfile", "-Command", r"Remove-Item C:\Windows\x"])
+        .iter()
+        .any(|f| f.place == System && f.action == Delete));
+    assert!(found(r"C:\Windows\System32\robocopy.exe", &[r"C:\empty", r"C:\Windows", "/MIR"])
+        .iter()
+        .any(|f| f.place == System && f.action == Delete));
+    // 対照: 起動するプログラムが C:\Windows にあっても、それ自体は消す先ではない。
+    assert_eq!(found(r"C:\Windows\System32\cmd.exe", &["/c", "dir"]), Vec::new());
+    assert_eq!(found("git", &["status"]), Vec::new());
+    assert_eq!(found("python", &["build.py"]), Vec::new());
+}
+
+#[test]
+fn the_description_names_the_place_the_target_the_action_and_the_command() {
+    let found = assess_line(r"Remove-Item C:\Windows\System32\x");
+    assert_eq!(
+        found.iter().map(DamageFinding::describe_ja).collect::<Vec<_>>(),
+        vec![r"システムの場所（C:\Windows\System32\x）を消すコマンド（Remove-Item）".to_string()]
+    );
+}
+
+/// 同じ組み合わせは1回だけ出す（引用符の中を読み直しても重ならない）。
+#[test]
+fn the_same_finding_is_reported_once() {
+    let found = assess_line(r#"cmd /c "del C:\Windows\x" & del C:\Windows\x"#);
+    assert_eq!(found.len(), 1, "{found:?}");
+}
