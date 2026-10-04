@@ -85,6 +85,9 @@ impl PermissionView {
                 format!("（機械判定と判定モデル {source}）")
             }
             (None, RiskBasis::WithModel, None) => "（機械判定と判定モデル）".to_string(),
+            // 判定モデルが使えず、LLM フォールバック判定で決めた（D-125。本実装が入るまではモックなので
+            // 当面ここは出ない）。
+            (None, RiskBasis::WithFallback, _) => "（機械判定とLLMフォールバック判定）".to_string(),
         };
         let style = match severity {
             Severity::High => LineStyle::Danger,

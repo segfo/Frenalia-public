@@ -114,6 +114,10 @@ pub struct ApprovalSettings {
     /// 判定モデル。省略時は`winnow:e4b`。以前の名前は`risk_model`。
     #[serde(alias = "risk_model")]
     pub judge_model: Option<String>,
+    /// 判定モデル（Ollaya）が使えないとき、重い LLM 判定（LMStudio）へフォールバックするか（D-125。
+    /// 3段フォールバックの②）。**省略時は偽**——重いので既定では飛ばす。**本実装が入るまではモック**
+    /// （判定しないので、真にしても挙動は機械判定＝③と変わらない）。本実装は`plans/DESIGN-COGNITION.md`。
+    pub use_llm_fallback: Option<bool>,
 }
 
 /// `.harness/settings.json`の`policy`キー（M15.7）。

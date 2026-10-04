@@ -38,6 +38,7 @@
 //! - 解読が要りそうなのに、機械の解読も LLM が示した箇所の解読も何も取れなかったときは、注記を出すだけである
 //!   （LLM が場所を示さなかった・示した文字列が行に無かった・示された符号化として読めなかった）
 
+use async_trait::async_trait;
 use futures::future::join;
 use harness_core::decision::questions;
 use harness_core::{
@@ -48,6 +49,41 @@ use harness_core::{
 use harness_tools::system_damage::{self, DamageFinding};
 
 use crate::encoded_span::SpanLocator;
+
+/// 判定モデル（Ollaya）が使えないときの、重い LLM による危険度判定（D-125）。
+///
+/// # 何のためにあるのか
+///
+/// Ollaya（速い専用の判定サーバ）が落ちているとき、機械の判定は字面しか読めず、解読器が字面で見つけ
+/// られる難読化も base64 系に限られる（文字コードの並び・hex・base32 等は見つけられない）。そこで、
+/// 要約や解読箇所の特定に使っている LMStudio の LLM に、コマンドの危険度を判定させる段を1つ挟む。
+/// Ollaya → **この LLM 判定** → 機械判定＋ハッシュ（fail-closed）の3段フォールバックの真ん中。
+///
+/// # 限界
+///
+/// LLM の呼び出しは重い（要約と同じ程度）。だから**設定で飛ばせる**（`approval.use_llm_fallback`）。
+/// **本実装（実際に LMStudio を呼んで JSON の危険度を返させる `LlmFallbackJudge`）は後回しで、今は
+/// [`MockFallbackJudge`] が入っている**（常に判定しないので、挙動は3段目の機械判定と同じ）。本実装は
+/// 認知レイヤーの設計（`plans/DESIGN-COGNITION.md`）に置く。
+#[async_trait]
+pub trait FallbackJudge: Send + Sync {
+    /// コマンドの行を判定する。判定できなければ `Ok(None)`（3段目の機械判定へ落ちる）。
+    async fn judge(&self, line: &str) -> Result<Option<RiskVerdict>, String>;
+}
+
+/// LLM フォールバック判定の土台のモック（D-125）。常に `Ok(None)`（判定しない）を返す。
+///
+/// **本実装が入るまでの暫定。** `LlmFallbackJudge`（LMStudio を呼ぶ）に差し替わったら、この型は消す。
+/// モックは判定しないので、これを入れても挙動は機械判定（fail-closed）と変わらない——土台（trait・配線・
+/// 設定）だけが先に入る。
+pub struct MockFallbackJudge;
+
+#[async_trait]
+impl FallbackJudge for MockFallbackJudge {
+    async fn judge(&self, _line: &str) -> Result<Option<RiskVerdict>, String> {
+        Ok(None)
+    }
+}
 
 /// 解読できた段のうち、判定モデルへ危険度を聞く数の上限（段ごとに1回の呼び出し、約1秒）。
 pub const MAX_DECODED_TO_ASK: usize = 4;
@@ -124,8 +160,8 @@ pub enum RiskReason {
 /// 難読化を解析しきれなかった理由（D-124）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObfuscationCause {
-    /// 判定モデル（Ollaya）が使えないのに、難読化された中身がある。機械の判定は字面しか読めないので、
-    /// 解読された中身が安全かを確かめる手段が無い。
+    /// 判定モデル（Ollaya）が使えないのに、**解読できない**難読化された中身がある。機械でも中身を読めず、
+    /// 判定モデルも無いので、安全かを確かめる手段が無い。解読できた段は機械が読むので、ここには当たらない。
     ModelUnavailable,
     /// 解読の上限に達し、その先にまだ難読化が残っている（底まで解けていない）。一番下で何が走るかを
     /// 見ていない。
@@ -197,10 +233,12 @@ impl RiskNote {
 /// 判定に何を使ったか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RiskBasis {
-    /// 機械の判定だけ（判定モデルを使わない設定か、使えなかった）。
+    /// 機械の判定だけ（判定モデルも LLM フォールバックも使えなかった）。
     MachineOnly,
-    /// 判定モデルも使った。
+    /// 判定モデル（Ollaya）も使った。
     WithModel,
+    /// 判定モデルが使えず、LLM フォールバック判定（LMStudio）で決めた（D-125）。
+    WithFallback,
 }
 
 /// 組み立てた結果。
@@ -257,13 +295,14 @@ impl RiskOutcome {
     pub fn apply_fail_closed(&mut self, subject: &PermissionSubject) {
         match self.basis {
             RiskBasis::MachineOnly => {
-                if has_obfuscation(subject) {
+                if has_opaque_obfuscation(subject) {
                     self.push_reason(RiskReason::OpaqueObfuscation(
                         ObfuscationCause::ModelUnavailable,
                     ));
                 }
             }
-            RiskBasis::WithModel => {
+            // 判定モデルも LLM フォールバックも、解読の上限の先は見ていない（行を判定しただけ）。
+            RiskBasis::WithModel | RiskBasis::WithFallback => {
                 if hit_decode_limit(subject) {
                     self.push_reason(RiskReason::OpaqueObfuscation(ObfuscationCause::DepthLimited));
                 }
@@ -272,14 +311,17 @@ impl RiskOutcome {
     }
 }
 
-/// 難読化された中身がある（ハーネスが符号化された塊を1つでも見つけた）。解読できたか否かは問わない
-/// ——「難読化を使っている」ことが fail-closed の引き金である（D-124 ルール1）。
-fn has_obfuscation(subject: &PermissionSubject) -> bool {
+/// **解読できない**難読化がある（ハーネスが符号化された塊を見つけたが、中身を読める形まで解けていない）。
+/// これが fail-closed の引き金である（D-124 ルール1）。
+///
+/// **解読できた段（`Text`）は外す**——その中身は機械の被害判定（`damage_in_decoded`）が既に読んでいるので、
+/// 読んだ結果で判定すればよい。難読化を使っていること自体を引き金にすると、無害な `pwsh -enc <Get-Date>`
+/// まで「高」になってしまう（機械が解読できたケースの漏れ。2026-10-04 修正）。
+fn has_opaque_obfuscation(subject: &PermissionSubject) -> bool {
     decoded_layers(subject).iter().any(|l| {
         matches!(
             l.outcome,
-            DecodeOutcome::Text { .. }
-                | DecodeOutcome::NotText
+            DecodeOutcome::NotText
                 | DecodeOutcome::DepthLimit { .. }
                 | DecodeOutcome::SizeLimit { .. }
                 | DecodeOutcome::CountLimit { .. }
@@ -426,10 +468,13 @@ pub async fn assess(
     history: &[String],
     model: Option<&dyn DecisionModel>,
     locator: Option<&dyn SpanLocator>,
+    fallback: Option<&dyn FallbackJudge>,
 ) -> Option<RiskOutcome> {
     let mut out = machine(subject)?;
     let Some(model) = model else {
-        // 判定モデルを使わない設定。機械の判定だけで決まる（basis は MachineOnly）。
+        // 判定モデルを使わない設定。LLM フォールバックがあれば聞き、無ければ機械の判定だけで決める
+        // （3段フォールバックの② → ③。D-125）。
+        consult_fallback(&mut out, subject, fallback).await;
         out.apply_fail_closed(subject);
         return Some(out);
     };
@@ -548,10 +593,42 @@ pub async fn assess(
             Err(e) => out.note_model_error(e.to_string()),
         }
     }
-    // 難読化を解析しきれなかったときは危険側へ倒す（D-124）。basis は上で確定している
-    // ——モデルの呼び出しが全部失敗していれば MachineOnly のままなので、ルール1が掛かる。
+    // 判定モデルの呼び出しが全部失敗していれば basis は MachineOnly のまま。LLM フォールバックがあれば
+    // 聞く（②）。それでも判定できなければ機械の fail-closed（③。D-124/D-125）。
+    consult_fallback(&mut out, subject, fallback).await;
     out.apply_fail_closed(subject);
     Some(out)
+}
+
+/// 判定モデルが使えなかった（basis が MachineOnly の）ときだけ、LLM フォールバック判定を聞く（D-125）。
+/// 判定できたら basis を `WithFallback` にして理由へ足す。判定できなければ何もしない（③の機械判定へ）。
+async fn consult_fallback(
+    out: &mut RiskOutcome,
+    subject: &PermissionSubject,
+    fallback: Option<&dyn FallbackJudge>,
+) {
+    if out.basis != RiskBasis::MachineOnly {
+        return;
+    }
+    let Some(fallback) = fallback else {
+        return;
+    };
+    let Some(line) = subject_line(subject) else {
+        return;
+    };
+    match fallback.judge(&line).await {
+        Ok(Some(verdict)) => {
+            out.basis = RiskBasis::WithFallback;
+            if verdict.level == RiskLevel::Danger {
+                out.push_reason(RiskReason::Model {
+                    verdict,
+                    origin: Origin::Command,
+                });
+            }
+        }
+        Ok(None) => {}
+        Err(e) => out.note_model_error(e),
+    }
 }
 
 fn previews(subject: &PermissionSubject) -> &[FilePreview] {

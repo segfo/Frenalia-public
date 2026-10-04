@@ -46,6 +46,10 @@ pub struct ApprovalRisk {
     /// 解読する箇所を選ばせる LLM（`harness_engine::encoded_span`）。**要約と同じプロバイダとモデル**で、
     /// 起動時に要約の設定から組む（`harness_tui::run`）。要約を作らない設定なら`None`（選ばせない）。
     pub locator: Option<Arc<dyn SpanLocator>>,
+    /// 判定モデル（Ollaya）が使えないときに聞く、重い LLM フォールバック判定（D-125。3段目の機械判定の
+    /// 手前）。`approval.use_llm_fallback`が真なら入る。**本実装が入るまではモック**（判定しない）。
+    /// `None`なら Ollaya が使えないとき機械判定へ直行する。
+    pub fallback: Option<Arc<dyn harness_engine::approval_risk::FallbackJudge>>,
 }
 
 /// 要約を起こす前に、危険度の判定を待つ上限。**判定モデルを使うときは、危険度を先に出してから要約する**
@@ -507,6 +511,7 @@ pub(crate) fn start_risk(
     let (tx, rx) = oneshot::channel();
     let check = risk.check.clone();
     let locator = risk.locator.clone();
+    let fallback = risk.fallback.clone();
     let background = background.clone();
     let token = cancel.clone();
     tokio::spawn(async move {
@@ -514,7 +519,13 @@ pub(crate) fn start_risk(
             biased;
             // キャンセルされたときは何も送らない（承認画面はもう別のものを見ている）。
             _ = token.cancelled() => return,
-            outcome = approval_risk::assess(&subject, &history, Some(&*check), locator.as_deref()) => outcome,
+            outcome = approval_risk::assess(
+                &subject,
+                &history,
+                Some(&*check),
+                locator.as_deref(),
+                fallback.as_deref(),
+            ) => outcome,
         };
         let Some(outcome) = outcome else {
             return;

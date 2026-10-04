@@ -119,9 +119,20 @@ fn run_with(
     model: Option<&FakeModel>,
     locator: Option<&FakeLocator>,
 ) -> RiskOutcome {
+    run_full(subject, history, model, locator, None)
+}
+
+fn run_full(
+    subject: &PermissionSubject,
+    history: &[String],
+    model: Option<&FakeModel>,
+    locator: Option<&FakeLocator>,
+    fallback: Option<&dyn FallbackJudge>,
+) -> RiskOutcome {
     let model = model.map(|m| m as &dyn DecisionModel);
     let locator = locator.map(|l| l as &dyn SpanLocator);
-    futures::executor::block_on(assess(subject, history, model, locator)).expect("判定する材料")
+    futures::executor::block_on(assess(subject, history, model, locator, fallback))
+        .expect("判定する材料")
 }
 
 /// 決まった箇所を答える、場所を選ばせる部品。呼ばれた行を控える。
@@ -532,10 +543,11 @@ fn a_failed_model_falls_back_to_the_machine_judgement_and_says_so_once() {
     );
 }
 
-/// fail-closed（D-124 ルール1）: 判定モデルを使えないのに難読化された中身があれば、危険側へ倒す。
+/// fail-closed（D-124 ルール1）: 判定モデルを使えないのに**解読できない**難読化があれば、危険側へ倒す。
 /// **確かめられなかっただけで、危険と判明したわけではない**（境界ではない。画面に高を出すだけ）。
+/// 解読できた段は機械が中身を読むので、ここには当たらない（機械が解読できたケースの漏れを直した）。
 #[test]
-fn obfuscation_without_the_model_is_treated_as_high() {
+fn opaque_obfuscation_without_the_model_is_treated_as_high() {
     let has_cause = |out: &RiskOutcome| {
         out.reasons.iter().any(|r| {
             matches!(
@@ -544,19 +556,45 @@ fn obfuscation_without_the_model_is_treated_as_high() {
             )
         })
     };
-    // 判定モデルを使わない設定（model=None）。解読できた中身が無害（Get-Date）でも、難読化そのものが引き金。
-    let out = run(&with_decoded("pwsh -enc AAAA", "Get-Date"), &[], None);
+    // 解読できない段（NotText。base64は読めたが文字にならない＝圧縮/暗号/実行ファイル）を持つ材料。
+    let opaque = || {
+        let mut c = CommandSubject::line_only("pwsh -enc AAAA");
+        c.decoded.push(DecodedLayer {
+            depth: 1,
+            source: EncodedSource::EncodedCommand,
+            outcome: DecodeOutcome::NotText,
+            in_file: None,
+        });
+        PermissionSubject::Command(c)
+    };
+    // 判定モデルを使わない設定（model=None）。中身を読めないので危険側へ倒す。
+    let out = run(&opaque(), &[], None);
     assert_eq!(out.severity(), Severity::High);
     assert!(has_cause(&out), "{:?}", out.reasons);
 
     // 判定モデルが落ちている（呼び出しが失敗する）ときも同じ。
     let mut failing = FakeModel::quiet();
     failing.fail = true;
-    let out = run(&with_decoded("pwsh -enc AAAA", "Get-Date"), &[], Some(&failing));
+    let out = run(&opaque(), &[], Some(&failing));
     assert_eq!(out.severity(), Severity::High);
     assert!(has_cause(&out));
 
-    // 対照: 難読化が無ければ、モデルが無くても倒さない。
+    // 対照(1): 機械が解読できた段（Text・無害 Get-Date）＋model=None は、機械が読んだ結果で判定する。
+    // 難読化そのものは引き金にしない（この漏れを直した）。
+    let out = run(&with_decoded("pwsh -enc AAAA", "Get-Date"), &[], None);
+    assert_eq!(out.severity(), Severity::NeedsReview);
+    assert!(!has_cause(&out), "{:?}", out.reasons);
+
+    // 対照(2): 解読できた段が危険（del）なら「高」だが、理由は機械の被害判定（Damage）であって難読化ではない。
+    let out = run(&with_decoded("pwsh -enc AAAA", r"del /s /q C:\*"), &[], None);
+    assert_eq!(out.severity(), Severity::High);
+    assert!(!has_cause(&out), "{:?}", out.reasons);
+    assert!(out
+        .reasons
+        .iter()
+        .any(|r| matches!(r, RiskReason::Damage { .. })));
+
+    // 対照(3): 難読化が無ければ、モデルが無くても倒さない。
     let out = run(&shell("git log"), &[], None);
     assert_eq!(out.severity(), Severity::NeedsReview);
     assert!(!has_cause(&out));
@@ -716,4 +754,100 @@ fn a_bound_script_is_judged_even_when_the_model_says_it_reads_no_source() {
         "メモの字面に機械の被害判定を掛けている: {:?}",
         out.reasons
     );
+}
+
+/// 決まった答えを返す LLM フォールバック判定の偽物（D-125）。
+struct FakeFallback {
+    verdict: Option<RiskVerdict>,
+    fail: bool,
+}
+
+#[async_trait]
+impl FallbackJudge for FakeFallback {
+    async fn judge(&self, _line: &str) -> Result<Option<RiskVerdict>, String> {
+        if self.fail {
+            return Err("接続を拒まれた".into());
+        }
+        Ok(self.verdict)
+    }
+}
+
+/// D-125: 判定モデルが使えないとき、LLM フォールバック判定を聞く（②）。判定できれば機械の fail-closed（③）
+/// より先に効き、判定できなければ③へ落ちる。
+#[test]
+fn the_llm_fallback_runs_between_the_model_and_the_machine() {
+    // 解読できない段（NotText）を持つ材料。フォールバックが無ければ③で「高」（ルール1）になる。
+    let opaque = || {
+        let mut c = CommandSubject::line_only("pwsh -enc AAAA");
+        c.decoded.push(DecodedLayer {
+            depth: 1,
+            source: EncodedSource::EncodedCommand,
+            outcome: DecodeOutcome::NotText,
+            in_file: None,
+        });
+        PermissionSubject::Command(c)
+    };
+
+    // フォールバックが「危険」と判定 → basis=WithFallback、理由が付く。機械の fail-closed は掛からない。
+    let danger = FakeFallback {
+        verdict: Some(RiskVerdict::from_score(1.8).unwrap()),
+        fail: false,
+    };
+    let out = run_full(&opaque(), &[], None, None, Some(&danger));
+    assert_eq!(out.basis, RiskBasis::WithFallback);
+    assert_eq!(out.severity(), Severity::High);
+    assert!(out
+        .reasons
+        .iter()
+        .any(|r| matches!(r, RiskReason::Model { .. })));
+    assert!(!out.reasons.iter().any(|r| matches!(
+        r,
+        RiskReason::OpaqueObfuscation(ObfuscationCause::ModelUnavailable)
+    )));
+
+    // フォールバックが「無害」と判定 → basis=WithFallback、理由は付かない。難読化の fail-closed も掛からない
+    // （②が判定したので③へ落ちない）。
+    let harmless = FakeFallback {
+        verdict: Some(RiskVerdict::from_score(0.1).unwrap()),
+        fail: false,
+    };
+    let out = run_full(&opaque(), &[], None, None, Some(&harmless));
+    assert_eq!(out.basis, RiskBasis::WithFallback);
+    assert_eq!(out.severity(), Severity::NeedsReview);
+
+    // フォールバックが「判定できない」（Ok(None)）→ ③の機械 fail-closed へ落ちる（高）。
+    let abstain = FakeFallback {
+        verdict: None,
+        fail: false,
+    };
+    let out = run_full(&opaque(), &[], None, None, Some(&abstain));
+    assert_eq!(out.basis, RiskBasis::MachineOnly);
+    assert_eq!(out.severity(), Severity::High);
+
+    // フォールバックが落ちている → ③へ落ちる（高）。
+    let failing = FakeFallback {
+        verdict: None,
+        fail: true,
+    };
+    let out = run_full(&opaque(), &[], None, None, Some(&failing));
+    assert_eq!(out.basis, RiskBasis::MachineOnly);
+    assert_eq!(out.severity(), Severity::High);
+}
+
+/// 今のモック（`MockFallbackJudge`）は判定しないので、入れても挙動は機械判定（③）と同じ。
+#[test]
+fn the_mock_fallback_does_not_change_the_outcome() {
+    let mut c = CommandSubject::line_only("pwsh -enc AAAA");
+    c.decoded.push(DecodedLayer {
+        depth: 1,
+        source: EncodedSource::EncodedCommand,
+        outcome: DecodeOutcome::NotText,
+        in_file: None,
+    });
+    let subject = PermissionSubject::Command(c);
+    let with_mock = run_full(&subject, &[], None, None, Some(&MockFallbackJudge));
+    let without = run_full(&subject, &[], None, None, None);
+    assert_eq!(with_mock.basis, RiskBasis::MachineOnly);
+    assert_eq!(with_mock.severity(), without.severity());
+    assert_eq!(with_mock.reasons, without.reasons);
 }

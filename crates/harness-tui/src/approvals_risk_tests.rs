@@ -104,6 +104,7 @@ fn risk_of(fake: &Arc<FakeRisk>) -> ApprovalRisk {
         check: fake.clone(),
         label: "ollaya / test".into(),
         locator: None,
+        fallback: None,
     }
 }
 

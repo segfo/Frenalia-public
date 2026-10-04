@@ -371,11 +371,22 @@ fn resolve_approval_risk(settings: &harness_config::Settings) -> Option<harness_
     match harness_providers::DecideClient::new(base_url, model) {
         Ok(client) => {
             let label = client.label();
+            // Ollaya が使えないときの LLM フォールバック判定（D-125。設定で飛ばせる）。
+            // **本実装が入るまではモック**（判定しない）。本実装は認知レイヤー（`DESIGN-COGNITION.md`）。
+            let fallback: Option<std::sync::Arc<dyn harness_engine::approval_risk::FallbackJudge>> =
+                approval
+                    .use_llm_fallback
+                    .unwrap_or(false)
+                    .then(|| {
+                        std::sync::Arc::new(harness_engine::approval_risk::MockFallbackJudge)
+                            as std::sync::Arc<dyn harness_engine::approval_risk::FallbackJudge>
+                    });
             Some(harness_tui::ApprovalRisk {
                 check: std::sync::Arc::new(client),
                 label,
                 // 要約と同じ LLM から`harness_tui::run`が組む（要約の設定はそちらへ渡る）。
                 locator: None,
+                fallback,
             })
         }
         Err(reason) => {
