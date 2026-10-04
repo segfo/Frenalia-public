@@ -271,8 +271,32 @@ fn the_refusal_tells_the_model_what_to_write() {
 
     let found = review(&json!({ "command": slipped }), std::slice::from_ref(&value));
     let message = found[0].refusal_ja();
-    assert!(message.contains("{{user:1}}"), "{message}");
+    assert!(message.contains("{{val:1}}"), "{message}");
     assert!(message.contains("308"), "{message}");
     assert!(message.contains('1'), "{message}");
-    assert_eq!(found[0].reference(), "{{user:1}}");
+    assert_eq!(found[0].reference(), "{{val:1}}");
+}
+
+/// **古い綴り`{{user:N}}`も読み続ける。** 置き場が`value_store`へ移る前にモデルへ伝えていた書き方なので、
+/// 文脈に残っているものを無言で落とさない（落とすと、その綴りが残ったコマンドが走る）。
+#[test]
+fn the_old_spelling_still_substitutes() {
+    let value = blob('a');
+    let one = std::slice::from_ref(&value);
+    for command in ["pwsh --enc {{val:1}}", "pwsh --enc {{user:1}}"] {
+        assert_eq!(
+            substitute(&json!({ "command": command }), one),
+            json!({ "command": format!("pwsh --enc {value}") }),
+            "{command}"
+        );
+    }
+    // 1つの文字列に両方が出ても、出てきた順に差し込む。
+    let (a, b) = (blob('a'), blob('b'));
+    assert_eq!(
+        substitute(
+            &json!({ "command": "cmp {{user:2}} {{val:1}}" }),
+            &[a.clone(), b.clone()]
+        ),
+        json!({ "command": format!("cmp {b} {a}") })
+    );
 }

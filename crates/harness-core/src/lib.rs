@@ -19,6 +19,7 @@ pub mod schema;
 pub mod text;
 pub mod tool;
 pub mod user_reference;
+pub mod value_store;
 pub mod wire_log;
 
 /// `tool.rs`の待機理由機構（`WaitReason`/`WaitReasons`/`WaitState`）のテスト。
@@ -69,3 +70,4 @@ pub use user_reference::{
     review as review_user_references, substitute as substitute_user_references,
     values_in as user_reference_values, Transcription as UserValueTranscription,
 };
+pub use value_store::{from_messages as value_store_for, ValueStore};

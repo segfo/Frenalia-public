@@ -233,8 +233,18 @@ fn build_request(
     tool_specs: &[ToolSpec],
     config: &AgentLoopConfig,
 ) -> CompletionRequest {
+    // ハーネスが持っている値の一覧を**毎ターン作り直して**足す（D-115。`harness_core::value_store`）。
+    // 中身は1文字も載らない——載せればモデルが書き写せてしまうし、解読した中身は攻撃者が
+    // 書いたかもしれないデータで、ここはモデルが最も信用する位置だから。
+    //
+    // **`cache: false`。** 中身がターンごとに変わるので、送り直しを前提にする
+    // （1つめの塊＝環境の事実は変わらないので、そちらの使い回しは壊さない）。
+    let mut system = state.system.clone();
+    if let Some(text) = harness_core::value_store_for(&state.messages).render() {
+        system.push(SystemBlock { text, cache: false });
+    }
     CompletionRequest {
-        system: state.system.clone(),
+        system,
         messages: state.messages.clone(),
         tools: tool_specs.to_vec(),
         tool_choice: if tool_specs.is_empty() {

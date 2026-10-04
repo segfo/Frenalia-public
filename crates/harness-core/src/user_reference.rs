@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! ユーザー: pwsh --enc cAB3AHMAaAAg……（308文字）
-//! モデル:   run_shell { command: "pwsh --enc {{user:1}}" }
+//! モデル:   run_shell { command: "pwsh --enc {{val:1}}" }
 //! ハーネス: pwsh --enc cAB3AHMAaAAg……（ユーザーの文から取り出してそのまま差し込む）
 //! ```
 //!
@@ -74,7 +74,11 @@ const MAX_SCANNED_WORD_CHARS: usize = 65_536;
 pub const MIN_REFERENCE_CHARS: usize = 40;
 
 /// モデルへ伝える書き方（システムプロンプトと、ここの取り出しが同じ綴りを見る）。
-pub const SYNTAX_EXAMPLE: &str = "{{user:1}}";
+pub const SYNTAX_EXAMPLE: &str = "{{val:1}}";
+
+/// 番号で指す書き方の綴り。**`{{val:N}}`が正で、`{{user:N}}`は古い別名**
+/// （置き場が[`crate::value_store`]へ移る前の綴り。覚え直しを強いないために読み続ける）。
+const MARKERS: [&str; 2] = ["{{val:", "{{user:"];
 
 /// `messages`から、モデルが参照できる値を取り出す（並び順が番号になる。1つ目が`{{user:1}}`）。
 ///
@@ -111,7 +115,8 @@ fn text_of(message: &Message) -> String {
         .join(" ")
 }
 
-/// ツールの入力の**すべての文字列**の中の`{{user:N}}`を、`values`のN番目（1始まり）へ置き換える。
+/// ツールの入力の**すべての文字列**の中の`{{val:N}}`（と古い別名`{{user:N}}`）を、
+/// `values`のN番目（1始まり）へ置き換える。
 ///
 /// 置き換えるのは番号が在るものだけで、**無い番号はそのまま残す**（モジュールdoc「守らないもの」）。
 pub fn substitute(input: &Value, values: &[String]) -> Value {
@@ -128,14 +133,18 @@ pub fn substitute(input: &Value, values: &[String]) -> Value {
     }
 }
 
-/// 1つの文字列の中の`{{user:N}}`を置き換える。
+/// 1つの文字列の中の`{{val:N}}`（と古い別名`{{user:N}}`）を置き換える。
 fn substitute_text(text: &str, values: &[String]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(at) = rest.find("{{user:") {
+    while let Some((at, marker)) = MARKERS
+        .iter()
+        .filter_map(|m| rest.find(m).map(|at| (at, *m)))
+        .min_by_key(|(at, _)| *at)
+    {
         let (before, from_marker) = rest.split_at(at);
         out.push_str(before);
-        let after_marker = &from_marker["{{user:".len()..];
+        let after_marker = &from_marker[marker.len()..];
         let Some(end) = after_marker.find("}}") else {
             // 閉じていない。これ以降は綴りとして残す。
             out.push_str(from_marker);
@@ -150,7 +159,7 @@ fn substitute_text(text: &str, values: &[String]) -> String {
         {
             Some(value) => out.push_str(value),
             // 番号が無い・数でない: 書いた綴りをそのまま残す（人が承認画面で見て気付ける）。
-            None => out.push_str(&from_marker[..="{{user:".len() + end + 1]),
+            None => out.push_str(&from_marker[..=marker.len() + end + 1]),
         }
         rest = after;
     }
@@ -161,7 +170,7 @@ fn substitute_text(text: &str, values: &[String]) -> String {
 /// モデルがユーザーの値を**書き写していた**という審査の結果1件（[`review`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcription {
-    /// 何番目のユーザーの値を写したか（1始まり。`{{user:N}}`のN）。
+    /// 何番目の値を写したか（1始まり。`{{val:N}}`のN）。
     pub number: usize,
     /// モデルが書いた部分の長さ（文字）。
     pub written_chars: usize,
@@ -177,9 +186,9 @@ impl Transcription {
         self.differences == 0
     }
 
-    /// 参照の書き方（`{{user:N}}`）。
+    /// 参照の書き方（`{{val:N}}`）。
     pub fn reference(&self) -> String {
-        format!("{{{{user:{}}}}}", self.number)
+        format!("{{{{val:{}}}}}", self.number)
     }
 
     /// 実行を断ったことを**モデルへ**伝える文（ツールの結果として返す）。

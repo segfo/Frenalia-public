@@ -199,7 +199,7 @@ async fn a_damaged_transcription_never_runs() {
     .await;
     assert_eq!(file, None, "壊れた写しでファイルが書かれてはいけない");
     // モデルへ返るのは、何が違ったかと、次に何を書けばよいか。
-    assert!(result.contains("{{user:1}}"), "{result}");
+    assert!(result.contains("{{val:1}}"), "{result}");
     assert!(result.contains("書き写した値は実行しません"), "{result}");
     // 断ったことは会話の記録にも残す。
     assert_eq!(transcription_notices(&events), vec![(1, true)]);
@@ -229,4 +229,62 @@ async fn a_different_long_value_runs_untouched() {
     .await;
     assert_eq!(file.as_deref(), Some(other.as_str()));
     assert_eq!(transcription_notices(&events), Vec::new());
+}
+
+/// **モデルへ送るリクエストに、値の一覧が実際に載っている**（D-115）。
+///
+/// 一覧を組む関数があることと、それがリクエストへ配線されていることは別の事実である
+/// （`B-06`。ここを測らないと、組めるのに一度も送られない状態を緑のまま見逃す）。
+/// あわせて**中身が1文字も載っていない**ことを対で確かめる——載せればモデルが書き写せてしまう。
+#[tokio::test]
+async fn the_request_carries_the_value_list_without_the_value_itself() {
+    let value = long_value();
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("requests.jsonl");
+    let provider = MockProvider::new(vec![end_turn()]).with_request_record_path(record.clone());
+
+    let mut state = ConversationState::new(vec![harness_core::SystemBlock {
+        text: "環境の事実".to_string(),
+        cache: true,
+    }]);
+    state.push_user_text(format!("これを実行して {value}"));
+
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::Deny, vec![], dir.path());
+    run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 2,
+            compaction: Default::default(),
+            degeneracy: None,
+        },
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("the loop itself must not fail");
+
+    let sent = std::fs::read_to_string(&record).expect("リクエストが記録されていない");
+    let request: serde_json::Value = serde_json::from_str(sent.lines().next().unwrap()).unwrap();
+    let system = request["system"].to_string();
+    let chars = value.chars().count();
+    assert!(
+        system.contains("{{val:1}}") && system.contains(&format!("{chars}文字")),
+        "値の一覧がリクエストへ載っていない:
+{system}"
+    );
+    assert!(
+        !system.contains(&value),
+        "値の中身がシステムプロンプトへ載っている（書き写せてしまう）"
+    );
+    // 1つめの塊（環境の事実）は残っている——一覧を足したせいで消していない。
+    assert!(system.contains("環境の事実"), "{system}");
 }
