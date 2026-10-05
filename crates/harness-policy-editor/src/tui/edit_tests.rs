@@ -1812,5 +1812,134 @@ fn r_on_a_domain_header_marks_nothing() {
         "試験の前提: 2行目は alpha の下のフォルダ"
     );
     app.on_key(key(KeyCode::Char('R')));
-    assert!(app.recursive.contains("C:/proj/tc"), "フォルダの行には付く: {}", app.status);
+    // P4.4 から印は木の鍵（`Node::key`。段がある木では「ドメイン名＋区切り＋パス」）で持つ。
+    let folder = app.selected_node().expect("行");
+    assert!(
+        app.recursive.contains(&app.tree.node(folder).key),
+        "フォルダの行には付く: {}",
+        app.status
+    );
+    assert!(!app.recursive.contains("C:/proj/tc"), "パスで持つと別のドメインの同じフォルダと区別できない");
+}
+
+// --- P4.4: 位置ごとのドメインの記録のファイルの候補 ------------------------------
+
+/// 位置の情報がある記録を1件作り、`fs-audit.jsonl`を書く（補助は`position_view_tests`・`position_candidates_tests`）。
+fn seed_position_record_with_fs(
+    ws: &tempfile::TempDir,
+    instances: &[harness_policy::process_event::ProcessInstance],
+    events: &[harness_policy::FsAuditEvent],
+) {
+    let (dir, _) =
+        crate::position_view::position_view_tests::seed_position_record(ws.path(), "s1", instances);
+    crate::position_candidates::position_candidates_tests::write_fs_events(&dir, events);
+}
+
+/// **`[x]`の重ねは候補ごとのドメインで引く**（ドメイン欄の名前で引くと、別のドメインの宣言で`[x]`になる）。
+/// `pwsh`ドメインが`C:/b/y`を読んでいるとき、`pwsh`の候補は`[x]`、入口のドメインの同じパスの候補は`[ ]`。
+#[test]
+fn the_declared_mark_follows_each_candidates_domain() {
+    use crate::position_candidates::position_candidates_tests::fs_event;
+    use crate::position_view::position_view_tests::{user_example, CMD, PWSH};
+    use harness_policy::policy_file::{PolicyDomain, PolicyFile, ENTRY_DOMAIN};
+    use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
+
+    let ws = workspace();
+    // 入口のドメインは C:/b/** を読み、pwsh への辺を持つ（pwsh は C:/b/y だけ＝狭める向きなので検査に通る）。
+    let mut entry = PolicyDomain::new(ENTRY_DOMAIN);
+    entry.fs.read.push("C:/b/**".to_string());
+    entry
+        .process
+        .transitions
+        .push(editor_edge(PWSH, ArgvMatcher::Any(AnyMarker), "pwsh"));
+    let mut pwsh = PolicyDomain::new("pwsh");
+    pwsh.fs.read.push("C:/b/y".to_string());
+    let mut file = PolicyFile {
+        domains: vec![pwsh, entry],
+        ..Default::default()
+    };
+    file.domains.sort_by(|a, b| a.name.cmp(&b.name));
+    crate::policy_file::save(ws.path(), &file).expect("保存");
+    seed_position_record_with_fs(
+        &ws,
+        &user_example(),
+        &[fs_event("C:/b/y", Some(1), CMD), fs_event("C:/b/y", Some(2), PWSH)],
+    );
+
+    let app = open_edit(&ws);
+    let view = app.view.as_ref().expect("view");
+    let at = |domain: &str| {
+        view.domains
+            .iter()
+            .position(|d| d.as_deref() == Some(domain))
+            .unwrap_or_else(|| panic!("{domain} の候補: {:?}", view.domains))
+    };
+    assert!(app.candidate_is_on(at("pwsh")), "pwsh の宣言で [x]");
+    assert!(
+        !app.candidate_is_on(at(ENTRY_DOMAIN)),
+        "入口のドメインは C:/b/y そのものを宣言していない"
+    );
+}
+
+/// **`R`の印はドメインごと**: 2つのドメインが同じフォルダの下を触るとき、入口のドメインのフォルダで`R`を押すと
+/// 入口のドメインの合成提案だけが作られる（対の側: pwsh の同じフォルダには付かない）。
+#[test]
+fn recursive_marks_are_per_domain() {
+    use crate::position_candidates::position_candidates_tests::fs_event;
+    use crate::position_view::position_view_tests::{user_example, CMD, PWSH};
+    use harness_policy::policy_file::ENTRY_DOMAIN;
+
+    let ws = workspace();
+    seed_position_record_with_fs(
+        &ws,
+        &user_example(),
+        &[
+            fs_event("C:/data/s/d1", Some(1), CMD),
+            fs_event("C:/data/s/d2", Some(1), CMD),
+            fs_event("C:/data/s/d1", Some(2), PWSH),
+            fs_event("C:/data/s/d2", Some(2), PWSH),
+        ],
+    );
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    let rows = app.tree.rows(&app.expanded);
+    let row = rows
+        .iter()
+        .position(|r| {
+            let node = app.tree.node(r.node);
+            node.path == "C:/data/s" && node.domain.as_deref() == Some(ENTRY_DOMAIN)
+        })
+        .expect("入口のドメインの C:/data/s の行");
+    app.selected_row = row;
+    app.on_key(key(KeyCode::Char('R')));
+
+    let made: Vec<(Option<String>, String)> = app
+        .recursive_proposals()
+        .into_iter()
+        .map(|(domain, p)| (domain, p.value))
+        .collect();
+    assert_eq!(
+        made,
+        vec![(Some(ENTRY_DOMAIN.to_string()), "C:/data/s/**".to_string())],
+        "{}",
+        app.status
+    );
+}
+
+/// 位置ごとのドメインの記録の`a`は、**P4.5 まで書かずに理由を言う**（寿命: P4.5 で1回の確定にまとめる）。
+#[test]
+fn approving_a_position_record_is_left_to_p45() {
+    use crate::position_candidates::position_candidates_tests::fs_event;
+    use crate::position_view::position_view_tests::{user_example, CMD};
+
+    let ws = workspace();
+    seed_position_record_with_fs(&ws, &user_example(), &[fs_event("C:/a/x", Some(1), CMD)]);
+    let mut app = open_edit(&ws);
+    let id = app.view.as_ref().expect("view").proposals[0].id.clone();
+    app.accepted.insert(id);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char('a')));
+    assert!(app.modal.is_none(), "確認ダイアログを出してはいけない");
+    assert!(app.status.contains("P4.5"), "{}", app.status);
+    assert!(!crate::policy_file::path(ws.path()).exists());
 }

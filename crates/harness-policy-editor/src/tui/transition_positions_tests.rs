@@ -433,3 +433,76 @@ fn clicking_a_position_row_and_its_mark_does_what_the_keys_do() {
         app.status
     );
 }
+
+/// **子が親の持たないファイルを触る位置は P5 まで書けない**（決定65(6) の暫定）。FS/ネットのタブで子のドメインの
+/// 候補（`C:/secret/x`）を選ぶと、観測のタブのその位置は判定器が広げる向きと答え、行と`Space`が「P5まで書けません」と
+/// 言って予約できない（P4.4 でファイルの候補がドメインごとになってから出る）。
+/// 対の側: 選ぶ前は書ける見込みで、`Space`で予約できる。
+#[test]
+fn a_widening_position_says_it_cannot_be_written_until_p5() {
+    use crate::position_candidates::position_candidates_tests::{fs_event, write_fs_events};
+    let ws = workspace();
+    let (dir, _) = seed_position_record(ws.path(), "s1", &[root(1, CMD), child(2, 1, CALC)]);
+    write_fs_events(
+        &dir,
+        &[
+            fs_event("C:/a/x", Some(1), CMD),
+            fs_event("C:/secret/x", Some(2), CALC),
+        ],
+    );
+
+    // 対の側（選ぶ前）: 書ける見込み。
+    let mut app = open_observed_tab(ws.path());
+    press(&mut app, KeyCode::Char(' '));
+    assert!(
+        app.pending
+            .positions
+            .as_ref()
+            .unwrap()
+            .approve
+            .contains(&key_of(&app, CALC)),
+        "{}",
+        app.status
+    );
+
+    // FS/ネットのタブで calc のドメインの候補を選んでから、観測のタブへ戻る。
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    press(&mut app, KeyCode::F(2));
+    let view = app.view.as_ref().expect("候補");
+    let id = view
+        .proposals
+        .iter()
+        .zip(&view.domains)
+        .find(|(p, d)| p.value == "C:/secret/x" && d.as_deref() == Some("calc"))
+        .map(|(p, _)| p.id.clone())
+        .expect("calc のドメインの候補");
+    app.accepted.insert(id); // FS/ネットのタブの Space と同じ集合
+    press(&mut app, KeyCode::F(2));
+    let positions = app.pending.positions.as_ref().unwrap();
+    let calc = positions
+        .view
+        .assignment
+        .positions
+        .iter()
+        .position(|p| p.exe == CALC)
+        .unwrap();
+    assert!(
+        matches!(
+            positions.verdicts[calc],
+            crate::position_view::EdgeVerdict::Widens { .. }
+        ),
+        "{:?}",
+        positions.verdicts
+    );
+    let lines = screen(&app);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("calc.exe") && squash(l).contains("P5まで書けません")),
+        "{}",
+        lines.join("\n")
+    );
+    press(&mut app, KeyCode::Char(' '));
+    assert!(app.pending.positions.as_ref().unwrap().approve.is_empty());
+    assert!(app.status.contains("P5まで書けません"), "{}", app.status);
+}

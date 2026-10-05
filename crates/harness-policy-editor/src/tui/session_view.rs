@@ -167,6 +167,11 @@ impl SessionView {
     }
 
     /// 承認できない（広すぎる）候補の件数。**隠すなら件数は必ず出す**（B-09）。
+    /// 位置ごとのドメインの記録か（候補の書く先が候補ごとに決まっている。P4.4）。
+    pub fn by_position(&self) -> bool {
+        self.domains.iter().any(Option::is_some)
+    }
+
     pub fn blocked_count(&self) -> usize {
         self.too_broad.iter().filter(|b| **b).count()
     }
@@ -181,10 +186,19 @@ impl SessionView {
     }
 }
 
-// 候補一覧へ重ねる宣言（`[x]`）。2026-10-05に`state.rs`から**そのまま**移した（`plans/position-domains/P4.md`の
-// P4.4 の準備。`state.rs`は本体1,000行を超えているので、候補ごとのドメインで引くように直す前に置き場を分けた）。
+// 候補一覧へ重ねる宣言（`[x]`）。2026-10-05に`state.rs`から移した（`plans/position-domains/P4.md`の P4.4。
+// `state.rs`は本体1,000行を超えているので、候補ごとのドメインで引くように直す前に置き場を分けた）。
 impl crate::tui::state::App {
-    /// この値が**もう宣言されている**なら、それを取り消すための対象を返す（空なら未宣言）。
+    /// 候補（`view.proposals`の添字）を書く先のドメイン。**位置ごとのドメインの記録なら候補ごとの名前**
+    /// （[`SessionView::domains`]）、そうでなければドメイン欄の名前（今までどおり）。
+    pub fn candidate_domain(&self, index: usize) -> String {
+        self.view
+            .as_ref()
+            .and_then(|view| view.domains.get(index).cloned().flatten())
+            .unwrap_or_else(|| self.domain.text().trim().to_string())
+    }
+
+    /// ドメイン`domain`でこの値が**もう宣言されている**なら、それを取り消すための対象を返す（空なら未宣言）。
     ///
     /// # なぜ宣言側のキーで作るのか
     ///
@@ -192,8 +206,12 @@ impl crate::tui::state::App {
     /// 外したときに消すべきは**`policy.json`に書かれている行**なので、候補のキーではなく
     /// 宣言側のキーで対象を作らなければならない——候補のキーで作ると、存在しない行を
     /// 消そうとして「無かった」になり、`[x]`が外れないまま確定が通る。
-    pub fn declared_targets_for(&self, value: &str) -> Vec<crate::unapprove::UnapproveTarget> {
-        let Some(domain) = self.declared_domain.as_ref() else {
+    pub fn declared_targets_for(
+        &self,
+        domain: &str,
+        value: &str,
+    ) -> Vec<crate::unapprove::UnapproveTarget> {
+        let Some(domain) = self.declared_policy.as_ref().and_then(|f| f.domain(domain)) else {
             return Vec::new();
         };
         domain
@@ -207,34 +225,46 @@ impl crate::tui::state::App {
             .collect()
     }
 
-    /// 候補1件が「確定後に許可されている状態か」＝チェックが入っているか。
+    /// 候補1件（`view.proposals`の添字）が「確定後に許可されている状態か」＝チェックが入っているか。
     ///
     /// 承認予定（`accepted`）だけでなく**既に宣言されているもの**も入る。同じ場所へ二重に
     /// チェックを付けさせないためで、これが無いと承認済みの実行ファイルが毎回未選択で現れる。
-    pub fn proposal_is_on(&self, proposal: &RuleProposal) -> bool {
+    /// 宣言は**その候補を書く先のドメイン**（[`Self::candidate_domain`]）で引く。
+    pub fn candidate_is_on(&self, index: usize) -> bool {
+        let Some(proposal) = self.view.as_ref().and_then(|v| v.proposals.get(index)) else {
+            return false;
+        };
         if self.accepted.contains(&proposal.id) {
             return true;
         }
         // 宣言が複数あるとき（`read`と`read_exec`など）は、**1つでも残るなら許可されている**。
-        self.declared_targets_for(&proposal.value)
+        self.declared_targets_for(&self.candidate_domain(index), &proposal.value)
             .iter()
             .any(|target| !self.unapproved.contains(target))
     }
 
-    /// 候補一覧へ重ねる宣言（[`Self::declared_domain`]）を、いまのドメイン名で作り直す。
+    /// [`Self::candidate_is_on`]を候補そのもので引く（番号で`view.proposals`の添字を探す）。
+    pub fn proposal_is_on(&self, proposal: &RuleProposal) -> bool {
+        let index = self
+            .view
+            .as_ref()
+            .and_then(|v| v.proposals.iter().position(|p| p.id == proposal.id));
+        match index {
+            Some(index) => self.candidate_is_on(index),
+            None => self.accepted.contains(&proposal.id),
+        }
+    }
+
+    /// 候補一覧へ重ねる宣言（[`Self::declared_policy`]）を読み直す。**`policy.json`全体を持つ**——位置ごとの
+    /// ドメインの記録では候補ごとに別のドメインを引くため（P4.4）。
     ///
     /// 読めなかった場合は`None`にする。**「宣言が無い」と「読めなかった」を同じ表示にしない**
     /// ため、読めなかったことは`status`へ出す（D-43）。
     pub fn refresh_declared_overlay(&mut self) {
-        let name = self.domain.text().trim().to_string();
-        if name.is_empty() {
-            self.declared_domain = None;
-            return;
-        }
         match crate::policy_file::load(&self.workspace_root) {
-            Ok(file) => self.declared_domain = file.domain(&name).cloned(),
+            Ok(file) => self.declared_policy = Some(file),
             Err(e) => {
-                self.declared_domain = None;
+                self.declared_policy = None;
                 self.status =
                     format!("policy.jsonを読めませんでした（宣言済みの重ねは出ません）: {e}");
             }

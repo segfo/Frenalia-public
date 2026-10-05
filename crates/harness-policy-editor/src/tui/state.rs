@@ -591,10 +591,10 @@ pub struct App {
     /// 候補を作り直す操作（セッション移動など）では**必ず空にする**——idの指す先が
     /// 変わるので、残すと無関係な候補に「手で変えた」印が付く。
     pub hand_changed: BTreeSet<String>,
-    /// [D-63] `R`で**再帰**を指定したノードのパス集合（木のノードパスそのもの）。
+    /// [D-63] `R`で**再帰**を指定したノードの鍵の集合（`Node::key`。ドメインの段が無い木ではパスそのもの）。
     ///
     /// ここに入っているノードは、承認時に`<path>/**`という値の宣言として合成される
-    /// （[`super::edit::App::recursive_proposals`]）。**候補idではなくノードパスで持つ**のは、
+    /// （[`super::edit::App::recursive_proposals`]）。**候補idではなくノードの鍵で持つ**のは、
     /// 印を付けられる対象が候補とは限らないため——`.rustup/toolchains`のように
     /// 「中のファイルだけが観測されていて、そのフォルダ自身は候補になっていない」構造ノードにも
     /// 付けられる必要がある（付けられないと、今回いちばん困る形が救えない）。
@@ -660,15 +660,15 @@ pub struct App {
     /// `Esc`の二度押しの1回目（判定と窓の長さは会話画面と共有する`harness_term::double_esc`）。何もしていない`Esc`の
     /// ときだけ残る——`Esc`以外のキーも、他の働きをした`Esc`も数え直し（[`App::on_key_at`]）。
     pub double_esc: harness_term::double_esc::DoubleEsc,
-    /// 編集画面の`[x]`重ねに使う、**いまドメイン欄に入っている名前**の宣言のスナップショット。
+    /// 編集画面の`[x]`重ねに使う`policy.json`のスナップショット（候補ごとのドメインで引く。2026-10-05・P4.4）。
     ///
     /// # なぜキャッシュするのか
     ///
     /// 候補行を描くたびに`policy.json`を読むと、100msごとの再描画でファイルI/Oが走る。
-    /// 一方で常に持ち歩くと古くなる——**`declared_domain`が古いと、外して確定したつもりの行が
+    /// 一方で常に持ち歩くと古くなる——**`declared_policy`が古いと、外して確定したつもりの行が
     /// `[x]`のまま残る**（あるいはその逆）。作り直す点は[`App::refresh_declared_overlay`]に
     /// 集約してあり、ドメイン名の打ち替え・セッションを開く・確定した後に呼ぶ。
-    pub declared_domain: Option<crate::PolicyDomain>,
+    pub declared_policy: Option<crate::PolicyFile>,
 }
 
 // `Esc`の二度押しの判定と窓の長さ（1秒）は`harness_term::double_esc`が持つ（会話画面と同じ規則。2026-10-03にここから移した）。
@@ -729,7 +729,7 @@ impl App {
             declared_reassign: Default::default(),
             declared_transitions: Default::default(),
             double_esc: Default::default(),
-            declared_domain: None,
+            declared_policy: None,
         };
         app.reload_sessions();
         app

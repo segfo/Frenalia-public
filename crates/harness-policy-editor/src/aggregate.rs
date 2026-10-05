@@ -295,8 +295,9 @@ impl Aggregate {
         );
     }
 
-    /// 観測された実行像1件を`fs.read_exec`の候補へ合流させる（モジュールdoc参照）。
-    fn add_exec_image(&mut self, image: &str, timestamp_unix_ms: u64) {
+    /// 観測された実行像1件を`fs.read_exec`の候補へ合流させる（モジュールdoc参照）。位置ごとの候補
+    /// （`crate::position_candidates`）が、ファイル操作をしなかった子の実行ファイルを子のドメインへ足すのにも使う（決定65 Q8）。
+    pub(crate) fn add_exec_image(&mut self, image: &str, timestamp_unix_ms: u64) {
         self.add_exec_candidate(
             image,
             Source::Etw,
@@ -369,6 +370,18 @@ impl Aggregate {
     /// 畳み込み後の候補（異なる`(パス, access)`ごとに1件）。
     pub fn candidates(&self) -> &[DeniedCandidate] {
         self.folder.candidates()
+    }
+
+    /// この実行ファイルが既に`fs.read_exec`の候補にあるか（候補と同じ正規化で比べる）。
+    pub(crate) fn has_exec_candidate(&self, image: &str) -> bool {
+        let normalized = harness_policy::normalize::normalize_path(image);
+        self.folder.candidates().iter().any(|candidate| {
+            matches!(
+                &candidate.requested,
+                harness_policy::normalize::Requested::Fs { path, access: FsAccess::ReadExec }
+                    if *path == normalized
+            )
+        })
     }
 
     /// 許可ルールの提案。**適用はしない**（D-42: 反映は常にユーザーの明示操作）。
@@ -473,13 +486,26 @@ pub(crate) fn from_log(
     rules: crate::exclusion::ExclusionRules,
 ) -> Aggregate {
     let mut tail = crate::audit_tail::AuditTail::new(path);
-    let mut aggregate = Aggregate::new(rules);
     let (events, skipped) = tail.poll_fs_events();
-    for event in &events {
-        aggregate.add_event(event);
-    }
+    let refs: Vec<&FsAuditEvent> = events.iter().collect();
+    let mut aggregate = Aggregate::from_events(&refs, rules);
     aggregate.add_unparsable(skipped);
     aggregate
+}
+
+impl Aggregate {
+    /// 監査イベントの並びから集計する（[`from_log`]と、位置ごとの候補がドメインの分だけを集計するのが共有する。
+    /// `crate::position_candidates`、2026-10-05・P4.4）。**取り込みの規則は[`Aggregate::add_event`]の1つ**。
+    pub(crate) fn from_events(
+        events: &[&FsAuditEvent],
+        rules: crate::exclusion::ExclusionRules,
+    ) -> Aggregate {
+        let mut aggregate = Aggregate::new(rules);
+        for event in events {
+            aggregate.add_event(event);
+        }
+        aggregate
+    }
 }
 
 /// 設定ファイルへそのまま書ける綴りか（`C:/...`・UNC）。

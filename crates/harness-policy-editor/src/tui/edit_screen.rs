@@ -150,7 +150,12 @@ fn draw_domain(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(focus_style(focused))
-        .title(" ドメイン（このコマンドに何を許すか、の単位） ");
+        .title(if app.view.as_ref().is_some_and(|view| view.by_position()) {
+            // P4.4: 位置ごとのドメインの記録では、候補ごとに書く先のドメインが決まっている。
+            " ドメイン（この記録は位置ごとにドメインが決まっています（欄は使いません）） "
+        } else {
+            " ドメイン（このコマンドに何を許すか、の単位） "
+        });
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(
@@ -255,7 +260,7 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App, targets: &mut Target
             // 毎回`[ ]`で現れて、同じ場所へ二重にチェックを付けることになる。
             let selected = approvable
                 .iter()
-                .filter(|i| app.proposal_is_on(&view.proposals[***i]))
+                .filter(|i| app.candidate_is_on(***i))
                 .count();
             let mark = if approvable.is_empty() {
                 "[-]"
@@ -297,7 +302,7 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App, targets: &mut Target
             // [D-63] 再帰指定。**書かれる値そのもの（`/**`）を出す**——「再帰」という語より、
             // 実際にpolicy.jsonへ入る文字列を見せた方が誤解が無い。色は赤（この1行が他の全部より
             // 重い操作なので、一覧の中で埋もれてはいけない）。
-            if app.recursive.contains(&node.path) {
+            if app.recursive.contains(&node.key) {
                 spans.push(Span::styled(
                     "/**".to_string(),
                     Style::default()
@@ -356,7 +361,8 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App, targets: &mut Target
                 // **なぜこの行にチェックが入っているのかを言う。** 宣言済みだからチェックが
                 // 入っているのに理由が無いと、「自分が選んだのか」「もう許可されているのか」が
                 // 区別できず、外していいのかも判断できない。
-                let declared = app.declared_targets_for(&proposal.value);
+                let declared =
+                    app.declared_targets_for(&app.candidate_domain(*index), &proposal.value);
                 if !declared.is_empty() {
                     let keys: Vec<&str> = declared.iter().map(|t| t.key.dotted()).collect();
                     let reserved = declared.iter().all(|t| app.unapproved.contains(t));
@@ -374,7 +380,10 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App, targets: &mut Target
                 // 「外せば消える」ように見えて嘘になる（消えるのは親で、兄弟の許可も一緒に消える）
                 // ので、注記だけにする。
                 if declared.is_empty() {
-                    if let Some(domain) = app.declared_domain.as_ref() {
+                    let domain_name = app.candidate_domain(*index);
+                    if let Some(domain) =
+                        app.declared_policy.as_ref().and_then(|f| f.domain(&domain_name))
+                    {
                         if let Some((key, covering)) =
                             domain.covering_fs_declaration(&proposal.value)
                         {

@@ -36,6 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent};
+use harness_config::FsAccess;
 
 use harness_policy::policy_file::{PolicyFile, ENTRY_DOMAIN};
 use harness_policy::position_domains::{Position, PositionSource};
@@ -171,9 +172,27 @@ impl PositionsState {
     }
 
     /// 判定を取り直し、**書けなくなった位置の予約を外す**（外した件数を返す）。
-    fn refresh_verdicts(&mut self, workspace_root: &Path) -> usize {
+    ///
+    /// `extra_fs`は FS/ネットのタブで選んだ位置ごとのドメインの候補（[`App::position_extra_fs`]。ドメインは
+    /// 割り当ての名前で、付け替えはここで当てる）。子が親の持たないファイルを選ぶと、その位置は広げる向きになる
+    /// （決定65(6)、P4.4）。
+    fn refresh_verdicts(
+        &mut self,
+        workspace_root: &Path,
+        extra_fs: &[(String, String, FsAccess)],
+    ) -> usize {
         let edges = position_edges(&self.view.assignment, &self.renamed, &self.narrow);
-        self.verdicts = position_view::verdicts(&self.policy, workspace_root, &edges, &[]);
+        let extra: Vec<(String, String, FsAccess)> = extra_fs
+            .iter()
+            .map(|(domain, value, access)| {
+                (
+                    renamed_name(&self.renamed, domain).to_string(),
+                    value.clone(),
+                    *access,
+                )
+            })
+            .collect();
+        self.verdicts = position_view::verdicts(&self.policy, workspace_root, &edges, &extra);
         let writable: BTreeSet<PositionKey> = self
             .view
             .assignment
@@ -299,7 +318,7 @@ impl App {
         if let Some(previous) = previous.filter(|p| p.view.session_id == state.view.session_id) {
             state.carry_over(previous);
         }
-        state.refresh_verdicts(&self.workspace_root);
+        state.refresh_verdicts(&self.workspace_root, &self.position_extra_fs());
         let rows = state.visible().len();
         checkbox_tree::clamp_row(&mut state.row, rows);
         self.pending.positions = Some(state);
@@ -369,6 +388,29 @@ impl App {
             _ => {}
         }
         None
+    }
+
+    /// 位置の判定に足すファイルの宣言: FS/ネットのタブで選んだ、位置ごとのドメインの候補と`R`の合成提案（P4.4）。
+    /// ドメインは割り当ての名前（付け替えは[`PositionsState::refresh_verdicts`]が当てる）。位置の情報が無い記録は空。
+    fn position_extra_fs(&self) -> Vec<(String, String, FsAccess)> {
+        let Some(view) = self.view.as_ref().filter(|view| view.by_position()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (proposal, domain) in view.proposals.iter().zip(&view.domains) {
+            if !self.accepted.contains(&proposal.id) {
+                continue;
+            }
+            if let (Some(domain), Some(access)) = (domain, proposal.key.fs_access()) {
+                out.push((domain.clone(), proposal.value.clone(), access));
+            }
+        }
+        for (domain, proposal) in self.recursive_proposals() {
+            if let (Some(domain), Some(access)) = (domain, proposal.key.fs_access()) {
+                out.push((domain, proposal.value, access));
+            }
+        }
+        out
     }
 
     /// 位置の行を出しているか（「遷移・観測から」のタブで、選んでいる記録に位置の情報がある）。
@@ -446,12 +488,13 @@ impl App {
         }
         let key = key_of(&selected.position);
         let workspace_root = self.workspace_root.clone();
+        let extra_fs = self.position_extra_fs();
         let Some(positions) = self.pending.positions.as_mut() else {
             return;
         };
         if positions.approve.remove(&key) {
             if positions.narrow.remove(&key) {
-                positions.refresh_verdicts(&workspace_root);
+                positions.refresh_verdicts(&workspace_root, &extra_fs);
             }
             self.status = format!("{name} の承認をやめました");
         } else {
@@ -478,6 +521,7 @@ impl App {
         }
         let key = key_of(&selected.position);
         let workspace_root = self.workspace_root.clone();
+        let extra_fs = self.position_extra_fs();
         let Some(positions) = self.pending.positions.as_mut() else {
             return;
         };
@@ -487,7 +531,7 @@ impl App {
             return;
         }
         if positions.narrow.remove(&key) {
-            positions.refresh_verdicts(&workspace_root);
+            positions.refresh_verdicts(&workspace_root, &extra_fs);
             self.status = format!("{name}: 任意の引数を許します");
             return;
         }
@@ -513,7 +557,7 @@ impl App {
             return;
         }
         positions.narrow.insert(key.clone());
-        positions.refresh_verdicts(&workspace_root);
+        positions.refresh_verdicts(&workspace_root, &extra_fs);
         let verdict = positions
             .verdicts
             .get(selected.index)
@@ -529,7 +573,7 @@ impl App {
         // 絞ると書けない。絞りを戻し、予約も元どおりにする（取り直しで外れた予約を戻す）。
         positions.narrow.remove(&key);
         positions.approve.insert(key);
-        positions.refresh_verdicts(&workspace_root);
+        positions.refresh_verdicts(&workspace_root, &extra_fs);
         let detail = match verdict {
             EdgeVerdict::Widens { detail } | EdgeVerdict::Rejected { detail } => detail,
             EdgeVerdict::AlreadyDeclared | EdgeVerdict::Writable => String::new(),
@@ -593,6 +637,7 @@ impl App {
     /// 欄の名前を選んでいる位置の遷移先にする（名前ごと付け替えるので、子の行の遷移元も変わる）。
     fn apply_position_rename(&mut self) {
         let workspace_root = self.workspace_root.clone();
+        let extra_fs = self.position_extra_fs();
         let selected = self.selected_position();
         let Some(positions) = self.pending.positions.as_mut() else {
             return;
@@ -624,7 +669,7 @@ impl App {
         } else {
             positions.renamed.insert(original, text.clone());
         }
-        positions.refresh_verdicts(&workspace_root);
+        positions.refresh_verdicts(&workspace_root, &extra_fs);
         self.status = format!(
             "{name} の遷移先を {text} にしました（この位置から起きる子の遷移元も {text} になります）"
         );

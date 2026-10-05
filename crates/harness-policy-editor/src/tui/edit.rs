@@ -107,8 +107,22 @@ impl App {
             let domains = vec![None; proposals.len()];
             SessionView::new(data, notes, tree, proposals, domains)
         } else {
-            let aggregate = crate::aggregate::from_session(&entry.dir, &manifest);
+            // 位置の情報がある記録は候補をドメインごとに作る（決定65(5)、P4.4）。`policy.json`が読めなければ
+            // 位置を割り当てられないので、今までどおりの1つの一覧にして理由を注記に出す（`B-10`）。
+            let candidates = match policy_file::load(&self.workspace_root) {
+                Ok(file) => crate::position_candidates::from_session(&entry.dir, &manifest, &file),
+                Err(e) => crate::position_candidates::whole(
+                    &entry.dir,
+                    &manifest,
+                    Some(format!("policy.json を読めないので、位置ごとのドメインに分けずに見せています: {e}")),
+                ),
+            };
+            let aggregate = candidates.fs;
             let mut notes = failure_note_block(&manifest);
+            for note in &candidates.notes {
+                notes.push_str(note);
+                notes.push('\n');
+            }
             // 収集器そのものが動いていない場合は、候補が0件である理由がここにしか無い（D-43）。
             if !manifest.collector_started {
                 notes.push_str(
@@ -125,10 +139,8 @@ impl App {
                 fs: Some(Box::new(aggregate)),
                 net: None,
             };
-            let proposals = data.proposals();
-            // 位置ごとのドメインはまだ読まない（P4.4）。全部`None`＝ドメインの段の無い木。
-            let domains = vec![None; proposals.len()];
-            SessionView::new(data, notes, tree, proposals, domains)
+            // 位置の情報が無い記録は`domains`が全部`None`＝ドメインの段の無い木（今までどおり）。
+            SessionView::new(data, notes, tree, candidates.proposals, candidates.domains)
         };
         self.view = Some(view);
         self.rebuild_tree();
@@ -349,10 +361,10 @@ impl App {
             return;
         };
         let under = self.tree.bulk_selectable_proposals(node);
-        let approvable: Vec<&harness_policy::RuleProposal> = under
+        let approvable: Vec<usize> = under
             .iter()
-            .filter(|i| !view.too_broad[**i])
-            .map(|i| &view.proposals[*i])
+            .copied()
+            .filter(|i| !view.too_broad[*i])
             .collect();
         let blocked = under.len() - approvable.len();
 
@@ -380,12 +392,13 @@ impl App {
         // **チェックの意味は「確定後に許可されているか」の1つに統一する。** したがって
         // 「入っている」には承認予定（`accepted`）と**既に宣言されているもの**の両方が入り、
         // 外す操作は前者なら選択解除・後者なら**宣言の取り消しの予約**になる。
-        let all_selected = approvable.iter().all(|p| self.proposal_is_on(p));
-        let ids: Vec<String> = approvable.iter().map(|p| p.id.clone()).collect();
+        let all_selected = approvable.iter().all(|i| self.candidate_is_on(*i));
+        let ids: Vec<String> = approvable.iter().map(|i| view.proposals[*i].id.clone()).collect();
         // 宣言側の対象は**宣言のキー**で作る（候補のキーとは違い得る。`declared_targets_for`）。
+        // ドメインは候補ごと（位置ごとのドメインの記録。それ以外はドメイン欄。`candidate_domain`）。
         let declared: Vec<crate::unapprove::UnapproveTarget> = approvable
             .iter()
-            .flat_map(|p| self.declared_targets_for(&p.value))
+            .flat_map(|i| self.declared_targets_for(&self.candidate_domain(*i), &view.proposals[*i].value))
             .collect();
         let label = self.tree.node(node).path.clone();
         if all_selected {
@@ -587,11 +600,7 @@ impl App {
                 "この行そのものは候補ではありません（配下を選ぶならスペース）".to_string();
             return;
         }
-        let approvable: Vec<&harness_policy::RuleProposal> = own
-            .iter()
-            .filter(|i| !view.too_broad[**i])
-            .map(|i| &view.proposals[*i])
-            .collect();
+        let approvable: Vec<usize> = own.iter().copied().filter(|i| !view.too_broad[*i]).collect();
         if approvable.is_empty() {
             self.status = match harness_policy::breadth::check(&view.proposals[own[0]]).message() {
                 Some(reason) => format!(
@@ -603,11 +612,11 @@ impl App {
             return;
         }
 
-        let all_selected = approvable.iter().all(|p| self.proposal_is_on(p));
-        let ids: Vec<String> = approvable.iter().map(|p| p.id.clone()).collect();
+        let all_selected = approvable.iter().all(|i| self.candidate_is_on(*i));
+        let ids: Vec<String> = approvable.iter().map(|i| view.proposals[*i].id.clone()).collect();
         let declared: Vec<crate::unapprove::UnapproveTarget> = approvable
             .iter()
-            .flat_map(|p| self.declared_targets_for(&p.value))
+            .flat_map(|i| self.declared_targets_for(&self.candidate_domain(*i), &view.proposals[*i].value))
             .collect();
         let label = self.tree.node(node).path.clone();
         if all_selected {
@@ -659,7 +668,9 @@ impl App {
             return;
         }
         let path = self.tree.node(node).path.clone();
-        if self.recursive.remove(&path) {
+        // 印は木の鍵で持つ（ドメインの段がある木では、同じフォルダでもドメインごとに別の印。P4.4）。
+        let key = self.tree.node(node).key.clone();
+        if self.recursive.remove(&key) {
             self.status = format!("{path} の再帰指定を外しました");
             return;
         }
@@ -678,7 +689,7 @@ impl App {
                 return;
             }
         }
-        self.recursive.insert(path.clone());
+        self.recursive.insert(key);
         let under = self.tree.subtree_proposals(node).len();
         // **何を選んだのかを範囲で言う**（B-32）。件数だけでは「見えている分」と読まれる。
         self.status = format!(
@@ -719,17 +730,22 @@ impl App {
     /// **配下に観測された種別ごとに1本ずつ**作る——1本へ寄せると、`read`しか要らなかった経路まで
     /// 書込可になる（P-03、本モジュールが一般化でしないのと同じ理由）。配下に候補が1件も
     /// 無いノード（全部フィルタで隠れている等）は`fs.read`を既定にする。
-    pub(crate) fn recursive_proposals(&self) -> Vec<harness_policy::RuleProposal> {
+    ///
+    /// **書く先のドメインと組で返す**（2026-10-05、P4.4）。ドメインの段がある木の印は、その見出しのドメインの
+    /// 合成提案になる（`Node::domain`）。段の無い木は`None`（ドメイン欄へ書く、今までどおり）。
+    pub(crate) fn recursive_proposals(&self) -> Vec<(Option<String>, harness_policy::RuleProposal)> {
         let Some(view) = self.view.as_ref() else {
             return Vec::new();
         };
         let mut out = Vec::new();
         let mut seq = 0usize;
-        // 木のノードを引き直す（`recursive`はパスで持っているので、木が作り直されても残る）。
-        for path in &self.recursive {
-            let Some(node) = (0..self.tree.len()).find(|i| &self.tree.node(*i).path == path) else {
+        // 木のノードを引き直す（`recursive`は鍵で持っているので、木が作り直されても残る）。
+        for key in &self.recursive {
+            let Some(node) = (0..self.tree.len()).find(|i| &self.tree.node(*i).key == key) else {
                 continue;
             };
+            let path = &self.tree.node(node).path;
+            let domain = self.tree.node(node).domain.clone();
             let keys = self.recursive_keys_for(node);
             let evidence: Vec<_> = self
                 .tree
@@ -739,7 +755,7 @@ impl App {
                 .collect();
             for key in keys {
                 seq += 1;
-                out.push(harness_policy::RuleProposal {
+                out.push((domain.clone(), harness_policy::RuleProposal {
                     id: format!("rec-{seq}"),
                     key,
                     value: format!("{path}/**"),
@@ -749,7 +765,7 @@ impl App {
                          created there later"
                             .to_string(),
                     ],
-                });
+                }));
             }
         }
         out
@@ -761,7 +777,7 @@ impl App {
     /// 数え漏らすと、`R`だけを付けたユーザーに「選択 0件」と見えて**承認できないと誤解させる**
     /// （実際には承認される。実運用でこの取り違えが起きた）。`request_approval`のガードは
     /// 最初から両方を見ているので、**表示だけが取り残されていた**——選ぶ手段を増やしたら、
-    /// 選択の有無を見る場所を全部数える（B-06）。`accepted`は候補id、`recursive`はノードのパスを
+    /// 選択の有無を見る場所を全部数える（B-06）。`accepted`は候補id、`recursive`はノードの鍵を
     /// 持つ別々の集合なので、二重に数えることはない。
     pub(crate) fn selected_count(&self) -> usize {
         self.accepted.len() + self.recursive.len()

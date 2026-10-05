@@ -29,7 +29,10 @@ impl App {
             .as_ref()
             .map(|v| v.proposals.clone())
             .unwrap_or_default();
-        let recursive = self.recursive_proposals();
+        // 書く先は1つのドメイン（ドメイン欄）。位置ごとのドメインの記録はここまで来ない（`request_approval`が断る）
+        // ので、合成提案の書く先のドメイン（組の1つ目）はここでは使わない。
+        let recursive: Vec<harness_policy::RuleProposal> =
+            self.recursive_proposals().into_iter().map(|(_, p)| p).collect();
         proposals.extend(recursive.iter().cloned());
         let mut accept_ids: Vec<String> = self.accepted.iter().cloned().collect();
         accept_ids.extend(recursive.iter().map(|p| p.id.clone()));
@@ -40,6 +43,12 @@ impl App {
     pub(super) fn request_approval(&mut self) {
         if self.view.is_none() {
             self.status = "開いている記録がありません".to_string();
+            return;
+        }
+        // 位置ごとのドメインの記録は、ドメインごとのファイルの宣言と位置の辺を1回の確定で書く（P4.5 の
+        // `position_approve`）。それまでは何も書かずに理由を言う（`B-32`。寿命: P4.5 でこの分岐を消す）。
+        if self.view.as_ref().is_some_and(|view| view.by_position()) {
+            self.status = "位置ごとのドメインの記録の承認は P4.5 で1回の確定にまとめます。いまは書けません".to_string();
             return;
         }
         // **取り消しだけの確定も通す。** チェックを外す操作は`accepted`を増やさないので、

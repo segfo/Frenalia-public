@@ -109,6 +109,10 @@ pub mod net_aggregate;
 /// 型なので**windows専用**。
 #[cfg(windows)]
 pub mod position_view;
+/// 位置の情報がある記録のファイルの候補を、通し番号で位置のドメインへ振り分けて作る（決定65(5)、P4.4）。
+/// 位置を読む口が[`position_view`]なので**windows専用**。
+#[cfg(windows)]
+pub mod position_candidates;
 /// `policy.json`の型と読み書き。**実体は[`harness_policy::policy_file`]へ移した**
 /// （2026-09-12、段階6b）——`harness.exe`とSpawn Daemonも同じ`load`を通す必要が生じ、
 /// このクレートは`harness-sandbox`に依存しているのであちら側から見えないためである。
