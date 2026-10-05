@@ -647,8 +647,8 @@ pub struct App {
     /// **`view`・`filter`のどちらかを変えたら`rebuild_tree`を呼ぶこと。**
     /// 呼ばないと、木が古い候補を指したまま操作されることになる。
     pub tree: ProposalTree,
-    /// 展開しているノードのパス。**木を作り直しても残す**ので、フィルタや一般化の度合いを
-    /// 変えても開いていた場所が閉じない。
+    /// 展開しているノードの鍵（`Node::key`。ドメインの段が無い木ではパスそのもの）。**木を作り直しても
+    /// 残す**ので、フィルタや一般化の度合いを変えても開いていた場所が閉じない。
     pub expanded: HashSet<String>,
     /// 木の**見えている行**での選択位置。
     pub selected_row: usize,
@@ -706,23 +706,6 @@ pub struct App {
     /// `[x]`のまま残る**（あるいはその逆）。作り直す点は[`App::refresh_declared_overlay`]に
     /// 集約してあり、ドメイン名の打ち替え・セッションを開く・確定した後に呼ぶ。
     pub declared_domain: Option<crate::PolicyDomain>,
-}
-
-/// 宣言画面の1行。ドメインの見出し行と、その配下の宣言1件を同じ列で表す。
-///
-/// 木にしない（`ProposalTree`を使わない）のは、この画面が見せるのは
-/// **`policy.json`に書かれている行そのもの**であり、パスの階層は選択の単位ではないためである
-/// ——取り消しは1エントリ単位で、畳み込みや一括選択の対象にならない。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeclaredRow {
-    /// ドメインの見出し（`commands`と最終更新を添える）。
-    Domain {
-        name: String,
-        command: Option<String>,
-        entries: usize,
-    },
-    /// 宣言1件。
-    Entry(crate::unapprove::UnapproveTarget),
 }
 
 // `Esc`の二度押しの判定と窓の長さ（1秒）は`harness_term::double_esc`が持つ（会話画面と同じ規則。2026-10-03にここから移した）。

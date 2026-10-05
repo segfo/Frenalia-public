@@ -2691,6 +2691,129 @@ fn every_box_that_overflows_moves_one_notch_on_the_wheel() {
     );
 }
 
+/// `policy.json`に`domains`を書き、宣言画面（`F3`）を開いた状態。
+fn declared_screen_with_domains(
+    ws: &std::path::Path,
+    domains: Vec<crate::policy_file::PolicyDomain>,
+) -> App {
+    crate::policy_file::save(
+        ws,
+        &crate::policy_file::PolicyFile {
+            schema_version: crate::policy_file::POLICY_SCHEMA_VERSION,
+            domains,
+        },
+    )
+    .expect("policy.json");
+    let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+    press(&mut app, KeyCode::F(3));
+    assert_eq!(app.screen, Screen::Declared);
+    app
+}
+
+/// `name`が`value`を読むドメイン。
+fn reading_domain(name: &str, value: &str) -> crate::policy_file::PolicyDomain {
+    let mut domain = crate::policy_file::PolicyDomain::new(name);
+    domain.fs.read.push(value.to_string());
+    domain
+}
+
+/// 木の見えている行（段数とラベル）。
+fn tree_rows(
+    tree: &crate::tui::proposal_tree::ProposalTree,
+    expanded: &std::collections::HashSet<String>,
+) -> Vec<(usize, String)> {
+    tree.rows(expanded)
+        .into_iter()
+        .map(|row| (row.depth, tree.node(row.node).label.clone()))
+        .collect()
+}
+
+/// **同じパスを2つのドメインが宣言すると、宣言画面（F3）でも承認待ち（F2）でも、別々のドメインの見出しの下に
+/// 2行出る**（決定65。位置ごとのドメインでは同じパスを複数のドメインが持つのが普通になる）。
+///
+/// 直す前は、木へ渡すのがキーと値だけだったので2つの宣言が1行にまとまり、その行にはドメイン名が出ず、
+/// `c`・`R`は「宣言が2件ある」と断っていた。
+/// 対の側: 1つのドメインだけなら見出しは出ず、今までの木のまま。
+#[test]
+fn the_same_path_in_two_domains_shows_two_rows() {
+    const SHARED: &str = "C:/shared/data";
+    let both_rows = |rows: &[String]| -> Vec<usize> {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| row.contains(SHARED))
+            .map(|(i, _)| i)
+            .collect()
+    };
+
+    // F3（宣言画面）。
+    let ws = workspace();
+    let mut app = declared_screen_with_domains(
+        ws.path(),
+        vec![reading_domain("alpha", SHARED), reading_domain("beta", SHARED)],
+    );
+    assert_eq!(
+        tree_rows(&app.declared_tree, &app.declared_expanded),
+        vec![
+            (0, "[alpha]".to_string()),
+            (1, SHARED.to_string()),
+            (0, "[beta]".to_string()),
+            (1, SHARED.to_string()),
+        ]
+    );
+    let grid = frame(&mut app, 160, 30);
+    let rows = box_inner(&grid, " 承認済みの宣言");
+    let shared = both_rows(&rows);
+    assert_eq!(shared.len(), 2, "宣言画面に2行出ていない:\n{}", rows.join("\n"));
+    assert!(rows[shared[0]].contains("[alpha] fs.read"), "{}", rows[shared[0]]);
+    assert!(rows[shared[1]].contains("[beta] fs.read"), "{}", rows[shared[1]]);
+    let header = |name: &str| {
+        rows.iter()
+            .position(|row| row.contains(name) && !row.contains(SHARED))
+            .unwrap_or_else(|| panic!("見出し {name} の行が無い:\n{}", rows.join("\n")))
+    };
+    assert!(header("[alpha]") < shared[0] && shared[0] < header("[beta]") && header("[beta]") < shared[1]);
+
+    // 2つの行は別々に操作できる（alpha の行の取り消しの予約に beta の宣言が入らない）。
+    press(&mut app, KeyCode::Down);
+    press(&mut app, KeyCode::Char(' '));
+    let reserved: Vec<&str> = app.unapproved.iter().map(|t| t.domain.as_str()).collect();
+    assert_eq!(reserved, vec!["alpha"], "{}", app.status);
+
+    // F2（承認待ちの FS/ネット）。候補が位置ごとのドメインを持つ記録（P4.4 が作る形）。
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    press(&mut app, KeyCode::F(2));
+    let candidate = |id: &str| harness_policy::RuleProposal {
+        id: id.to_string(),
+        key: harness_policy::generalize::SettingsKey::FsRead,
+        value: SHARED.to_string(),
+        evidence: Vec::new(),
+        warnings: Vec::new(),
+    };
+    app.view = Some(crate::tui::state::SessionView::new(
+        Default::default(),
+        String::new(),
+        String::new(),
+        vec![candidate("fs-1"), candidate("fs-2")],
+        vec![Some("alpha".to_string()), Some("beta".to_string())],
+    ));
+    app.expanded.clear();
+    app.rebuild_tree();
+    let grid = frame(&mut app, 160, 30);
+    let rows = box_inner(&grid, " 候補:");
+    assert_eq!(both_rows(&rows).len(), 2, "承認待ちに2行出ていない:\n{}", rows.join("\n"));
+    assert!(rows.iter().any(|row| row.contains("[alpha]")), "{}", rows.join("\n"));
+    assert!(rows.iter().any(|row| row.contains("[beta]")), "{}", rows.join("\n"));
+
+    // 対の側: 1つのドメインだけなら見出しは出ない（今までの木）。
+    let ws = workspace();
+    let app = declared_screen_with_domains(ws.path(), vec![reading_domain("alpha", SHARED)]);
+    assert_eq!(
+        tree_rows(&app.declared_tree, &app.declared_expanded),
+        vec![(0, SHARED.to_string())]
+    );
+}
+
 /// マウスのクリック（`tui::pointer`）の試験。このファイルの描画の道具を使うので、子に置く。
 #[path = "pointer_tests.rs"]
 mod pointer_tests;

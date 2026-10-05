@@ -118,16 +118,17 @@ impl App {
             .map(|t| TreeItem {
                 key: t.key,
                 value: &t.value,
+                domain: Some(&t.domain),
             })
             .collect();
         let visible: Vec<usize> = (0..items.len()).collect();
         // 宣言に「広すぎて承認できない」は無い（既に承認された結果なので全件が操作対象）。
         let too_broad = vec![false; items.len()];
         self.declared_tree = ProposalTree::from_items(&items, &visible, &too_broad);
-        // 初回は根だけ開けておく（候補画面と同じ作法）。
+        // 初回は根だけ開けておく（候補画面と同じ作法。ドメインの段があれば見出しとその直下の根）。
         if self.declared_expanded.is_empty() {
             self.declared_expanded
-                .extend(self.declared_tree.paths_at_depth(1));
+                .extend(self.declared_tree.initially_open());
         }
         checkbox_tree::clamp_row(
             &mut self.declared_row,
@@ -178,9 +179,9 @@ impl App {
         let Some(node) = self.selected_declared_node() else {
             return;
         };
-        let path = self.declared_tree.node(node).path.clone();
-        if self.declared_tree.has_children(node) && !self.declared_expanded.contains(&path) {
-            self.declared_expanded.insert(path);
+        let key = self.declared_tree.node(node).key.clone();
+        if self.declared_tree.has_children(node) && !self.declared_expanded.contains(&key) {
+            self.declared_expanded.insert(key);
         } else if self.declared_tree.has_children(node) {
             self.declared_row += 1;
             checkbox_tree::clamp_row(
@@ -194,9 +195,9 @@ impl App {
         let Some(node) = self.selected_declared_node() else {
             return;
         };
-        let path = self.declared_tree.node(node).path.clone();
-        if self.declared_expanded.contains(&path) {
-            self.declared_expanded.remove(&path);
+        let key = self.declared_tree.node(node).key.clone();
+        if self.declared_expanded.contains(&key) {
+            self.declared_expanded.remove(&key);
             return;
         }
         // 閉じていれば親へ戻る。

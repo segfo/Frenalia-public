@@ -114,7 +114,7 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) ->
             let mark = Mark::of(under.len(), kept);
             let opened = app
                 .declared_expanded
-                .contains(&app.declared_tree.node(node).path);
+                .contains(&app.declared_tree.node(node).key);
 
             // 付け替えの予約の印。**`c`・`R`が効くのはこの行自身の宣言（1件のとき）**なので、
             // 配下を持つディレクトリの行でも、その行自身の宣言を付け替えるなら出す。
@@ -133,12 +133,14 @@ fn draw_tree(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) ->
                     )
                 });
 
-            // この画面固有の追記＝ドメイン名とキー（葉のときだけ）。
+            // この画面固有の追記＝ドメイン名とキー（葉のときだけ。ドメインの見出しの配下がちょうど1件でも、
+            // 見出しの行には出さない——その1件の行が下に同じものを出す）。
             let mut extra = Vec::new();
-            if under.len() != 1 {
+            let leaf = under.len() == 1 && !app.declared_tree.node(node).is_domain_header;
+            if !leaf {
                 extra.extend(reassign_span.clone());
             }
-            if under.len() == 1 {
+            if leaf {
                 if let Some(target) = app.declared.get(under[0]) {
                     extra.push(Span::styled(
                         format!("  [{}] {}", target.domain, target.key.dotted()),

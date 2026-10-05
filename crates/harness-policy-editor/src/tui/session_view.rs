@@ -6,6 +6,8 @@
 
 use harness_policy::RuleProposal;
 
+use crate::tui::proposal_tree::TreeItem;
+
 /// 選択中セッションの中身。**候補の計算はJSONLから毎回やり直す**（B-13）。
 ///
 /// # なぜ「FSかnetのどちらか」ではないのか
@@ -95,6 +97,9 @@ pub struct SessionView {
     /// 行ごとに出すと同じ文が候補の数だけ並び（実測849件）、個別の警告が埋もれる。
     /// 共通のものは注記として1度だけ出し、行には**その行に固有のもの**だけを残す。
     pub common_warnings: Vec<String>,
+    /// 候補ごとに書く先のドメイン（`proposals`と同じ並び）。**位置ごとのドメインの記録だけ`Some`**
+    /// （決定65。P4.4 が入れる）。全部`None`なら、候補の木は今までどおりドメインの段を持たない。
+    pub domains: Vec<Option<String>>,
 }
 
 impl SessionView {
@@ -114,12 +119,16 @@ impl SessionView {
             .collect()
     }
 
+    /// `domains`は`proposals`と同じ長さ（候補ごとに書く先のドメイン）。**引数にしてあるのは、候補を
+    /// 作り直す経路（accessの巡回など）が黙って`None`へ戻さないため**——呼び出し側の全部をコンパイラが数える。
     pub fn new(
         data: SessionData,
         notes: String,
         tree: String,
         proposals: Vec<RuleProposal>,
+        domains: Vec<Option<String>>,
     ) -> Self {
+        debug_assert_eq!(domains.len(), proposals.len());
         let common_warnings = Self::common_warnings(&proposals);
         let too_broad = proposals
             .iter()
@@ -132,7 +141,22 @@ impl SessionView {
             proposals,
             too_broad,
             common_warnings,
+            domains,
         }
+    }
+
+    /// 候補の木（[`crate::tui::proposal_tree::ProposalTree::from_items`]）へ渡す行。宣言画面と同じ形で、
+    /// 候補ごとのドメインを添える（2つ以上のドメインが出ると木がドメインの見出しで分かれる）。
+    pub fn tree_items(&self) -> Vec<TreeItem<'_>> {
+        self.proposals
+            .iter()
+            .zip(&self.domains)
+            .map(|(proposal, domain)| TreeItem {
+                key: proposal.key,
+                value: &proposal.value,
+                domain: domain.as_deref(),
+            })
+            .collect()
     }
 
     /// フィルタを通した候補の添字（`proposals`への添字）。

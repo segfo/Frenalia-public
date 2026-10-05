@@ -1760,3 +1760,57 @@ fn marking_a_read_only_directory_recursive_is_still_allowed() {
         app.status
     );
 }
+
+/// 候補の木にドメインの見出しがあるとき（位置ごとのドメインの記録、決定65）、**見出しの行では`R`が何も印を付けない**。
+/// 見出しのパスはドメイン名なので、通すと`<ドメイン名>/**`という宣言を作ってしまう。
+/// 対の側: その下のフォルダの行では今までどおり印が付く。
+#[test]
+fn r_on_a_domain_header_marks_nothing() {
+    let ws = workspace();
+    let mut app = open_edit(&ws);
+    let proposal = |id: &str, value: &str| harness_policy::RuleProposal {
+        id: id.to_string(),
+        key: harness_policy::generalize::SettingsKey::FsRead,
+        value: value.to_string(),
+        evidence: Vec::new(),
+        warnings: Vec::new(),
+    };
+    app.view = Some(crate::tui::state::SessionView::new(
+        Default::default(),
+        String::new(),
+        String::new(),
+        vec![
+            proposal("fs-1", "C:/proj/tc/a.txt"),
+            proposal("fs-2", "C:/proj/tc/b.txt"),
+            proposal("fs-3", "C:/other/c.txt"),
+        ],
+        vec![
+            Some("alpha".to_string()),
+            Some("alpha".to_string()),
+            Some("beta".to_string()),
+        ],
+    ));
+    app.expanded.clear();
+    app.rebuild_tree();
+    app.edit_focus = EditField::Proposals;
+    app.selected_row = 0;
+    let header = app.selected_node().expect("見出しの行");
+    assert!(app.tree.node(header).is_domain_header, "試験の前提: 1行目は見出し");
+
+    app.on_key(key(KeyCode::Char('R')));
+    assert!(app.recursive.is_empty(), "見出しの行に印は付かない: {:?}", app.recursive);
+    assert!(
+        app.status.contains("ドメインの見出しの行は再帰にできません"),
+        "何も起きない理由を言う: {}",
+        app.status
+    );
+
+    app.on_key(key(KeyCode::Down));
+    assert_eq!(
+        app.tree.node(app.selected_node().expect("行")).path,
+        "C:/proj/tc",
+        "試験の前提: 2行目は alpha の下のフォルダ"
+    );
+    app.on_key(key(KeyCode::Char('R')));
+    assert!(app.recursive.contains("C:/proj/tc"), "フォルダの行には付く: {}", app.status);
+}

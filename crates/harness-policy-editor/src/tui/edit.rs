@@ -103,7 +103,9 @@ impl App {
                 net: Some(Box::new(net)),
             };
             let proposals = data.proposals();
-            SessionView::new(data, notes, tree, proposals)
+            // 位置ごとのドメインはまだ読まない（P4.4）。全部`None`＝ドメインの段の無い木。
+            let domains = vec![None; proposals.len()];
+            SessionView::new(data, notes, tree, proposals, domains)
         } else {
             let aggregate = crate::aggregate::from_session(&entry.dir, &manifest);
             let mut notes = failure_note_block(&manifest);
@@ -124,7 +126,9 @@ impl App {
                 net: None,
             };
             let proposals = data.proposals();
-            SessionView::new(data, notes, tree, proposals)
+            // 位置ごとのドメインはまだ読まない（P4.4）。全部`None`＝ドメインの段の無い木。
+            let domains = vec![None; proposals.len()];
+            SessionView::new(data, notes, tree, proposals, domains)
         };
         self.view = Some(view);
         self.rebuild_tree();
@@ -232,12 +236,12 @@ impl App {
     pub(crate) fn rebuild_tree(&mut self) {
         let visible = self.visible_proposals();
         self.tree = match self.view.as_ref() {
-            Some(view) => ProposalTree::build(&view.proposals, &visible, &view.too_broad),
+            Some(view) => ProposalTree::from_items(&view.tree_items(), &visible, &view.too_broad),
             None => ProposalTree::default(),
         };
         // 初回は根だけ開けておく（全部閉じていると何も見えず、全部開くと平坦な一覧に戻る）。
         if self.expanded.is_empty() {
-            self.expanded.extend(self.tree.paths_at_depth(1));
+            self.expanded.extend(self.tree.initially_open());
         }
         self.clamp_row();
     }
@@ -289,8 +293,8 @@ impl App {
         if !self.tree.has_children(node) {
             return;
         }
-        let path = self.tree.node(node).path.clone();
-        if self.expanded.insert(path) {
+        let key = self.tree.node(node).key.clone();
+        if self.expanded.insert(key) {
             return;
         }
         // 既に開いている → 子へ移動する（行番号は1つ下）。
@@ -303,8 +307,8 @@ impl App {
         let Some(node) = self.selected_node() else {
             return;
         };
-        let path = self.tree.node(node).path.clone();
-        if self.expanded.remove(&path) {
+        let key = self.tree.node(node).key.clone();
+        if self.expanded.remove(&key) {
             self.clamp_row();
             return;
         }
@@ -509,7 +513,8 @@ impl App {
             self.hand_changed.insert(proposals[index].id.clone());
             changed.push(format!("{} を {}", proposals[index].value, next.dotted()));
         }
-        let rebuilt = SessionView::new(view.data, view.notes, view.tree, proposals);
+        // accessを変えても書く先のドメインは変わらない（黙って`None`へ戻さない）。
+        let rebuilt = SessionView::new(view.data, view.notes, view.tree, proposals, view.domains);
 
         // **承認できなくなったものは選択から外す。** 1件でも混ざると`approve::plan`は
         // 何も書かずに全部を拒否するので、黙って残すと承認そのものが通らなくなる。
@@ -643,6 +648,11 @@ impl App {
         let Some(node) = self.selected_node() else {
             return;
         };
+        // 見出しのパスはドメイン名なので、通すと`<ドメイン名>/**`という宣言を作ってしまう。
+        if self.tree.node(node).is_domain_header {
+            self.status = "ドメインの見出しの行は再帰にできません（その下のフォルダの行で R）".to_string();
+            return;
+        }
         if !self.tree.has_children(node) {
             self.status =
                 "再帰にできるのはディレクトリの行だけです（この行自身を許すなら d）".to_string();

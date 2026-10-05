@@ -240,7 +240,7 @@ fn draw_proposals(frame: &mut Frame, area: Rect, app: &App, targets: &mut Target
             let node = app.tree.node(row.node);
             let indent = "  ".repeat(row.depth);
             let has_children = app.tree.has_children(row.node);
-            let opened = app.expanded.contains(&node.path);
+            let opened = app.expanded.contains(&node.key);
 
             // 配下の選択状況（全部／一部／なし）。一部だけ選ばれている状態が見えないと、
             // 「まとめて選んだあと個別に外す」使い方ができない。
