@@ -721,6 +721,24 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture",
         ],
     ),
+    // 位置ごとのドメイン（決定65）の実機E2E。パス1でユーザーの例の連鎖を記録し、エディタの画面で
+    // 位置ごとに承認し、`harness.exe --enforce-transitions`（e2e-mock のビルド。先に
+    // `cargo build -p harness-cli --features e2e-mock`）で記録した連鎖だけが通ることを確かめる
+    // （`crates/harness-policy-editor/tests/position_domains_e2e.rs`）。
+    (
+        "e2e-policy-editor-position-domains",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "position_domains_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ],
+    ),
     // ポリシーエディタのパス2（Tier2aでのドメイン記録）の実機E2E。WFPの出口強制daemonを
     // 起こすため管理者権限と外部への到達性が要る（`crates/harness-policy-editor/tests/
     // record_net_e2e.rs`）。**2本目は対のテスト**で、生ソケットがWFPに落とされることを
