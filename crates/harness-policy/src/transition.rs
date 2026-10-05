@@ -829,6 +829,13 @@ fn compile_argv(matcher: &ArgvMatcher) -> Result<CompiledMatcher, regex::Error> 
 #[path = "transition_check.rs"]
 mod transition_check;
 
+/// 1つのドメインから見た遷移の形（届く範囲の権限・起動で届くドメイン・最長の連鎖）と、自己ループ辺の一覧
+/// （ポリシーエディタの宣言画面の遷移タブ、`plans/PLAN-POLICY-EDITOR-POSITION-DOMAINS.md` の P4.2）。
+/// **検査に落ちる宣言でも答える**（[`rights_summary`]・[`edge_direction`]と同じ）。
+#[path = "transition_shape.rs"]
+mod transition_shape;
+pub use transition_shape::{self_loops, shape, LongestChain, SelfLoop, TransitionShape};
+
 #[cfg(test)]
 #[path = "transition_tests.rs"]
 mod transition_tests;
