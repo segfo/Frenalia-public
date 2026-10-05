@@ -486,49 +486,6 @@ fn next_read_timeout(collecting: bool, first_request: bool) -> std::time::Durati
     }
 }
 
-#[cfg(test)]
-mod timeout_selection_tests {
-    use super::{next_read_timeout, DRAIN_INTERVAL, IDLE_TIMEOUT, START_TIMEOUT};
-
-    /// 許可側——**1件でも受けたあとの待機は、時間で打ち切らない。**
-    ///
-    /// これがD-56の本体である（ユーザーがエディタで考えている時間を待つ）。
-    /// 旧実装はここが60秒で、しかも時間切れで終了していた。
-    #[test]
-    fn once_a_request_has_arrived_the_idle_wait_is_effectively_unbounded() {
-        let waited = next_read_timeout(false, false);
-        assert_eq!(waited, IDLE_TIMEOUT);
-        assert!(
-            waited > std::time::Duration::from_secs(60 * 60),
-            "[BUG-098] the collector must outlive the user thinking in the editor. \
-             Anything on a human timescale re-creates the extra UAC prompt that D-56 removed: \
-             {waited:?}"
-        );
-    }
-
-    /// 禁止側——**最初の1件だけは短く待つ。**
-    ///
-    /// 片側だけだと「常に無期限に待つ」実装でも上のテストは通る。そうすると
-    /// **昇格トークンを握ったプロセスが、誰にも使われないまま残る**。
-    #[test]
-    fn the_first_request_is_still_waited_for_only_briefly() {
-        let waited = next_read_timeout(false, true);
-        assert_eq!(waited, START_TIMEOUT);
-        assert!(
-            waited <= std::time::Duration::from_secs(60),
-            "[BUG-098] a daemon that was started but never spoken to holds an elevated token; \
-             that state must stay detectable: {waited:?}"
-        );
-    }
-
-    /// 収集中は、待機の話とは無関係にドレイン間隔で起きる（1件目かどうかも効かない）。
-    #[test]
-    fn while_collecting_the_wait_is_the_drain_interval_regardless() {
-        assert_eq!(next_read_timeout(true, true), DRAIN_INTERVAL);
-        assert_eq!(next_read_timeout(true, false), DRAIN_INTERVAL);
-    }
-}
-
 fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
     let volumes = drive_letter_map();
     let mut current: Option<Generation> = None;
@@ -1431,5 +1388,48 @@ mod flush_batch_record_all_tests {
         policy.fs_audit_log_path = other_sink.join("fs-audit.jsonl");
         policy.capture_argv = false;
         validate_request(&policy).expect("argvを頼んでいない記録まで止まっている");
+    }
+}
+
+#[cfg(test)]
+mod timeout_selection_tests {
+    use super::{next_read_timeout, DRAIN_INTERVAL, IDLE_TIMEOUT, START_TIMEOUT};
+
+    /// 許可側——**1件でも受けたあとの待機は、時間で打ち切らない。**
+    ///
+    /// これがD-56の本体である（ユーザーがエディタで考えている時間を待つ）。
+    /// 旧実装はここが60秒で、しかも時間切れで終了していた。
+    #[test]
+    fn once_a_request_has_arrived_the_idle_wait_is_effectively_unbounded() {
+        let waited = next_read_timeout(false, false);
+        assert_eq!(waited, IDLE_TIMEOUT);
+        assert!(
+            waited > std::time::Duration::from_secs(60 * 60),
+            "[BUG-098] the collector must outlive the user thinking in the editor. \
+             Anything on a human timescale re-creates the extra UAC prompt that D-56 removed: \
+             {waited:?}"
+        );
+    }
+
+    /// 禁止側——**最初の1件だけは短く待つ。**
+    ///
+    /// 片側だけだと「常に無期限に待つ」実装でも上のテストは通る。そうすると
+    /// **昇格トークンを握ったプロセスが、誰にも使われないまま残る**。
+    #[test]
+    fn the_first_request_is_still_waited_for_only_briefly() {
+        let waited = next_read_timeout(false, true);
+        assert_eq!(waited, START_TIMEOUT);
+        assert!(
+            waited <= std::time::Duration::from_secs(60),
+            "[BUG-098] a daemon that was started but never spoken to holds an elevated token; \
+             that state must stay detectable: {waited:?}"
+        );
+    }
+
+    /// 収集中は、待機の話とは無関係にドレイン間隔で起きる（1件目かどうかも効かない）。
+    #[test]
+    fn while_collecting_the_wait_is_the_drain_interval_regardless() {
+        assert_eq!(next_read_timeout(true, true), DRAIN_INTERVAL);
+        assert_eq!(next_read_timeout(true, false), DRAIN_INTERVAL);
     }
 }
