@@ -22,15 +22,16 @@ fn literal(exe: &str, argv: &str) -> EdgeRef {
     }
 }
 
+/// 承認・取り消しの要求（遷移先は[`CHILD`]。自己ループ辺は凍結中で書けない）。
 fn request<'a>(
     ws: &'a Path,
     approve: &'a [EdgeRef],
     remove: &'a [EdgeRef],
 ) -> TransitionRequest<'a> {
-    request_to(ws, ENTRY_DOMAIN, approve, remove)
+    request_to(ws, CHILD, approve, remove)
 }
 
-/// 遷移先を選んだ要求（[`request`]は既定の自己ループ）。
+/// 遷移先を選んだ要求（[`request`]は[`CHILD`]へ向ける）。
 fn request_to<'a>(
     ws: &'a Path,
     to_domain: &'a str,
@@ -68,6 +69,60 @@ fn approve_and_reload(ws: &Path, edges: &[EdgeRef]) -> Vec<transition_listing::R
     listed(ws)
 }
 
+/// 試験で使う遷移先（宣言の無いドメイン。呼び出し元より狭いので検査を通る）。
+///
+/// **自己ループ辺は書けない**（決定65(3)で凍結）ので、承認する試験はこのドメインへ向ける。
+const CHILD: &str = "child";
+
+/// **禁止側**: 遷移先が遷移元と同じ（自己ループ辺）なら、**書く前に**断る。
+///
+/// 自己ループ辺は深さを区別しなくなる書き方で、ユーザーの明示操作として設計するまで凍結している
+/// （`plans/POLICY-EDITOR-TOMOYO-DIG.md` 決定65(3)）。既に`policy.json`があっても1バイトも変えない。
+#[test]
+fn a_self_loop_is_refused_before_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    declare_domain_with_read(tmp.path(), ENTRY_DOMAIN, "C:/x/**");
+    let before = std::fs::read(policy_file::path(tmp.path())).unwrap();
+
+    match plan(&request_to(tmp.path(), ENTRY_DOMAIN, &[any("C:/git.exe")], &[])) {
+        Err(TransitionApproveError::SelfLoopFrozen { domain }) => {
+            assert_eq!(domain, ENTRY_DOMAIN)
+        }
+        other => panic!("自己ループ辺が断られなかった: {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(policy_file::path(tmp.path())).unwrap(),
+        before,
+        "断ったのにpolicy.jsonが変わった"
+    );
+}
+
+/// **対の側**（`B-01`）: 手で書いた自己ループ辺は、凍結の後も取り消せる。
+///
+/// 書くのを止めて消すのまで止めると、凍結前に書かれた自己ループ辺を手でJSONを編集しないと外せなくなる。
+#[test]
+fn an_existing_self_loop_can_still_be_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut file = policy_file::PolicyFile::default();
+    let mut entry = PolicyDomain::new(ENTRY_DOMAIN);
+    entry.process.transitions.push(TransitionEdge {
+        exe: ExeMatcher::Literal("C:/git.exe".to_string()),
+        argv: ArgvMatcher::Any(AnyMarker),
+        cwd: None,
+        to: ENTRY_DOMAIN.to_string(),
+        env: None,
+    });
+    file.domains.push(entry);
+    policy_file::save(tmp.path(), &file).expect("手で書いた自己ループ辺が保存できない");
+
+    // 遷移先の欄が呼び出し元のままでも、取り消しだけの確定は遷移先を使わないので通る。
+    let plan = plan(&request_to(tmp.path(), ENTRY_DOMAIN, &[], &[any("C:/git.exe")]))
+        .expect("自己ループ辺を取り消せない");
+    assert_eq!(plan.removed, vec![any("C:/git.exe")]);
+    assert!(commit(tmp.path(), &plan).expect("書けない"));
+    assert!(listed(tmp.path()).is_empty(), "取り消したのに自己ループ辺が残っている");
+}
+
 // --- 承認 -------------------------------------------------------------------
 
 /// 承認した辺が`policy.json`へ届き、**モデルが見るのと同じ一覧**に出る。
@@ -83,22 +138,7 @@ fn an_approved_edge_shows_up_in_the_same_listing_the_model_sees() {
         "観測の綴りがパターンとして書かれている"
     );
     assert_eq!(rows[0].argv, transition_listing::ANY_ARGV);
-    assert_eq!(rows[0].to_domain, ENTRY_DOMAIN);
-}
-
-/// 遷移先に呼び出し元と同じドメインを渡せば自己ループが書け、**表に関係なく起こせる**。
-#[test]
-fn a_self_loop_is_written_when_the_destination_is_the_callers_own_domain() {
-    let tmp = tempfile::tempdir().unwrap();
-    let plan = plan(&request(tmp.path(), &[any("C:/git.exe")], &[])).expect("承認できない");
-    assert_eq!(plan.to_domain, ENTRY_DOMAIN);
-    assert!(!plan.created_to_domain, "呼び出し元は遷移先として作り直さない");
-
-    let rows = approve_and_reload(tmp.path(), &[any("C:/git.exe")]);
-    assert!(
-        rows[0].runnable_now,
-        "自己ループなのに「いまは起こせない」になっている"
-    );
+    assert_eq!(rows[0].to_domain, CHILD);
 }
 
 /// [2026-10-01] **別のドメインへの遷移が書ける**（§10.1.2の撤去一覧6つ目を外した）。

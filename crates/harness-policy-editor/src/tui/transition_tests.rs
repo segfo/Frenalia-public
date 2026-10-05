@@ -11,6 +11,8 @@ use crossterm::event::KeyModifiers;
 use harness_policy::transition_listing;
 use harness_sandbox::tier2a::policy_learnd::observed::{observed_path, ObservedRecord, Spawn};
 
+use crate::tui::text_input::TextInput;
+
 fn write_observed(ws: &Path, spawns: &[(&str, &str)]) {
     let path = observed_path(ws);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -44,6 +46,14 @@ fn declared_rows(ws: &Path) -> Vec<transition_listing::Row> {
     let text = ws.to_string_lossy().into_owned();
     let input = file.transition_graph_input(Some(&text), &[]);
     transition_listing::rows(&input, ENTRY_DOMAIN, &Default::default()).expect("一覧が作れない")
+}
+
+/// 試験で承認するときの遷移先（宣言の無いドメイン）。**欄は空で始まり、自己ループ辺は凍結中**
+/// （決定65(3)）なので、承認を確定する試験は先にここを入れておく。
+const CHILD: &str = "child";
+
+fn point_destination_at_child(app: &mut App) {
+    app.pending.destination.input = TextInput::new(CHILD);
 }
 
 /// **今日測った台本がそのまま一覧になる。**
@@ -105,6 +115,7 @@ fn selecting_and_confirming_writes_the_edge_to_the_policy_file() {
     let mut app = app_at(tmp.path());
     app.pending.tab = Tab(PendingTab::TransitionsObserved);
     app.reload_transitions();
+    point_destination_at_child(&mut app);
 
     press(&mut app, KeyCode::Char(' '));
     assert_eq!(app.pending.approve.len(), 1, "Spaceで選べていない");
@@ -133,6 +144,7 @@ fn an_already_declared_row_can_be_unchecked_and_removed() {
     let mut app = app_at(tmp.path());
     app.pending.tab = Tab(PendingTab::TransitionsObserved);
     app.reload_transitions();
+    point_destination_at_child(&mut app);
     press(&mut app, KeyCode::Char(' '));
     app.commit_transition();
 
@@ -171,6 +183,7 @@ fn narrowing_the_argv_requires_selecting_the_row_first() {
     let mut app = app_at(tmp.path());
     app.pending.tab = Tab(PendingTab::TransitionsObserved);
     app.reload_transitions();
+    point_destination_at_child(&mut app);
 
     press(&mut app, KeyCode::Char('u'));
     assert!(app.pending.narrow.is_empty());
@@ -203,6 +216,7 @@ fn the_default_is_any_argument_not_the_observed_one() {
     let mut app = app_at(tmp.path());
     app.pending.tab = Tab(PendingTab::TransitionsObserved);
     app.reload_transitions();
+    point_destination_at_child(&mut app);
     press(&mut app, KeyCode::Char(' '));
     app.commit_transition();
 
@@ -276,6 +290,7 @@ fn observed_tab_with(ws: &Path, spawns: &[(&str, &str)]) -> App {
     let mut app = app_at(ws);
     app.pending.tab = Tab(PendingTab::TransitionsObserved);
     app.reload_transitions();
+    point_destination_at_child(&mut app);
     app
 }
 
@@ -669,17 +684,52 @@ fn app_with_one_observed(ws: &Path) -> App {
     app
 }
 
-/// **既定は呼び出し元と同じドメイン**（自己ループ）。欄に触らずに確定すると、今までどおりの辺が書かれる。
+/// **欄は空で始まる**（決定65。かつての既定は呼び出し元＝自己ループ辺だった）。名前を入れずに
+/// 承認を確定しようとしたら、理由を言って何も書かない（`B-32`）。
 #[test]
-fn without_touching_the_destination_the_edge_stays_in_the_callers_domain() {
+fn the_destination_field_starts_empty_and_an_unnamed_commit_writes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_one_observed(tmp.path());
-    assert_eq!(app.pending.destination.name(), ENTRY_DOMAIN);
+    assert_eq!(app.pending.destination.name(), "", "欄が空で始まっていない");
 
     press(&mut app, KeyCode::Char(' '));
-    app.commit_transition();
+    press(&mut app, KeyCode::Char('a'));
 
-    assert_eq!(declared_rows(tmp.path())[0].to_domain, ENTRY_DOMAIN);
+    assert!(app.modal.is_none(), "名前の無い遷移先で確認ダイアログが出た");
+    assert!(app.status.contains("遷移先"), "理由を言っていない: {}", app.status);
+    assert!(
+        !policy_file::path(tmp.path()).exists(),
+        "名前が無いのにpolicy.jsonを書いた"
+    );
+}
+
+/// **禁止側**: 呼び出し元と同じ名前（自己ループ辺）を入れると、欄が「凍結中」と言い、
+/// 確定しようとしても**書く前に断る**（判定は`transition_approve::plan`の1か所）。
+#[test]
+fn typing_the_callers_own_domain_is_refused_as_frozen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_one_observed(tmp.path());
+
+    press(&mut app, KeyCode::Char(' '));
+    type_destination(&mut app, ENTRY_DOMAIN);
+    assert!(app.destination_needs_attention(), "欄が自己ループを目立たせていない");
+    assert!(
+        app.destination_label().contains("凍結"),
+        "欄の横に理由が出ていない: {}",
+        app.destination_label()
+    );
+
+    press(&mut app, KeyCode::Char('a'));
+    let modal = app.modal.as_ref().expect("断った理由のダイアログが出ていない");
+    assert!(
+        matches!(modal.confirm, Confirm::ReadOnly),
+        "書ける形の確認ダイアログが出た"
+    );
+    assert!(modal.lines.join("\n").contains("凍結"), "{:?}", modal.lines);
+    assert!(
+        !policy_file::path(tmp.path()).exists(),
+        "自己ループ辺を書いた"
+    );
 }
 
 /// **欄で選んだ遷移先へ辺が向く。** 確認ダイアログは遷移先と、宣言の無いドメインを作ることを先に言う。

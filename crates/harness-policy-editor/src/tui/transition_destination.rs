@@ -12,12 +12,13 @@
 //! `Enter`で戻るのと**同じ形**にした（決定62: 出どころが違っても操作系をそろえる）。
 //! 別々の遷移先へ分けたいときは、遷移先を変えて確定を2回に分ける。
 //!
-//! # 既定は呼び出し元と同じドメイン（自己ループ）
+//! # 欄は空で始まる（2026-10-05、決定65）
 //!
-//! 欄には最初から[`ENTRY_DOMAIN`]が入っている。自己ループは`harness.exe`が用意する必要が無く
-//! いつでも起こせ、遷移の編集時検査にも落ちない（向きが「同じ」）。別ドメインは利用者が
-//! 名前を入れたときだけ書く——**承認は常に利用者の明示操作**（D-42）で、既定で別ドメインへ
-//! 倒すと、空のドメインが黙って増える。
+//! かつては最初から[`ENTRY_DOMAIN`]（呼び出し元）が入っていて、欄に触らずに確定した辺はすべて
+//! 自己ループ辺になった。自己ループ辺は深さを区別しなくなる書き方で、決定65(3)で凍結したので、
+//! 欄は空で始める。呼び出し元と同じ名前を入れると欄の横に理由を出し、確定は
+//! [`crate::transition_approve::plan`]が書く前に断る（**判定はそこ1か所**。欄は見せるだけ）。
+//! 別ドメインは利用者が名前を入れたときだけ書く——**承認は常に利用者の明示操作**（D-42）。
 //!
 //! # ここが持たないもの
 //!
@@ -44,7 +45,7 @@ pub struct DestinationField {
 impl Default for DestinationField {
     fn default() -> Self {
         Self {
-            input: TextInput::new(ENTRY_DOMAIN),
+            input: TextInput::new(""),
             focused: false,
         }
     }
@@ -89,14 +90,20 @@ impl App {
         outlook_from_table(&self.pending, self.pending.destination.name())
     }
 
-    /// 遷移先の名前の問題（空・入れ物の名前にできない）。自己ループは入れ物を作らないので見ない。
+    /// 遷移先の名前の問題（空・呼び出し元と同じ＝自己ループ辺・入れ物の名前にできない）。
+    ///
+    /// 自己ループ辺の判定は**見せるためだけ**にここでも引く——書くかどうかは
+    /// [`crate::transition_approve::plan`]が決める（`SelfLoopFrozen`）。
     fn destination_name_problem(&self) -> Option<String> {
         let name = self.pending.destination.name();
         if name.is_empty() {
             return Some("空です。名前を入れてください".to_string());
         }
         if name == ENTRY_DOMAIN {
-            return None;
+            return Some(
+                "呼び出し元と同じドメインです。自己ループ辺は凍結中のため書けません（決定65）"
+                    .to_string(),
+            );
         }
         profile_name_problem(name).map(|problem| format!("この名前は使えません: {problem}"))
     }
@@ -136,9 +143,9 @@ impl App {
     pub(crate) fn destination_for_commit(&mut self, adding: bool) -> Option<String> {
         let name = self.pending.destination.name().to_string();
         if adding && name.is_empty() {
-            self.status = format!(
-                "遷移先ドメインが空です（Tab で欄へ移って名前を入れてください。既定は {ENTRY_DOMAIN}）"
-            );
+            self.status =
+                "遷移先ドメインが空です（Tab で欄へ移って、呼び出し元と別のドメイン名を入れてください）"
+                    .to_string();
             return None;
         }
         Some(name)

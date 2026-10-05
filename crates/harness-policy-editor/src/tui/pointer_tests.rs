@@ -1184,7 +1184,7 @@ fn a_letter_hint_leaves_the_field_before_pressing_the_key() {
 #[test]
 fn the_confirmation_buttons_do_what_their_keys_do() {
     type Make = fn(&std::path::Path) -> App;
-    let confirmation: Make = |ws| transition_confirmation_to(ws, "workspace-shell");
+    let confirmation: Make = |ws| transition_confirmation_to(ws, "build");
     let read_only: Make = |ws| {
         let mut app = record_screen_with_content(ws);
         app.modal = Some(state::Modal {
@@ -1224,8 +1224,8 @@ fn the_confirmation_buttons_do_what_their_keys_do() {
 
     // 書いた中身（作業ディレクトリの綴りを除いて同じ）。
     let (ws_click, ws_keys) = (workspace(), workspace());
-    let mut clicked = transition_confirmation_to(ws_click.path(), "workspace-shell");
-    let mut keyed = transition_confirmation_to(ws_keys.path(), "workspace-shell");
+    let mut clicked = transition_confirmation_to(ws_click.path(), "build");
+    let mut keyed = transition_confirmation_to(ws_keys.path(), "build");
     let grid = frame(&mut clicked, SIZE.0, SIZE.1);
     let bottom = modal_bottom(&grid, &clicked);
     click(&mut clicked, cell_of(&grid, Some(bottom), "y=書く", None));

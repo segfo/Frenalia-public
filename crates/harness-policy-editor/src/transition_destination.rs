@@ -37,8 +37,10 @@ use harness_sandbox::tier2a::policy_grants::{DomainGrants, SkipReason, SkippedDe
 /// 遷移先ドメインを`harness.exe`が用意する見込み。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outlook {
-    /// 遷移先が呼び出し元と同じドメイン（自己ループ）。**用意は要らない**——Daemonは表を引かず、
-    /// 呼び出し元の実体のまま起こす（`spawnd::server::serve_spawn_request`）。
+    /// 遷移先が呼び出し元と同じドメイン（自己ループ辺）。**凍結中で、エディタからは書けない**
+    /// （決定65(3)）。この変種が出るのは、遷移先の欄に呼び出し元の名前が入ったときと、手で書いた
+    /// 自己ループ辺の見込みを引いたときである。Daemonは表を引かず、呼び出し元の実体のまま起こす
+    /// （`spawnd::server::serve_spawn_request`）。
     SameDomain,
     /// 宣言の上では用意される。
     Provisioned {
@@ -76,7 +78,9 @@ impl Outlook {
     /// 遷移先の欄と一覧の行末に出す一言。
     pub fn short_label(&self) -> String {
         match self {
-            Outlook::SameDomain => "同じドメインの中で起こす（用意は要らない）".to_string(),
+            Outlook::SameDomain => {
+                "呼び出し元と同じドメイン（自己ループ辺は凍結中で書けない）".to_string()
+            }
             Outlook::Provisioned { declarations: 0 } => {
                 "用意される見込み（ファイル宣言なし・共通の土台だけ）".to_string()
             }
@@ -104,9 +108,9 @@ impl Outlook {
     pub fn notice_lines(&self, to_domain: &str) -> Vec<String> {
         match self {
             Outlook::SameDomain => vec![
-                format!("遷移先は呼び出し元と同じドメイン（{to_domain}）です。"),
-                "  起こした子は呼び出し元と同じ権限で動きます。別のドメインへ分けるなら、".to_string(),
-                "  Tab で遷移先の欄へ移って名前を変えてから確定してください。".to_string(),
+                format!("遷移先が呼び出し元と同じドメイン（{to_domain}）です。"),
+                "  自己ループ辺は凍結中のため書けません（決定65）。".to_string(),
+                "  Tab で遷移先の欄へ移って、別のドメイン名を入れてから確定してください。".to_string(),
             ],
             Outlook::Provisioned { declarations: 0 } => vec![
                 format!("遷移先 {to_domain} はファイル宣言を持たないので、harness.exe は"),

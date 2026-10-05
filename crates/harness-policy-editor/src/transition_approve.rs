@@ -28,8 +28,9 @@
 //! かつては遷移先を必ず呼び出し元と同じドメインに倒していた（`provisional_destination`。
 //! `harness.exe`が別ドメインを用意できるかをエディタが知る手段が無かったため）。#30（D-112）で
 //! 用意できるかが`policy.json`と承認台帳から決まるようになったので外し、[`TransitionRequest::to_domain`]で
-//! 受ける。**書く前に断るのは2つだけ**——入れ物の名前にできない名前
-//! （[`crate::transition_destination::profile_name_problem`]）と、編集時検査に落ちる宣言。
+//! 受ける。**書く前に断るのは3つ**——遷移元と同じ遷移先（自己ループ辺。凍結中、
+//! `plans/POLICY-EDITOR-TOMOYO-DIG.md` 決定65(3)）、入れ物の名前にできない名前
+//! （[`crate::transition_destination::profile_name_problem`]）、編集時検査に落ちる宣言。
 //! 「宣言の上では用意されない」遷移先（通信を宣言している・許可が付かない宣言がある）は**断らずに書く**
 //! ——警告は画面が[`crate::transition_destination::Outlook`]で出す（`Startable`と同じ姿勢。
 //! 書けるが通らないことを見えるところへ出し、判断はユーザーに残す）。
@@ -126,7 +127,8 @@ pub struct TransitionRequest<'a> {
     pub workspace_root: &'a Path,
     /// 遷移元ドメイン。**画面が1つ持つ**（辺の3つ組のうち1つ目）。
     pub from_domain: &'a str,
-    /// 足す辺の遷移先ドメイン（1回の確定で1つ）。`from_domain`と同じなら自己ループ。
+    /// 足す辺の遷移先ドメイン（1回の確定で1つ）。**`from_domain`と同じ値は断る**
+    /// （[`TransitionApproveError::SelfLoopFrozen`]）。
     ///
     /// **既定値を持たせない**——呼び出し側が選んだ値を必ず渡す（かつての暫定は、ここを
     /// 遷移元で埋めていた）。`policy.json`に無い名前なら、宣言の無いドメインとして作る。
@@ -146,6 +148,14 @@ pub enum TransitionApproveError {
     NothingSelected,
     #[error("この宣言では書けません（何も書いていません）:\n{0}")]
     Rejected(String),
+    /// 遷移先が遷移元と同じ（自己ループ辺）。**凍結中で書かない**——自己ループ辺は深さを区別しなくなる
+    /// 書き方で、ユーザーの明示操作として設計するまで書かない（`plans/POLICY-EDITOR-TOMOYO-DIG.md`
+    /// 決定65(3)）。手で書いた自己ループ辺の取り消しは止めない（`B-01`）。
+    #[error(
+        "遷移先が遷移元と同じドメイン「{domain}」です。自己ループ辺（深さを区別しない書き方）は凍結中のため\
+         書けません（何も書いていません）。遷移先の欄に別のドメイン名を入れてください"
+    )]
+    SelfLoopFrozen { domain: String },
     /// 遷移先の名前が、`harness.exe`の入れ物（AppContainerプロファイル）の名前にできない。
     #[error("遷移先ドメイン「{to_domain}」には書けません（何も書いていません）: {reason}")]
     DestinationName { to_domain: String, reason: String },
@@ -204,16 +214,24 @@ impl TransitionPlan {
 ///
 /// [`transition::check_all`]は`policy_file::load`が読むたびに掛けている検査そのものである。
 /// ここで先に掛けるのは、**書いてから落ちる**のを避けるためで、規則を写しているのではない
-/// ——[`policy_file::save`]自身は検査しないので、書いた後に読めないファイルを作れてしまう。
+/// ——[`policy_file::save`]も同じ検査を掛ける（BUG-188）が、ここで先に掛けるのは、
+/// 確認ダイアログに理由を出してから何も書かずに止めるためである。
 pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApproveError> {
     if req.approve.is_empty() && req.remove.is_empty() {
         return Err(TransitionApproveError::NothingSelected);
     }
     let to_domain = req.to_domain.to_string();
+    // **自己ループ辺は書かない**（決定65(3)。凍結中）。取り消しだけの確定は遷移先を使わないので通す
+    // ——手で書いた自己ループ辺を外す操作まで止めない（`B-01`）。
+    if !req.approve.is_empty() && to_domain == req.from_domain {
+        return Err(TransitionApproveError::SelfLoopFrozen {
+            domain: req.from_domain.to_string(),
+        });
+    }
     // **入れ物の名前にできない遷移先は書く前に断る**（決定63「自動生成名の検証を『あれば良い』に
     // 落とさない」と同じ理由。編集時検査は通るのに、`harness.exe`が起動時に用意できない）。
-    // 自己ループは入れ物を作らないので見ない。取り消しだけの確定も見ない（遷移先を使わない）。
-    if !req.approve.is_empty() && to_domain != req.from_domain {
+    // 取り消しだけの確定は見ない（遷移先を使わない）。
+    if !req.approve.is_empty() {
         if let Some(reason) = crate::transition_destination::profile_name_problem(&to_domain) {
             return Err(TransitionApproveError::DestinationName { to_domain, reason });
         }
