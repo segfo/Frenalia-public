@@ -16,14 +16,25 @@
 //! **ユーザーがやることは同じ**である——選んで、許す。画面を分けると同じ操作を2箇所に
 //! 実装することになる（決定62、`docs/CODE-STRUCTURE-RULES.md`§5.1）。
 //!
-//! # 遷移元ドメインは固定である。遷移先は欄で選ぶ
+//! # 遷移元はその行の遷移元。遷移先は欄で選ぶ
 //!
-//! 遷移元は[`ENTRY_DOMAIN`]（`workspace-shell`）を使う。**記録画面のドメイン欄とは混ぜない**
-//! ——あちらは「パス2で記録中のドメイン名」で由来が違い、入口ドメインが固定なのは
-//! `run_shell`経路だけである（`policy_file::ENTRY_DOMAIN`のdoc）。混ぜると、
+//! 各行は自分の遷移元（[`Candidate::from_domain`]）の宣言で判定し、承認したらその遷移元から辺を書き、却下印もその
+//! 遷移元で残す（2026-10-05、`plans/position-domains/P4.md`の P4.6。それまでは全部の行を[`ENTRY_DOMAIN`]で判定して
+//! いたので、位置ごとのドメインの`pwsh`から断られた生成を入口のドメインの宣言で判定し、入口のドメインの辺として
+//! 書いていた）。拒否の行の遷移元は記録された呼び出し元で、**記録に無い拒否は承認できない**。観測の平らな行は入口の
+//! ドメイン（`observed.jsonl`は`run_shell`の根の子しか持たない。P4.8 で`observed.jsonl`ごと消える）。
+//! **記録画面のドメイン欄とは混ぜない**——あちらは「パス2で記録中のドメイン名」で由来が違う。混ぜると、
 //! **Daemonが一度も見ないドメインへ遷移を書く**ことになる。
 //!
-//! 遷移先は`Tab`で入る欄で選ぶ（2026-10-01。既定は遷移元と同じ。[`super::transition_destination`]）。
+//! 遷移先は`Tab`で入る欄で選ぶ（2026-10-01。**欄は空で始まる**——自己ループ辺の凍結（決定65(3)、P0c）から。
+//! [`super::transition_destination`]）。欄は1つで、1回の確定で予約した全部の辺に効く。
+//!
+//! # 入口のドメインの決め打ちが残る場所（P4.6）
+//!
+//! (1) 観測の平らな行の遷移元（上）。(2) 遷移先の見込みの表（[`crate::transition_destination::outlooks`]）の作り方——
+//! `harness.exe`は入口のドメインを遷移先として用意しない（`PolicyFile::transition_target_domains`）ので、入口のドメインを
+//! 「呼び出し元と同じ」として表を作ると、入口のドメイン行きの辺が「用意されない」側に数えられる。(3) モデルが見るのと同じ
+//! 宣言済みの一覧（[`PendingState::declared_rows`]）——モデルは入口のドメインで動く。
 //!
 //! # 木にしない（`F2`のFS/ネットのタブとの違い）
 //!
@@ -49,9 +60,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use harness_policy::policy_file::{self, ENTRY_DOMAIN};
 
-use crate::transition_approve::EdgeRef;
+use crate::transition_approve::SourcedEdgeRef;
 use crate::transition_candidates::{
-    from_denials, from_observations, Candidate, Declared, DeclaredEdges,
+    denial_sources, from_denials, from_observations, Candidate, Declared, DeclaredEdgesByDomain,
 };
 use crate::tui::checkbox_tree;
 use crate::tui::state::{Action, App, Screen};
@@ -158,12 +169,15 @@ pub struct Counts {
     pub total: usize,
 }
 
-/// 候補の同一性＝**観測された`(exe, argv)`の組**。
+/// 候補の同一性＝**遷移元と、観測された`(exe, argv)`の組**。
 ///
-/// 予約（承認する／引数を絞る）をこの組で持つ。**書く辺そのもの（[`EdgeRef`]）で持たない**
-/// ——引数を絞るかどうかで辺は変わるが、**ユーザーが指している行は同じ**だからである。
+/// 予約（承認する／引数を絞る／却下する）をこの組で持つ。**書く辺そのもの（[`crate::transition_approve::EdgeRef`]）で持たない**
+/// ——引数を絞るかどうかで辺は変わるが、**ユーザーが指している行は同じ**だからである。遷移元を入れるのは、
+/// 同じ`(exe, argv)`でも遷移元が違えば別の辺・別の却下印になるから（P4.6）。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CandidateKey {
+    /// 遷移元（[`Candidate::from_domain`]。記録に無い行は空——その行は承認も却下も予約できない）。
+    pub from_domain: String,
     pub exe: String,
     pub argv: String,
 }
@@ -171,6 +185,7 @@ pub struct CandidateKey {
 impl CandidateKey {
     pub(super) fn of(candidate: &Candidate) -> Self {
         Self {
+            from_domain: candidate.from_domain.clone().unwrap_or_default(),
             exe: candidate.exe.clone(),
             argv: candidate.argv.clone(),
         }
@@ -198,8 +213,8 @@ pub struct PendingState {
     pub approve: BTreeSet<CandidateKey>,
     /// そのうち「観測された引数のときだけ許す」もの。既定は任意の引数（＝この集合の外）。
     pub narrow: BTreeSet<CandidateKey>,
-    /// 取り消しの予約（**宣言に書かれている辺**で指す）。
-    pub remove: BTreeSet<EdgeRef>,
+    /// 取り消しの予約（遷移元と、**宣言に書かれている辺**で指す）。
+    pub remove: BTreeSet<SourcedEdgeRef>,
     pub filter: PendingFilter,
     /// いまの却下印（`dismissed.json`）。**読めなかったら空**で、理由は`notes`に出る。
     pub dismissed: Dismissals,
@@ -208,7 +223,7 @@ pub struct PendingState {
     pub dismiss: BTreeSet<CandidateKey>,
     /// 却下の取り消しの予約（保留中へ戻す）。
     pub undismiss: BTreeSet<CandidateKey>,
-    /// 承認する辺の遷移先（欄。既定は遷移元と同じ）。
+    /// 承認する辺の遷移先（欄。**空で始まる**——P0c 以降。空のまま確定すると理由を言って書かない）。
     pub destination: super::transition_destination::DestinationField,
     /// `policy.json`の各ドメインを`harness.exe`が用意する見込み（読み直すたびに作り直す）。
     pub outlooks: std::collections::BTreeMap<String, crate::transition_destination::Outlook>,
@@ -248,11 +263,13 @@ impl PendingState {
 
     /// この候補は却下印を持っているか（**宣言済みかどうかは見ない**。段の振り分けは[`Self::visible`]）。
     ///
-    /// 遷移元は画面が辺を書く先（[`ENTRY_DOMAIN`]）で比べる——承認と同じ3つ組である
-    /// （`transition_dismissed`のモジュールdoc）。
+    /// 遷移元は**その行の遷移元**で比べる——承認と同じ3つ組である（`transition_dismissed`のモジュールdoc）。
+    /// 遷移元が記録に無い行は印を持たない。
     pub fn is_dismissed(&self, candidate: &Candidate) -> bool {
-        self.dismissed
-            .contains(ENTRY_DOMAIN, &candidate.exe, &candidate.argv)
+        candidate.from_domain.as_deref().is_some_and(|from| {
+            self.dismissed
+                .contains(from, &candidate.exe, &candidate.argv)
+        })
     }
 
     /// この候補は却下を予約されているか。
@@ -292,9 +309,10 @@ impl PendingState {
 
     /// この候補の宣言は取り消し予約されているか。
     pub fn is_unreserved(&self, candidate: &Candidate) -> bool {
-        candidate
-            .removal_ref()
-            .is_some_and(|target| self.remove.contains(&target))
+        match (candidate.from_domain.as_ref(), candidate.removal_ref()) {
+            (Some(from), Some(target)) => self.remove.contains(&(from.clone(), target)),
+            _ => false,
+        }
     }
 
     /// 見出しに出す件数（**「無い」と「隠している」を区別する**。`B-09`）。
@@ -354,7 +372,15 @@ impl App {
             crate::transition_destination::outlooks(&file, ENTRY_DOMAIN, &grants);
         let provisioned = crate::transition_destination::provisioned_names(&self.pending.outlooks);
         let workspace = workspace_root.to_string_lossy().into_owned();
-        let declared = match DeclaredEdges::build(&file, &workspace, ENTRY_DOMAIN, &provisioned) {
+        // 拒否の記録を先に読む——その行の遷移元ごとに宣言を組む（P4.6）。入口のドメインは観測の平らな行と宣言済みの
+        // 一覧のために必ず組む（モジュールdocの決め打ちの(1)(3)）。
+        let denials = harness_sandbox::tier2a::spawnd::transitions::read_folded(&workspace_root);
+        let mut sources = BTreeSet::from([ENTRY_DOMAIN.to_string()]);
+        if let Ok(read) = &denials {
+            sources.extend(denial_sources(&read.records));
+        }
+        let declared = match DeclaredEdgesByDomain::build(&file, &workspace, &sources, &provisioned)
+        {
             Ok(declared) => declared,
             Err(e) => {
                 self.pending.observed.clear();
@@ -365,7 +391,10 @@ impl App {
                 return;
             }
         };
-        self.pending.declared_rows = declared.rows().to_vec();
+        let entry = declared
+            .get(ENTRY_DOMAIN)
+            .expect("入口のドメインの宣言は必ず組む");
+        self.pending.declared_rows = entry.rows().to_vec();
 
         // 選んでいる記録に位置の情報があれば、観測のタブは位置の木で見せ、平らな一覧（`observed.jsonl`）は読まない
         // （決定65の細目6。P4.8 で`observed.jsonl`ごと消える）。
@@ -375,7 +404,7 @@ impl App {
             match harness_sandbox::tier2a::policy_learnd::observed::read_folded(&workspace_root) {
                 Ok(read) => {
                     push_read_notes(&mut notes, "観測", read.dropped, read.skipped);
-                    from_observations(&read.records, &declared)
+                    from_observations(&read.records, entry)
                 }
                 Err(e) => {
                     notes.push(format!("observed.jsonlを読めませんでした: {e}"));
@@ -384,7 +413,7 @@ impl App {
             }
         };
         self.pending.denied =
-            match harness_sandbox::tier2a::spawnd::transitions::read_folded(&workspace_root) {
+            match denials {
                 Ok(read) => {
                     push_read_notes(&mut notes, "拒否", read.dropped, read.skipped);
                     from_denials(&read.records, &declared)
@@ -413,18 +442,18 @@ impl App {
         let dismissed = self.pending.dismissed.clone();
         self.pending
             .dismiss
-            .retain(|k| !dismissed.contains(ENTRY_DOMAIN, &k.exe, &k.argv));
+            .retain(|k| !dismissed.contains(&k.from_domain, &k.exe, &k.argv));
         self.pending
             .undismiss
-            .retain(|k| dismissed.contains(ENTRY_DOMAIN, &k.exe, &k.argv));
+            .retain(|k| dismissed.contains(&k.from_domain, &k.exe, &k.argv));
 
         // 消えた宣言への取り消し予約を落とす（別経路で消えていた場合に、消せない予約が残らない）。
-        let alive: BTreeSet<EdgeRef> = self
+        let alive: BTreeSet<SourcedEdgeRef> = self
             .pending
             .observed
             .iter()
             .chain(self.pending.denied.iter())
-            .filter_map(Candidate::removal_ref)
+            .filter_map(|c| Some((c.from_domain.clone()?, c.removal_ref()?)))
             .collect();
         self.pending.remove.retain(|target| alive.contains(target));
 
@@ -539,9 +568,12 @@ impl App {
                 }
             }
             Declared::ByThisEdge { .. } => {
-                let Some(target) = candidate.removal_ref() else {
+                let (Some(from), Some(target)) =
+                    (candidate.from_domain.clone(), candidate.removal_ref())
+                else {
                     return;
                 };
+                let target = (from, target);
                 if self.pending.remove.remove(&target) {
                     self.status = format!("{} の取り消しをやめました", candidate.exe_file_name());
                 } else {
@@ -569,6 +601,13 @@ impl App {
                 self.status = format!(
                     "パターンの宣言が{matched}本一致していて、どれを与えるか決められません。\
                      宣言画面（F3）で減らしてください"
+                );
+            }
+            // 入口のドメインへ寄せない（別のドメインの生成を入口のドメインの辺として書いてしまう。P4.6）。
+            Declared::NoSourceDomain => {
+                self.status = format!(
+                    "{}: どのドメインから断られたかが記録に無いので承認できません（判定する宣言が決まりません）",
+                    candidate.exe_file_name()
                 );
             }
         }

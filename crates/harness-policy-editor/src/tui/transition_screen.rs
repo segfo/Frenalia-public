@@ -321,6 +321,13 @@ fn declared_mark_and_tail<'a>(app: &App, candidate: &Candidate) -> (Mark, Vec<Sp
                 Style::default().fg(Color::Yellow),
             )],
         ),
+        Declared::NoSourceDomain => (
+            Mark::NotApplicable,
+            vec![Span::styled(
+                "  どのドメインから断られたかが記録に無いので承認できません".to_string(),
+                Style::default().fg(Color::DarkGray),
+            )],
+        ),
     }
 }
 
@@ -383,10 +390,8 @@ fn source_label(candidate: &Candidate) -> String {
             format!("← {}", file_name(p))
         }
         Source::Observed { parent_exe: None } => "← （記録の入口）".to_string(),
-        Source::Denied {
-            by_kernel: true, ..
-        } => "カーネルが拒否".to_string(),
-        Source::Denied { from_domain, .. } => match from_domain {
+        Source::Denied { by_kernel: true } => "カーネルが拒否".to_string(),
+        Source::Denied { by_kernel: false } => match candidate.from_domain.as_deref() {
             Some(domain) => format!("拒否（{domain}から）"),
             None => "拒否".to_string(),
         },
@@ -512,6 +517,7 @@ mod transition_screen_tests {
             last_ts: 1,
             argv_truncation: false,
             source: Source::Observed { parent_exe: None },
+            from_domain: None,
             declared: Declared::No,
             startable: crate::transition_candidates::Startable::AsFarAsWeKnow,
         }

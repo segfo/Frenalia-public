@@ -22,6 +22,15 @@
 //! （`plans/DESIGN-MAC-ENFORCEMENT.md` §10.2）。書き戻すと正本が2つになり、しかも
 //! 昇格側が書いたファイルを非特権側が書き換える経路ができる。
 //!
+//! # 判定はその行の遷移元で（2026-10-05、P4.6）
+//!
+//! 拒否の記録は遷移元（呼び出し元のドメイン）を持つ。位置ごとのドメイン（決定65）では`workspace-shell`以外から
+//! 断られた生成が普通に出るので、**各行をその行の遷移元の宣言で判定する**（[`DeclaredEdgesByDomain`]）。
+//! 遷移元が記録に無い拒否（カーネルの拒否など）は判定も承認もしない（[`Declared::NoSourceDomain`]）——入口の
+//! ドメインへ寄せると、別のドメインの生成を入口のドメインの辺として書いてしまう。観測の平らな行
+//! （`observed.jsonl`）は`run_shell`の根の子しか持たないので、遷移元は入口のドメインである（呼び出し側が
+//! 入口のドメインの[`DeclaredEdges`]を渡す。`observed.jsonl`ごと P4.8 で消える）。
+//!
 //! # ここが持たないもの
 //!
 //! - **宣言済みの辺の一覧そのもの**（表示・並べ替え）。[`harness_policy::transition_listing`]が持つ
@@ -60,7 +69,10 @@ pub struct Candidate {
     /// 切れた値をそのまま書くと、二度と一致しない辺ができる。
     pub argv_truncation: bool,
     pub source: Source,
-    /// いまの`policy.json`から見て、この生成はどう扱われるか。
+    /// 遷移元（この行を判定し、承認したら辺を書く先のドメイン）。観測の平らな行は入口のドメイン、拒否の行は
+    /// 記録された呼び出し元。**`None`は遷移元を観測していない拒否**で、判定も承認もしない（モジュールdoc）。
+    pub from_domain: Option<String>,
+    /// いまの`policy.json`から見て（[`Self::from_domain`]の宣言で）、この生成はどう扱われるか。
     pub declared: Declared,
     /// **この綴りは、宣言したとして実際に起こせるのか。**
     ///
@@ -116,10 +128,8 @@ pub enum Source {
     /// パス1の観測（`observed.jsonl`）。**隔離していないので遷移元ドメインが無い**ので、
     /// 代わりに起こした側の実行ファイルが分かることがある（§10.3）。
     Observed { parent_exe: Option<String> },
-    /// 拒否の待ち行列（`pending.jsonl`）。
+    /// 拒否の待ち行列（`pending.jsonl`）。呼び出し元のドメインは[`Candidate::from_domain`]が持つ（2か所に持たない）。
     Denied {
-        /// 呼び出し元のドメイン。**`None`は観測していない**（カーネル拒否では取れない）。
-        from_domain: Option<String>,
         /// OSカーネルが止めたものか（`false`はSpawn Daemonが断ったもの）。
         by_kernel: bool,
     },
@@ -164,6 +174,9 @@ pub enum Declared {
     Ambiguous { matched: usize },
     /// 遷移元ドメインがそもそも宣言されていない（まだ1件も承認していない状態）。
     UnknownSourceDomain,
+    /// **どのドメインから断られたかが記録に無い**（カーネルの拒否など）。判定する宣言が決まらないので、
+    /// 承認も却下もできない（入口のドメインへ寄せない。2026-10-05、P4.6）。
+    NoSourceDomain,
 }
 
 impl Candidate {
@@ -361,6 +374,50 @@ impl DeclaredEdges {
     }
 }
 
+/// 遷移元ごとの[`DeclaredEdges`]（拒否の行をその行の遷移元で判定するため。2026-10-05、P4.6）。
+#[derive(Debug)]
+pub struct DeclaredEdgesByDomain {
+    by_from: std::collections::BTreeMap<String, DeclaredEdges>,
+}
+
+impl DeclaredEdgesByDomain {
+    /// `from_domains`の各遷移元について組む（`policy.json`に無い遷移元も組める——その行は
+    /// [`Declared::UnknownSourceDomain`]になる）。他の引数は[`DeclaredEdges::build`]と同じ。
+    pub fn build(
+        file: &PolicyFile,
+        workspace_root: &str,
+        from_domains: &std::collections::BTreeSet<String>,
+        provisioned: &std::collections::BTreeSet<String>,
+    ) -> Result<Self, GraphError> {
+        let mut by_from = std::collections::BTreeMap::new();
+        for from in from_domains {
+            by_from.insert(
+                from.clone(),
+                DeclaredEdges::build(file, workspace_root, from, provisioned)?,
+            );
+        }
+        Ok(Self { by_from })
+    }
+
+    /// 遷移元`from`の宣言（組んでいなければ`None`）。
+    pub fn get(&self, from: &str) -> Option<&DeclaredEdges> {
+        self.by_from.get(from)
+    }
+}
+
+/// 拒否の記録に出てくる遷移元の集合（[`DeclaredEdgesByDomain::build`]へ渡す）。遷移元を観測していない拒否は数えない。
+pub fn denial_sources(records: &[PendingRecord]) -> std::collections::BTreeSet<String> {
+    records
+        .iter()
+        .filter_map(|record| match record {
+            PendingRecord::DeniedByDaemon(denial) | PendingRecord::DeniedByKernel(denial) => {
+                denial.from_domain.clone()
+            }
+            PendingRecord::Overflowed { .. } => None,
+        })
+        .collect()
+}
+
 /// 観測（`observed.jsonl`）を候補にする。
 ///
 /// **あふれの行と、出どころの分からない行は候補にしない**（種類ではないため）。
@@ -371,6 +428,8 @@ pub fn from_observations(records: &[ObservedRecord], declared: &DeclaredEdges) -
         .iter()
         .filter_map(|record| match record {
             ObservedRecord::ObservedSpawn(spawn) => Some(Candidate {
+                // 観測の平らな行の遷移元は、呼び出し側が渡した宣言の遷移元（入口のドメイン。モジュールdoc）。
+                from_domain: Some(declared.from_domain().to_string()),
                 declared: declared.classify(&spawn.exe, &spawn.argv),
                 startable: Startable::of(&spawn.exe),
                 exe: spawn.exe.clone(),
@@ -402,7 +461,10 @@ pub fn from_observations(records: &[ObservedRecord], declared: &DeclaredEdges) -
 /// **`FixTheEnvironment`も候補にしない**（固定したファイルを呼び出し元が書き換えられるので
 /// 固定辺を断ったもの）。直す場所は宣言ではない。**除いた件数はこの画面に出ない**——
 /// `NotAboutPolicy`と同じ扱いで、出すなら画面の側に件数の欄を足す必要がある。
-pub fn from_denials(records: &[PendingRecord], declared: &DeclaredEdges) -> Vec<Candidate> {
+///
+/// **各行はその行の遷移元の宣言で判定する**（`declared`から引く。2026-10-05、P4.6）。遷移元を観測していない行と、
+/// `declared`に組まれていない遷移元の行は[`Declared::NoSourceDomain`]（判定も承認もしない）。
+pub fn from_denials(records: &[PendingRecord], declared: &DeclaredEdgesByDomain) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = records
         .iter()
         .filter_map(|record| {
@@ -422,18 +484,26 @@ pub fn from_denials(records: &[PendingRecord], declared: &DeclaredEdges) -> Vec<
                 // Daemonの標準エラーが持つ。
                 Remedy::FixTheEnvironment => return None,
             }
+            let judged = denial
+                .from_domain
+                .as_deref()
+                .and_then(|from| declared.get(from));
+            debug_assert!(
+                denial.from_domain.is_none() || judged.is_some(),
+                "遷移元の宣言を組み忘れている（denial_sources を通すこと）"
+            );
             Some(Candidate {
-                declared: declared.classify(&denial.exe, &denial.argv),
+                declared: judged.map_or(Declared::NoSourceDomain, |edges| {
+                    edges.classify(&denial.exe, &denial.argv)
+                }),
                 startable: Startable::of(&denial.exe),
                 exe: denial.exe.clone(),
                 argv: denial.argv.clone(),
                 count: denial.count,
                 last_ts: denial.last_ts,
                 argv_truncation: denial.argv_truncation,
-                source: Source::Denied {
-                    from_domain: denial.from_domain.clone(),
-                    by_kernel,
-                },
+                source: Source::Denied { by_kernel },
+                from_domain: denial.from_domain.clone(),
             })
         })
         .collect();

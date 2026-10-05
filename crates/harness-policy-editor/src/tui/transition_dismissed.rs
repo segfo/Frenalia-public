@@ -17,11 +17,11 @@
 //!
 //! # 1件の鍵は`(遷移元ドメイン, exe, argv)`
 //!
-//! 遷移元ドメインは**画面が辺を書く先**（今日は`policy_file::ENTRY_DOMAIN`に固定）であって、
-//! 観測した呼び出し元ではない——観測（`observed.jsonl`）は隔離していないので呼び出し元の
-//! ドメインを持たない。**承認と同じ3つ組で持つ**（承認の予約`CandidateKey`と辺の指定`EdgeRef`が
-//! 遷移元を画面の1つに預けているのと同じ形）ので、却下は「承認したら書かれる辺を、書かない」と
-//! 読める。exeとargvは**観測された綴りそのまま**書き、比べるときだけ
+//! 遷移元ドメインは**承認したら辺を書く先＝その行の遷移元**（2026-10-05、P4.6。それまでは
+//! `policy_file::ENTRY_DOMAIN`に固定）——拒否の行は記録された呼び出し元、観測の平らな行は入口のドメイン
+//! （観測は隔離していないので呼び出し元のドメインを持たず、`run_shell`の根の子しか持たない）。遷移元は
+//! 予約（`CandidateKey::from_domain`）が持つ。**承認と同じ3つ組で持つ**ので、却下は「承認したら書かれる辺を、
+//! 書かない」と読める。exeとargvは**観測された綴りそのまま**書き、比べるときだけ
 //! `fold_for_pattern_comparison`で畳む——宣言済みの判定（`transition_candidates`）と同じ畳み方で、
 //! 判定器が同じ生成とみなすものを、却下でも同じものとみなす。
 //!
@@ -87,21 +87,17 @@ pub const NOTICE: &str = concat!(
     "    強制中の拒否も止まりません（断られた生成は pending.jsonl に積まれ続けます）。"
 );
 
-/// 確認ダイアログに出す明細（**何も書かない**）。件数と1件ずつの綴りを出し、最後に[`NOTICE`]。
+/// 確認ダイアログに出す明細（**何も書かない**）。件数と1件ずつの綴り（遷移元つき）を出し、最後に[`NOTICE`]。
 pub fn confirmation_lines(
     workspace_root: &Path,
-    from_domain: &str,
     dismiss: &BTreeSet<CandidateKey>,
     undismiss: &BTreeSet<CandidateKey>,
 ) -> Vec<String> {
-    let mut lines = vec![
-        format!("{}:", path(workspace_root).display()),
-        format!("遷移元ドメイン: {from_domain}"),
-    ];
+    let mut lines = vec![format!("{}:", path(workspace_root).display())];
     if !dismiss.is_empty() {
         lines.push(format!("却下する {}件:", dismiss.len()));
         for key in dismiss {
-            lines.push(format!("  × {} {}", key.exe, key.argv));
+            lines.push(format!("  × [{}] {} {}", key.from_domain, key.exe, key.argv));
         }
     }
     if !undismiss.is_empty() {
@@ -110,7 +106,7 @@ pub fn confirmation_lines(
             undismiss.len()
         ));
         for key in undismiss {
-            lines.push(format!("  ↺ {} {}", key.exe, key.argv));
+            lines.push(format!("  ↺ [{}] {} {}", key.from_domain, key.exe, key.argv));
         }
     }
     lines.push(String::new());
@@ -134,7 +130,7 @@ struct DismissedFile {
 /// 却下1件。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DismissedEntry {
-    /// 遷移元ドメイン（**承認したら辺を書く先**。観測した呼び出し元ではない。モジュールdoc）。
+    /// 遷移元ドメイン（**承認したら辺を書く先**＝その行の遷移元。モジュールdoc）。
     pub from_domain: String,
     /// 観測された綴りそのまま。
     pub exe: String,
@@ -202,10 +198,9 @@ impl Dismissals {
         self.entries.is_empty()
     }
 
-    /// 予約の差分を当てる。**消す方を先にやる**（`transition_approve::plan`と同じ順序）。
+    /// 予約の差分を当てる。**消す方を先にやる**（`transition_approve::plan`と同じ順序）。遷移元は予約が持つ。
     fn apply(
         &mut self,
-        from_domain: &str,
         dismiss: &BTreeSet<CandidateKey>,
         undismiss: &BTreeSet<CandidateKey>,
         now_unix_ms: u64,
@@ -214,7 +209,7 @@ impl Dismissals {
         for key in undismiss {
             let before = self.entries.len();
             self.entries
-                .retain(|e| !e.refers_to(from_domain, &key.exe, &key.argv));
+                .retain(|e| !e.refers_to(&key.from_domain, &key.exe, &key.argv));
             if self.entries.len() == before {
                 applied.not_found += 1;
             } else {
@@ -222,12 +217,12 @@ impl Dismissals {
             }
         }
         for key in dismiss {
-            if self.contains(from_domain, &key.exe, &key.argv) {
+            if self.contains(&key.from_domain, &key.exe, &key.argv) {
                 applied.already += 1;
                 continue;
             }
             self.entries.push(DismissedEntry {
-                from_domain: from_domain.to_string(),
+                from_domain: key.from_domain.clone(),
                 exe: key.exe.clone(),
                 argv: key.argv.clone(),
                 dismissed_unix_ms: now_unix_ms,
@@ -290,7 +285,6 @@ pub fn load(workspace_root: &Path) -> Result<Dismissals, DismissedError> {
 /// 読めないファイルには書かない（`Err`）。そのとき予約は呼び出し側に残る。
 pub fn update(
     workspace_root: &Path,
-    from_domain: &str,
     dismiss: &BTreeSet<CandidateKey>,
     undismiss: &BTreeSet<CandidateKey>,
     now_unix_ms: u64,
@@ -298,7 +292,7 @@ pub fn update(
     harness_grant_ledger::with_named_lock(LOCK_NAME, || {
         let mut current = load(workspace_root)?;
         let before = current.clone();
-        let mut applied = current.apply(from_domain, dismiss, undismiss, now_unix_ms);
+        let mut applied = current.apply(dismiss, undismiss, now_unix_ms);
         if current == before {
             return Ok(applied);
         }

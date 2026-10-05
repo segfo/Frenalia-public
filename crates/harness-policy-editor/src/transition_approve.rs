@@ -140,6 +140,10 @@ impl EdgeRef {
     }
 }
 
+/// 遷移元のドメイン名と、その遷移元の辺の指し方（承認待ちの遷移タブの予約・位置ごとのドメインの確定の取り消し。
+/// 2026-10-05、P4.6——拒否の行はその行の遷移元から辺を書く・消す）。
+pub type SourcedEdgeRef = (String, EdgeRef);
+
 /// 承認・取り消しの要求。
 pub struct TransitionRequest<'a> {
     pub workspace_root: &'a Path,
@@ -234,6 +238,12 @@ impl TransitionPlan {
 /// ここで先に掛けるのは、**書いてから落ちる**のを避けるためで、規則を写しているのではない
 /// ——[`policy_file::save`]も同じ検査を掛ける（BUG-188）が、ここで先に掛けるのは、
 /// 確認ダイアログに理由を出してから何も書かずに止めるためである。
+///
+/// # 画面からは呼ばれない（2026-10-05、P4.6）
+///
+/// 承認待ちの遷移タブの確定は、遷移元の違う予約を1回の保存で書くため`crate::position_approve`へ移った。
+/// これは1つの遷移元の辺の形・事前の検査・書いた後の検査を固定する試験（`transition_approve_tests`）の入口として
+/// 残っている（[`commit`]も同じ）。部品（[`apply_edge_changes`]・[`check_added`]）は`position_approve`と共有する。
 pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApproveError> {
     if req.approve.is_empty() && req.remove.is_empty() {
         return Err(TransitionApproveError::NothingSelected);

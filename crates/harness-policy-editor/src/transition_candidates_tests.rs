@@ -37,6 +37,17 @@ fn declared(file: &PolicyFile) -> DeclaredEdges {
     declared_with(file, &Default::default())
 }
 
+/// 拒否の行を判定する遷移元ごとの宣言（この試験の拒否は全部入口のドメインから）。
+fn declared_by_domain(file: &PolicyFile) -> DeclaredEdgesByDomain {
+    DeclaredEdgesByDomain::build(
+        file,
+        WS,
+        &[ENTRY_DOMAIN.to_string()].into(),
+        &Default::default(),
+    )
+    .expect("宣言が組めない")
+}
+
 /// 用意される見込みの遷移先を渡して組む。
 fn declared_with(
     file: &PolicyFile,
@@ -204,7 +215,7 @@ fn a_denial_that_a_declaration_would_fix_becomes_a_candidate() {
             denial: TransitionDenial::NoMatchingEdge,
         },
     )];
-    let candidates = from_denials(&records, &declared(&file));
+    let candidates = from_denials(&records, &declared_by_domain(&file));
 
     assert_eq!(candidates.len(), 1);
     assert!(candidates[0].is_approvable());
@@ -231,7 +242,7 @@ fn a_denial_that_is_not_about_policy_is_not_offered_as_a_candidate() {
     )];
 
     assert!(
-        from_denials(&records, &declared(&file)).is_empty(),
+        from_denials(&records, &declared_by_domain(&file)).is_empty(),
         "宣言をどう書いても変わらない拒否を候補に出している"
     );
 }
@@ -250,7 +261,7 @@ fn an_overflow_report_is_not_a_candidate() {
     }];
 
     assert!(from_observations(&observed_records, &declared(&file)).is_empty());
-    assert!(from_denials(&denied_records, &declared(&file)).is_empty());
+    assert!(from_denials(&denied_records, &declared_by_domain(&file)).is_empty());
 }
 
 // --- 並び -------------------------------------------------------------------

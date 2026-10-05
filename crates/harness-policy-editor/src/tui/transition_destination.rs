@@ -14,23 +14,28 @@
 //!
 //! # 欄は空で始まる（2026-10-05、決定65）
 //!
-//! かつては最初から[`ENTRY_DOMAIN`]（呼び出し元）が入っていて、欄に触らずに確定した辺はすべて
+//! かつては最初から[`ENTRY_DOMAIN`](harness_policy::policy_file::ENTRY_DOMAIN)（呼び出し元）が入っていて、欄に触らずに確定した辺はすべて
 //! 自己ループ辺になった。自己ループ辺は深さを区別しなくなる書き方で、決定65(3)で凍結したので、
-//! 欄は空で始める。呼び出し元と同じ名前を入れると欄の横に理由を出し、確定は
-//! [`crate::transition_approve::plan`]が書く前に断る（**判定はそこ1か所**。欄は見せるだけ）。
+//! 欄は空で始める。呼び出し元（選んでいる行の遷移元。P4.6）と同じ名前を入れると欄の横に理由を出し、確定は
+//! [`crate::position_approve::plan`]が書く前に断る（**判定はそこ1か所**。欄は見せるだけ）。
 //! 別ドメインは利用者が名前を入れたときだけ書く——**承認は常に利用者の明示操作**（D-42）。
 //!
 //! # ここが持たないもの
 //!
 //! - **用意される見込み**: [`crate::transition_destination`]（`harness.exe`と同じ付与の関数を通す）
-//! - **書けるかの最終判断**: [`crate::transition_approve::plan`]（名前の検査・編集時検査）
+//! - **書けるかの最終判断**: [`crate::position_approve::plan`]（名前の検査・編集時検査）
+//!
+//! # 限界
+//!
+//! 見込みの表は入口のドメインを「呼び出し元と同じ」として作る（`tui::transition`のモジュールdocの決め打ちの(2)）。
+//! 入口のドメイン以外の行を選んで欄に入口のドメインの名前を入れると、見込みの一言は「呼び出し元と同じドメイン」と
+//! 出る（実際には自己ループ辺ではないが、`harness.exe`は入口のドメインを遷移先として用意しないので、通らないことは
+//! 変わらない）。
 
 use crossterm::event::{KeyCode, KeyEvent};
 
-use harness_policy::policy_file::ENTRY_DOMAIN;
 use harness_sandbox::tier2a::domain_profile_name_problem;
 
-use crate::transition_approve::TransitionPlan;
 use crate::transition_destination::Outlook;
 use crate::tui::state::{edit_text, App, Screen};
 use crate::tui::text_input::TextInput;
@@ -88,19 +93,31 @@ impl App {
     ///
     /// `policy.json`に無い名前は「宣言の無いドメイン」として答える（確定すると作るため）。
     pub fn destination_outlook(&self) -> Outlook {
-        outlook_from_table(&self.pending, self.pending.destination.name())
+        outlook_from_table(
+            &self.pending,
+            self.pending.destination.name(),
+            self.destination_source().as_deref(),
+        )
+    }
+
+    /// 欄と比べる呼び出し元＝**選んでいる行の遷移元**（P4.6。行が無い・遷移元が記録に無い行なら`None`）。
+    fn destination_source(&self) -> Option<String> {
+        self.pending
+            .visible()
+            .get(self.pending.row())
+            .and_then(|candidate| candidate.from_domain.clone())
     }
 
     /// 遷移先の名前の問題（空・呼び出し元と同じ＝自己ループ辺・入れ物の名前にできない）。
     ///
     /// 自己ループ辺の判定は**見せるためだけ**にここでも引く——書くかどうかは
-    /// [`crate::transition_approve::plan`]が決める（`SelfLoopFrozen`）。
+    /// [`crate::position_approve::plan`]が辺ごとに決める（`SelfLoopFrozen`）。
     fn destination_name_problem(&self) -> Option<String> {
         let name = self.pending.destination.name();
         if name.is_empty() {
             return Some("空です。名前を入れてください".to_string());
         }
-        if name == ENTRY_DOMAIN {
+        if self.destination_source().as_deref() == Some(name) {
             return Some(
                 "呼び出し元と同じドメインです。自己ループ辺は凍結中のため書けません（決定65）"
                     .to_string(),
@@ -121,29 +138,19 @@ impl App {
             return problem;
         }
         let mut label = self.destination_outlook().short_label();
-        if name != ENTRY_DOMAIN && !self.pending.outlooks.contains_key(name) {
+        if self.destination_source().as_deref() != Some(name)
+            && !self.pending.outlooks.contains_key(name)
+        {
             label.push_str("。policy.json に無いので、確定すると宣言の無いドメインとして作ります");
         }
         label
     }
 
-    /// 確定の直前に、足す辺の遷移先について言うこと（**何が起きるかを全部**）。
-    pub(crate) fn destination_notice_lines(&self, plan: &TransitionPlan) -> Vec<String> {
-        let mut lines = Vec::new();
-        if plan.created_to_domain {
-            lines.push(format!(
-                "遷移先ドメイン {} は policy.json に無いので、宣言の無いドメインとして作ります。",
-                plan.to_domain
-            ));
-        }
-        lines.extend(self.outlook_notice_lines(&plan.to_domain));
-        lines
-    }
-
-    /// 遷移先`to_domain`を`harness.exe`が用意する見込みの説明（表を引くだけ）。平らな一覧の確定と、位置ごとのドメインの
-    /// 確定（`tui::position_commit`。拒否からの予約の遷移先）が同じこれを出す。
+    /// 遷移先`to_domain`を`harness.exe`が用意する見込みの説明（表を引くだけ）。確定の確認ダイアログ
+    /// （`tui::position_commit`。拒否からの予約の遷移先）が出す。遷移元が何個でも欄は1つなので、ここでは自己ループ辺を
+    /// 判定しない（それは`position_approve::plan`が辺ごとに断る）。
     pub(crate) fn outlook_notice_lines(&self, to_domain: &str) -> Vec<String> {
-        outlook_from_table(&self.pending, to_domain).notice_lines(to_domain)
+        outlook_from_table(&self.pending, to_domain, None).notice_lines(to_domain)
     }
 
     /// 足す辺があるのに遷移先が空なら、理由を言って`None`（**何も書かない**。`B-32`）。
@@ -159,9 +166,13 @@ impl App {
     }
 }
 
-/// 表から見込みを引く（呼び出し元と同じなら自己ループ、表に無ければ宣言の無いドメイン）。
-fn outlook_from_table(pending: &crate::tui::transition::PendingState, name: &str) -> Outlook {
-    if name == ENTRY_DOMAIN {
+/// 表から見込みを引く（呼び出し元`from`と同じなら自己ループ、表に無ければ宣言の無いドメイン）。
+fn outlook_from_table(
+    pending: &crate::tui::transition::PendingState,
+    name: &str,
+    from: Option<&str>,
+) -> Outlook {
+    if from == Some(name) {
         return Outlook::SameDomain;
     }
     pending

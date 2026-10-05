@@ -820,3 +820,266 @@ fn a_destination_that_will_not_be_provisioned_is_warned_about_but_written() {
         .expect("宣言済みの行が無い");
     assert!(!shown, "用意されない遷移先への辺が「起こせる」と出ている");
 }
+
+// --- 拒否の行はその行の遷移元で判定・承認する（2026-10-05、P4.6） ---------------------------
+
+const HOSTNAME: &str = "C:/tools/hostname.exe";
+const WHOAMI: &str = "C:/tools/whoami.exe";
+const CALC: &str = "C:/tools/calc.exe";
+
+/// 拒否の待ち行列（`pending.jsonl`）に、遷移元つき（`None`は遷移元を観測していない）の拒否を書く。
+fn write_denials(ws: &Path, denials: &[(Option<&str>, &str, &str)]) {
+    use harness_policy::transition::TransitionDenial;
+    use harness_sandbox::tier2a::spawnd::transitions::{pending_path, Denial, PendingRecord};
+    use harness_sandbox::tier2a::spawnd::DenyReason;
+
+    let queue = pending_path(ws);
+    std::fs::create_dir_all(queue.parent().unwrap()).unwrap();
+    let mut text = String::new();
+    for (from, exe, argv) in denials {
+        let record = PendingRecord::DeniedByDaemon(Denial {
+            from_domain: from.map(str::to_string),
+            exe: exe.to_string(),
+            argv: argv.to_string(),
+            cwd: None,
+            reason: DenyReason::Transition {
+                denial: TransitionDenial::NoMatchingEdge,
+            },
+            count: 1,
+            first_ts: 1,
+            last_ts: 1,
+            argv_truncation: false,
+        });
+        text.push_str(&serde_json::to_string(&record).unwrap());
+        text.push('\n');
+    }
+    std::fs::write(&queue, text).unwrap();
+}
+
+/// 拒否のタブを「全部」で開く（宣言済み・承認できない行も見せる）。
+fn denied_tab(ws: &Path) -> App {
+    let mut app = app_at(ws);
+    app.pending.tab = Tab(PendingTab::TransitionsDenied);
+    app.reload_transitions();
+    app.pending.filter = PendingFilter::All;
+    app
+}
+
+/// 遷移元が`from`で実行ファイルが`exe`の拒否の行を選ぶ。
+fn select_denial(app: &mut App, from: Option<&str>, exe: &str) {
+    let index = app
+        .pending
+        .visible()
+        .iter()
+        .position(|c| c.from_domain.as_deref() == from && c.exe == exe)
+        .expect("その拒否の行");
+    *app.pending.row_mut() = index;
+}
+
+fn denial_row(app: &App, from: Option<&str>, exe: &str) -> Candidate {
+    app.pending
+        .denied
+        .iter()
+        .find(|c| c.from_domain.as_deref() == from && c.exe == exe)
+        .cloned()
+        .expect("その拒否の行")
+}
+
+/// ドメイン`name`の辺の（exe, 遷移先）。
+fn edges_of(ws: &Path, name: &str) -> Vec<(String, String)> {
+    use harness_policy::transition::ExeMatcher;
+    policy_file::load(ws)
+        .expect("policy.jsonが読めない")
+        .domain(name)
+        .map(|d| {
+            d.process
+                .transitions
+                .iter()
+                .map(|e| match &e.exe {
+                    ExeMatcher::Literal(exe) | ExeMatcher::Pattern(exe) => (exe.clone(), e.to.clone()),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_domains(ws: &Path, domains: Vec<harness_policy::policy_file::PolicyDomain>) {
+    let file = harness_policy::policy_file::PolicyFile {
+        domains,
+        ..Default::default()
+    };
+    policy_file::save(ws, &file).expect("setup");
+}
+
+/// **別のドメインから断られた行は、そのドメインの宣言で判定する**（入口のドメインに決め打ちすると、pwsh から断られた
+/// 生成を入口のドメインの宣言で判定してしまう）。pwsh の行は pwsh の辺で「宣言済み」、入口のドメインの同じ生成は
+/// 「未宣言」。対の側（`B-01`）: 宣言済みの pwsh の行を取り消すと、pwsh の辺が消える。
+#[test]
+fn a_denial_from_another_domain_is_judged_against_that_domain() {
+    use harness_policy::policy_file::PolicyDomain;
+    use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut pwsh = PolicyDomain::new("pwsh");
+    pwsh.process
+        .transitions
+        .push(editor_edge(CALC, ArgvMatcher::Any(AnyMarker), "calc"));
+    save_domains(tmp.path(), vec![PolicyDomain::new("calc"), pwsh]);
+    write_denials(
+        tmp.path(),
+        &[(Some("pwsh"), CALC, "calc"), (Some(ENTRY_DOMAIN), CALC, "calc")],
+    );
+
+    let mut app = denied_tab(tmp.path());
+    assert!(
+        matches!(
+            denial_row(&app, Some("pwsh"), CALC).declared,
+            Declared::ByThisEdge { .. }
+        ),
+        "pwsh の行が pwsh の辺で判定されていない"
+    );
+    assert!(
+        denial_row(&app, Some(ENTRY_DOMAIN), CALC).is_approvable(),
+        "入口のドメインの行が pwsh の辺で宣言済みになっている"
+    );
+
+    select_denial(&mut app, Some("pwsh"), CALC);
+    press(&mut app, KeyCode::Char(' '));
+    confirm(&mut app);
+    assert!(edges_of(tmp.path(), "pwsh").is_empty(), "{}", app.status);
+}
+
+/// **承認すると、その行の遷移元のドメインに辺を書く**（入口のドメインには何も足さない）。
+#[test]
+fn approving_it_writes_the_edge_from_that_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_denials(tmp.path(), &[(Some("pwsh"), HOSTNAME, "hostname")]);
+    let mut app = denied_tab(tmp.path());
+    select_denial(&mut app, Some("pwsh"), HOSTNAME);
+    press(&mut app, KeyCode::Char(' '));
+    app.pending.destination.input = TextInput::new("hostname");
+    confirm(&mut app);
+
+    assert_eq!(
+        edges_of(tmp.path(), "pwsh"),
+        vec![(HOSTNAME.to_string(), "hostname".to_string())],
+        "{}",
+        app.status
+    );
+    assert!(edges_of(tmp.path(), ENTRY_DOMAIN).is_empty());
+}
+
+/// **却下印もその行の遷移元で残す**（承認したら書かれる辺を、書かない——同じ3つ組）。
+#[test]
+fn dismissing_a_denial_records_its_own_source_domain() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_denials(tmp.path(), &[(Some("pwsh"), HOSTNAME, "hostname")]);
+    let mut app = denied_tab(tmp.path());
+    select_denial(&mut app, Some("pwsh"), HOSTNAME);
+    press(&mut app, KeyCode::Char('x'));
+    confirm(&mut app);
+
+    let marks = transition_dismissed::load(tmp.path()).expect("却下印");
+    assert!(marks.contains("pwsh", HOSTNAME, "hostname"), "{}", app.status);
+    assert!(!marks.contains(ENTRY_DOMAIN, HOSTNAME, "hostname"));
+}
+
+/// **どのドメインから断られたかが記録に無い拒否は承認できない**（入口のドメインへ寄せると、別のドメインの生成を
+/// 入口のドメインの辺として書いてしまう）。`Space`は予約せず理由を言う（`B-32`）。
+#[test]
+fn a_denial_without_a_source_domain_says_why_it_cannot_be_approved() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_denials(tmp.path(), &[(None, HOSTNAME, "hostname")]);
+    let mut app = denied_tab(tmp.path());
+    let row = denial_row(&app, None, HOSTNAME);
+    assert_eq!(row.declared, Declared::NoSourceDomain);
+    assert!(!row.is_approvable());
+
+    select_denial(&mut app, None, HOSTNAME);
+    press(&mut app, KeyCode::Char(' '));
+    assert!(app.pending.approve.is_empty());
+    assert!(
+        app.status.contains("どのドメインから断られたかが記録に無い"),
+        "{}",
+        app.status
+    );
+}
+
+/// **遷移元の違う2つの拒否を1回の`y`で書く**（保存を遷移元ごとに分けない）。
+/// 対の側: 片方が書けない（入口のドメインからは広げる向き）なら、もう片方（pwsh からは狭める向き）も書かない。
+#[test]
+fn two_denials_from_two_domains_are_written_with_one_save() {
+    use harness_policy::policy_file::PolicyDomain;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_denials(
+        tmp.path(),
+        &[(Some("pwsh"), HOSTNAME, "hostname"), (Some(ENTRY_DOMAIN), WHOAMI, "whoami")],
+    );
+    let mut app = denied_tab(tmp.path());
+    for (from, exe) in [(Some("pwsh"), HOSTNAME), (Some(ENTRY_DOMAIN), WHOAMI)] {
+        select_denial(&mut app, from, exe);
+        press(&mut app, KeyCode::Char(' '));
+    }
+    app.pending.destination.input = TextInput::new("tool");
+    confirm(&mut app);
+    assert_eq!(
+        edges_of(tmp.path(), "pwsh"),
+        vec![(HOSTNAME.to_string(), "tool".to_string())],
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        edges_of(tmp.path(), ENTRY_DOMAIN),
+        vec![(WHOAMI.to_string(), "tool".to_string())]
+    );
+
+    // 対の側: 遷移先 wide は C:/secret/** を読む。pwsh は同じものを読むので狭める向き、入口のドメインは読まないので
+    // 広げる向き。1回の確定なので、pwsh の辺も書かれない。
+    let other = tempfile::tempdir().unwrap();
+    let reading = |name: &str| {
+        let mut domain = PolicyDomain::new(name);
+        domain.fs.read.push("C:/secret/**".to_string());
+        domain
+    };
+    save_domains(other.path(), vec![reading("pwsh"), reading("wide")]);
+    let before = std::fs::read(policy_file::path(other.path())).unwrap();
+    write_denials(
+        other.path(),
+        &[(Some("pwsh"), HOSTNAME, "hostname"), (Some(ENTRY_DOMAIN), WHOAMI, "whoami")],
+    );
+    let mut app = denied_tab(other.path());
+    for (from, exe) in [(Some("pwsh"), HOSTNAME), (Some(ENTRY_DOMAIN), WHOAMI)] {
+        select_denial(&mut app, from, exe);
+        press(&mut app, KeyCode::Char(' '));
+    }
+    app.pending.destination.input = TextInput::new("wide");
+    press(&mut app, KeyCode::Char('a'));
+    assert!(
+        matches!(app.modal.as_ref().map(|m| m.confirm), Some(Confirm::ReadOnly)),
+        "書けない確定で書く確認を出した"
+    );
+    app.modal = None;
+    app.commit_transition();
+    assert_eq!(
+        std::fs::read(policy_file::path(other.path())).unwrap(),
+        before,
+        "片方だけ書いた: {}",
+        app.status
+    );
+}
+
+/// **遷移先の欄の「呼び出し元と同じ」は、選んでいる行の遷移元と比べる**（P4.6。入口のドメインとだけ比べると、pwsh の
+/// 行で`pwsh`と打っても凍結と言わず、確定で初めて断られる）。対の側: pwsh の行で入口のドメインの名前は凍結ではない。
+#[test]
+fn the_destination_field_compares_with_the_selected_rows_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_denials(tmp.path(), &[(Some("pwsh"), HOSTNAME, "hostname")]);
+    let mut app = denied_tab(tmp.path());
+    select_denial(&mut app, Some("pwsh"), HOSTNAME);
+
+    app.pending.destination.input = TextInput::new("pwsh");
+    assert!(app.destination_label().contains("凍結"), "{}", app.destination_label());
+    app.pending.destination.input = TextInput::new(ENTRY_DOMAIN);
+    assert!(!app.destination_label().contains("凍結中のため"), "{}", app.destination_label());
+}

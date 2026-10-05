@@ -54,7 +54,8 @@ use crate::position_candidates::SessionCandidates;
 use crate::position_view::{lands_elsewhere, take_self_loops};
 use crate::session_dir::RecordManifest;
 use crate::transition_approve::{
-    self, apply_edge_changes, check_added, EdgeChanges, EdgeRef, TransitionApproveError,
+    self, apply_edge_changes, check_added, EdgeChanges, EdgeRef, SourcedEdgeRef,
+    TransitionApproveError,
 };
 use crate::transition_candidates::Startable;
 use crate::unapprove::{remove_value, UnapproveTarget};
@@ -114,7 +115,7 @@ pub struct PositionRequest<'a> {
     pub edges: Vec<EdgeWrite>,
     /// 消す辺（遷移元, [`EdgeRef`]）。承認待ちの遷移タブの取り消しの予約と同じ指し方（`policy.json`に書かれている
     /// 綴りを畳んで比べる）。
-    pub remove_edges: Vec<(String, EdgeRef)>,
+    pub remove_edges: Vec<SourcedEdgeRef>,
     /// 取り消すファイル・通信の宣言（チェックを外したもの）。
     pub unapprove: Vec<UnapproveTarget>,
     /// 確定のダイアログで自己ループ辺の置き換えを見せ、ユーザーが`y`を押したときだけ`true`（決定65 Q7・D-42）。
@@ -150,8 +151,8 @@ pub struct PositionPlan {
     /// 足そうとしたが同じ辺が既にあった。
     pub already_declared: Vec<(String, TransitionEdge)>,
     pub self_loops_replaced: Vec<(String, TransitionEdge)>,
-    pub edges_removed: Vec<(String, EdgeRef)>,
-    pub edges_not_found: Vec<(String, EdgeRef)>,
+    pub edges_removed: Vec<SourcedEdgeRef>,
+    pub edges_not_found: Vec<SourcedEdgeRef>,
     pub unapproved: Vec<UnapproveTarget>,
     pub unapprove_not_found: Vec<UnapproveTarget>,
     /// `policy.json`に無かったので宣言の無いドメインとして作るもの（名前の順）。

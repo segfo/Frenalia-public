@@ -9,6 +9,7 @@ const DOMAIN: &str = "workspace-shell";
 
 fn key(exe: &str, argv: &str) -> CandidateKey {
     CandidateKey {
+        from_domain: DOMAIN.to_string(),
         exe: exe.to_string(),
         argv: argv.to_string(),
     }
@@ -43,7 +44,6 @@ fn a_dismissal_is_written_and_survives_reading_it_back() {
     let tmp = tempfile::tempdir().unwrap();
     let applied = update(
         tmp.path(),
-        DOMAIN,
         &keys(&[("C:/git.exe", "git status")]),
         &none(),
         42,
@@ -69,7 +69,6 @@ fn writing_leaves_only_the_file_itself() {
     let tmp = tempfile::tempdir().unwrap();
     update(
         tmp.path(),
-        DOMAIN,
         &keys(&[("C:/git.exe", "git status")]),
         &none(),
         1,
@@ -88,7 +87,6 @@ fn undismissing_removes_only_that_mark() {
     let tmp = tempfile::tempdir().unwrap();
     update(
         tmp.path(),
-        DOMAIN,
         &keys(&[("C:/git.exe", "git status"), ("C:/cargo.exe", "cargo build")]),
         &none(),
         1,
@@ -97,7 +95,6 @@ fn undismissing_removes_only_that_mark() {
 
     let applied = update(
         tmp.path(),
-        DOMAIN,
         &none(),
         &keys(&[("C:/git.exe", "git status")]),
         2,
@@ -118,16 +115,15 @@ fn undismissing_removes_only_that_mark() {
 fn the_same_dismissal_twice_is_counted_as_already_there_and_not_rewritten() {
     let tmp = tempfile::tempdir().unwrap();
     let marks = keys(&[("C:/git.exe", "git status")]);
-    update(tmp.path(), DOMAIN, &marks, &none(), 1).unwrap();
+    update(tmp.path(), &marks, &none(), 1).unwrap();
 
-    let second = update(tmp.path(), DOMAIN, &marks, &none(), 2).unwrap();
+    let second = update(tmp.path(), &marks, &none(), 2).unwrap();
     assert_eq!(second.added, 0);
     assert_eq!(second.already, 1);
     assert!(!second.wrote, "何も変わらないのに書いている");
 
     let missing = update(
         tmp.path(),
-        DOMAIN,
         &none(),
         &keys(&[("C:/never.exe", "x")]),
         3,
@@ -146,7 +142,6 @@ fn a_second_writer_does_not_erase_what_the_first_one_wrote() {
     let seen_by_b = load(tmp.path()).unwrap();
     update(
         tmp.path(),
-        DOMAIN,
         &keys(&[("C:/a.exe", "a")]),
         &none(),
         1,
@@ -155,7 +150,6 @@ fn a_second_writer_does_not_erase_what_the_first_one_wrote() {
     assert!(seen_by_b.is_empty());
     update(
         tmp.path(),
-        DOMAIN,
         &keys(&[("C:/b.exe", "b")]),
         &none(),
         2,
@@ -174,7 +168,6 @@ fn the_match_folds_like_the_judge_but_not_more() {
     let tmp = tempfile::tempdir().unwrap();
     update(
         tmp.path(),
-        DOMAIN,
         &keys(&[(r"C:\Git\cmd\git.exe", "git status")]),
         &none(),
         1,
@@ -207,7 +200,6 @@ fn a_broken_file_is_reported_and_left_as_it_is() {
 
     let write = update(
         tmp.path(),
-        DOMAIN,
         &keys(&[("C:/git.exe", "git status")]),
         &none(),
         1,
@@ -242,7 +234,6 @@ fn a_file_from_a_newer_editor_is_neither_read_nor_overwritten() {
     );
     assert!(update(
         tmp.path(),
-        DOMAIN,
         &keys(&[("C:/git.exe", "git status")]),
         &none(),
         1
