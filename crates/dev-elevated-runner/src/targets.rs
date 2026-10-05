@@ -704,6 +704,23 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "policy_learnd::etw::tier1_record_all_spike_tests",
         ],
     ),
+    // ポリシーエディタの決定65（記録した木の位置ごとのドメイン）の前提: ETWの`ProcessStart`の
+    // `ParentProcessSequenceNumber`が親自身の`ProcessSequenceNumber`を指すかを測る（P1b、
+    // `plans/etw-spike/RESULTS.md` §24）。使い捨てなので、P2fで試験ファイルと一緒に消す。
+    (
+        "spike-etw-process-lineage",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "policy_learnd::etw::process_lineage_spike_tests",
+        ],
+    ),
     // ポリシーエディタのパス1（Tier1でrecord-all記録）の実機E2E。ビルド済みの
     // `harness-policy-editor.exe`を起動する形なので、収集器の解決経路（current_exeの隣）も
     // 本番と同じものを通る（`crates/harness-policy-editor/tests/record_e2e.rs`）。

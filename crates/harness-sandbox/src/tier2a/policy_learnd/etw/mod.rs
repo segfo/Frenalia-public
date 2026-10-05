@@ -105,3 +105,13 @@ mod argv_capture_spike_tests;
 #[cfg(all(windows, test))]
 #[path = "logger_slot_spike_tests.rs"]
 mod logger_slot_spike_tests;
+
+/// 親の通し番号（`ParentProcessSequenceNumber`）が親自身の`ProcessSequenceNumber`を指すかの実測
+/// （ポリシーエディタの決定65、`plans/PLAN-POLICY-EDITOR-POSITION-DOMAINS.md` P1b。結果は
+/// `plans/etw-spike/RESULTS.md` §24）。
+///
+/// **モジュール名は`KNOWN_TARGETS`の`spike-etw-process-lineage`のフィルタ文字列と一致していなければ
+/// ならない**（改名するとBUG-056と同じ「0件マッチ」が再発する）。P2fでキーと一緒に消す。
+#[cfg(all(windows, test))]
+#[path = "process_lineage_spike_tests.rs"]
+mod process_lineage_spike_tests;
