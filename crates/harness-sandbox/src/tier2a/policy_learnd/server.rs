@@ -37,7 +37,6 @@ use super::etw::scope::{ScopeTracker, ScopeVerdict};
 use super::etw::session::EtwFsSession;
 use super::etw::volumes::drive_letter_map;
 use super::instances::{self, ProcessIdentity, ProcessInstances};
-use super::observed::ObservedCandidates;
 use super::process_audit::ProcessAudit;
 use super::{process_audit_path, LearnError, LearnPolicy, LearnRequest, LearnResponse};
 use crate::elevated_launch::validate_audit_sink_path;
@@ -120,7 +119,7 @@ struct Generation {
     /// argv観測のセッション（段階6d、§10.3）。**`capture_argv`のときだけ`Some`**で、
     /// **張れなければこの世代は作られない**（fail-open のFS側とは逆。§10.3）。
     argv_session: Option<MofFsSession>,
-    /// プロセスの木（`process-audit.jsonl`）と遷移の辺の候補（`observed.jsonl`）の書き手
+    /// プロセスの木（`process-audit.jsonl`）の書き手
     /// （P2c、決定23）。`argv_session`と対で`Some`になる——コマンドラインを結び付ける相手が
     /// 居ない世代は木を書かない。
     process_audit: Option<ProcessAudit>,
@@ -214,11 +213,10 @@ impl Generation {
                     // **書き先は検証済みの`sink_path`から導出する**（親からは受け取らない、決定23(1)）。
                     // ファイルは依頼側が先に作ってある（`client::start_collect_bytes`、BUG-109）。
                     let audit_path = process_audit_path(&sink_path);
-                    let audit = ProcessAudit::start(
-                        audit_path.clone(),
-                        ObservedCandidates::new(&policy.workspace_root),
-                        &|line| append_line(&audit_path, line),
-                    );
+                    let audit =
+                        ProcessAudit::start(audit_path.clone(), &|line| {
+                            append_line(&audit_path, line)
+                        });
                     (Some(session), Some(audit))
                 }
                 Err(e) => {
@@ -309,18 +307,12 @@ impl Generation {
         else {
             return;
         };
-        let now = harness_policy::event::now_unix_ms();
         let audit_path = audit.path().to_path_buf();
-        let result = audit.drain(
+        audit.drain(
             &self.instances,
             session.drain_process_starts(),
-            now,
             &|line| append_line(&audit_path, line),
         );
-        if let Err(e) = result {
-            // **記録の失敗で収集を止めない**（`P-07`）。事実は制御レコードへ残す。
-            append_control(&self.sink_path, &format!("argv_candidate_write_failed: {e}"));
-        }
     }
 
     /// 最後の取り残しを回収し、ETWセッションを止め、統計を制御レコードとして残す。
@@ -332,23 +324,18 @@ impl Generation {
             record_collection_stats(&self.sink_path, &outcome, &self.tracker, &self.dropped);
         }
         if let Some(session) = self.argv_session.take() {
-            let dropped = session.dropped_process_starts();
             let outcome = session.stop();
             // **止めたあとに最後の1バッチが残っている。** `stop`は溜まっている分を
             // `MofFsOutcome`で返すので、そこから拾わないと**記録の末尾が丸ごと落ちる**。
             if let Some(audit) = self.process_audit.take() {
                 let now = harness_policy::event::now_unix_ms();
                 let audit_path = audit.path().to_path_buf();
-                let (argv_stats, audit_stats, result) = audit.finish(
+                let audit_stats = audit.finish(
                     &self.instances,
                     outcome.process_starts,
                     now,
                     &|line| append_line(&audit_path, line),
                 );
-                if let Err(e) = result {
-                    append_control(&self.sink_path, &format!("argv_candidate_write_failed: {e}"));
-                }
-                record_argv_stats(&self.sink_path, argv_stats, dropped);
                 // 木を書けなかったことは**木の側ではなくこちらにも**残す——書けないファイルへ
                 // 「書けなかった」と書いても読まれない（`B-10`）。
                 if audit_stats.write_failed > 0 {
@@ -364,62 +351,6 @@ impl Generation {
             }
         }
         self.written
-    }
-}
-
-/// argv観測の取りこぼしを制御レコードへ残す（D-43: 隠さない）。
-///
-/// **0件の項目は書かない。** 全部書くと、実際に落ちているものが並びに埋もれる。
-fn record_argv_stats(
-    sink_path: &Path,
-    stats: super::observed::ArgvStats,
-    dropped_by_capacity: u64,
-) {
-    append_control(
-        sink_path,
-        &format!(
-            "argv_capture_summary: recorded={} out_of_scope={}",
-            stats.recorded, stats.out_of_scope
-        ),
-    );
-    if stats.unresolved > 0 {
-        append_control(
-            sink_path,
-            &format!(
-                "argv_without_image: {} observed command line(s) could not be matched to a \
-                 process start from the Kernel-Process provider, so they produced no candidate",
-                stats.unresolved
-            ),
-        );
-    }
-    if stats.without_exe > 0 {
-        append_control(
-            sink_path,
-            &format!(
-                "argv_without_settings_path: {} process(es) started from an image path that \
-                 cannot be expressed in settings (unmapped volume)",
-                stats.without_exe
-            ),
-        );
-    }
-    if stats.without_command_line > 0 {
-        append_control(
-            sink_path,
-            &format!(
-                "argv_missing_command_line: {} process start event(s) carried no command line \
-                 (an older MOF event version, or no pid)",
-                stats.without_command_line
-            ),
-        );
-    }
-    if dropped_by_capacity > 0 {
-        append_control(
-            sink_path,
-            &format!(
-                "argv_events_dropped_by_capacity: {dropped_by_capacity} process start event(s) \
-                 were discarded before they could be drained"
-            ),
-        );
     }
 }
 
@@ -581,29 +512,40 @@ fn validate_request(policy: &LearnPolicy) -> Result<std::path::PathBuf, String> 
     let sink = validate_audit_sink_path(&policy.fs_audit_log_path, &policy.workspace_root)
         .map_err(|e| format!("rejected audit sink path: {e}"))?;
     if policy.capture_argv {
-        // **候補の積み先にも同じ検問を掛ける**（段階6d）。パスは要求から受け取らず
-        // `workspace_root`から導出するが、それだけでは足りない——途中の
-        // `.harness/transitions`がジャンクションなら、**昇格プロセスが任意の場所へ
-        // 追記する**ことになる（`validate_sink_under`が親を`canonicalize`して潰す）。
+        // **プロセスの木の積み先にも同じ検問を掛ける**（決定23(1)。2026-10-05 までは
+        // 辺の候補の記録に掛けていたが、あれは P4.8 で消えた）。パスは要求から受け取らず
+        // `fs-audit.jsonl`から導出するが、それだけでは足りない——途中がジャンクションなら、
+        // **昇格プロセスが任意の場所へ追記する**ことになる
+        // （`validate_sink_under`が親を`canonicalize`して潰す）。
         //
-        // **置き場が無ければ断る。** 作るのは非昇格のharnessの仕事で（BUG-109。昇格側が
-        // 作ると所有者が`BUILTIN\Administrators`になり、以後`.harness/**`の保護が完成しない）、
-        // ここで作ってしまうと**その不変条件が黙って壊れる**。FS側のシンクが
-        // 「存在すること」を要求しているのと同じ形である。
-        //
-        // **比べる相手は`workspace_root`である。** 置き場そのもの
-        // （`.harness/transitions`）を許可範囲に渡すと、**そこがジャンクションでも
-        // 「自分自身の下」になって必ず通る**——限定として何も言っていないことになる。
-        crate::elevated_launch::validate_sink_under(
-            &super::observed::observed_path(&policy.workspace_root),
+        // **比べる相手は`workspace_root`である。** 置き場そのもの（記録のディレクトリ）を
+        // 許可範囲に渡すと、**そこがジャンクションでも「自分自身の下」になって必ず通る**
+        // ——限定として何も言っていないことになる。
+        let audit = crate::elevated_launch::validate_sink_under(
+            &super::process_audit_path(&policy.fs_audit_log_path),
             &policy.workspace_root,
         )
         .map_err(|e| {
             format!(
-                "rejected transition candidate sink: {e} (the non-elevated side creates \
-                 .harness/transitions/ before asking; see docs/bugs/BUG-109.md)"
+                "rejected process audit sink: {e} (the non-elevated side creates the recording \
+                 directory before asking; see docs/bugs/BUG-109.md)"
             )
         })?;
+        // **ファイルが無ければ断る。** 作るのは非昇格のharnessの仕事で（BUG-109。昇格側が
+        // 作ると所有者が`BUILTIN\Administrators`になり、以後`.harness/**`の保護が完成しない）、
+        // ここで作ってしまうと**その不変条件が黙って壊れる**。
+        //
+        // **ここは`validate_sink_under`に無い検査である**——あちらは「まだ無いファイル」を
+        // 通す（親を解決してから名前を足す）。P4.8 までは、辺の候補の記録の置き場
+        // （`.harness/transitions/`）が無いことで同じ断りが起きていたが、木の置き場は
+        // `fs-audit.jsonl`と同じ記録のディレクトリなので、**先行作成の有無はファイルで見るしかない。**
+        if !audit.is_file() {
+            return Err(format!(
+                "rejected process audit sink: {} does not exist (the non-elevated side creates it \
+                 before asking; see docs/bugs/BUG-109.md)",
+                audit.display()
+            ));
+        }
     }
     Ok(sink)
 }
@@ -1466,16 +1408,17 @@ mod flush_batch_record_all_tests {
         );
     }
 
-    /// **[段階6d] 候補の積み先も受信側で検証する**（`P-01`）。
+    /// **[決定23(1)] プロセスの木の積み先も受信側で検証する**（`P-01`）。
     ///
-    /// 要求から受け取るのは`workspace_root`だけで、積み先はそこから導出する。だが導出だけでは
+    /// 要求から受け取るのは`fs-audit.jsonl`のパスだけで、木の積み先はそこから導出する。だが導出だけでは
     /// 足りない——**途中がジャンクションなら、昇格プロセスが任意の場所へ追記する**ことになる。
     ///
     /// ここで固定するのは「置き場が無ければ断る」側である（**作るのは非昇格のharness**で、
     /// 昇格側が作ると所有者が`BUILTIN\Administrators`になり`.harness/**`の保護が完成しない。
     /// BUG-109）。ジャンクションの解決そのものは`elevated_launch`の検問が持つ。
+    /// P4.8 までは辺の候補の記録（`.harness/transitions/`配下）に同じ検問を掛けていた。
     #[test]
-    fn a_recording_that_captures_argv_is_rejected_when_the_candidate_sink_is_missing() {
+    fn a_recording_that_captures_argv_is_rejected_when_the_process_audit_sink_is_missing() {
         let workspace = tempfile::tempdir().expect("tempdir");
         let sink_dir = workspace.path().join(".harness").join("sandbox").join("g1");
         std::fs::create_dir_all(&sink_dir).expect("create sink dir");
@@ -1489,16 +1432,14 @@ mod flush_batch_record_all_tests {
             capture_argv: true,
         };
 
-        // `.harness/transitions/`がまだ無い＝非昇格側の先行作成が失敗している。
+        // `process-audit.jsonl`がまだ無い＝非昇格側の先行作成が失敗している。
         let error = validate_request(&policy).expect_err("置き場が無いのに受理された");
-        assert!(error.contains("transition candidate sink"), "{error}");
+        assert!(error.contains("process audit sink"), "{error}");
 
         // **対の側**: 先に作ってあれば通る（これが無いと「常に断る」実装でも緑になり、
         // argv観測が一度も始まらない）。
-        std::fs::create_dir_all(crate::tier2a::transitions_log::transitions_dir(
-            workspace.path(),
-        ))
-        .expect("create transitions dir");
+        std::fs::write(super::super::process_audit_path(&policy.fs_audit_log_path), "")
+            .expect("create the process audit sink");
         validate_request(&policy).expect("先行作成してあるのに断られた");
 
         // argvを頼まない記録は、置き場の有無に関係なく通る（波及範囲を広げない）。

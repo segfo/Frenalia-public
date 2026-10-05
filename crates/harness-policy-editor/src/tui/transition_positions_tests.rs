@@ -13,7 +13,6 @@ use ratatui::Terminal;
 use harness_policy::policy_file::{self, PolicyDomain, PolicyFile, ENTRY_DOMAIN};
 use harness_policy::process_event::ProcessInstance;
 use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
-use harness_sandbox::tier2a::policy_learnd::observed::{observed_path, ObservedRecord, Spawn};
 
 use crate::position_view::position_view_tests::{
     child, root, seed_position_record, seed_record, user_example, with_command_line, workspace,
@@ -106,26 +105,6 @@ fn screen(app: &App) -> Vec<String> {
 /// 空白を落とす（全角文字の後ろのセルと、桁をそろえる空白を無視して比べるため）。
 fn squash(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
-fn write_observed(ws: &Path, spawns: &[(&str, &str)]) {
-    let path = observed_path(ws);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let mut text = String::new();
-    for (exe, argv) in spawns {
-        let record = ObservedRecord::ObservedSpawn(Spawn {
-            parent_exe: Some(CMD.to_string()),
-            exe: exe.to_string(),
-            argv: argv.to_string(),
-            count: 1,
-            first_ts: 1,
-            last_ts: 1,
-            argv_truncation: false,
-        });
-        text.push_str(&serde_json::to_string(&record).unwrap());
-        text.push('\n');
-    }
-    std::fs::write(&path, text).unwrap();
 }
 
 /// **位置の情報がある記録は、位置の木で見せる**（決定65の困りごと2）。行は木の順・字下げは段数・遷移先と
@@ -225,16 +204,16 @@ fn narrowing_a_position_with_a_relative_argument_is_refused_with_the_reason() {
     );
 }
 
-/// **位置の情報が無い記録は今の平らな一覧に注記を添える**（決定65の細目6）。
-/// 対の側: 位置の情報がある記録では平らな一覧の行が出ない（同じ`observed.jsonl`があっても）。
+/// **位置の情報が無い記録は、観測のタブに注記だけを出す**（決定65の細目6。P4.8 で平らな候補の
+/// 一覧は記録の側ごと消えたので、行は1つも出ない）。
+/// 対の側: 位置の情報がある記録では木が出て、注記は出ない。
 #[test]
-fn an_old_record_without_process_audit_shows_the_flat_list_with_a_note() {
+fn an_old_record_without_process_audit_shows_only_a_note() {
     let ws = workspace();
     seed_record(ws.path(), "old");
-    write_observed(ws.path(), &[(PWSH, "pwsh -c x")]);
     let app = open_observed_tab(ws.path());
     assert!(app.pending.positions.is_none());
-    assert_eq!(app.pending.visible().len(), 1, "平らな一覧が出る");
+    assert!(app.pending.visible().is_empty(), "行が出ている");
     assert!(
         app.pending
             .notes
@@ -245,10 +224,8 @@ fn an_old_record_without_process_audit_shows_the_flat_list_with_a_note() {
     );
 
     let ws = workspace();
-    write_observed(ws.path(), &[(PWSH, "pwsh -c x")]);
     let app = app_with_record(ws.path(), &user_example());
     assert!(app.pending.positions.is_some());
-    assert!(app.pending.visible().is_empty(), "平らな一覧の行が出ている");
     assert!(!app
         .pending
         .notes

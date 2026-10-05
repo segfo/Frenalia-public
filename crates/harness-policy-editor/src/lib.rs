@@ -132,10 +132,11 @@ pub mod shell_output;
 /// [段階⑦] 選んだ候補を遷移の宣言として`policy.json`へ書く／消す。
 /// **ACEは付かない**（遷移の宣言は付与の対象を持たない）。
 pub mod transition_approve;
-/// [段階⑦] 観測（`observed.jsonl`）と拒否（`pending.jsonl`）を**遷移の辺の候補**にする。
+/// [段階⑦] 拒否（`pending.jsonl`）を**遷移の辺の候補**にする。
 /// 「もう宣言済みか」はSpawn Daemonと同じ判定器に聞く（判定を2つ作らない）。
+/// パス1の記録の側は[`position_view`]が位置ごとに候補を作る（平らな観測の記録は P4.8 で消えた）。
 ///
-/// **windows専用**——入力の型（観測と拒否の行）も、「その綴りを起こせるか」の判定も
+/// **windows専用**——入力の型（拒否の行）も、「その綴りを起こせるか」の判定も
 /// `harness_sandbox`のwindows専用モジュールが持つため。
 #[cfg(windows)]
 pub mod transition_candidates;

@@ -7,7 +7,6 @@ use super::*;
 
 use harness_policy::policy_file::{PolicyDomain, ENTRY_DOMAIN};
 use harness_policy::transition::AnyMarker;
-use harness_sandbox::tier2a::policy_learnd::observed::Spawn;
 use harness_sandbox::tier2a::spawnd::transitions::Denial;
 use harness_sandbox::tier2a::spawnd::DenyReason;
 
@@ -33,10 +32,6 @@ fn policy(edges: Vec<TransitionEdge>) -> PolicyFile {
     }
 }
 
-fn declared(file: &PolicyFile) -> DeclaredEdges {
-    declared_with(file, &Default::default())
-}
-
 /// 拒否の行を判定する遷移元ごとの宣言（この試験の拒否は全部入口のドメインから）。
 fn declared_by_domain(file: &PolicyFile) -> DeclaredEdgesByDomain {
     DeclaredEdgesByDomain::build(
@@ -48,24 +43,25 @@ fn declared_by_domain(file: &PolicyFile) -> DeclaredEdgesByDomain {
     .expect("宣言が組めない")
 }
 
-/// 用意される見込みの遷移先を渡して組む。
-fn declared_with(
+/// 用意される見込みの遷移先を渡して、遷移元ごとの表として組む。
+fn declared_by_domain_with(
     file: &PolicyFile,
     provisioned: &std::collections::BTreeSet<String>,
-) -> DeclaredEdges {
-    DeclaredEdges::build(file, WS, ENTRY_DOMAIN, provisioned).expect("宣言が組めない")
+) -> DeclaredEdgesByDomain {
+    DeclaredEdgesByDomain::build(file, WS, &[ENTRY_DOMAIN.to_string()].into(), provisioned)
+        .expect("宣言が組めない")
 }
 
-fn observed(exe: &str, argv: &str) -> ObservedRecord {
-    ObservedRecord::ObservedSpawn(Spawn {
-        parent_exe: Some("C:/pwsh.exe".to_string()),
-        exe: exe.to_string(),
-        argv: argv.to_string(),
-        count: 1,
-        first_ts: 1,
-        last_ts: 1,
-        argv_truncation: false,
-    })
+/// 宣言を足せば通る拒否の行（**宣言済みかの重ね方と並びを測る入口**。P4.8 までは
+/// パス1の平らな観測でこれを測っていたが、あの記録は消えた）。
+fn unmatched(exe: &str, argv: &str) -> PendingRecord {
+    denial(
+        exe,
+        argv,
+        DenyReason::Transition {
+            denial: TransitionDenial::NoMatchingEdge,
+        },
+    )
 }
 
 fn denial(exe: &str, argv: &str, reason: DenyReason) -> PendingRecord {
@@ -88,7 +84,7 @@ fn denial(exe: &str, argv: &str, reason: DenyReason) -> PendingRecord {
 #[test]
 fn an_unobserved_program_with_no_declaration_is_approvable() {
     let file = policy(Vec::new());
-    let candidates = from_observations(&[observed("C:/git.exe", "git status")], &declared(&file));
+    let candidates = from_denials(&[unmatched("C:/git.exe", "git status")], &declared_by_domain(&file));
 
     assert_eq!(candidates.len(), 1);
     assert!(candidates[0].is_approvable());
@@ -106,7 +102,7 @@ fn a_program_declared_with_this_exact_spelling_becomes_removable() {
         ArgvMatcher::Any(AnyMarker),
         ENTRY_DOMAIN,
     )]);
-    let candidates = from_observations(&[observed("C:/git.exe", "git status")], &declared(&file));
+    let candidates = from_denials(&[unmatched("C:/git.exe", "git status")], &declared_by_domain(&file));
 
     assert!(!candidates[0].is_approvable());
     assert!(candidates[0].is_removable());
@@ -150,7 +146,7 @@ fn runnable_now_of(candidate: &Candidate) -> bool {
 #[test]
 fn an_edge_into_a_domain_that_will_not_be_provisioned_is_shown_as_not_runnable() {
     let file = policy_with_an_edge_into_git_domain();
-    let candidates = from_observations(&[observed("C:/git.exe", "git status")], &declared(&file));
+    let candidates = from_denials(&[unmatched("C:/git.exe", "git status")], &declared_by_domain(&file));
     assert!(
         !runnable_now_of(&candidates[0]),
         "用意されない遷移先への遷移が「いま起こせる」と表示されている"
@@ -163,9 +159,9 @@ fn an_edge_into_a_domain_that_will_not_be_provisioned_is_shown_as_not_runnable()
 fn an_edge_into_a_domain_that_will_be_provisioned_is_shown_as_runnable() {
     let file = policy_with_an_edge_into_git_domain();
     let provisioned: std::collections::BTreeSet<String> = ["git-domain".to_string()].into();
-    let candidates = from_observations(
-        &[observed("C:/git.exe", "git status")],
-        &declared_with(&file, &provisioned),
+    let candidates = from_denials(
+        &[unmatched("C:/git.exe", "git status")],
+        &declared_by_domain_with(&file, &provisioned),
     );
     assert!(runnable_now_of(&candidates[0]));
 }
@@ -183,10 +179,7 @@ fn a_candidate_covered_only_by_a_pattern_is_not_removable_from_this_row() {
         ArgvMatcher::Any(AnyMarker),
         ENTRY_DOMAIN,
     )]);
-    let candidates = from_observations(
-        &[observed("C:/tools/git.exe", "git status")],
-        &declared(&file),
-    );
+    let candidates = from_denials(&[unmatched("C:/tools/git.exe", "git status")], &declared_by_domain(&file));
 
     assert!(
         !candidates[0].is_removable(),
@@ -251,16 +244,11 @@ fn a_denial_that_is_not_about_policy_is_not_offered_as_a_candidate() {
 #[test]
 fn an_overflow_report_is_not_a_candidate() {
     let file = policy(Vec::new());
-    let observed_records = [ObservedRecord::Overflowed {
-        dropped: 3,
-        last_ts: 1,
-    }];
     let denied_records = [PendingRecord::Overflowed {
         dropped: 3,
         last_ts: 1,
     }];
 
-    assert!(from_observations(&observed_records, &declared(&file)).is_empty());
     assert!(from_denials(&denied_records, &declared_by_domain(&file)).is_empty());
 }
 
@@ -271,15 +259,15 @@ fn an_overflow_report_is_not_a_candidate() {
 fn the_order_does_not_depend_on_the_order_in_the_file() {
     let file = policy(Vec::new());
     let forward = [
-        observed("C:/rustc.exe", "rustc a"),
-        observed("C:/cargo.exe", "cargo build"),
-        observed("C:/git.exe", "git status"),
+        unmatched("C:/rustc.exe", "rustc a"),
+        unmatched("C:/cargo.exe", "cargo build"),
+        unmatched("C:/git.exe", "git status"),
     ];
     let mut backward = forward.clone();
     backward.reverse();
 
-    let a = from_observations(&forward, &declared(&file));
-    let b = from_observations(&backward, &declared(&file));
+    let a = from_denials(&forward, &declared_by_domain(&file));
+    let b = from_denials(&backward, &declared_by_domain(&file));
     assert_eq!(a, b);
     assert_eq!(
         a.iter().map(|c| c.exe_file_name()).collect::<Vec<_>>(),
@@ -301,11 +289,11 @@ fn the_order_does_not_depend_on_the_order_in_the_file() {
 #[test]
 fn a_store_app_spelling_is_reported_as_not_startable() {
     let file = policy(Vec::new());
-    let store = observed(
+    let store = unmatched(
         r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe\pwsh.exe",
         "pwsh -NoProfile",
     );
-    let candidates = from_observations(&[store], &declared(&file));
+    let candidates = from_denials(&[store], &declared_by_domain(&file));
 
     assert_eq!(candidates[0].startable, Startable::NotThroughTheAppModel);
     assert!(
@@ -326,8 +314,8 @@ fn a_store_app_spelling_is_reported_as_not_startable() {
 #[test]
 fn an_ordinary_program_carries_no_startability_note() {
     let file = policy(Vec::new());
-    let ordinary = observed(r"C:\Program Files\Git\cmd\git.exe", "git --version");
-    let candidates = from_observations(&[ordinary], &declared(&file));
+    let ordinary = unmatched(r"C:\Program Files\Git\cmd\git.exe", "git --version");
+    let candidates = from_denials(&[ordinary], &declared_by_domain(&file));
 
     assert_eq!(candidates[0].startable, Startable::AsFarAsWeKnow);
     assert!(candidates[0].startable.note().is_none());

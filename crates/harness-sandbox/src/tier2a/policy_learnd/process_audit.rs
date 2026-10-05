@@ -42,13 +42,6 @@
 //! 表に無い pid のたびにスコープ判定の「判定できなかった」の数を増やしていた
 //! （[BUG-228](../../../../docs/bugs/BUG-228.md)）。
 //!
-//! # `observed.jsonl`は同じ結び付けの結果から書く（暫定）
-//!
-//! 遷移の辺の候補（`observed.rs`）は、ここで結び付けた結果を**答えの決まった`Resolution`**で
-//! 1件ずつ渡して書く（書式は変えない）。`Resolution::Unknown`を渡さないのは、それを渡すと
-//! `observe`の中の持ち越しに入り、次の呼び出しで別のプロセスとして解決されるからである。
-//! `observed.jsonl`は P4.8 で読む側ごと消える暫定の記録（決定65の寿命）。
-//!
 //! # 限界（同じ場所で言う）
 //!
 //! - **行の順序は開始順を保証しない。** 読む側は全部読んでから木を組む
@@ -67,8 +60,7 @@ use harness_policy::process_event::{
 
 use super::etw::mof::{MofProcessStart, EVENT_TYPE_PROCESS_DC_START};
 use super::instances::ProcessInstances;
-use super::observed::{ArgvEvent, ArgvStats, ObservedCandidates, Resolution};
-use crate::tier2a::transitions_log::{argv_truncation_from_utf16, QueueError};
+use crate::tier2a::transitions_log::argv_truncation_from_utf16;
 
 /// 結び付けの時刻の窓（±、両端を含む）。決定65の追記(4)（実測の根拠は`RESULTS.md` §24.5）。
 pub(super) const ARGV_WINDOW_MS: u64 = 2;
@@ -123,9 +115,9 @@ pub(super) struct ProcessAuditStats {
     pub(super) dcstart_excluded: u64,
     /// 持ち越しても相手のインスタンスが無かった MOF の開始。
     pub(super) mof_without_instance: u64,
-    /// 同じインスタンスへ2件目の MOF の開始が結び付いた（`observed.jsonl`へ二重に入れない）。
+    /// 同じインスタンスへ2件目の MOF の開始が結び付いた（2件目は使わない）。
     pub(super) bound_twice: u64,
-    /// インスタンスを`NoArgvObserved`で書いた後に、その MOF の開始が届いた（`observed.jsonl`へは入れる）。
+    /// インスタンスを`NoArgvObserved`で書いた後に、その MOF の開始が届いた。
     pub(super) argv_after_settled: u64,
     /// 待ちの上限を超えたので、待たずに決めた（インスタンスか MOF の開始）。
     pub(super) overflowed: u64,
@@ -145,29 +137,22 @@ struct Awaiting {
 pub(super) struct ProcessAudit {
     /// `process_audit_path(検証済みの fs-audit のパス)`。
     path: PathBuf,
-    /// `observed.jsonl`の積み先（同じ結び付けの結果から書く、暫定）。
-    candidates: ObservedCandidates,
     /// 表（[`ProcessInstances`]）のどこまで見たか。
     cursor: usize,
     /// 引数待ちの対象インスタンス。
     awaiting: Vec<Awaiting>,
     /// 相手のインスタンスがまだ無い MOF の開始（1回持ち越したか）。
     unpaired: Vec<(MofProcessStart, bool)>,
-    /// MOF の開始が1件でも結び付いたインスタンス（`observed.jsonl`へ二重に入れないため）。
+    /// MOF の開始が1件でも結び付いたインスタンス（2件目を数えるため）。
     bound: HashSet<usize>,
     stats: ProcessAuditStats,
 }
 
 impl ProcessAudit {
     /// 版の行を書いて始める。`write_line`は1行追記して成否を返す（`server.rs`の`append_line`）。
-    pub(super) fn start(
-        path: PathBuf,
-        candidates: ObservedCandidates,
-        write_line: &dyn Fn(&str) -> bool,
-    ) -> Self {
+    pub(super) fn start(path: PathBuf, write_line: &dyn Fn(&str) -> bool) -> Self {
         let mut audit = Self {
             path,
-            candidates,
             cursor: 0,
             awaiting: Vec::new(),
             unpaired: Vec::new(),
@@ -189,35 +174,27 @@ impl ProcessAudit {
 
     /// 1回のドレイン。表に増えたインスタンスと、届いた MOF の開始を結び付け、決まったものを書く。
     ///
-    /// **戻り値は`observed.jsonl`の書込の失敗だけ**（最初の1つ）。結び付かなかったことは失敗では
-    /// ないので数えるだけ（`P-07`: 記録の都合で収集を止めない）。
+    /// **結び付かなかったことは失敗ではない**ので数えるだけ（`P-07`: 記録の都合で収集を止めない）。
     pub(super) fn drain(
         &mut self,
         instances: &ProcessInstances,
         mof: Vec<MofProcessStart>,
-        now_ms: u64,
         write_line: &dyn Fn(&str) -> bool,
-    ) -> Result<(), QueueError> {
-        self.pass(instances, mof, now_ms, write_line, true)
+    ) {
+        self.pass(instances, mof, write_line, true);
     }
 
-    /// 何も持ち越さずに全部書き切り、歩留まりを制御レコードとして`process-audit.jsonl`へ書き、
-    /// `observed.jsonl`を畳む。返す`ArgvStats`は`fs-audit.jsonl`側の既存の統計（`record_argv_stats`）に渡す。
+    /// 何も持ち越さずに全部書き切り、歩留まりを制御レコードとして`process-audit.jsonl`へ書く。
     pub(super) fn finish(
         mut self,
         instances: &ProcessInstances,
         mof: Vec<MofProcessStart>,
         now_ms: u64,
         write_line: &dyn Fn(&str) -> bool,
-    ) -> (ArgvStats, ProcessAuditStats, Result<usize, QueueError>) {
-        let pass = self.pass(instances, mof, now_ms, write_line, false);
+    ) -> ProcessAuditStats {
+        self.pass(instances, mof, write_line, false);
         self.write_controls(now_ms, write_line);
-        let flushed = self.candidates.finish(now_ms);
-        let result = match pass {
-            Err(e) => Err(e),
-            Ok(()) => flushed,
-        };
-        (self.candidates.stats(), self.stats, result)
+        self.stats
     }
 
     /// `drain`と`finish`の本体。`may_carry`が偽なら何も持ち越さない。
@@ -225,12 +202,10 @@ impl ProcessAudit {
         &mut self,
         instances: &ProcessInstances,
         mof: Vec<MofProcessStart>,
-        now_ms: u64,
         write_line: &dyn Fn(&str) -> bool,
         may_carry: bool,
-    ) -> Result<(), QueueError> {
+    ) {
         let mut settled: Vec<(usize, ArgvBinding)> = Vec::new();
-        let mut first_error = None;
 
         // 1. 表に増えたインスタンスのうち対象のものを、引数待ちへ。
         for index in self.cursor..instances.len() {
@@ -239,7 +214,7 @@ impl ProcessAudit {
                 continue;
             }
             if identity.seq.is_none() {
-                // 同一性が無いので書けない。`observed.jsonl`へは 2. で入れる。
+                // 同一性が無いので書けない（番号の無いインスタンスは木の節点にできない）。
                 self.stats.without_sequence_number += 1;
                 continue;
             }
@@ -267,7 +242,8 @@ impl ProcessAudit {
                 continue;
             }
             let Some(pid) = start.pid else {
-                self.candidates.count_missing_command_line();
+                // pid が無い開始は、どのインスタンスにも結び付けられない（数えるだけ）。
+                self.stats.no_command_line_field += 1;
                 continue;
             };
             match pair(instances, pid, start.timestamp_unix_ms) {
@@ -280,7 +256,6 @@ impl ProcessAudit {
                         self.stats.overflowed += 1;
                     }
                     self.stats.mof_without_instance += 1;
-                    self.count_unmatched(&start);
                 }
                 Pairing::Ambiguous(found) => {
                     for index in found {
@@ -290,13 +265,8 @@ impl ProcessAudit {
                             settled.push((index, missing(ArgvMissingReason::AmbiguousWithinWindow)));
                         }
                     }
-                    self.count_unmatched(&start);
                 }
-                Pairing::Exact(index) => {
-                    if let Err(e) = self.bind(instances, index, start, now_ms, &mut settled) {
-                        first_error.get_or_insert(e);
-                    }
-                }
+                Pairing::Exact(index) => self.bind(instances, index, start, &mut settled),
             }
         }
 
@@ -317,41 +287,25 @@ impl ProcessAudit {
         for (index, argv) in settled {
             self.write_instance(instances, index, argv, write_line);
         }
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
     }
 
-    /// `Exact`の結び付け1件。`observed.jsonl`へは**答えの決まった`Resolution`**で1件だけ渡す。
+    /// `Exact`の結び付け1件。待っているインスタンスへコマンドラインを当て、決まった行を`settled`へ積む。
     fn bind(
         &mut self,
         instances: &ProcessInstances,
         index: usize,
         start: MofProcessStart,
-        now_ms: u64,
         settled: &mut Vec<(usize, ArgvBinding)>,
-    ) -> Result<(), QueueError> {
+    ) {
         let identity = instances.get(index);
-        let pid = identity.pid;
-        // **コマンドラインの無い開始は、どの分岐でも1回だけ数える**（旧`drain_argv`と同じ数え方）。
-        if start.command_line.is_none() {
-            self.candidates.count_missing_command_line();
-        }
         if !identity.in_scope {
-            return match start.command_line {
-                Some(argv) => self.candidates.observe(
-                    vec![ArgvEvent { pid, argv }],
-                    |_| Resolution::OutOfScope,
-                    now_ms,
-                ),
-                None => Ok(()),
-            };
+            // 対象外のプロセスの開始。木には入らない（数えない——件数は対象のものだけで読む）。
+            return;
         }
         if !self.bound.insert(index) {
-            // 同じインスタンスへ2件目。`observed.jsonl`へ二重に入れない。
+            // 同じインスタンスへ2件目。1件目で決まっているので使わない。
             self.stats.bound_twice += 1;
-            return Ok(());
+            return;
         }
         match self.awaiting.iter().position(|a| a.index == index) {
             Some(position) => {
@@ -377,38 +331,10 @@ impl ProcessAudit {
                 };
                 settled.push((index, binding));
             }
-            // 番号の無いインスタンスは`process-audit.jsonl`に書けないが、`observed.jsonl`へは入れる。
+            // 番号の無いインスタンスは`process-audit.jsonl`に書けない（上で数えてある）。
             None if identity.seq.is_none() => {}
             // 番号があるのに待っていない＝もう書いた（持ち越しを超えた・待ちがあふれた）。
             None => self.stats.argv_after_settled += 1,
-        }
-        match start.command_line {
-            Some(argv) => {
-                let resolution = Resolution::InScope {
-                    exe: identity.image_name.clone(),
-                    // **親は番号で引く**（pid で引き直さない、決定65の追記(3)）。記録の根の親
-                    // （harness 本体）は記録を始める前から居るので表に無く、`None`になる。
-                    parent_exe: identity
-                        .parent_seq
-                        .and_then(|seq| instances.by_seq(seq))
-                        .and_then(|parent| parent.image_name.clone()),
-                };
-                self.candidates.observe(
-                    vec![ArgvEvent { pid, argv }],
-                    move |_| resolution.clone(),
-                    now_ms,
-                )
-            }
-            None => Ok(()),
-        }
-    }
-
-    /// 結び付けられなかった MOF の開始を、`fs-audit.jsonl`側の既存の数え方で1回だけ数える。
-    fn count_unmatched(&mut self, start: &MofProcessStart) {
-        if start.command_line.is_some() {
-            self.candidates.count_unresolved();
-        } else {
-            self.candidates.count_missing_command_line();
         }
     }
 

@@ -12,17 +12,21 @@
 //!
 //! # なぜ2つを同じ画面のタブにするのか
 //!
-//! 出どころは違う（片方は隔離せずに観測したもの、片方は断られたもの）が、
+//! 出どころは違う（片方は隔離せずに記録したプロセスの木、片方は断られた生成）が、
 //! **ユーザーがやることは同じ**である——選んで、許す。画面を分けると同じ操作を2箇所に
 //! 実装することになる（決定62、`docs/CODE-STRUCTURE-RULES.md`§5.1）。
+//!
+//! **「観測から」のタブが持つのは位置の木だけである**（P4.3・P4.8）。P4.8 までは
+//! 深さを持たない平らな候補の一覧も同じタブに出していたが、記録の側の積み先ごと消えた
+//! （決定65の寿命）。プロセスの木を持たない古い記録では、このタブは注記だけを出す。
 //!
 //! # 遷移元はその行の遷移元。遷移先は欄で選ぶ
 //!
 //! 各行は自分の遷移元（[`Candidate::from_domain`]）の宣言で判定し、承認したらその遷移元から辺を書き、却下印もその
 //! 遷移元で残す（2026-10-05、`plans/position-domains/P4.md`の P4.6。それまでは全部の行を[`ENTRY_DOMAIN`]で判定して
 //! いたので、位置ごとのドメインの`pwsh`から断られた生成を入口のドメインの宣言で判定し、入口のドメインの辺として
-//! 書いていた）。拒否の行の遷移元は記録された呼び出し元で、**記録に無い拒否は承認できない**。観測の平らな行は入口の
-//! ドメイン（`observed.jsonl`は`run_shell`の根の子しか持たない。P4.8 で`observed.jsonl`ごと消える）。
+//! 書いていた）。拒否の行の遷移元は記録された呼び出し元で、**記録に無い拒否は承認できない**。位置の木の行の遷移元は
+//! その位置の親のドメインである（[`super::transition_positions`]）。
 //! **記録画面のドメイン欄とは混ぜない**——あちらは「パス2で記録中のドメイン名」で由来が違う。混ぜると、
 //! **Daemonが一度も見ないドメインへ遷移を書く**ことになる。
 //!
@@ -31,18 +35,20 @@
 //!
 //! # 入口のドメインの決め打ちが残る場所（P4.6）
 //!
-//! (1) 観測の平らな行の遷移元（上）。(2) 遷移先の見込みの表（[`crate::transition_destination::outlooks`]）の作り方——
+//! (1) モデルが見るのと同じ宣言済みの一覧を組むための遷移元（下の(3)と同じ理由）。
+//! (2) 遷移先の見込みの表（[`crate::transition_destination::outlooks`]）の作り方——
 //! `harness.exe`は入口のドメインを遷移先として用意しない（`PolicyFile::transition_target_domains`）ので、入口のドメインを
 //! 「呼び出し元と同じ」として表を作ると、入口のドメイン行きの辺が「用意されない」側に数えられる。(3) モデルが見るのと同じ
 //! 宣言済みの一覧（[`PendingState::declared_rows`]）——モデルは入口のドメインで動く。
 //!
-//! # 木にしない（`F2`のFS/ネットのタブとの違い）
+//! # 拒否のタブは木にしない（`F2`のFS/ネットのタブとの違い）
 //!
 //! FS側が[`super::proposal_tree::ProposalTree`]を使うのは、実測849件のパスが平坦だと
-//! 「この下をまとめて許す」という判断ができないからである。**遷移の行はパスではなく
+//! 「この下をまとめて許す」という判断ができないからである。**拒否の行はパスではなく
 //! プログラム**で、今日測った候補は11件だった。木にする理由（階層が読めない）が立たないので
 //! 平坦な一覧にする。チェックの記号と選択の移動は[`super::checkbox_tree`]を通す
-//! ——そこは対の操作と同じものである。
+//! ——そこは対の操作と同じものである（観測のタブの位置の木は、記録した木の形がそのまま
+//! 判定の単位なので別物である）。
 //!
 //! # ここが持たないもの
 //!
@@ -62,7 +68,7 @@ use harness_policy::policy_file::{self, ENTRY_DOMAIN};
 
 use crate::transition_approve::SourcedEdgeRef;
 use crate::transition_candidates::{
-    denial_sources, from_denials, from_observations, Candidate, Declared, DeclaredEdgesByDomain,
+    denial_sources, from_denials, Candidate, Declared, DeclaredEdgesByDomain,
 };
 use crate::tui::checkbox_tree;
 use crate::tui::state::{Action, App, Screen};
@@ -79,7 +85,7 @@ use crate::tui::state::Confirm;
 pub enum PendingTab {
     /// 記録セッションが観測したファイル・通信の候補（従来の編集画面）。
     FsNet,
-    /// パス1が観測した遷移の候補（`observed.jsonl`）。
+    /// パス1が記録したプロセスの木の位置ごとの遷移（`process-audit.jsonl`、決定65）。
     TransitionsObserved,
     /// Spawn Daemonが断った遷移の要求（`pending.jsonl`）。
     TransitionsDenied,
@@ -199,15 +205,12 @@ impl CandidateKey {
 #[derive(Debug, Default)]
 pub struct PendingState {
     pub tab: Tab,
-    /// 観測の候補（`observed.jsonl`）。
-    pub observed: Vec<Candidate>,
     /// 拒否の候補（`pending.jsonl`）。
     pub denied: Vec<Candidate>,
     /// 宣言済みの辺（**モデルが見るのと同じ一覧**）。
     pub declared_rows: Vec<harness_policy::transition_listing::Row>,
     /// 読めなかった・飛ばした・あふれた事実。**黙らせない**（`B-10`）。
     pub notes: Vec<String>,
-    pub observed_row: usize,
     pub denied_row: usize,
     /// 承認の予約。
     pub approve: BTreeSet<CandidateKey>,
@@ -246,11 +249,12 @@ impl Default for Tab {
 }
 
 impl PendingState {
-    /// いま見えている候補（フィルタ適用後）。
+    /// いま見えている候補（フィルタ適用後）。**拒否のタブだけが平らな候補を持つ**
+    /// （観測のタブは位置の木、FS/ネットのタブはファイルの候補で、どちらも別の型である）。
     pub fn visible(&self) -> Vec<&Candidate> {
-        let all = match self.tab.0 {
+        let all: &[Candidate] = match self.tab.0 {
             PendingTab::TransitionsDenied => &self.denied,
-            _ => &self.observed,
+            _ => &[],
         };
         all.iter()
             .filter(|c| match self.filter {
@@ -282,19 +286,17 @@ impl PendingState {
         self.undismiss.contains(&CandidateKey::of(candidate))
     }
 
-    /// いま選ばれている行の位置（タブごとに覚える）。
+    /// いま選ばれている行の位置。**平らな候補を持つのは拒否のタブだけ**なので、
+    /// 他のタブでは0を返す（観測のタブの選択は位置の木が自分で持つ）。
     pub fn row(&self) -> usize {
         match self.tab.0 {
             PendingTab::TransitionsDenied => self.denied_row,
-            _ => self.observed_row,
+            _ => 0,
         }
     }
 
     pub(crate) fn row_mut(&mut self) -> &mut usize {
-        match self.tab.0 {
-            PendingTab::TransitionsDenied => &mut self.denied_row,
-            _ => &mut self.observed_row,
-        }
+        &mut self.denied_row
     }
 
     /// この候補は承認予約されているか。
@@ -320,9 +322,9 @@ impl PendingState {
     /// 振り分けは[`Self::visible`]と同じ条件である——別の条件で数えると、見出しの件数と
     /// `f`で切り替えた先の行数が食い違う。
     pub fn counts(&self, tab: PendingTab) -> Counts {
-        let all = match tab {
+        let all: &[Candidate] = match tab {
             PendingTab::TransitionsDenied => &self.denied,
-            _ => &self.observed,
+            _ => &[],
         };
         let undecided = all.iter().filter(|c| c.is_approvable());
         let dismissed = undecided.clone().filter(|c| self.is_dismissed(c)).count();
@@ -357,7 +359,6 @@ impl App {
             Err(e) => {
                 // **読めないことを黙って空一覧にしない**（`B-10`）。
                 // 空と壊れているは別の事実で、後者は候補を1件も承認できない状態である。
-                self.pending.observed.clear();
                 self.pending.denied.clear();
                 self.pending.declared_rows.clear();
                 self.pending.outlooks.clear();
@@ -372,8 +373,8 @@ impl App {
             crate::transition_destination::outlooks(&file, ENTRY_DOMAIN, &grants);
         let provisioned = crate::transition_destination::provisioned_names(&self.pending.outlooks);
         let workspace = workspace_root.to_string_lossy().into_owned();
-        // 拒否の記録を先に読む——その行の遷移元ごとに宣言を組む（P4.6）。入口のドメインは観測の平らな行と宣言済みの
-        // 一覧のために必ず組む（モジュールdocの決め打ちの(1)(3)）。
+        // 拒否の記録を先に読む——その行の遷移元ごとに宣言を組む（P4.6）。入口のドメインは宣言済みの
+        // 一覧のために必ず組む（モジュールdocの決め打ちの(1)）。
         let denials = harness_sandbox::tier2a::spawnd::transitions::read_folded(&workspace_root);
         let mut sources = BTreeSet::from([ENTRY_DOMAIN.to_string()]);
         if let Ok(read) = &denials {
@@ -383,7 +384,6 @@ impl App {
         {
             Ok(declared) => declared,
             Err(e) => {
-                self.pending.observed.clear();
                 self.pending.denied.clear();
                 self.pending.declared_rows.clear();
                 self.pending.positions = None;
@@ -396,22 +396,10 @@ impl App {
             .expect("入口のドメインの宣言は必ず組む");
         self.pending.declared_rows = entry.rows().to_vec();
 
-        // 選んでいる記録に位置の情報があれば、観測のタブは位置の木で見せ、平らな一覧（`observed.jsonl`）は読まない
-        // （決定65の細目6。P4.8 で`observed.jsonl`ごと消える）。
-        self.pending.observed = if self.reload_positions(&file, &mut notes) {
-            Vec::new()
-        } else {
-            match harness_sandbox::tier2a::policy_learnd::observed::read_folded(&workspace_root) {
-                Ok(read) => {
-                    push_read_notes(&mut notes, "観測", read.dropped, read.skipped);
-                    from_observations(&read.records, entry)
-                }
-                Err(e) => {
-                    notes.push(format!("observed.jsonlを読めませんでした: {e}"));
-                    Vec::new()
-                }
-            }
-        };
+        // 選んでいる記録に位置の情報（`process-audit.jsonl`）があれば、観測のタブは位置の木で見せる。
+        // **無ければこのタブは注記だけを出す**（`reload_positions`が注記を積む。決定65の細目6）
+        // ——深さを持たない平らな候補の一覧は P4.8 で記録の側ごと消えた。
+        self.reload_positions(&file, &mut notes);
         self.pending.denied =
             match denials {
                 Ok(read) => {
@@ -450,9 +438,8 @@ impl App {
         // 消えた宣言への取り消し予約を落とす（別経路で消えていた場合に、消せない予約が残らない）。
         let alive: BTreeSet<SourcedEdgeRef> = self
             .pending
-            .observed
+            .denied
             .iter()
-            .chain(self.pending.denied.iter())
             .filter_map(|c| Some((c.from_domain.clone()?, c.removal_ref()?)))
             .collect();
         self.pending.remove.retain(|target| alive.contains(target));

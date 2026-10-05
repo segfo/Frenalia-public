@@ -2,12 +2,12 @@
 //!
 //! # ここでしか測れないもの
 //!
-//! 単体テスト（`observed_tests`・`client_tests`）は**行の形と断り方**を固定するが、
+//! 単体テスト（`process_audit_tests`・`client_tests`）は**行の形と断り方**を固定するが、
 //! 次の2つは実機でしか成立しない。
 //!
-//! 1. **実際に起こしたコマンドのコマンドラインが`observed.jsonl`の行になる**
+//! 1. **実際に起こしたコマンドのコマンドラインが`process-audit.jsonl`のインスタンスの行に入る**
 //!    ——2つのETWセッション（マニフェスト＝実行ファイルのフルパス、MOF＝コマンドライン）が
-//!    両方張れて、pidで突き合わせが成立して初めて1行になる。単体では全部作り物になる
+//!    両方張れて、時刻の窓で突き合わせが成立して初めて1行になる。単体では全部作り物になる
 //! 2. **枠が無ければ記録が始まらない**（§10.3 fail-closed）——`ERROR_NO_SYSTEM_RESOURCES`は
 //!    マシン全体の資源が埋まったときにしか返らない
 //!
@@ -24,9 +24,10 @@
 
 use std::path::Path;
 
+use harness_policy::process_event::{parse_process_audit, ArgvBinding, ProcessInstance};
+
 use super::etw::mof::MofFsSession;
-use super::observed::{observed_path, ObservedRecord, Spawn};
-use super::LearnPolicy;
+use super::{process_audit_path, LearnPolicy};
 
 /// 観測が配送され始めるまでの待ち（既存スパイクの実測値と同じ）。
 const WARMUP: std::time::Duration = std::time::Duration::from_millis(1500);
@@ -58,30 +59,36 @@ fn fresh_collector_next_to_the_test_binary() {
     let _ = super::reuse_tests::ensure_collector_next_to_test_binary();
 }
 
-fn spawns(path: &Path) -> Vec<Spawn> {
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| match serde_json::from_str::<ObservedRecord>(line) {
-            Ok(ObservedRecord::ObservedSpawn(spawn)) => Some(spawn),
-            Ok(ObservedRecord::Overflowed { .. }) => None,
-            Err(e) => panic!("候補の行が読めない（{e}）: {line}"),
-        })
-        .collect()
+/// 書かれたプロセスの木のインスタンス（空のファイル＝1件も書かれていない、は空で返す）。
+fn instances(path: &Path) -> Vec<ProcessInstance> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    parse_process_audit(&text)
+        .unwrap_or_else(|e| panic!("{} が読めない: {e}", path.display()))
+        .instances
 }
 
-/// **記録中に起こしたコマンドのargvが候補の行になる。**
+/// そのインスタンスに結び付いたコマンドライン（結び付いていなければ`None`）。
+fn command_line(instance: &ProcessInstance) -> Option<&str> {
+    match &instance.argv {
+        ArgvBinding::Exact { command_line, .. } => Some(command_line),
+        ArgvBinding::Missing { .. } => None,
+    }
+}
+
+/// **記録中に起こしたコマンドのargvが、プロセスの木のインスタンスの行に入る。**
 ///
 /// 固定するのは3点。
 ///
-/// 1. 行が出ること（2つのセッションが張れて、pidで突き合わせが成立したこと）
-/// 2. `exe`が**フルパス**であること——MOFの`ImageFileName`は葉の名前しか持たないので、
+/// 1. 行が出ること（2つのセッションが張れて、時刻の窓で突き合わせが成立したこと）
+/// 2. `image_path`が**フルパス**であること——MOFの`ImageFileName`は葉の名前しか持たないので、
 ///    ここが`cmd.exe`だけなら**突き合わせをやめてMOF側の値を載せている**
-/// 3. `argv`に起こしたときの引数がそのまま入っていること
+/// 3. 結び付いたコマンドラインに起こしたときの引数がそのまま入っていること
 #[test]
 #[ignore = "requires administrator (starts real ETW sessions); run via dev-elevated-runner"]
-fn a_command_started_during_the_recording_becomes_a_candidate() {
+fn a_command_started_during_the_recording_lands_in_the_process_tree_with_its_argv() {
     fresh_collector_next_to_the_test_binary();
     let workspace = tempfile::tempdir().expect("tempdir");
     let sink_dir = workspace.path().join(".harness").join("sandbox").join("g-1");
@@ -116,32 +123,36 @@ fn a_command_started_during_the_recording_becomes_a_candidate() {
     session.stop().expect("stop the recording");
     drop(session);
 
-    let path = observed_path(workspace.path());
-    let written = spawns(&path);
+    let path = process_audit_path(&sink_dir.join("fs-audit.jsonl"));
+    let written = instances(&path);
     let found = written
         .iter()
-        .find(|spawn| spawn.argv.contains(&marker))
+        .find(|instance| command_line(instance).is_some_and(|argv| argv.contains(&marker)))
         .unwrap_or_else(|| {
             panic!(
-                "起こしたコマンドのargvが候補になっていない。{} 行あった: {:#?}\n\
-                 （制御レコード側の理由は {} を見る）",
+                "起こしたコマンドのargvが木の行に入っていない。{} 行あった: {:#?}\n\
+                 （歩留まりの理由は {} の制御レコードを見る）",
                 written.len(),
                 written,
-                sink_dir.join("fs-audit.jsonl").display()
+                path.display()
             )
         });
 
-    let exe = found.exe.to_ascii_lowercase();
+    let exe = found
+        .image_path
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     assert!(
         exe.ends_with("cmd.exe") && exe.contains(':'),
-        "exeがフルパスでない（{}）。MOF側の`ImageFileName`は葉の名前しか持たないので、\
+        "image_pathがフルパスでない（{:?}）。MOF側の`ImageFileName`は葉の名前しか持たないので、\
          これは突き合わせをやめてMOFの値を載せている",
-        found.exe
+        found.image_path
     );
+    let argv = command_line(found).expect("結び付いた行を選んでいる");
     assert!(
-        found.argv.contains("echo"),
-        "argvが起こしたときの綴りを保っていない: {}",
-        found.argv
+        argv.contains("echo"),
+        "argvが起こしたときの綴りを保っていない: {argv}"
     );
 }
 
@@ -244,11 +255,11 @@ fn a_recording_is_refused_when_no_system_logger_slot_is_left() {
         ),
         "断り方が専用の変種で返っていない（呼び出し側はこの失敗だけ記録を中止する）: {error:?}"
     );
-    // **候補のファイルは残さない**（先行作成はするが、記録は始まっていない）。
-    let path = observed_path(workspace.path());
+    // **木の行は1つも書かない**（先行作成はするが、記録は始まっていない）。
+    let path = process_audit_path(&sink_dir.join("fs-audit.jsonl"));
     assert!(
-        spawns(&path).is_empty(),
-        "始まらなかった記録が候補を書いている: {}",
+        instances(&path).is_empty(),
+        "始まらなかった記録がプロセスの木を書いている: {}",
         path.display()
     );
 }

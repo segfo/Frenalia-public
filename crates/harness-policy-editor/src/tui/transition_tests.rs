@@ -9,28 +9,20 @@ use std::path::Path;
 
 use crossterm::event::KeyModifiers;
 use harness_policy::transition_listing;
-use harness_sandbox::tier2a::policy_learnd::observed::{observed_path, ObservedRecord, Spawn};
 
 use crate::tui::text_input::TextInput;
 
-fn write_observed(ws: &Path, spawns: &[(&str, &str)]) {
-    let path = observed_path(ws);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let mut text = String::new();
-    for (exe, argv) in spawns {
-        let record = ObservedRecord::ObservedSpawn(Spawn {
-            parent_exe: Some("C:/pwsh.exe".to_string()),
-            exe: exe.to_string(),
-            argv: argv.to_string(),
-            count: 1,
-            first_ts: 1,
-            last_ts: 1,
-            argv_truncation: false,
-        });
-        text.push_str(&serde_json::to_string(&record).unwrap());
-        text.push('\n');
-    }
-    std::fs::write(&path, text).unwrap();
+/// 入口のドメインから断られた生成を`pending.jsonl`へ書く（**平らな候補の入口**）。
+///
+/// P4.8 までは同じ試験をパス1の平らな観測（消えた記録）で組んでいた。測っているのは
+/// 候補1行に対する操作（承認・取り消し・引数の絞り・却下印・遷移先の欄）で、
+/// **出どころが拒否になっても同じ機構を通る**。
+fn write_flat_candidates(ws: &Path, spawns: &[(&str, &str)]) {
+    let denials: Vec<(Option<&str>, &str, &str)> = spawns
+        .iter()
+        .map(|(exe, argv)| (Some(ENTRY_DOMAIN), *exe, *argv))
+        .collect();
+    write_denials(ws, &denials);
 }
 
 fn app_at(ws: &Path) -> App {
@@ -83,14 +75,14 @@ fn the_eleven_programs_measured_today_all_show_up_as_candidates() {
         ("C:/VS/bin/link.exe", "link x.o"),
         ("C:/VS/bin/VCTIP.exe", "vctip"),
     ];
-    write_observed(tmp.path(), &measured);
+    write_flat_candidates(tmp.path(), &measured);
 
     let mut app = app_at(tmp.path());
-    app.pending.tab = Tab(PendingTab::TransitionsObserved);
+    app.pending.tab = Tab(PendingTab::TransitionsDenied);
     app.reload_transitions();
 
     assert_eq!(
-        app.pending.observed.len(),
+        app.pending.denied.len(),
         11,
         "観測した候補が11本出ていない"
     );
@@ -110,10 +102,10 @@ fn the_eleven_programs_measured_today_all_show_up_as_candidates() {
 #[test]
 fn selecting_and_confirming_writes_the_edge_to_the_policy_file() {
     let tmp = tempfile::tempdir().unwrap();
-    write_observed(tmp.path(), &[("C:/git.exe", "git status")]);
+    write_flat_candidates(tmp.path(), &[("C:/git.exe", "git status")]);
 
     let mut app = app_at(tmp.path());
-    app.pending.tab = Tab(PendingTab::TransitionsObserved);
+    app.pending.tab = Tab(PendingTab::TransitionsDenied);
     app.reload_transitions();
     point_destination_at_child(&mut app);
 
@@ -139,10 +131,10 @@ fn selecting_and_confirming_writes_the_edge_to_the_policy_file() {
 #[test]
 fn an_already_declared_row_can_be_unchecked_and_removed() {
     let tmp = tempfile::tempdir().unwrap();
-    write_observed(tmp.path(), &[("C:/git.exe", "git status")]);
+    write_flat_candidates(tmp.path(), &[("C:/git.exe", "git status")]);
 
     let mut app = app_at(tmp.path());
-    app.pending.tab = Tab(PendingTab::TransitionsObserved);
+    app.pending.tab = Tab(PendingTab::TransitionsDenied);
     app.reload_transitions();
     point_destination_at_child(&mut app);
     press(&mut app, KeyCode::Char(' '));
@@ -178,10 +170,10 @@ fn an_already_declared_row_can_be_unchecked_and_removed() {
 #[test]
 fn narrowing_the_argv_requires_selecting_the_row_first() {
     let tmp = tempfile::tempdir().unwrap();
-    write_observed(tmp.path(), &[("C:/git.exe", "git config --list")]);
+    write_flat_candidates(tmp.path(), &[("C:/git.exe", "git config --list")]);
 
     let mut app = app_at(tmp.path());
-    app.pending.tab = Tab(PendingTab::TransitionsObserved);
+    app.pending.tab = Tab(PendingTab::TransitionsDenied);
     app.reload_transitions();
     point_destination_at_child(&mut app);
 
@@ -209,12 +201,12 @@ fn narrowing_the_argv_requires_selecting_the_row_first() {
 /// これが無いと「常に観測した引数で絞る」実装でも上のテストは緑になり、
 /// 実行のたびに変わる引数（一時ディレクトリ等）では**二度と一致しない辺**ができる。
 #[test]
-fn the_default_is_any_argument_not_the_observed_one() {
+fn the_default_is_any_argument_not_the_recorded_one() {
     let tmp = tempfile::tempdir().unwrap();
-    write_observed(tmp.path(), &[("C:/git.exe", "git config --list")]);
+    write_flat_candidates(tmp.path(), &[("C:/git.exe", "git config --list")]);
 
     let mut app = app_at(tmp.path());
-    app.pending.tab = Tab(PendingTab::TransitionsObserved);
+    app.pending.tab = Tab(PendingTab::TransitionsDenied);
     app.reload_transitions();
     point_destination_at_child(&mut app);
     press(&mut app, KeyCode::Char(' '));
@@ -230,14 +222,14 @@ fn the_default_is_any_argument_not_the_observed_one() {
 #[test]
 fn a_broken_candidate_file_is_reported_rather_than_shown_as_empty() {
     let tmp = tempfile::tempdir().unwrap();
-    let path = observed_path(tmp.path());
+    let path = harness_sandbox::tier2a::spawnd::transitions::pending_path(tmp.path());
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "これはJSONではない\n").unwrap();
 
     let mut app = app_at(tmp.path());
     app.reload_transitions();
 
-    assert!(app.pending.observed.is_empty());
+    assert!(app.pending.denied.is_empty());
     assert!(
         app.pending
             .notes
@@ -253,7 +245,7 @@ fn a_broken_candidate_file_is_reported_rather_than_shown_as_empty() {
 fn pressing_space_with_no_rows_says_why_nothing_happened() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_at(tmp.path());
-    app.pending.tab = Tab(PendingTab::TransitionsObserved);
+    app.pending.tab = Tab(PendingTab::TransitionsDenied);
     app.reload_transitions();
 
     press(&mut app, KeyCode::Char(' '));
@@ -285,10 +277,10 @@ fn the_f2_key_cycles_the_three_tabs_of_the_pending_screen() {
 // --- 却下（`dismissed.json`。決定62「却下印の永続化を実装した」） -----------------------
 
 /// 遷移タブに入った状態のエディタを作る（観測の候補を読み込み済み）。
-fn observed_tab_with(ws: &Path, spawns: &[(&str, &str)]) -> App {
-    write_observed(ws, spawns);
+fn flat_tab_with(ws: &Path, spawns: &[(&str, &str)]) -> App {
+    write_flat_candidates(ws, spawns);
     let mut app = app_at(ws);
-    app.pending.tab = Tab(PendingTab::TransitionsObserved);
+    app.pending.tab = Tab(PendingTab::TransitionsDenied);
     app.reload_transitions();
     point_destination_at_child(&mut app);
     app
@@ -323,7 +315,7 @@ fn visible_exes(app: &App) -> Vec<String> {
 #[test]
 fn dismissing_moves_a_row_from_pending_to_dismissed_and_the_counts_follow() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = observed_tab_with(
+    let mut app = flat_tab_with(
         tmp.path(),
         &[("C:/a.exe", "a"), ("C:/b.exe", "b"), ("C:/c.exe", "c")],
     );
@@ -338,7 +330,7 @@ fn dismissing_moves_a_row_from_pending_to_dismissed_and_the_counts_follow() {
     assert!(!transition_dismissed::path(tmp.path()).exists());
     confirm(&mut app);
 
-    let counts = app.pending.counts(PendingTab::TransitionsObserved);
+    let counts = app.pending.counts(PendingTab::TransitionsDenied);
     assert_eq!(
         counts,
         Counts {
@@ -375,7 +367,7 @@ fn dismissing_moves_a_row_from_pending_to_dismissed_and_the_counts_follow() {
 #[test]
 fn undismissing_brings_the_row_back_to_pending() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = observed_tab_with(tmp.path(), &[("C:/a.exe", "a"), ("C:/b.exe", "b")]);
+    let mut app = flat_tab_with(tmp.path(), &[("C:/a.exe", "a"), ("C:/b.exe", "b")]);
     let target = selected_exe(&app);
     press(&mut app, KeyCode::Char('x'));
     confirm(&mut app);
@@ -397,7 +389,7 @@ fn undismissing_brings_the_row_back_to_pending() {
     assert!(visible_exes(&app).contains(&target), "保留中へ戻っていない");
     assert_eq!(
         app.pending
-            .counts(PendingTab::TransitionsObserved)
+            .counts(PendingTab::TransitionsDenied)
             .dismissed,
         0
     );
@@ -408,14 +400,14 @@ fn undismissing_brings_the_row_back_to_pending() {
 #[test]
 fn a_dismissal_survives_reopening_the_editor() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut first = observed_tab_with(tmp.path(), &[("C:/a.exe", "a"), ("C:/b.exe", "b")]);
+    let mut first = flat_tab_with(tmp.path(), &[("C:/a.exe", "a"), ("C:/b.exe", "b")]);
     let target = selected_exe(&first);
     press(&mut first, KeyCode::Char('x'));
     confirm(&mut first);
     drop(first);
 
     let mut second = app_at(tmp.path());
-    second.pending.tab = Tab(PendingTab::TransitionsObserved);
+    second.pending.tab = Tab(PendingTab::TransitionsDenied);
     second.reload_transitions();
     assert!(
         !visible_exes(&second).contains(&target),
@@ -424,7 +416,7 @@ fn a_dismissal_survives_reopening_the_editor() {
     assert_eq!(
         second
             .pending
-            .counts(PendingTab::TransitionsObserved)
+            .counts(PendingTab::TransitionsDenied)
             .dismissed,
         1
     );
@@ -439,7 +431,7 @@ fn a_broken_dismissed_file_is_reported_read_as_empty_and_not_overwritten() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, "壊れている").unwrap();
 
-    let mut app = observed_tab_with(tmp.path(), &[("C:/a.exe", "a"), ("C:/b.exe", "b")]);
+    let mut app = flat_tab_with(tmp.path(), &[("C:/a.exe", "a"), ("C:/b.exe", "b")]);
     assert!(
         app.pending
             .notes
@@ -487,7 +479,7 @@ fn no_single_key_reserves_more_than_one_approval_but_x_dismisses_them_all() {
         KeyCode::Delete,
     ]);
     for code in keys {
-        let mut app = observed_tab_with(tmp.path(), &rows);
+        let mut app = flat_tab_with(tmp.path(), &rows);
         press(&mut app, code);
         assert!(
             app.pending.approve.len() <= 1,
@@ -496,7 +488,7 @@ fn no_single_key_reserves_more_than_one_approval_but_x_dismisses_them_all() {
         );
     }
 
-    let mut app = observed_tab_with(tmp.path(), &rows);
+    let mut app = flat_tab_with(tmp.path(), &rows);
     press(&mut app, KeyCode::Char('X'));
     assert_eq!(
         app.pending.dismiss.len(),
@@ -510,7 +502,7 @@ fn no_single_key_reserves_more_than_one_approval_but_x_dismisses_them_all() {
 #[test]
 fn bulk_dismissal_skips_rows_reserved_for_approval() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = observed_tab_with(
+    let mut app = flat_tab_with(
         tmp.path(),
         &[("C:/a.exe", "a"), ("C:/b.exe", "b"), ("C:/c.exe", "c")],
     );
@@ -530,7 +522,7 @@ fn bulk_dismissal_skips_rows_reserved_for_approval() {
 #[test]
 fn approval_and_dismissal_are_never_reserved_together_on_one_row() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = observed_tab_with(tmp.path(), &[("C:/a.exe", "a")]);
+    let mut app = flat_tab_with(tmp.path(), &[("C:/a.exe", "a")]);
 
     press(&mut app, KeyCode::Char(' '));
     press(&mut app, KeyCode::Char('x'));
@@ -553,7 +545,7 @@ fn approval_and_dismissal_are_never_reserved_together_on_one_row() {
 #[test]
 fn approving_a_dismissed_row_writes_the_edge_and_clears_its_mark() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = observed_tab_with(tmp.path(), &[("C:/git.exe", "git status")]);
+    let mut app = flat_tab_with(tmp.path(), &[("C:/git.exe", "git status")]);
     press(&mut app, KeyCode::Char('x'));
     confirm(&mut app);
 
@@ -574,7 +566,7 @@ fn approving_a_dismissed_row_writes_the_edge_and_clears_its_mark() {
 #[test]
 fn the_dismissal_confirmation_names_its_file_and_says_what_it_does_not_change() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = observed_tab_with(tmp.path(), &[("C:/git.exe", "git status")]);
+    let mut app = flat_tab_with(tmp.path(), &[("C:/git.exe", "git status")]);
     press(&mut app, KeyCode::Char('x'));
     press(&mut app, KeyCode::Char('a'));
 
@@ -599,7 +591,7 @@ fn the_dismissal_confirmation_names_its_file_and_says_what_it_does_not_change() 
 #[test]
 fn x_on_a_declared_row_says_why_nothing_happened() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = observed_tab_with(tmp.path(), &[("C:/git.exe", "git status")]);
+    let mut app = flat_tab_with(tmp.path(), &[("C:/git.exe", "git status")]);
     press(&mut app, KeyCode::Char(' '));
     confirm(&mut app);
     press(&mut app, KeyCode::Char('f')); // 却下済み
@@ -611,52 +603,6 @@ fn x_on_a_declared_row_says_why_nothing_happened() {
         app.status.contains("宣言済み"),
         "理由を言っていない: {}",
         app.status
-    );
-}
-
-/// 却下は**2つのタブで同じ印**を見る——同じ`(exe, argv)`は、承認でも同じ辺になるため。
-#[test]
-fn a_dismissal_in_the_observed_tab_also_covers_the_same_program_in_the_denied_tab() {
-    use harness_policy::transition::TransitionDenial;
-    use harness_sandbox::tier2a::spawnd::transitions::{pending_path, Denial, PendingRecord};
-    use harness_sandbox::tier2a::spawnd::DenyReason;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let denial = PendingRecord::DeniedByDaemon(Denial {
-        from_domain: Some(ENTRY_DOMAIN.to_string()),
-        exe: "C:/git.exe".to_string(),
-        argv: "git status".to_string(),
-        cwd: None,
-        reason: DenyReason::Transition {
-            denial: TransitionDenial::NoMatchingEdge,
-        },
-        count: 1,
-        first_ts: 1,
-        last_ts: 1,
-        argv_truncation: false,
-    });
-    let queue = pending_path(tmp.path());
-    std::fs::create_dir_all(queue.parent().unwrap()).unwrap();
-    std::fs::write(
-        &queue,
-        format!("{}\n", serde_json::to_string(&denial).unwrap()),
-    )
-    .unwrap();
-
-    let mut app = observed_tab_with(tmp.path(), &[("C:/git.exe", "git status")]);
-    press(&mut app, KeyCode::Char('x'));
-    confirm(&mut app);
-
-    app.cycle_pending_tab(false);
-    assert_eq!(app.pending.tab.0, PendingTab::TransitionsDenied);
-    assert_eq!(app.pending.denied.len(), 1);
-    assert!(
-        app.pending.visible().is_empty(),
-        "拒否のタブでは保留中に残っている"
-    );
-    assert_eq!(
-        app.pending.counts(PendingTab::TransitionsDenied).dismissed,
-        1
     );
 }
 
@@ -676,10 +622,10 @@ fn type_destination(app: &mut App, name: &str) {
     assert!(!app.pending.destination.focused, "Enterで一覧へ戻れない");
 }
 
-fn app_with_one_observed(ws: &Path) -> App {
-    write_observed(ws, &[("C:/curl.exe", "curl https://example.com")]);
+fn app_with_one_flat_candidate(ws: &Path) -> App {
+    write_flat_candidates(ws, &[("C:/curl.exe", "curl https://example.com")]);
     let mut app = app_at(ws);
-    app.pending.tab = Tab(PendingTab::TransitionsObserved);
+    app.pending.tab = Tab(PendingTab::TransitionsDenied);
     app.reload_transitions();
     app
 }
@@ -689,7 +635,7 @@ fn app_with_one_observed(ws: &Path) -> App {
 #[test]
 fn the_destination_field_starts_empty_and_an_unnamed_commit_writes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_one_observed(tmp.path());
+    let mut app = app_with_one_flat_candidate(tmp.path());
     assert_eq!(app.pending.destination.name(), "", "欄が空で始まっていない");
 
     press(&mut app, KeyCode::Char(' '));
@@ -708,7 +654,7 @@ fn the_destination_field_starts_empty_and_an_unnamed_commit_writes_nothing() {
 #[test]
 fn typing_the_callers_own_domain_is_refused_as_frozen() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_one_observed(tmp.path());
+    let mut app = app_with_one_flat_candidate(tmp.path());
 
     press(&mut app, KeyCode::Char(' '));
     type_destination(&mut app, ENTRY_DOMAIN);
@@ -736,7 +682,7 @@ fn typing_the_callers_own_domain_is_refused_as_frozen() {
 #[test]
 fn the_destination_typed_into_the_field_is_where_the_edge_points() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_one_observed(tmp.path());
+    let mut app = app_with_one_flat_candidate(tmp.path());
 
     press(&mut app, KeyCode::Char(' '));
     type_destination(&mut app, "iso");
@@ -755,7 +701,7 @@ fn the_destination_typed_into_the_field_is_where_the_edge_points() {
 #[test]
 fn keys_typed_into_the_destination_field_do_not_trigger_actions() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_one_observed(tmp.path());
+    let mut app = app_with_one_flat_candidate(tmp.path());
 
     press(&mut app, KeyCode::Tab);
     for ch in ['a', 'x', 'f', ' ', 'u'] {
@@ -771,7 +717,7 @@ fn keys_typed_into_the_destination_field_do_not_trigger_actions() {
 #[test]
 fn an_empty_destination_stops_the_commit_with_a_reason() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut app = app_with_one_observed(tmp.path());
+    let mut app = app_with_one_flat_candidate(tmp.path());
 
     press(&mut app, KeyCode::Char(' '));
     type_destination(&mut app, "");
@@ -794,7 +740,7 @@ fn a_destination_that_will_not_be_provisioned_is_warned_about_but_written() {
         file.domains.push(domain);
     }
     policy_file::save(tmp.path(), &file).unwrap();
-    let mut app = app_with_one_observed(tmp.path());
+    let mut app = app_with_one_flat_candidate(tmp.path());
 
     press(&mut app, KeyCode::Char(' '));
     type_destination(&mut app, "net");
@@ -809,7 +755,7 @@ fn a_destination_that_will_not_be_provisioned_is_warned_about_but_written() {
     // 一覧の「いま起こせるか」も見込みの表に従う（宣言済みの行の表示）。
     let shown = app
         .pending
-        .observed
+        .denied
         .iter()
         .find_map(|c| match &c.declared {
             crate::transition_candidates::Declared::ByThisEdge { runnable_now, .. } => {

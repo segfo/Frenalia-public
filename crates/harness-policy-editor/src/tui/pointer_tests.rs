@@ -38,7 +38,7 @@ fn snapshot(app: &App) -> String {
          record: focus={:?} pass={:?} net={:?} command={} cwd={} domain={} running={}\n\
          edit: focus={:?} session={} row={} accepted={:?} expanded={} recursive={} hand={:?} \
          filter={:?} tree={} domain={} unapproved={:?}\n\
-         pending: observed={} denied={} approve={:?} narrow={:?} remove={:?} dismiss={:?} \
+         pending: denied={} approve={:?} narrow={:?} remove={:?} dismiss={:?} \
          undismiss={:?} filter={:?} dest_focused={} dest={}\n\
          declared: row={} expanded={} approve={:?} reassign={:?}\n\
          declared_transitions: tab={:?} row={} remove={:?}",
@@ -65,7 +65,6 @@ fn snapshot(app: &App) -> String {
         app.show_tree,
         app.domain.text(),
         app.unapproved,
-        app.pending.observed_row,
         app.pending.denied_row,
         app.pending.approve,
         app.pending.narrow,
@@ -295,11 +294,16 @@ fn tree_row(app: &App, label: &str) -> usize {
         .unwrap_or_else(|| panic!("候補の木に「{label}」の行が無い"))
 }
 
-/// 遷移タブ（観測から）に候補が3つある状態（同じ名前の`git.exe`が2つと`findstr.exe`）。
+/// 遷移タブ（拒否から）に候補が3つある状態（同じ名前の`git.exe`が2つと`findstr.exe`）。
+///
+/// P4.8 までは同じ3件をパス1の平らな観測（消えた記録）で置いていた。測るのはクリックの
+/// 当たり判定で、**平らな候補の一覧を持つのは拒否のタブだけ**になった。
 fn transition_tab_with_three_candidates(ws: &std::path::Path) -> App {
-    use harness_sandbox::tier2a::policy_learnd::observed::{observed_path, ObservedRecord, Spawn};
+    use harness_policy::transition::TransitionDenial;
+    use harness_sandbox::tier2a::spawnd::transitions::{pending_path, Denial, PendingRecord};
+    use harness_sandbox::tier2a::spawnd::DenyReason;
 
-    let path = observed_path(ws);
+    let path = pending_path(ws);
     std::fs::create_dir_all(path.parent().expect("parent")).expect("transitions dir");
     let text: String = [
         "C:/Program Files/Git/cmd/git.exe",
@@ -308,10 +312,14 @@ fn transition_tab_with_three_candidates(ws: &std::path::Path) -> App {
     ]
     .iter()
     .map(|exe| {
-        let record = ObservedRecord::ObservedSpawn(Spawn {
-            parent_exe: Some("C:/pwsh.exe".to_string()),
+        let record = PendingRecord::DeniedByDaemon(Denial {
+            from_domain: Some(harness_policy::policy_file::ENTRY_DOMAIN.to_string()),
             exe: exe.to_string(),
             argv: "x --y".to_string(),
+            cwd: None,
+            reason: DenyReason::Transition {
+                denial: TransitionDenial::NoMatchingEdge,
+            },
             count: 1,
             first_ts: 1,
             last_ts: 1,
@@ -320,14 +328,12 @@ fn transition_tab_with_three_candidates(ws: &std::path::Path) -> App {
         format!("{}\n", serde_json::to_string(&record).expect("jsonl"))
     })
     .collect();
-    std::fs::write(&path, text).expect("observed.jsonl");
+    std::fs::write(&path, text).expect("pending.jsonl");
     let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
     press(&mut app, KeyCode::F(2));
     press(&mut app, KeyCode::F(2));
-    assert_eq!(
-        app.pending.tab.0,
-        transition::PendingTab::TransitionsObserved
-    );
+    press(&mut app, KeyCode::F(2));
+    assert_eq!(app.pending.tab.0, transition::PendingTab::TransitionsDenied);
     assert_eq!(app.pending.visible().len(), 3, "候補が読めていない");
     app
 }
@@ -783,7 +789,7 @@ fn a_transition_row_and_its_mark_do_what_the_keys_do() {
         "git.exe (bin)"
     };
     assert_eq!(transition_row(&probe, &exe), row);
-    let list = |grid: &[Vec<String>]| boxed(grid, " 遷移・観測から:");
+    let list = |grid: &[Vec<String>]| boxed(grid, " 遷移・拒否から:");
     assert_click_is_keys(
         "行",
         &transition_tab_with_three_candidates,

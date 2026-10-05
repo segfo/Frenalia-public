@@ -80,11 +80,12 @@ fn the_same_sequence_number_is_inserted_once() {
     assert_eq!(instances.len(), 3);
 }
 
-/// **親は番号で引く。pid で引き直さない**（決定65の追記(3)）。
+/// **親の番号はそのまま持ち回る。pid で引き直さない**（決定65の追記(3)）。
 ///
-/// 親の pid が使い回された後に pid で引くと、後から来た別のプロセスが親に見える。
+/// 親の pid が使い回された後に pid で引くと、後から来た別のプロセスが親に見える——`process-audit.jsonl`へ
+/// 書くのは番号で、木に組むのは読む側である（`harness_policy::process_tree`）。
 #[test]
-fn the_parent_is_looked_up_by_sequence_number_not_by_pid() {
+fn the_parent_number_is_kept_as_is_and_pid_lookup_would_hit_the_reused_process() {
     let instances = table(&[
         start(100, Some(1), None, 10),    // 親
         start(200, Some(2), Some(1), 20), // 子（親の番号 1）
@@ -92,15 +93,10 @@ fn the_parent_is_looked_up_by_sequence_number_not_by_pid() {
     ]);
 
     let child = instances.at(200, 40).expect("子が引ける");
-    let parent = instances
-        .by_seq(child.parent_seq.expect("親の番号がある"))
-        .expect("親が引ける");
-    assert_eq!(parent.seq, Some(1));
-    assert_eq!(parent.image_name.as_deref(), Some("C:/tools/p100-1.exe"));
+    assert_eq!(child.parent_seq, Some(1));
 
     // 対照: 同じ時点で pid から引くと、使い回した別のプロセスに当たる（これを使わない理由）。
     assert_eq!(instances.at(100, 40).and_then(|i| i.seq), Some(3));
-    assert!(instances.by_seq(99).is_none());
 }
 
 /// 時刻の窓は**両端を含み、それより外は含まない**（決定65の追記(4)の 2ms）。

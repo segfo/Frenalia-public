@@ -1,13 +1,15 @@
-//! [段階⑦] 観測と拒否を**遷移の辺の候補**にする（`plans/POLICY-EDITOR-TOMOYO-DIG.md` 決定62・63）。
+//! [段階⑦] 拒否された生成を**遷移の辺の候補**にする（`plans/POLICY-EDITOR-TOMOYO-DIG.md` 決定62・63）。
 //!
 //! # 何のためにあるのか
 //!
 //! 「このプログラムが何を起こしてよいか」は、**まだ何も禁じていない状態で1回走らせて観測する**か、
-//! **禁じた状態で断られたものを見る**かのどちらかでしか分からない。前者は`observed.jsonl`、
-//! 後者は`pending.jsonl`が持つ。ここはその2つを、**同じ形の1行**へ寄せる。
+//! **禁じた状態で断られたものを見る**かのどちらかでしか分からない。ここは後者
+//! （`pending.jsonl`）を1行ずつ候補にする。
 //!
-//! 寄せるのは、**ユーザーがやることが同じ**だからである——選んで、許す。出どころが違うだけで
-//! 操作系を2つ作ると、同じ処理が2箇所に生える（`docs/CODE-STRUCTURE-RULES.md`規則5.1）。
+//! **前者（パス1の観測）はここを通らない。** 2026-10-05 までは平らな一覧として同じ形へ寄せていたが、
+//! 深さを持たないので「どの位置での生成か」を言えず、位置ごとのドメイン（決定65）では
+//! 入口のドメインの辺として書くしかなかった。いまはプロセスの木（`process-audit.jsonl`）を読む
+//! [`crate::position_view`]が位置ごとに候補を作り、記録の側の平らな積み先は P4.8 で消えた。
 //!
 //! # 「もう宣言済みか」は自分で判定しない
 //!
@@ -27,9 +29,7 @@
 //! 拒否の記録は遷移元（呼び出し元のドメイン）を持つ。位置ごとのドメイン（決定65）では`workspace-shell`以外から
 //! 断られた生成が普通に出るので、**各行をその行の遷移元の宣言で判定する**（[`DeclaredEdgesByDomain`]）。
 //! 遷移元が記録に無い拒否（カーネルの拒否など）は判定も承認もしない（[`Declared::NoSourceDomain`]）——入口の
-//! ドメインへ寄せると、別のドメインの生成を入口のドメインの辺として書いてしまう。観測の平らな行
-//! （`observed.jsonl`）は`run_shell`の根の子しか持たないので、遷移元は入口のドメインである（呼び出し側が
-//! 入口のドメインの[`DeclaredEdges`]を渡す。`observed.jsonl`ごと P4.8 で消える）。
+//! ドメインへ寄せると、別のドメインの生成を入口のドメインの辺として書いてしまう。
 //!
 //! # ここが持たないもの
 //!
@@ -45,7 +45,6 @@ use harness_policy::transition::{
     TransitionEdge, TransitionGraph,
 };
 use harness_policy::transition_listing::{self, Row};
-use harness_sandbox::tier2a::policy_learnd::observed::ObservedRecord;
 use harness_sandbox::tier2a::spawnd::transitions::{remedy, PendingRecord, Remedy};
 
 use crate::transition_approve::{ArgvChoice, EdgeRef};
@@ -122,12 +121,13 @@ impl Startable {
     }
 }
 
-/// この候補がどこから来たか。**画面の見出しを分けるためと、拒否側だけに出す注記のため。**
+/// この候補がどこから来たか。**拒否側だけに出す注記のため。**
+///
+/// **いまは1つだけである**（P4.8 まではパス1の平らな観測もここに居た）。残してあるのは、
+/// 行が「誰に断られたか」を注記として出すためで、`by_kernel`の真偽だけでは
+/// 出どころを1語で言えない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
-    /// パス1の観測（`observed.jsonl`）。**隔離していないので遷移元ドメインが無い**ので、
-    /// 代わりに起こした側の実行ファイルが分かることがある（§10.3）。
-    Observed { parent_exe: Option<String> },
     /// 拒否の待ち行列（`pending.jsonl`）。呼び出し元のドメインは[`Candidate::from_domain`]が持つ（2か所に持たない）。
     Denied {
         /// OSカーネルが止めたものか（`false`はSpawn Daemonが断ったもの）。
@@ -416,36 +416,6 @@ pub fn denial_sources(records: &[PendingRecord]) -> std::collections::BTreeSet<S
             PendingRecord::Overflowed { .. } => None,
         })
         .collect()
-}
-
-/// 観測（`observed.jsonl`）を候補にする。
-///
-/// **あふれの行と、出どころの分からない行は候補にしない**（種類ではないため）。
-/// あふれた件数は呼び出し側が[`harness_sandbox::tier2a::transitions_log::FoldedRead::dropped`]で
-/// 受け取り、画面に出すこと（`B-10`）。
-pub fn from_observations(records: &[ObservedRecord], declared: &DeclaredEdges) -> Vec<Candidate> {
-    let mut out: Vec<Candidate> = records
-        .iter()
-        .filter_map(|record| match record {
-            ObservedRecord::ObservedSpawn(spawn) => Some(Candidate {
-                // 観測の平らな行の遷移元は、呼び出し側が渡した宣言の遷移元（入口のドメイン。モジュールdoc）。
-                from_domain: Some(declared.from_domain().to_string()),
-                declared: declared.classify(&spawn.exe, &spawn.argv),
-                startable: Startable::of(&spawn.exe),
-                exe: spawn.exe.clone(),
-                argv: spawn.argv.clone(),
-                count: spawn.count,
-                last_ts: spawn.last_ts,
-                argv_truncation: spawn.argv_truncation,
-                source: Source::Observed {
-                    parent_exe: spawn.parent_exe.clone(),
-                },
-            }),
-            ObservedRecord::Overflowed { .. } => None,
-        })
-        .collect();
-    sort_for_display(&mut out);
-    out
 }
 
 /// 拒否（`pending.jsonl`）を候補にする。

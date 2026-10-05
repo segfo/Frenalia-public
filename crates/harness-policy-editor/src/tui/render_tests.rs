@@ -273,37 +273,21 @@ fn every_screen_survives_a_tiny_terminal() {
 #[test]
 fn the_transition_tab_renders_with_candidates() {
     let ws = workspace();
-    let path = harness_sandbox::tier2a::policy_learnd::observed::observed_path(ws.path());
-    std::fs::create_dir_all(path.parent().expect("parent")).expect("transitions dir");
-    let mut text = String::new();
     // 同じ名前が2つ並ぶ形（置き場を添える経路を通す）と、1つだけの形の両方を置く。
-    for exe in [
-        "C:/Program Files/Git/cmd/git.exe",
-        "C:/Program Files/Git/mingw64/bin/git.exe",
-        "C:/Windows/System32/findstr.exe",
-    ] {
-        let record =
-            harness_sandbox::tier2a::policy_learnd::observed::ObservedRecord::ObservedSpawn(
-                harness_sandbox::tier2a::policy_learnd::observed::Spawn {
-                    parent_exe: Some("C:/pwsh.exe".to_string()),
-                    exe: exe.to_string(),
-                    argv: "git --version".to_string(),
-                    count: 1,
-                    first_ts: 1,
-                    last_ts: 1,
-                    argv_truncation: false,
-                },
-            );
-        text.push_str(&serde_json::to_string(&record).expect("jsonl"));
-        text.push('\n');
-    }
-    std::fs::write(&path, text).expect("observed.jsonl");
+    write_denials(
+        ws.path(),
+        &[
+            ("C:/Program Files/Git/cmd/git.exe", "git --version"),
+            ("C:/Program Files/Git/mingw64/bin/git.exe", "git --version"),
+            ("C:/Windows/System32/findstr.exe", "git --version"),
+        ],
+    );
 
     let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
     app.screen = Screen::Edit;
-    app.pending.tab = transition::Tab(transition::PendingTab::TransitionsObserved);
+    app.pending.tab = transition::Tab(transition::PendingTab::TransitionsDenied);
     app.reload_transitions();
-    assert_eq!(app.pending.observed.len(), 3, "候補が読めていない");
+    assert_eq!(app.pending.denied.len(), 3, "候補が読めていない");
 
     for (width, height) in [(1u16, 1u16), (20, 5), (80, 20), (200, 40)] {
         render(&app, width, height);
@@ -554,29 +538,46 @@ fn box_height(rows: &[String]) -> usize {
         .count()
 }
 
-/// 遷移タブ（観測から）に候補が1件ある状態。
-fn transition_tab_with_one_candidate(ws: &std::path::Path) -> App {
-    use harness_sandbox::tier2a::policy_learnd::observed::{observed_path, ObservedRecord, Spawn};
+/// 入口のドメインから断られた生成を`pending.jsonl`へ書く（平らな候補の入口）。
+///
+/// P4.8 までは同じ行をパス1の平らな観測（消えた記録）で置いていた。
+fn write_denials(ws: &std::path::Path, spawns: &[(&str, &str)]) {
+    use harness_policy::transition::TransitionDenial;
+    use harness_sandbox::tier2a::spawnd::transitions::{pending_path, Denial, PendingRecord};
+    use harness_sandbox::tier2a::spawnd::DenyReason;
 
-    let path = observed_path(ws);
-    std::fs::create_dir_all(path.parent().expect("parent")).expect("transitions dir");
-    let record = ObservedRecord::ObservedSpawn(Spawn {
-        parent_exe: Some("C:/pwsh.exe".to_string()),
-        exe: "C:/Program Files/Git/cmd/git.exe".to_string(),
-        argv: "git --version".to_string(),
-        count: 1,
-        first_ts: 1,
-        last_ts: 1,
-        argv_truncation: false,
-    });
-    let line = serde_json::to_string(&record).expect("jsonl");
-    std::fs::write(&path, format!("{line}\n")).expect("observed.jsonl");
+    let queue = pending_path(ws);
+    std::fs::create_dir_all(queue.parent().expect("parent")).expect("transitions dir");
+    let mut text = String::new();
+    for (exe, argv) in spawns {
+        let record = PendingRecord::DeniedByDaemon(Denial {
+            from_domain: Some(harness_policy::policy_file::ENTRY_DOMAIN.to_string()),
+            exe: exe.to_string(),
+            argv: argv.to_string(),
+            cwd: None,
+            reason: DenyReason::Transition {
+                denial: TransitionDenial::NoMatchingEdge,
+            },
+            count: 1,
+            first_ts: 1,
+            last_ts: 1,
+            argv_truncation: false,
+        });
+        text.push_str(&serde_json::to_string(&record).expect("jsonl"));
+        text.push('\n');
+    }
+    std::fs::write(&queue, text).expect("pending.jsonl");
+}
+
+/// 遷移タブ（拒否から）に候補が1件ある状態。
+fn transition_tab_with_one_candidate(ws: &std::path::Path) -> App {
+    write_denials(ws, &[("C:/Program Files/Git/cmd/git.exe", "git --version")]);
 
     let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
     app.screen = Screen::Edit;
-    app.pending.tab = transition::Tab(transition::PendingTab::TransitionsObserved);
+    app.pending.tab = transition::Tab(transition::PendingTab::TransitionsDenied);
     app.reload_transitions();
-    assert_eq!(app.pending.observed.len(), 1, "候補が読めていない");
+    assert_eq!(app.pending.denied.len(), 1, "候補が読めていない");
     app
 }
 
@@ -3043,12 +3044,12 @@ fn reservation_sizes(app: &App) -> (usize, usize) {
 const TOOL_X: &str = "C:/tools/x.exe";
 const TOOL_Y: &str = "C:/tools/y.exe";
 
-/// 承認待ちの状態（位置の情報が無いパス1の記録）: FS の候補2件（`a.txt`だけ宣言済み）・観測した生成2件と
-/// 入口のドメインからの拒否2件（どちらも`x.exe`だけ宣言済み）。宣言済みの行と未宣言の行の両方を持たせる——
+/// 承認待ちの状態（位置の情報が無いパス1の記録）: FS の候補2件（`a.txt`だけ宣言済み）と、
+/// 入口のドメインからの拒否2件（`x.exe`だけ宣言済み）。宣言済みの行と未宣言の行の両方を持たせる——
 /// `Space`のように行の状態で向きが変わるキーを、片方の行だけで測らないため。
+/// **観測のタブは位置の情報が無いので注記だけを出す**（平らな候補の一覧は P4.8 で消えた）。
 fn pending_fixture() -> tempfile::TempDir {
     use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher, TransitionDenial};
-    use harness_sandbox::tier2a::policy_learnd::observed::{observed_path, ObservedRecord, Spawn};
     use harness_sandbox::tier2a::spawnd::transitions::{pending_path, Denial, PendingRecord};
     use harness_sandbox::tier2a::spawnd::DenyReason;
 
@@ -3105,24 +3106,6 @@ fn pending_fixture() -> tempfile::TempDir {
     };
     crate::policy_file::save(ws.path(), &file).expect("policy.json");
 
-    let observed = observed_path(ws.path());
-    std::fs::create_dir_all(observed.parent().expect("parent")).expect("transitions dir");
-    let mut text = String::new();
-    for exe in [TOOL_X, TOOL_Y] {
-        let record = ObservedRecord::ObservedSpawn(Spawn {
-            parent_exe: Some("C:/pwsh.exe".to_string()),
-            exe: exe.to_string(),
-            argv: "x".to_string(),
-            count: 1,
-            first_ts: 1,
-            last_ts: 1,
-            argv_truncation: false,
-        });
-        text.push_str(&serde_json::to_string(&record).expect("json"));
-        text.push('\n');
-    }
-    std::fs::write(&observed, text).expect("observed.jsonl");
-
     let mut text = String::new();
     for exe in [TOOL_X, TOOL_Y] {
         let record = PendingRecord::DeniedByDaemon(Denial {
@@ -3141,7 +3124,9 @@ fn pending_fixture() -> tempfile::TempDir {
         text.push_str(&serde_json::to_string(&record).expect("json"));
         text.push('\n');
     }
-    std::fs::write(pending_path(ws.path()), text).expect("pending.jsonl");
+    let queue = pending_path(ws.path());
+    std::fs::create_dir_all(queue.parent().expect("parent")).expect("transitions dir");
+    std::fs::write(&queue, text).expect("pending.jsonl");
     ws
 }
 
@@ -3173,6 +3158,9 @@ fn tab_probe<'a>(
 ///
 /// 画面をまたぐ食い違い（承認待ちの`a`は足す確定、宣言画面の`a`は取り消しの確定。決定62の問題2）は画面が違うので
 /// 数えない（手付かずのまま）。`a`はどのタブでも確認ダイアログを出すだけで、予約は変えない。
+///
+/// 承認待ちの「遷移・観測から」のタブは**位置の木として測る**（下の「位置の木」の測定点）——平らな候補の
+/// 一覧は P4.8 で消え、このタブに出る行は位置の木だけになった。
 #[test]
 fn no_key_has_opposite_directions_in_two_tabs_of_one_screen() {
     use std::collections::{BTreeMap, BTreeSet};
@@ -3185,7 +3173,6 @@ fn no_key_has_opposite_directions_in_two_tabs_of_one_screen() {
         ("承認待ち", "FS/ネット", ' ', BY_ROW),
         ("承認待ち", "FS/ネット", 'd', BY_ROW),
         ("承認待ち", "FS/ネット", 'R', ADDS),
-        ("承認待ち", "遷移・観測から", ' ', BY_ROW),
         ("承認待ち", "遷移・拒否から", ' ', BY_ROW),
         ("承認待ち", "位置の木", ' ', ADDS),
         ("宣言", "ファイル・通信", ' ', REMOVES),
@@ -3225,12 +3212,6 @@ fn no_key_has_opposite_directions_in_two_tabs_of_one_screen() {
                 app
             },
             |app| app.tree.rows(&app.expanded).len(),
-        ),
-        tab_probe(
-            "承認待ち",
-            "遷移・観測から",
-            |row| pending_tab(2, row),
-            |app| app.pending.visible().len(),
         ),
         tab_probe(
             "承認待ち",

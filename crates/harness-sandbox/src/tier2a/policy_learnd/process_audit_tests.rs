@@ -2,7 +2,7 @@
 //!
 //! **ETWもファイルの書込先も使わない**——`write_line`には行を`RefCell<Vec<String>>`へ積む閉包を渡し、
 //! 積んだ行は読む側の本物の関数（`harness_policy::process_event::parse_process_audit`）で読み戻す
-//! （書いた形を読む側が読めることまで一緒に測る）。`observed.jsonl`だけは一時ディレクトリへ書く。
+//! （書いた形を読む側が読めることまで一緒に測る）。
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -15,7 +15,6 @@ use harness_policy::process_event::{
 use super::super::etw::mof::{MofProcessStart, EVENT_TYPE_PROCESS_DC_START, EVENT_TYPE_PROCESS_START};
 use super::super::etw::session::ProcessStartInfo;
 use super::super::instances::{remember, ProcessInstances};
-use super::super::observed::{ObservedRecord, Spawn};
 use super::*;
 
 /// 記録の根の親（harness 本体）の pid。
@@ -104,24 +103,7 @@ impl Sink {
 }
 
 fn audit(workspace: &Path, sink: &Sink) -> ProcessAudit {
-    ProcessAudit::start(
-        workspace.join("process-audit.jsonl"),
-        ObservedCandidates::new(workspace),
-        &sink.write(),
-    )
-}
-
-fn observed_spawns(workspace: &Path) -> Vec<Spawn> {
-    let path = super::super::observed::observed_path(workspace);
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| match serde_json::from_str(line).expect("観測の行が読めない") {
-            ObservedRecord::ObservedSpawn(spawn) => Some(spawn),
-            ObservedRecord::Overflowed { .. } => None,
-        })
-        .collect()
+    ProcessAudit::start(workspace.join("process-audit.jsonl"), &sink.write())
 }
 
 fn argv_of(instance: &ProcessInstance) -> &ArgvBinding {
@@ -153,9 +135,7 @@ fn the_header_is_the_first_line() {
         [r#"{"kind":"header","schema_version":1}"#],
         "始めた時点で書くのは版の行だけ"
     );
-    audit
-        .drain(&instances, vec![mof(100, "cmd /c x", 10)], 20, &sink.write())
-        .unwrap();
+    audit.drain(&instances, vec![mof(100, "cmd /c x", 10)], &sink.write());
 
     let lines = sink.lines.borrow().clone();
     assert_eq!(lines[0], r#"{"kind":"header","schema_version":1}"#);
@@ -163,7 +143,7 @@ fn the_header_is_the_first_line() {
     assert_eq!(sink.instances().len(), 1);
 }
 
-/// **差 2ms は結び付く**（窓の端を含む）。`observed.jsonl`にも同じ結び付けの結果が1種類入る。
+/// **差 2ms は結び付く**（窓の端を含む）。
 #[test]
 fn a_start_within_the_window_binds_the_command_line() {
     let tmp = tempfile::tempdir().unwrap();
@@ -172,21 +152,16 @@ fn a_start_within_the_window_binds_the_command_line() {
     add(&mut instances, &manifest(100, 1, None, "cmd", 10), true, true);
 
     let mut audit = audit(tmp.path(), &sink);
-    audit
-        .drain(&instances, vec![mof(100, "cmd /c build", 12)], 20, &sink.write())
-        .unwrap();
+    audit.drain(&instances, vec![mof(100, "cmd /c build", 12)], &sink.write());
 
     let written = sink.instances();
     assert_eq!(written.len(), 1);
     assert_eq!(argv_of(&written[0]), &exact("cmd /c build", ArgvTruncation::None));
-    let spawns = observed_spawns(tmp.path());
-    assert_eq!(spawns.len(), 1, "{spawns:?}");
-    assert_eq!(spawns[0].exe, "C:/tools/cmd.exe");
-    assert_eq!(spawns[0].argv, "cmd /c build");
+    assert_eq!(written[0].image_path.as_deref(), Some("C:/tools/cmd.exe"));
 }
 
 /// **差 3ms は結び付かない**——インスタンスは持ち越しの後に「観測されなかった」で書かれ、
-/// MOF の開始は相手の無いものとして数える（`observed.jsonl`にも入らない）。
+/// MOF の開始は相手の無いものとして数える。
 #[test]
 fn a_start_outside_the_window_is_not_bound() {
     let tmp = tempfile::tempdir().unwrap();
@@ -195,17 +170,13 @@ fn a_start_outside_the_window_is_not_bound() {
     add(&mut instances, &manifest(100, 1, None, "cmd", 10), true, true);
 
     let mut audit = audit(tmp.path(), &sink);
-    audit
-        .drain(&instances, vec![mof(100, "cmd /c build", 13)], 20, &sink.write())
-        .unwrap();
-    let (argv_stats, stats, _) = audit.finish(&instances, Vec::new(), 30, &sink.write());
+    audit.drain(&instances, vec![mof(100, "cmd /c build", 13)], &sink.write());
+    let stats = audit.finish(&instances, Vec::new(), 30, &sink.write());
 
     let written = sink.instances();
     assert_eq!(written.len(), 1);
     assert_eq!(argv_of(&written[0]), &missing(ArgvMissingReason::NoArgvObserved));
     assert_eq!(stats.mof_without_instance, 1);
-    assert_eq!(argv_stats.unresolved, 1);
-    assert!(observed_spawns(tmp.path()).is_empty());
 }
 
 /// **窓の中に同じ pid の候補が2つあれば結び付けない**（どれの引数か決めない、§19.3.11）。
@@ -218,10 +189,8 @@ fn two_instances_within_the_window_are_ambiguous() {
     add(&mut instances, &manifest(100, 2, None, "b", 11), true, true);
 
     let mut audit = audit(tmp.path(), &sink);
-    audit
-        .drain(&instances, vec![mof(100, "a --x", 10)], 20, &sink.write())
-        .unwrap();
-    let (argv_stats, stats, _) = audit.finish(&instances, Vec::new(), 30, &sink.write());
+    audit.drain(&instances, vec![mof(100, "a --x", 10)], &sink.write());
+    let stats = audit.finish(&instances, Vec::new(), 30, &sink.write());
 
     let written = sink.instances();
     assert_eq!(written.len(), 2);
@@ -234,8 +203,6 @@ fn two_instances_within_the_window_are_ambiguous() {
     }
     assert_eq!(stats.ambiguous, 2);
     assert_eq!(stats.exact, 0);
-    assert_eq!(argv_stats.unresolved, 1, "結び付かなかったコマンドラインとして1回数える");
-    assert!(observed_spawns(tmp.path()).is_empty(), "どちらの辺としても書かない");
 }
 
 /// **引数の来ないインスタンスは1回だけ持ち越し、次のドレインで「観測されなかった」で書く。**
@@ -248,17 +215,17 @@ fn an_instance_without_argv_is_written_after_one_carry_over() {
     add(&mut instances, &manifest(100, 1, None, "a", 10), true, true);
 
     let mut audit = audit(tmp.path(), &sink);
-    audit.drain(&instances, Vec::new(), 20, &sink.write()).unwrap();
+    audit.drain(&instances, Vec::new(), &sink.write());
     assert!(sink.instances().is_empty(), "1回目のドレインでは待つ");
 
-    audit.drain(&instances, Vec::new(), 22, &sink.write()).unwrap();
+    audit.drain(&instances, Vec::new(), &sink.write());
     let written = sink.instances();
     assert_eq!(written.len(), 1, "2回目のドレインで書く");
     assert_eq!(argv_of(&written[0]), &missing(ArgvMissingReason::NoArgvObserved));
 
     // `finish`: 新しく来たインスタンスを、持ち越さずにその場で書き切る。
     add(&mut instances, &manifest(200, 2, None, "b", 30), true, false);
-    let (_, stats, _) = audit.finish(&instances, Vec::new(), 40, &sink.write());
+    let stats = audit.finish(&instances, Vec::new(), 40, &sink.write());
     let written = sink.instances();
     assert_eq!(written.len(), 2);
     assert_eq!(written[1].seq, 2);
@@ -274,27 +241,21 @@ fn a_mof_start_that_arrives_before_its_instance_is_retried_once() {
     let mut instances = ProcessInstances::new();
 
     let mut audit = audit(tmp.path(), &sink);
-    audit
-        .drain(&instances, vec![mof(100, "git status", 10)], 20, &sink.write())
-        .unwrap();
+    audit.drain(&instances, vec![mof(100, "git status", 10)], &sink.write());
     assert!(sink.instances().is_empty());
 
     // 次のドレインでマニフェスト側が届いた。
     add(&mut instances, &manifest(100, 1, None, "git", 10), true, true);
-    audit.drain(&instances, Vec::new(), 22, &sink.write()).unwrap();
+    audit.drain(&instances, Vec::new(), &sink.write());
     let written = sink.instances();
     assert_eq!(written.len(), 1);
     assert_eq!(argv_of(&written[0]), &exact("git status", ArgvTruncation::None));
-    assert_eq!(observed_spawns(tmp.path()).len(), 1);
 
     // 対の側: 持ち越しは1回だけ——2回のドレインを待っても相手が来なければ数える。
-    audit
-        .drain(&instances, vec![mof(300, "late", 50)], 60, &sink.write())
-        .unwrap();
-    audit.drain(&instances, Vec::new(), 62, &sink.write()).unwrap();
-    let (argv_stats, stats, _) = audit.finish(&instances, Vec::new(), 70, &sink.write());
+    audit.drain(&instances, vec![mof(300, "late", 50)], &sink.write());
+    audit.drain(&instances, Vec::new(), &sink.write());
+    let stats = audit.finish(&instances, Vec::new(), 70, &sink.write());
     assert_eq!(stats.mof_without_instance, 1);
-    assert_eq!(argv_stats.unresolved, 1);
 }
 
 /// **切り詰めは UTF-16 の単位で判定する**（`plans/etw-spike/RESULTS.md` §23.3）。
@@ -324,8 +285,8 @@ fn truncation_is_judged_on_utf16_units() {
 
     let mut audit = audit(tmp.path(), &sink);
     let starts = cases.iter().map(|(pid, units, _)| mof_units(*pid, units, 10)).collect();
-    audit.drain(&instances, starts, 20, &sink.write()).unwrap();
-    let (_, stats, _) = audit.finish(&instances, Vec::new(), 30, &sink.write());
+    audit.drain(&instances, starts, &sink.write());
+    let stats = audit.finish(&instances, Vec::new(), 30, &sink.write());
 
     let written = sink.instances();
     for (pid, _, expected) in &cases {
@@ -355,29 +316,23 @@ fn out_of_scope_instances_are_not_written() {
     add(&mut instances, &manifest(200, 2, None, "outside", 10), false, false);
 
     let mut audit = audit(tmp.path(), &sink);
-    audit
-        .drain(
-            &instances,
+    audit.drain(
+        &instances,
             vec![mof(100, "inside -x", 10), mof(200, "outside -y", 10)],
-            20,
-            &sink.write(),
-        )
-        .unwrap();
-    let (argv_stats, _, _) = audit.finish(&instances, Vec::new(), 30, &sink.write());
+        &sink.write(),
+    );
+    let stats = audit.finish(&instances, Vec::new(), 30, &sink.write());
 
     let written = sink.instances();
     assert_eq!(written.len(), 1, "{written:?}");
     assert_eq!(written[0].seq, 1);
-    assert_eq!(argv_stats.out_of_scope, 1, "対象外も`observed`側の数え方では数える");
-    let spawns = observed_spawns(tmp.path());
-    assert_eq!(spawns.len(), 1);
-    assert_eq!(spawns[0].argv, "inside -x");
+    assert_eq!(stats.exact, 1, "対象のインスタンスの引数は結び付く（対の側）");
 }
 
 /// **根の印と、親の番号の出どころをそのまま運ぶ**（決定23(2)・決定65の追記(2)）。
 ///
 /// 親の欄が無い・0 の子は`parent_seq`を書かず`unresolved`、欄があれば`etw-field`で番号を書く。
-/// `observed.jsonl`の親の実行ファイルは**番号で**引く（pid で引き直さない）。
+/// 木に組むのは読む側なので、ここで固定するのは**書いた番号と出どころ**である。
 #[test]
 fn the_scope_root_and_the_parent_source_are_carried() {
     let tmp = tempfile::tempdir().unwrap();
@@ -389,15 +344,12 @@ fn the_scope_root_and_the_parent_source_are_carried() {
     add(&mut instances, &manifest(100, 3, None, "impostor", 25), false, false);
 
     let mut audit = audit(tmp.path(), &sink);
-    audit
-        .drain(
-            &instances,
+    audit.drain(
+        &instances,
             vec![mof(100, "root", 10), mof(200, "child --go", 20)],
-            40,
-            &sink.write(),
-        )
-        .unwrap();
-    let (_, stats, _) = audit.finish(&instances, Vec::new(), 50, &sink.write());
+        &sink.write(),
+    );
+    let stats = audit.finish(&instances, Vec::new(), 50, &sink.write());
 
     let written = sink.instances();
     let root = written.iter().find(|i| i.seq == 1).unwrap();
@@ -409,10 +361,8 @@ fn the_scope_root_and_the_parent_source_are_carried() {
     assert_eq!(child.image_path.as_deref(), Some("C:/tools/child.exe"));
     assert_eq!(child.parent_pid, Some(HOST));
     assert_eq!(stats.parent_unresolved, 1);
-
-    let spawns = observed_spawns(tmp.path());
-    let child_spawn = spawns.iter().find(|s| s.argv == "child --go").unwrap();
-    assert_eq!(child_spawn.parent_exe.as_deref(), Some("C:/tools/root.exe"));
+    // pid で親を引くと使い回した別のプロセス（`impostor`）に当たる。書いた番号はそちらではない。
+    assert_ne!(child.parent_seq, Some(3));
 }
 
 /// **歩留まりは制御レコードで書き、0件の項目は書かない**（決定23(4)）。要約の1行は必ず書く。
@@ -425,16 +375,12 @@ fn counts_are_written_as_control_records_and_zero_counts_are_not() {
     add(&mut instances, &manifest(200, 2, Some(1), "b", 10), true, false);
 
     let mut audit = audit(tmp.path(), &sink);
-    audit
-        .drain(
-            &instances,
+    audit.drain(
+        &instances,
             vec![mof(100, "a", 10), dcstart(999, "svchost -k x", 1)],
-            20,
-            &sink.write(),
-        )
-        .unwrap();
-    let (_, _, result) = audit.finish(&instances, Vec::new(), 30, &sink.write());
-    result.expect("observed.jsonl を畳めた");
+        &sink.write(),
+    );
+    let _ = audit.finish(&instances, Vec::new(), 30, &sink.write());
 
     let controls = sink.parsed().controls;
     assert_eq!(
@@ -472,20 +418,20 @@ fn dcstart_is_excluded_and_counted() {
     add(&mut instances, &manifest(100, 1, None, "a", 10), true, true);
 
     let mut audit = audit(tmp.path(), &sink);
-    audit
-        .drain(&instances, vec![dcstart(100, "a --old", 10)], 20, &sink.write())
-        .unwrap();
-    audit.drain(&instances, Vec::new(), 22, &sink.write()).unwrap();
-    let (argv_stats, stats, _) = audit.finish(&instances, Vec::new(), 30, &sink.write());
+    audit.drain(&instances, vec![dcstart(100, "a --old", 10)], &sink.write());
+    audit.drain(&instances, Vec::new(), &sink.write());
+    let stats = audit.finish(&instances, Vec::new(), 30, &sink.write());
 
     let written = sink.instances();
     assert_eq!(written.len(), 1);
     assert_eq!(argv_of(&written[0]), &missing(ArgvMissingReason::NoArgvObserved));
     assert_eq!(stats.dcstart_excluded, 1);
     assert_eq!(stats.exact, 0);
-    assert_eq!(argv_stats.without_command_line, 0, "DCStart はどの数にも入れない");
-    assert_eq!(argv_stats.unresolved, 0);
-    assert!(observed_spawns(tmp.path()).is_empty());
+    assert_eq!(
+        (stats.mof_without_instance, stats.no_command_line_field),
+        (0, 0),
+        "DCStart はどの数にも入れない"
+    );
 }
 
 /// **[BUG-228] 相手の無い MOF の開始は1回だけ数え、DCStart は「結び付かなかった」に数えない。**
@@ -502,26 +448,25 @@ fn an_unmatched_mof_start_is_counted_once_and_dcstart_is_not_counted_as_unresolv
     let instances = ProcessInstances::new();
 
     let mut audit = audit(tmp.path(), &sink);
-    audit
-        .drain(
-            &instances,
+    audit.drain(
+        &instances,
             vec![dcstart(4242, "svchost -k netsvcs", 1), mof(5000, "orphan --x", 5)],
-            10,
-            &sink.write(),
-        )
-        .unwrap();
-    for now in [12, 14, 16] {
-        audit.drain(&instances, Vec::new(), now, &sink.write()).unwrap();
+        &sink.write(),
+    );
+    for _ in 0..3 {
+        audit.drain(&instances, Vec::new(), &sink.write());
     }
-    let (argv_stats, stats, _) = audit.finish(&instances, Vec::new(), 20, &sink.write());
+    let stats = audit.finish(&instances, Vec::new(), 20, &sink.write());
 
-    assert_eq!(argv_stats.unresolved, 1, "相手の無い開始は1件として1回だけ数える");
-    assert_eq!(stats.mof_without_instance, 1);
+    assert_eq!(
+        stats.mof_without_instance, 1,
+        "相手の無い開始は1件として1回だけ数える"
+    );
     assert_eq!(stats.dcstart_excluded, 1);
-    assert_eq!(argv_stats.without_command_line, 0);
+    assert_eq!(stats.no_command_line_field, 0);
 }
 
-/// 同じインスタンスへ2件目の MOF の開始が結び付いても、`observed.jsonl`へ二重に入れない。
+/// 同じインスタンスへ2件目の MOF の開始が結び付いても、行は1つのままである。
 #[test]
 fn a_second_mof_start_for_the_same_instance_is_counted_not_recorded_twice() {
     let tmp = tempfile::tempdir().unwrap();
@@ -530,14 +475,12 @@ fn a_second_mof_start_for_the_same_instance_is_counted_not_recorded_twice() {
     add(&mut instances, &manifest(100, 1, None, "a", 10), true, true);
 
     let mut audit = audit(tmp.path(), &sink);
-    audit
-        .drain(&instances, vec![mof(100, "a 1", 10), mof(100, "a 1", 11)], 20, &sink.write())
-        .unwrap();
-    let (argv_stats, stats, _) = audit.finish(&instances, Vec::new(), 30, &sink.write());
+    audit.drain(&instances, vec![mof(100, "a 1", 10), mof(100, "a 1", 11)], &sink.write());
+    let stats = audit.finish(&instances, Vec::new(), 30, &sink.write());
 
     assert_eq!(sink.instances().len(), 1);
     assert_eq!(stats.bound_twice, 1);
-    assert_eq!(argv_stats.recorded, 1, "1つのインスタンスの観測は1件");
+    assert_eq!(stats.exact, 1, "1つのインスタンスの引数は1件");
 }
 
 /// `pair`は窓に入る数で3つに分かれる（純粋関数）。

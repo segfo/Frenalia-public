@@ -384,12 +384,6 @@ fn argv_label(app: &App, candidate: &Candidate) -> String {
 
 fn source_label(candidate: &Candidate) -> String {
     match &candidate.source {
-        Source::Observed {
-            parent_exe: Some(p),
-        } => {
-            format!("← {}", file_name(p))
-        }
-        Source::Observed { parent_exe: None } => "← （記録の入口）".to_string(),
         Source::Denied { by_kernel: true } => "カーネルが拒否".to_string(),
         Source::Denied { by_kernel: false } => match candidate.from_domain.as_deref() {
             Some(domain) => format!("拒否（{domain}から）"),
@@ -523,8 +517,8 @@ mod transition_screen_tests {
             count: 1,
             last_ts: 1,
             argv_truncation: false,
-            source: Source::Observed { parent_exe: None },
-            from_domain: None,
+            source: Source::Denied { by_kernel: false },
+            from_domain: Some(harness_policy::policy_file::ENTRY_DOMAIN.to_string()),
             declared: Declared::No,
             startable: crate::transition_candidates::Startable::AsFarAsWeKnow,
         }

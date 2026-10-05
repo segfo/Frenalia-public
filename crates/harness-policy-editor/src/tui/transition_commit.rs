@@ -42,9 +42,8 @@ impl App {
         let mut undismiss = self.pending.undismiss.clone();
         undismiss.extend(
             self.pending
-                .observed
+                .denied
                 .iter()
-                .chain(self.pending.denied.iter())
                 .filter(|c| self.pending.is_reserved(c) && self.pending.is_dismissed(c))
                 .map(CandidateKey::of),
         );
@@ -59,9 +58,8 @@ impl App {
     pub(super) fn reserved_edges(&self) -> (Vec<SourcedEdgeRef>, Vec<SourcedEdgeRef>) {
         let approve = self
             .pending
-            .observed
+            .denied
             .iter()
-            .chain(self.pending.denied.iter())
             .filter(|c| self.pending.is_reserved(c))
             .filter_map(|c| {
                 Some((

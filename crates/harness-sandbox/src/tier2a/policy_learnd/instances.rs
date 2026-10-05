@@ -8,12 +8,14 @@
 //! 後のプロセスの素性が付いた（2秒ごとのまとまりの中で起きても区別できなかった）。
 //!
 //! この表はそれを広げたもので、**3つ目の表ではない**（決定23(5)「新設は書き出す型だけ。
-//! メモリ上の表は既存を広げる」）。インスタンスを届いた順に1回ずつ持ち、3通りに引く。
+//! メモリ上の表は既存を広げる」）。インスタンスを届いた順に1回ずつ持ち、2通りに引く。
+//! **親は番号（`ProcessSequenceNumber`）のまま`process-audit.jsonl`へ書き、木に組むのは読む側である**
+//! （`harness_policy::process_tree`）——pid で引き直さない（決定65の追記(3)）。番号の表（`by_seq`）は
+//! 同じ番号を二重に入れないための索引として残っている。
 //!
 //! | 引き方 | 鍵 | 使う人 |
 //! |---|---|---|
 //! | [`ProcessInstances::at`] | pid ＋時刻（その時刻より前に始まった最も新しいもの） | FS の記録を書く2か所（`flush_batch`・`flush_batch_record_all`） |
-//! | [`ProcessInstances::by_seq`] | `ProcessSequenceNumber` | 親の実行ファイルを引く（親は pid ではなく番号で引く、決定65の追記(3)） |
 //! | [`ProcessInstances::near`] | pid ＋時刻の窓（両端を含む） | MOF 側のコマンドラインの結び付け（`process_audit.rs`、2ms の窓） |
 //!
 //! # インスタンスを外さない（限界）
@@ -106,11 +108,6 @@ impl ProcessInstances {
         let position = same_pid.partition_point(|&i| self.all[i].start_unix_ms <= at_unix_ms);
         let index = *same_pid.get(position.checked_sub(1)?)?;
         Some(&self.all[index])
-    }
-
-    /// 番号で引く（親の実行ファイル。親は pid では引き直さない、決定65の追記(3)）。
-    pub(super) fn by_seq(&self, seq: u64) -> Option<&ProcessIdentity> {
-        self.by_seq.get(&seq).map(|&index| &self.all[index])
     }
 
     /// **引数の結び付け用**: pid が同じで、開始が`at_unix_ms ± window_ms`（両端を含む）のものの添字。

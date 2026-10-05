@@ -490,21 +490,14 @@ fn start_collect_bytes(policy: &LearnPolicy) -> Result<Vec<u8>, LearnError> {
         "policy-learn audit sink",
     );
     if policy.capture_argv {
-        // **候補の積み先も先に作る**（段階6d）。書き手は同じ昇格プロセスなので、
-        // 先に作らなければ所有者が`BUILTIN\Administrators`になる——ここは
-        // `.harness/`配下＝制御面なので、次の起動で`.harness/**`の保護が完成せず
-        // Tier2aが丸ごと中止する（[BUG-109](../../../../docs/bugs/BUG-109.md)と同じ形）。
+        // **プロセスの木（`process-audit.jsonl`、決定23）を先に作る**（P2c）。書き手は昇格した
+        // 収集プロセスなので、先に作らなければ所有者が`BUILTIN\Administrators`になる——置き場は
+        // `.harness/`配下＝制御面なので、次の起動で`.harness/**`の保護が完成せず Tier2aが丸ごと
+        // 中止する（[BUG-109](../../../../docs/bugs/BUG-109.md)と同じ形・`B-36`）。名前は共有の定数から
+        // 導出するので、昇格側にパスを渡さなくても両側が同じファイルを指す。
         //
         // **拒否の待ち行列（`pending.jsonl`）には要らない。** あちらの書き手は
         // Spawn Daemonで、**昇格していない**（§10.2の書き手の表）。
-        crate::elevated_launch::precreate_audit_sink(
-            &super::observed::observed_path(&policy.workspace_root),
-            "observed transition candidates",
-        );
-        // **プロセスの木（`process-audit.jsonl`、決定23）も先に作る**（P2c）。書き手は同じ昇格
-        // プロセスで、置き場は`fs-audit.jsonl`と同じ記録のディレクトリ＝制御面なので、理由は
-        // 上と同じ（BUG-109・`B-36`）。名前は共有の定数から導出するので、昇格側にパスを
-        // 渡さなくても両側が同じファイルを指す。
         crate::elevated_launch::precreate_audit_sink(
             &super::process_audit_path(&policy.fs_audit_log_path),
             "process audit log",
@@ -789,38 +782,39 @@ mod client_tests {
         assert!(!daemon_is_dead(&error), "UACをもう1回出しても同じ拒否に着く");
     }
 
-    /// **[段階6d] 候補の積み先も、依頼する側（非昇格）が先に作る。**
+    /// **[決定23(1)] プロセスの木の積み先は、依頼する側（非昇格）が先に作る。**
     ///
-    /// `observed.jsonl`を書くのは**昇格した収集器**（`pending.jsonl`を書くSpawn Daemonとは
-    /// 違って昇格している）。先に作らなければ所有者が`BUILTIN\Administrators`になり、
-    /// `.harness/**`の保護が完成せずTier2aが丸ごと中止する——BUG-109と同じ形である。
+    /// `process-audit.jsonl`を書くのは**昇格した収集プロセス**（`pending.jsonl`を書く
+    /// Spawn Daemonとは違って昇格している）。先に作らなければ所有者が
+    /// `BUILTIN\Administrators`になり、`.harness/**`の保護が完成せずTier2aが丸ごと
+    /// 中止する——BUG-109と同じ形である。
     ///
     /// **測る対象は`start_collect_bytes`**（送信点2つが通る関数）。`precreate_sink`を
     /// 直接呼ぶと「配線されていなくても緑」になる。
     #[test]
-    fn the_candidate_sink_exists_before_the_collector_is_asked_to_open_it() {
+    fn the_process_audit_sink_exists_before_the_collector_is_asked_to_open_it() {
         let tmp = tempfile::tempdir().unwrap();
         let mut policy = policy(tmp.path().join("sandbox").join("s-1").join("fs-audit.jsonl"));
         policy.workspace_root = tmp.path().to_path_buf();
         policy.capture_argv = true;
-        let observed = super::super::observed::observed_path(tmp.path());
-        assert!(!observed.exists());
+        let audit = super::super::process_audit_path(&policy.fs_audit_log_path);
+        assert!(!audit.exists());
 
         start_collect_bytes(&policy).expect("serialize StartCollect");
 
         assert!(
-            observed.exists(),
+            audit.exists(),
             "収集器へ渡す前に積み先が無ければ、作るのは昇格側になる: {}",
-            observed.display()
+            audit.display()
         );
     }
 
-    /// **対の側**（`B-35`）: argv観測を頼んでいない記録は、候補の積み先を作らない。
+    /// **対の側**（`B-35`）: argv観測を頼んでいない記録は、木の積み先を作らない。
     ///
-    /// 常に作ると、`.harness/transitions/`が**使われていないワークスペースにも**現れ、
-    /// 「候補を集めた記録がある」と読めてしまう。
+    /// 常に作ると、**木を持たない記録にも空のファイルが現れ**、エディタから見て
+    /// 「位置の情報がある記録」と「無い記録」の区別が付かなくなる。
     #[test]
-    fn a_recording_without_argv_capture_does_not_create_the_candidate_sink() {
+    fn a_recording_without_argv_capture_does_not_create_the_process_audit_sink() {
         let tmp = tempfile::tempdir().unwrap();
         let mut policy = policy(tmp.path().join("sandbox").join("s-1").join("fs-audit.jsonl"));
         policy.workspace_root = tmp.path().to_path_buf();
@@ -828,7 +822,7 @@ mod client_tests {
 
         start_collect_bytes(&policy).expect("serialize StartCollect");
 
-        assert!(!super::super::observed::observed_path(tmp.path()).exists());
+        assert!(!super::super::process_audit_path(&policy.fs_audit_log_path).exists());
     }
 
     /// **既にあるシンクの中身を消さない。** 収集器は`append`で開くので、こちらが
