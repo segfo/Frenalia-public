@@ -76,7 +76,7 @@ use crate::process_event::{
 };
 use crate::process_tree::{walk, RootKind};
 use crate::transition::{
-    AnyMarker, ArgvMatcher, ExeMatcher, GraphError, Resolution, SpawnAttempt, TransitionDenial,
+    editor_edge, AnyMarker, ArgvMatcher, GraphError, Resolution, SpawnAttempt, TransitionDenial,
     TransitionEdge, TransitionGraph,
 };
 
@@ -189,7 +189,7 @@ impl Unassigned {
 pub struct EdgeToAdd {
     pub from_domain: String,
     /// `exe`はリテラル（観測した綴り）・`argv`は任意・`cwd`と`env`は書かない
-    /// ——エディタの遷移の承認（`harness_policy_editor::transition_approve`の`edge_for`）と同じ形。
+    /// ——エディタの遷移の承認と同じ形（どちらも[`editor_edge`]で作る）。
     pub edge: TransitionEdge,
     /// [`PositionSource::Proposed`]か[`PositionSource::ReplacesSelfLoop`]。**後者は遷移元の自己ループ辺を
     /// 取り除かないと書けない**——同じ実行ファイルに「任意の引数」の辺が2本当たり、判定器が
@@ -221,13 +221,12 @@ impl Assignment {
             .filter(|position| position.source != PositionSource::ExistingEdge)
             .map(|position| EdgeToAdd {
                 from_domain: position.from_domain.clone(),
-                edge: TransitionEdge {
-                    exe: ExeMatcher::Literal(position.exe.clone()),
-                    argv: ArgvMatcher::Any(AnyMarker),
-                    cwd: None,
-                    to: position.to_domain.clone(),
-                    env: None,
-                },
+                // 辺の形はエディタの遷移の承認と同じ1か所（`editor_edge`）で決める（`B-05`）。
+                edge: editor_edge(
+                    &position.exe,
+                    ArgvMatcher::Any(AnyMarker),
+                    &position.to_domain,
+                ),
                 source: position.source,
             })
             .collect()

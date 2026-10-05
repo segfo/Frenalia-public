@@ -108,17 +108,29 @@ impl ArgvChoice {
 }
 
 /// 辺を1本組み立てる。**遷移先は引数で受ける**（[`TransitionRequest::to_domain`]）。
+///
+/// 形（リテラルの exe・**cwdは宣言しない**・環境変数の差分も書かない）は[`transition::editor_edge`]の
+/// 1か所が持つ——位置ごとの割り当て（`harness_policy::position_domains`）が作る辺と同じ形にするため（`B-05`）。
 fn edge_for(edge: &EdgeRef, to_domain: &str) -> TransitionEdge {
-    TransitionEdge {
-        exe: ExeMatcher::Literal(edge.exe.clone()),
-        argv: edge.argv.matcher(),
-        // **cwdは宣言しない。** 観測にcwdは無く（§10.3）、拒否側のcwdは呼び出し元の実cwdで
-        // あって「ここでしか起こしてはいけない」という意思ではない。意思でないものを宣言へ
-        // 書くと、次に別の場所から走らせたときに理由の分からない拒否になる。
-        cwd: None,
-        to: to_domain.to_string(),
-        // 環境変数の差分も宣言しない（既定はセッションのbase env。§19.1）。
-        env: None,
+    transition::editor_edge(&edge.exe, edge.argv.matcher(), to_domain)
+}
+
+impl EdgeRef {
+    /// 辺そのものから指し方を作る（リテラルの exe で、引数が任意かリテラルの辺だけ）。パターンを含む辺は
+    /// [`EdgeRef`]で指せないので`None`。**「同じ辺か」の比べ方を[`refers_to`]の1つにする**ために使う。
+    fn of_edge(edge: &TransitionEdge) -> Option<EdgeRef> {
+        let ExeMatcher::Literal(exe) = &edge.exe else {
+            return None;
+        };
+        let argv = match &edge.argv {
+            ArgvMatcher::Any(_) => ArgvChoice::Any,
+            ArgvMatcher::Literal(value) => ArgvChoice::Literal(value.clone()),
+            ArgvMatcher::Pattern(_) => return None,
+        };
+        Some(EdgeRef {
+            exe: exe.clone(),
+            argv,
+        })
     }
 }
 
@@ -237,53 +249,119 @@ pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApp
         }
     }
     let mut file = policy_file::load(req.workspace_root)?;
-    if file.domain(req.from_domain).is_none() {
-        file.domains.push(PolicyDomain::new(req.from_domain));
+    let add: Vec<TransitionEdge> = req
+        .approve
+        .iter()
+        .map(|target| edge_for(target, &to_domain))
+        .collect();
+    let report = apply_edge_changes(
+        &mut file,
+        &EdgeChanges {
+            from_domain: req.from_domain,
+            add: &add,
+            remove: req.remove,
+            record_session: req.record_session,
+            now_unix_ms: req.now_unix_ms,
+        },
+    );
+    let (mut added, mut already_declared) = (Vec::new(), Vec::new());
+    for (index, target) in req.approve.iter().enumerate() {
+        if report.already_declared.contains(&index) {
+            already_declared.push(target.clone());
+        } else {
+            added.push(target.clone());
+        }
+    }
+    let added_at: Vec<(String, usize)> = report
+        .added
+        .iter()
+        .map(|index| (req.from_domain.to_string(), *index))
+        .collect();
+    check_added(&file, req.workspace_root, &added_at)?;
+
+    Ok(TransitionPlan {
+        created_to_domain: report.created_domains.contains(&to_domain),
+        file,
+        added,
+        already_declared,
+        removed: report.removed,
+        not_found: report.not_found,
+        to_domain,
+    })
+}
+
+/// 1つの遷移元へ足す辺・消す辺（[`apply_edge_changes`]の入力。2026-10-05、`plans/position-domains/P4.md`のP4.3）。
+pub struct EdgeChanges<'a> {
+    pub from_domain: &'a str,
+    /// 足す辺（形は[`transition::editor_edge`]で作ったもの）。**遷移先は辺ごとに違ってよい**
+    /// ——位置ごとのドメイン（決定65）では、1つの遷移元から別々の遷移先へ辺が出る。
+    pub add: &'a [TransitionEdge],
+    /// 消す辺。**`policy.json`に書かれている綴りで指すこと。**
+    pub remove: &'a [EdgeRef],
+    pub record_session: Option<&'a str>,
+    pub now_unix_ms: u64,
+}
+
+/// [`apply_edge_changes`]が何をしたか。**「足した」と「元からあった」、「消した」と「元から無かった」を
+/// 区別する**（`B-09`。[`TransitionPlan`]と同じ理由）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EdgeChangeReport {
+    /// 足した辺の、遷移元の`transitions`への添字（[`EdgeChanges::add`]の順）。[`check_added`]へ渡す。
+    pub added: Vec<usize>,
+    /// 足そうとしたが同じ`(exe, argv)`の辺が既にあった（[`EdgeChanges::add`]への添字）。
+    pub already_declared: Vec<usize>,
+    pub removed: Vec<EdgeRef>,
+    pub not_found: Vec<EdgeRef>,
+    /// 足した辺の遷移先で、`policy.json`に無かったので宣言の無いドメインとして作ったもの（名前の順）。
+    /// **遷移元を作ったことは入れない**——遷移元に届く辺があるとは限らない。
+    pub created_domains: Vec<String>,
+}
+
+/// 読み込んだ`file`へ、1つの遷移元の辺を足す・消す（**入出力なし・検査なし**）。書いた後の検査は
+/// [`check_added`]、保存は呼び出し側。[`plan`]と、位置ごとのドメインの確定（P4.5）・承認待ちの位置の行の
+/// 判定（`crate::position_view::verdicts`）が同じこれを通る（`docs/CODE-STRUCTURE-RULES.md` §5.0）。
+///
+/// 遷移元が`policy.json`に無ければ作る。
+pub fn apply_edge_changes(file: &mut PolicyFile, changes: &EdgeChanges<'_>) -> EdgeChangeReport {
+    if file.domain(changes.from_domain).is_none() {
+        file.domains.push(PolicyDomain::new(changes.from_domain));
         file.domains.sort_by(|a, b| a.name.cmp(&b.name));
     }
-
-    let mut plan = TransitionPlan {
-        file: PolicyFile::default(),
-        added: Vec::new(),
-        already_declared: Vec::new(),
-        removed: Vec::new(),
-        not_found: Vec::new(),
-        to_domain: to_domain.clone(),
-        created_to_domain: false,
-    };
-    // 足した辺の添字（検査に落ちたとき、どれが「広げる遷移」かを向きの判定器に聞くため）。
-    let mut added_indices: Vec<usize> = Vec::new();
-
+    let mut report = EdgeChangeReport::default();
+    let mut destinations: Vec<String> = Vec::new();
     {
         let entry = file
             .domains
             .iter_mut()
-            .find(|d| d.name == req.from_domain)
+            .find(|d| d.name == changes.from_domain)
             .expect("just inserted or already present");
 
         // **消す方を先にやる。** 同じ`(exe, argv)`を「消してから違う形で足し直す」が
         // 1回の確定でできる——逆順にすると、足したものをその場で消すことになる。
-        let (removed, not_found) = remove_edges(entry, req.remove);
-        plan.removed = removed;
-        plan.not_found = not_found;
+        let (removed, not_found) = remove_edges(entry, changes.remove);
+        report.removed = removed;
+        report.not_found = not_found;
 
-        for target in req.approve {
-            if entry
-                .process
-                .transitions
-                .iter()
-                .any(|edge| refers_to(target, edge))
-            {
-                plan.already_declared.push(target.clone());
+        for (index, edge) in changes.add.iter().enumerate() {
+            // 同じ辺か の比べ方は[`refers_to`]の1つ（リテラルの exe を畳んで比べ、引数の照合方法も見る）。
+            let declared = EdgeRef::of_edge(edge).is_some_and(|target| {
+                entry
+                    .process
+                    .transitions
+                    .iter()
+                    .any(|existing| refers_to(&target, existing))
+            });
+            if declared {
+                report.already_declared.push(index);
                 continue;
             }
-            entry.process.transitions.push(edge_for(target, &to_domain));
-            added_indices.push(entry.process.transitions.len() - 1);
-            plan.added.push(target.clone());
+            entry.process.transitions.push(edge.clone());
+            report.added.push(entry.process.transitions.len() - 1);
+            destinations.push(edge.to.clone());
         }
 
-        if !plan.added.is_empty() || !plan.removed.is_empty() {
-            if let Some(session) = req.record_session {
+        if !report.added.is_empty() || !report.removed.is_empty() {
+            if let Some(session) = changes.record_session {
                 if !entry
                     .provenance
                     .record_sessions
@@ -293,52 +371,73 @@ pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApp
                     entry.provenance.record_sessions.push(session.to_string());
                 }
             }
-            entry.provenance.updated_unix_ms = req.now_unix_ms;
+            entry.provenance.updated_unix_ms = changes.now_unix_ms;
         }
     }
 
     // **遷移先が無ければ、宣言の無いドメインとして作る。** 編集時検査は「宣言されていない
     // ドメインへの遷移」を断る（打ち間違いが空の＝常に狭い権限で黙って通るのを止めるため）ので、
-    // 作らないと書けない。作るのは**足す辺があるときだけ**（取り消しだけ・既にある辺だけの確定で
+    // 作らないと書けない。作るのは**足した辺の遷移先だけ**（取り消しだけ・既にある辺だけの確定で
     // 見覚えの無いドメインを増やさない）。
-    if !plan.added.is_empty() && file.domain(&to_domain).is_none() {
-        file.domains.push(PolicyDomain::new(to_domain.as_str()));
-        file.domains.sort_by(|a, b| a.name.cmp(&b.name));
-        plan.created_to_domain = true;
+    for to in destinations {
+        if file.domain(&to).is_none() {
+            file.domains.push(PolicyDomain::new(to.as_str()));
+            report.created_domains.push(to);
+        }
     }
+    if !report.created_domains.is_empty() {
+        file.domains.sort_by(|a, b| a.name.cmp(&b.name));
+        report.created_domains.sort();
+    }
+    report
+}
 
-    // **書く前に検査する。** ここで落ちれば`policy.json`は元のままである。
-    //
-    // **`policy.json`の外で書込を許した場所は空で渡す**——エディタはそれを知らない
-    // （`--fs-allow`はharnessの起動ごとの指定で、書く時点では原理的に分からない）。
-    // したがって固定した遷移は、ここを通っても`harness.exe`の起動時に初めて拒否されることがある
-    // （残課題 サンドボックス周辺 #65。`policy_file::load_for_session`のdoc）。
-    // **このエディタが書く辺は固定した遷移にならない**（`cwd`を宣言しない。[`edge_for`]）ので、
-    // 足した辺がそれで落ちることは無い（試験`an_edge_this_editor_writes_survives_the_writable_places_harness_adds`）。
-    let workspace = req.workspace_root.to_string_lossy();
+/// 足した辺を書いた後の`file`を検査する（**書く前に検査する**——ここで落ちれば`policy.json`は元のままである）。
+///
+/// [`transition::check_all`]（`policy_file::load`が読むたびに掛けている検査そのもの）に落ちたら、
+/// `added`（`(遷移元, transitions への添字)`）のうち広げる向きの辺があれば
+/// [`TransitionApproveError::WidensWithoutFixing`]（このエディタで取れる直し方を言い直す）、無ければ
+/// [`TransitionApproveError::Rejected`]。**向きの規則はここで書かない**——[`transition::edge_direction`]に聞く（`B-13`）。
+///
+/// **`policy.json`の外で書込を許した場所は空で渡す**——エディタはそれを知らない
+/// （`--fs-allow`はharnessの起動ごとの指定で、書く時点では原理的に分からない）。
+/// したがって固定した遷移は、ここを通っても`harness.exe`の起動時に初めて拒否されることがある
+/// （残課題 サンドボックス周辺 #65。`policy_file::load_for_session`のdoc）。
+/// **このエディタが書く辺は固定した遷移にならない**（`cwd`を宣言しない。[`edge_for`]）ので、
+/// 足した辺がそれで落ちることは無い（試験`an_edge_this_editor_writes_survives_the_writable_places_harness_adds`）。
+pub fn check_added(
+    file: &PolicyFile,
+    workspace_root: &Path,
+    added: &[(String, usize)],
+) -> Result<(), TransitionApproveError> {
+    let workspace = workspace_root.to_string_lossy();
     let input = file.transition_graph_input(Some(workspace.as_ref()), &[]);
     let rejected = match transition::check_all(&input) {
         Ok(rejections) => rejections.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
         Err(e) => vec![e.to_string()],
     };
-    if !rejected.is_empty() {
-        let detail = rejected.join("\n");
-        // 足した辺が「広げる遷移」だったなら、このエディタで取れる直し方を言い直す（変種のdoc）。
-        let widens = added_indices.iter().any(|index| {
-            matches!(
-                transition::edge_direction(&input, req.from_domain, *index),
-                Ok(Some(transition::Direction::WiderOrUnknown))
-            )
-        });
-        return Err(if widens {
-            TransitionApproveError::WidensWithoutFixing { to_domain, detail }
-        } else {
-            TransitionApproveError::Rejected(detail)
-        });
+    if rejected.is_empty() {
+        return Ok(());
     }
-
-    plan.file = file;
-    Ok(plan)
+    let detail = rejected.join("\n");
+    // 足した辺が「広げる遷移」だったなら、このエディタで取れる直し方を言い直す（変種のdoc）。
+    let widening = added.iter().find(|(from, index)| {
+        matches!(
+            transition::edge_direction(&input, from, *index),
+            Ok(Some(transition::Direction::WiderOrUnknown))
+        )
+    });
+    Err(match widening {
+        Some((from, index)) => TransitionApproveError::WidensWithoutFixing {
+            to_domain: file
+                .domain(from)
+                .and_then(|domain| domain.process.transitions.get(*index))
+                .map(|edge| edge.to.clone())
+                .unwrap_or_default(),
+            detail,
+        },
+        None => TransitionApproveError::Rejected(detail),
+    })
 }
 
 /// 決まった内容を書く。**`false`は「書く必要が無かった」**（`B-09`）。

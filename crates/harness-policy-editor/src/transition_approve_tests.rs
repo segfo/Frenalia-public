@@ -480,3 +480,43 @@ fn committing_with_nothing_selected_says_why() {
         Err(TransitionApproveError::NothingSelected)
     ));
 }
+
+// --- 辺の形は1か所 ---------------------------------------------------------
+
+/// **エディタが書く辺の形は`harness_policy::transition::editor_edge`の1か所**（P3b の注意4、`B-05`）。
+/// 遷移タブの承認（[`edge_for`]）と位置ごとの割り当て（`Assignment::edges_to_add`）が、同じ exe・引数・遷移先で
+/// 同じ辺を作る。対の側: 引数の照合方法が違えば別の辺になる（比べているのが中身であって、常に等しいのではない）。
+#[test]
+fn editor_edge_is_the_only_shape_the_editor_writes() {
+    use harness_policy::position_domains::{Assignment, Position, PositionSource};
+    const EXE: &str = "C:/Program Files/PowerShell/7/pwsh.exe";
+    let assignment = Assignment {
+        positions: vec![Position {
+            depth: 1,
+            from_domain: ENTRY_DOMAIN.to_string(),
+            exe: EXE.to_string(),
+            to_domain: "pwsh".to_string(),
+            source: PositionSource::Proposed,
+            instances: vec![2],
+            command_lines: Vec::new(),
+            argv_missing: 0,
+            argv_truncated: 0,
+        }],
+        roots: Vec::new(),
+        unassigned: Vec::new(),
+    };
+    let expected =
+        transition::editor_edge(EXE, ArgvMatcher::Any(transition::AnyMarker), "pwsh");
+
+    let from_positions = assignment.edges_to_add();
+    assert_eq!(from_positions.len(), 1);
+    assert_eq!(from_positions[0].edge, expected, "位置ごとの割り当ての辺の形が違う");
+    assert_eq!(edge_for(&any(EXE), "pwsh"), expected, "遷移タブの承認の辺の形が違う");
+
+    // 対の側: リテラルの引数で作った辺は、任意の引数の辺と等しくない。
+    assert_ne!(edge_for(&literal(EXE, "pwsh -c x"), "pwsh"), expected);
+    assert_eq!(
+        edge_for(&literal(EXE, "pwsh -c x"), "pwsh"),
+        transition::editor_edge(EXE, ArgvMatcher::Literal("pwsh -c x".to_string()), "pwsh")
+    );
+}
