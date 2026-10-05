@@ -388,50 +388,23 @@ impl Aggregate {
     /// PID再利用で親子関係が閉路になっても**1件も落とさない**: 閉路の中のプロセスは
     /// どこからも辿れなくなるので、走査の最後に根として拾い直す（表示から黙って
     /// 消えるより、親が変に見える方がまだ調べようがある、B-09）。
+    ///
+    /// 辿り方は[`harness_policy::process_tree::walk`]（2026-10-05に移した。位置ごとのドメインの
+    /// 割り当てが通し番号の木で同じ関数を通る）。並びは pid の昇順（`processes`の順）を入力の順として渡す。
     pub fn process_tree(&self) -> Vec<(usize, u32, ProcessNode)> {
-        let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-        let mut roots: Vec<u32> = Vec::new();
-        for (pid, node) in &self.processes {
-            match node.parent_pid {
-                Some(parent) if self.processes.contains_key(&parent) && parent != *pid => {
-                    children.entry(parent).or_default().push(*pid);
-                }
-                _ => roots.push(*pid),
-            }
-        }
-
-        let mut out = Vec::new();
-        let mut visited = std::collections::HashSet::new();
-        let walk = |start: u32,
-                    out: &mut Vec<(usize, u32, ProcessNode)>,
-                    visited: &mut std::collections::HashSet<u32>| {
-            let mut stack = vec![(0usize, start)];
-            while let Some((depth, pid)) = stack.pop() {
-                // 循環（PID再利用で親子が閉路になる）を踏んでも止まらないようにする。
-                if !visited.insert(pid) {
-                    continue;
-                }
-                if let Some(node) = self.processes.get(&pid) {
-                    out.push((depth, pid, node.clone()));
-                }
-                if let Some(kids) = children.get(&pid) {
-                    for kid in kids.iter().rev() {
-                        stack.push((depth + 1, *kid));
-                    }
-                }
-            }
-        };
-
-        for root in roots {
-            walk(root, &mut out, &mut visited);
-        }
-        // 閉路の中に居て根から辿れなかったプロセスを拾い直す（1件も落とさない）。
-        for pid in self.processes.keys() {
-            if !visited.contains(pid) {
-                walk(*pid, &mut out, &mut visited);
-            }
-        }
-        out
+        let nodes: Vec<(u32, Option<u32>)> = self
+            .processes
+            .iter()
+            .map(|(pid, node)| (*pid, node.parent_pid))
+            .collect();
+        harness_policy::process_tree::walk(&nodes)
+            .into_iter()
+            .filter_map(|entry| {
+                self.processes
+                    .get(&entry.key)
+                    .map(|node| (entry.depth, entry.key, node.clone()))
+            })
+            .collect()
     }
 
     pub fn process_count(&self) -> usize {
