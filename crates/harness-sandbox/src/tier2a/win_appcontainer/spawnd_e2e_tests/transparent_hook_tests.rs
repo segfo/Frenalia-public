@@ -69,6 +69,17 @@ fn process_hooks(workspace: &std::path::Path) -> Option<RedirectorSpec> {
 /// フックが何をしたのかはどこにも残らない**——6f-1でDaemonのstderrに同じ口を作ったのと同じ形。
 const REDIRECTOR_LOG_ENV: &str = "HARNESS_REDIRECTOR_DEBUG_LOG";
 
+/// [`run_probe_with_hooks`]が張るDLLの診断の受け皿の置き場。
+///
+/// **受け皿はワークスペースの中へ置く。** ここはこのドメインが書ける唯一の場所で、
+/// かつ`Case`が畳むときに一緒に消える。
+///
+/// [BUG-230] 測定（`cmd_nested_spawn_tests`）が中身をプロセスIDごとに読むので`pub(super)`にしてある
+/// ——ファイル名を2箇所に書くと、片方だけ変わったときに空のファイルを読んで「1行も無い」と見える。
+pub(super) fn redirector_log_path(workspace: &std::path::Path) -> std::path::PathBuf {
+    workspace.join("redirector.log")
+}
+
 /// DLLを注入したプローブを起こして、標準出力を返す。
 ///
 /// **要求受付capabilityを必ず積む**——積まないとフックが窓口へ届かず、
@@ -95,9 +106,7 @@ pub(super) fn run_probe_with_hooks(
     let probe = super::super::mac_spike_tests::probe_exe();
     let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
 
-    // **受け皿はワークスペースの中へ置く。** ここはこのドメインが書ける唯一の場所で、
-    // かつ`Case`が畳むときに一緒に消える。
-    let redirector_log = workspace.join("redirector.log");
+    let redirector_log = redirector_log_path(&workspace);
 
     let (child, job, out, err) = super::start_top_level(
         daemon,

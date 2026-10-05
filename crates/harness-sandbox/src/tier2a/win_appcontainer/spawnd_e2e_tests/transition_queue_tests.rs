@@ -38,7 +38,9 @@ use super::*;
 ///
 /// **`Case`が生きているうちに読む。** `Case`のdropはワークスペースごと畳むので、
 /// 落としてから読むと「1行も無い」に見える。
-fn queue_records(case: &Case) -> Vec<PendingRecord> {
+///
+/// [BUG-230] 測定（`cmd_nested_spawn_tests`）も同じ読み方を要るので`pub(super)`にしてある（写しを作らない）。
+pub(super) fn queue_records(case: &Case) -> Vec<PendingRecord> {
     let path = transitions::pending_path(&case.canonical_workspace);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
@@ -56,7 +58,7 @@ fn queue_records(case: &Case) -> Vec<PendingRecord> {
 }
 
 /// 行から「誰が拒否したか」と「何をすれば直るか」を取り出す。
-fn daemon_denial(record: &PendingRecord) -> &transitions::Denial {
+pub(super) fn daemon_denial(record: &PendingRecord) -> &transitions::Denial {
     match record {
         PendingRecord::DeniedByDaemon(denial) => denial,
         other => panic!("Daemonが拒否した行のはずだが、別の種類だった: {other:?}"),

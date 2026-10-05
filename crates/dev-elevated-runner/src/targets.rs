@@ -385,6 +385,28 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             // （テスト本体は`spawnd_e2e_tests`の中に在るので移動は起きない）。
             "--skip",
             "the_spawn_matrix_under_page_heap_records_where_it_faults",
+            // [BUG-230] `cmd.exe`を中の段に置いたときの原因を決める測定も受け入れではないので外す
+            // （`spawn-daemon-cmd-nested`が別に回す）。**判定が出て測定を消すときは、この2行と
+            // `spawn-daemon-cmd-nested`の項を一緒に消す**（測定ファイルのモジュールdocの寿命）。
+            "--skip",
+            "cmd_nested_spawn_tests",
+        ],
+    ),
+    // [BUG-230] 遷移の強制の下で`cmd.exe`が次のプログラムを起こせない件の原因を決める測定（4本の腕）。
+    // **合否は計器の検算と対照（中の段がPowerShellの腕）だけで、`cmd.exe`の腕は観測を印字する**。
+    // 寿命は測定ファイル（`spawnd_e2e_tests/cmd_nested_spawn_tests.rs`）のモジュールdocが持つ。
+    (
+        "spawn-daemon-cmd-nested",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "win_appcontainer::spawnd_e2e_tests::cmd_nested_spawn_tests",
         ],
     ),
     // [BUG-160] Daemon経由で起こした子の環境が二重に置き換わる件の測定と受け入れ（対2本）。
