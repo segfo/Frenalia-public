@@ -335,6 +335,62 @@ fn accepted_declarations<'p>(
         .collect()
 }
 
+/// 差分を**access種別ごとにまとめて**並べる。
+///
+/// `+ fs.read = <パス>`を1行ずつ出すと、687件では同じ`fs.read =`が687回並び、
+/// 「どの種別を何件許すのか」という一番知りたいことが読み取れない。種別を見出しにして
+/// パスをぶら下げる。
+///
+/// **既にある分は件数だけ**にする——変更ではないので明細を出しても判断は変わらず、
+/// これから増える分（＝承認の対象）が埋もれる。中身が知りたければ`policy.json`そのものを読む。
+///
+/// 承認待ちの確認ダイアログ（`tui::edit_commit`）と、位置ごとのドメインの確定の明細（`crate::position_approve`。
+/// 画面と CLI）が同じこれを通す。2026-10-05に`tui::edit_commit`から**そのまま**移した（P4.5 の準備）。
+pub(crate) fn group_by_key(
+    added: &[(&'static str, String)],
+    already_present: &[(&'static str, String)],
+) -> Vec<String> {
+    // 表示順は`SettingsKey`の並び（read → read_write → read_exec → net）に合わせて固定する
+    // ——実行のたびに順序が変わると差分を見比べられない。
+    const ORDER: &[&str] = &[
+        "fs.read",
+        "fs.read_write",
+        "fs.read_exec",
+        "net.allow_domains",
+    ];
+    let mut lines = Vec::new();
+
+    for key in ORDER {
+        let values: Vec<&str> = added
+            .iter()
+            .filter(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+            .collect();
+        if values.is_empty() {
+            continue;
+        }
+        lines.push(String::new());
+        lines.push(format!("  {key}  ＋{}件", values.len()));
+        for value in values {
+            lines.push(format!("      {value}"));
+        }
+    }
+
+    let mut present_lines = Vec::new();
+    for key in ORDER {
+        let count = already_present.iter().filter(|(k, _)| k == key).count();
+        if count > 0 {
+            present_lines.push(format!("  {key}  {count}件は既にあります（変更なし）"));
+        }
+    }
+    if !present_lines.is_empty() {
+        lines.push(String::new());
+        lines.extend(present_lines);
+    }
+
+    lines
+}
+
 /// 提案の値がworkspaceのどちら側にあるかを判定する。配下判定の実体は
 /// [`harness_sandbox::tier2a::policy_grants::is_under`]（付与の一覧を作る側と同じ規則を通す）。
 fn classify(proposal: &RuleProposal, workspace_root: &Path) -> PathClass {

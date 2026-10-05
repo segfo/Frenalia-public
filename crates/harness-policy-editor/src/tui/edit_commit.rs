@@ -176,7 +176,7 @@ impl App {
                 lines.push(format!("  ! {warning}"));
             }
 
-            lines.extend(group_by_key(
+            lines.extend(approve::group_by_key(
                 &plan.report.added,
                 &plan.report.already_present,
             ));
@@ -345,57 +345,4 @@ impl App {
             ),
         };
     }
-}
-
-/// 差分を**access種別ごとにまとめて**並べる。
-///
-/// `+ fs.read = <パス>`を1行ずつ出すと、687件では同じ`fs.read =`が687回並び、
-/// 「どの種別を何件許すのか」という一番知りたいことが読み取れない。種別を見出しにして
-/// パスをぶら下げる。
-///
-/// **既にある分は件数だけ**にする——変更ではないので明細を出しても判断は変わらず、
-/// これから増える分（＝承認の対象）が埋もれる。中身が知りたければ`policy.json`そのものを読む。
-fn group_by_key(
-    added: &[(&'static str, String)],
-    already_present: &[(&'static str, String)],
-) -> Vec<String> {
-    // 表示順は`SettingsKey`の並び（read → read_write → read_exec → net）に合わせて固定する
-    // ——実行のたびに順序が変わると差分を見比べられない。
-    const ORDER: &[&str] = &[
-        "fs.read",
-        "fs.read_write",
-        "fs.read_exec",
-        "net.allow_domains",
-    ];
-    let mut lines = Vec::new();
-
-    for key in ORDER {
-        let values: Vec<&str> = added
-            .iter()
-            .filter(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
-            .collect();
-        if values.is_empty() {
-            continue;
-        }
-        lines.push(String::new());
-        lines.push(format!("  {key}  ＋{}件", values.len()));
-        for value in values {
-            lines.push(format!("      {value}"));
-        }
-    }
-
-    let mut present_lines = Vec::new();
-    for key in ORDER {
-        let count = already_present.iter().filter(|(k, _)| k == key).count();
-        if count > 0 {
-            present_lines.push(format!("  {key}  {count}件は既にあります（変更なし）"));
-        }
-    }
-    if !present_lines.is_empty() {
-        lines.push(String::new());
-        lines.extend(present_lines);
-    }
-
-    lines
 }
