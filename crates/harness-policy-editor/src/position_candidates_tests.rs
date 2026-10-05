@@ -219,3 +219,27 @@ fn a_childs_own_executable_goes_to_the_childs_domain() {
         by_domain(&candidates)
     );
 }
+
+/// **CLI の`show`は、位置の情報がある記録では候補の行に書く先のドメインを添える**（画面と同じ番号・同じドメイン。
+/// `approve --accept fs-N`が画面と同じ候補を指す）。対の側: 位置の情報が無い記録は今までの`aggregate::render`と
+/// 1文字も変わらない。
+#[test]
+fn show_prints_each_candidates_domain_with_the_same_ids() {
+    let ws = workspace();
+    let (dir, manifest) = seed_position_record(ws.path(), "s1", &user_example());
+    write_fs_events(
+        &dir,
+        &[
+            fs_event("C:/a/x", Some(1), CMD),
+            fs_event("C:/b/y", Some(PWSH_SEQ), "C:/Program Files/PowerShell/7/pwsh.exe"),
+        ],
+    );
+    let candidates = load(&dir, &manifest, ws.path());
+    let text = render(&candidates, 40);
+    assert!(text.contains("fs-1     [workspace-shell] fs.read = C:/a/x"), "{text}");
+    assert!(text.contains("fs-2     [pwsh] fs.read = C:/b/y"), "{text}");
+
+    std::fs::remove_file(dir.process_audit_path()).expect("消す");
+    let old = load(&dir, &manifest, ws.path());
+    assert_eq!(render(&old, 40), crate::aggregate::render(&old.fs, 40));
+}

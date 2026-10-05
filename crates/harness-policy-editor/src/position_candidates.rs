@@ -24,10 +24,11 @@
 //! - どのドメインにも引けなかったファイル操作は件数だけ出す（承認できない、決定65の細目4）。
 //! - 注記・プロセスツリー・件数は記録全体の集計（[`SessionCandidates::fs`]）から出す。ドメインごとの集計の
 //!   除外の件数は数えない（同じ除外が全体の集計に1回ずつ数えてある）。
-//! - CLI（`show`・`approve`）はまだこの関数を通らない（P4.5 で揃える）。それまで、同じ記録の候補番号が画面と
-//!   CLI で食い違う（`plans/position-domains/P4.md`の P4.4 の実行時の記録）。
+//! - 画面（FS/ネットのタブ）と CLI（`show`・`approve`）は同じ[`load`]を通るので、同じ記録の候補番号が同じになる
+//!   （P4.5 で揃えた。それまでは CLI が記録全体を1つのドメインで番号付けしていた）。
 
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use harness_policy::policy_file::{PolicyFile, ENTRY_DOMAIN};
 use harness_policy::position_domains::{partition_fs, Unattributed};
@@ -55,6 +56,34 @@ impl SessionCandidates {
     pub fn by_position(&self) -> bool {
         self.unattributed.is_some()
     }
+}
+
+/// 記録の候補を、`policy.json`を読んでから作る（[`from_session`]）。**画面の FS/ネットのタブと CLI の`show`・`approve`が
+/// 同じこれを通る**——同じ記録の候補番号が画面と CLI で同じになる（`B-13`）。`policy.json`が読めなければ位置を
+/// 割り当てられないので、今までどおりの1つの一覧にして理由を注記に出す（`B-10`）。
+pub fn load(dir: &RecordSessionDir, manifest: &RecordManifest, workspace_root: &Path) -> SessionCandidates {
+    match harness_policy::policy_file::load(workspace_root) {
+        Ok(file) => from_session(dir, manifest, &file),
+        Err(e) => whole(
+            dir,
+            manifest,
+            Some(format!(
+                "policy.json を読めないので、位置ごとのドメインに分けずに見せています: {e}"
+            )),
+        ),
+    }
+}
+
+/// CLI の`show`に出す注記と候補一覧。位置ごとのドメインの記録は各行に`[<ドメイン>]`を添える（今までの記録は
+/// `aggregate::render`と同じ綴り）。
+pub fn render(candidates: &SessionCandidates, limit: usize) -> String {
+    let mut out = crate::aggregate::render_notes(&candidates.fs);
+    for note in &candidates.notes {
+        out.push_str(note);
+        out.push('\n');
+    }
+    crate::aggregate::render_candidates(&mut out, &candidates.proposals, &candidates.domains, limit);
+    out
 }
 
 /// 記録の候補を作る。位置の情報があれば（[`crate::position_view::load`]が`Some`）ドメインごと、無ければ今までどおり。

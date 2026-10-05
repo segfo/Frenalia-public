@@ -113,6 +113,10 @@ pub mod position_view;
 /// 位置を読む口が[`position_view`]なので**windows専用**。
 #[cfg(windows)]
 pub mod position_candidates;
+/// 位置ごとのドメインの記録を**1回の確定で書く**——ドメインごとのファイルの宣言と位置ごとの辺を1つの`policy.json`に
+/// 重ね、最後に1回だけ検査・保存する（決定65、P4.5）。位置の木を使うので**windows専用**。
+#[cfg(windows)]
+pub mod position_approve;
 /// `policy.json`の型と読み書き。**実体は[`harness_policy::policy_file`]へ移した**
 /// （2026-09-12、段階6b）——`harness.exe`とSpawn Daemonも同じ`load`を通す必要が生じ、
 /// このクレートは`harness-sandbox`に依存しているのであちら側から見えないためである。

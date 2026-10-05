@@ -116,6 +116,12 @@ fn edge_for(edge: &EdgeRef, to_domain: &str) -> TransitionEdge {
 }
 
 impl EdgeRef {
+    /// この指し方で`to_domain`へ移る辺（形は[`edge_for`]）。位置ごとのドメインの確定（`tui::position_commit`）が、
+    /// 拒否からの承認の予約を辺にするのに使う。
+    pub(crate) fn edge_to(&self, to_domain: &str) -> TransitionEdge {
+        edge_for(self, to_domain)
+    }
+
     /// 辺そのものから指し方を作る（リテラルの exe で、引数が任意かリテラルの辺だけ）。パターンを含む辺は
     /// [`EdgeRef`]で指せないので`None`。**「同じ辺か」の比べ方を[`refers_to`]の1つにする**ために使う。
     fn of_edge(edge: &TransitionEdge) -> Option<EdgeRef> {

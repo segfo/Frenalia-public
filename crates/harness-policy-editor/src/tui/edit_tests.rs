@@ -1926,20 +1926,125 @@ fn recursive_marks_are_per_domain() {
     );
 }
 
-/// 位置ごとのドメインの記録の`a`は、**P4.5 まで書かずに理由を言う**（寿命: P4.5 で1回の確定にまとめる）。
+/// 候補（値, ドメイン）の id。
+fn candidate_id(app: &App, value: &str, domain: &str) -> String {
+    let view = app.view.as_ref().expect("view");
+    view.proposals
+        .iter()
+        .zip(&view.domains)
+        .find(|(p, d)| p.value == value && d.as_deref() == Some(domain))
+        .map(|(p, _)| p.id.clone())
+        .expect("その候補")
+}
+
+/// **位置ごとのドメインの記録では、FS/ネットのタブの`a`が、ドメインごとのファイルの宣言と観測のタブで選んだ位置の辺を
+/// 1つの確認ダイアログにまとめ、`y`で1回に書く**（P4.5。片方だけ書けた状態を作らない）。ダイアログを出しただけでは
+/// 何も書かない。台帳には子のドメインの名前で載る。
+/// 対の側: 位置の辺を選ばずに子のドメインのファイルを選ぶと、届く辺が無いので何も書かずに理由を言う。
 #[test]
-fn approving_a_position_record_is_left_to_p45() {
+fn a_on_the_fs_tab_of_a_position_record_writes_files_and_edges_together() {
     use crate::position_candidates::position_candidates_tests::fs_event;
-    use crate::position_view::position_view_tests::{user_example, CMD};
+    use crate::position_view::position_view_tests::{child, root, CMD, PWSH};
+    use harness_policy::policy_file::ENTRY_DOMAIN;
+    use harness_sandbox::tier2a::policy_approval::DeclarationRef;
 
     let ws = workspace();
-    seed_position_record_with_fs(&ws, &user_example(), &[fs_event("C:/a/x", Some(1), CMD)]);
+    // 入口のドメイン（cmd）と子の pwsh が同じファイルを読む（子の届く範囲を呼び出し元が覆う＝狭める向き）。
+    seed_position_record_with_fs(
+        &ws,
+        &[root(1, CMD), child(2, 1, PWSH)],
+        &[
+            fs_event("C:/Users/x/b.txt", Some(1), CMD),
+            fs_event("C:/Users/x/b.txt", Some(2), PWSH),
+        ],
+    );
     let mut app = open_edit(&ws);
-    let id = app.view.as_ref().expect("view").proposals[0].id.clone();
-    app.accepted.insert(id);
+    let entry_id = candidate_id(&app, "C:/Users/x/b.txt", ENTRY_DOMAIN);
+    let pwsh_id = candidate_id(&app, "C:/Users/x/b.txt", "pwsh");
+    app.accepted.insert(entry_id);
+    app.accepted.insert(pwsh_id);
     app.edit_focus = EditField::Proposals;
+
+    // 対の側: 位置の辺をまだ選んでいない。
     app.on_key(key(KeyCode::Char('a')));
-    assert!(app.modal.is_none(), "確認ダイアログを出してはいけない");
-    assert!(app.status.contains("P4.5"), "{}", app.status);
+    let modal = app.modal.as_ref().expect("理由のダイアログ");
+    assert_eq!(modal.confirm, Confirm::ReadOnly);
+    assert!(
+        modal.lines.iter().any(|l| l.contains("pwsh") && l.contains("届く辺")),
+        "{:?}",
+        modal.lines
+    );
     assert!(!crate::policy_file::path(ws.path()).exists());
+    app.on_key(key(KeyCode::Esc));
+
+    // 観測のタブで pwsh の位置を選び、FS/ネットのタブへ戻って a。
+    app.on_key(key(KeyCode::F(2)));
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::F(2)));
+    app.on_key(key(KeyCode::F(2)));
+    assert!(!app.pending.tab.0.is_transition());
+    app.on_key(key(KeyCode::Char('a')));
+    let modal = app.modal.as_ref().expect("確認ダイアログ");
+    assert_eq!(modal.confirm, Confirm::Position, "{:?}", modal.lines);
+    assert!(
+        modal.lines.iter().any(|l| l.contains("ファイルの宣言: ドメイン pwsh")),
+        "{:?}",
+        modal.lines
+    );
+    assert!(
+        modal.lines.iter().any(|l| l.contains("遷移元ドメイン workspace-shell")),
+        "{:?}",
+        modal.lines
+    );
+    assert!(!crate::policy_file::path(ws.path()).exists(), "ダイアログを出しただけで書いた");
+
+    app.on_key(key(KeyCode::Char('y')));
+    let file = crate::policy_file::load(ws.path()).expect("load");
+    assert_eq!(file.domain("pwsh").unwrap().fs.read, vec!["C:/Users/x/b.txt".to_string()]);
+    let entry = file.domain(ENTRY_DOMAIN).unwrap();
+    assert_eq!(entry.fs.read, vec!["C:/Users/x/b.txt".to_string()]);
+    assert_eq!(entry.process.transitions.len(), 1);
+    assert_eq!(entry.process.transitions[0].to, "pwsh");
+    assert!(crate::approval_store::approval_store().load().is_approved(
+        ws.path(),
+        DeclarationRef {
+            domain: "pwsh",
+            value: "C:/Users/x/b.txt",
+            access: harness_config::FsAccess::Read,
+        },
+    ));
+    assert!(app.accepted.is_empty(), "書いた予約が残っている");
+}
+
+/// **ドメインが1つだけの位置ごとの記録では、木にドメインの段が無いので、`R`の印はそのドメインの合成提案になる**
+/// （段が無い木のノードはドメインを持たない。黙って書く先の無い提案にしない）。
+#[test]
+fn a_recursive_mark_in_a_one_domain_position_record_goes_to_that_domain() {
+    use crate::position_candidates::position_candidates_tests::fs_event;
+    use crate::position_view::position_view_tests::{child, root, CMD, PWSH};
+
+    let ws = workspace();
+    seed_position_record_with_fs(
+        &ws,
+        &[root(1, CMD), child(2, 1, PWSH)],
+        &[
+            fs_event("C:/data/s/d1", Some(2), PWSH),
+            fs_event("C:/data/s/d2", Some(2), PWSH),
+        ],
+    );
+    let mut app = open_edit(&ws);
+    assert!(!app.tree.has_domain_tier());
+    app.edit_focus = EditField::Proposals;
+    let rows = app.tree.rows(&app.expanded);
+    app.selected_row = rows
+        .iter()
+        .position(|r| app.tree.node(r.node).path == "C:/data/s")
+        .expect("C:/data/s の行");
+    app.on_key(key(KeyCode::Char('R')));
+    let made: Vec<(Option<String>, String)> = app
+        .recursive_proposals()
+        .into_iter()
+        .map(|(domain, p)| (domain, p.value))
+        .collect();
+    assert_eq!(made, vec![(Some("pwsh".to_string()), "C:/data/s/**".to_string())], "{}", app.status);
 }

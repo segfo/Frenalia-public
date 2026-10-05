@@ -13,6 +13,10 @@
 //! 1. 失敗した記録では**理由が出る**（`error`/`error_kind`が画面に届く）
 //! 2. 成功した記録では**理由が出ない**（対で固定する。片側だけだと「常に出る」実装でも緑になる、B-35）
 //! 3. 理由の欄が入る前に書かれた古いマニフェストでも、`show`が落ちず「記録されていません」と言う
+//! 4. 位置の情報がある記録（`process-audit.jsonl`を持つパス1）では、`show`が候補ごとに書く先のドメインを出し、
+//!    `approve --domain`を何も書かずに断る（P4.5。CLI が画面と同じ候補の作り方に繋がっているか）。`approve`が
+//!    書く側はここでは撃たない——統合試験は本物の承認台帳（`%APPDATA%`）を使うので、書く側は
+//!    `position_approve_tests`（試験ごとの一時台帳）が持つ
 
 #![cfg(windows)]
 
@@ -128,4 +132,108 @@ fn a_manifest_from_before_the_reason_field_still_shows_something_honest() {
 
     assert!(output.status.success(), "{stderr}");
     assert!(stderr.contains("記録されていません"), "{stderr}");
+}
+
+/// パス1の記録を作り、プロセスの木（cmd が根、その子の pwsh）と、それぞれの通し番号で読んだファイルを書く。
+///
+/// 形は`process-audit.jsonl`・`fs-audit.jsonl`の書式そのもの（ライブラリの試験の補助
+/// `position_view_tests::seed_position_record`・`position_candidates_tests::write_fs_events`の写し。統合試験からは
+/// `cfg(test)`の補助を呼べない）。書式が変わればここも読めなくなり、下の2本が赤くなる。
+fn seed_position_record(workspace_root: &Path, id: &str) {
+    use harness_policy::process_event::{
+        ArgvBinding, ArgvTruncation, ParentSeqSource, ProcessAuditRecord, ProcessInstance,
+        PROCESS_AUDIT_SCHEMA_VERSION,
+    };
+    let dir = RecordSessionDir::create(workspace_root, id).unwrap();
+    let mut manifest = RecordManifest::new(id, "cmd /c pwsh", workspace_root, workspace_root, 100);
+    manifest.status = RecordStatus::Finished;
+    manifest.collector_started = true;
+    manifest.etw_available = true;
+    manifest.exit_code = Some(0);
+    dir.write_manifest(&manifest).unwrap();
+
+    let instance = |seq: u64, parent: u64, image: &str, root: bool| ProcessInstance {
+        seq,
+        parent_seq: Some(parent),
+        parent_seq_source: ParentSeqSource::EtwField,
+        pid: seq as u32,
+        parent_pid: Some(parent as u32),
+        image_path: Some(image.to_string()),
+        argv: ArgvBinding::Exact {
+            command_line: format!("\"{image}\""),
+            truncation: ArgvTruncation::None,
+        },
+        is_scope_root: root,
+        timestamp_unix_ms: 1_700_000_000_000 + seq,
+    };
+    let mut audit = ProcessAuditRecord::Header {
+        schema_version: PROCESS_AUDIT_SCHEMA_VERSION,
+    }
+    .to_jsonl_line()
+    .unwrap();
+    audit.push('\n');
+    for record in [
+        instance(1, 9_000, "C:/Windows/System32/cmd.exe", true),
+        instance(2, 1, "C:/Program Files/PowerShell/7/pwsh.exe", false),
+    ] {
+        audit.push_str(&ProcessAuditRecord::Instance(record).to_jsonl_line().unwrap());
+        audit.push('\n');
+    }
+    std::fs::write(dir.process_audit_path(), audit).unwrap();
+
+    let mut fs = String::new();
+    for (path, seq) in [("C:/a/x", 1u64), ("C:/b/y", 2)] {
+        let mut event = harness_policy::FsAuditEvent::observed(
+            harness_policy::FsAuditKind::Etw,
+            path,
+            harness_config::FsAccess::Read,
+            true,
+            "record_all",
+            1_700_000_000_000,
+        );
+        event.process_sequence_number = Some(seq);
+        event.process_id = Some(seq as u32);
+        fs.push_str(&event.to_jsonl_line().unwrap());
+        fs.push('\n');
+    }
+    std::fs::write(dir.audit_log_path(), fs).unwrap();
+}
+
+/// **位置の情報がある記録では、`show`が候補ごとに書く先のドメインを出す**（画面と同じ番号・同じドメイン）。
+#[test]
+fn a_position_record_shows_each_candidates_domain() {
+    let ws = workspace();
+    seed_position_record(ws.path(), "s1");
+    let output = show(ws.path(), "s1");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("[workspace-shell] fs.read = C:/a/x"), "{stdout}");
+    assert!(stdout.contains("[pwsh] fs.read = C:/b/y"), "{stdout}");
+}
+
+/// **位置の情報がある記録の`approve --domain`は、何も書かずに断る**（1つのドメインへ全部書くと、位置ごとに分けた
+/// 意味が黙って消える）。`policy.json`は作られない。
+#[test]
+fn approving_a_position_record_with_a_domain_flag_writes_nothing() {
+    let ws = workspace();
+    seed_position_record(ws.path(), "s1");
+    let output = Command::new(editor_exe())
+        .args([
+            "approve",
+            "s1",
+            "--workspace",
+            &ws.path().to_string_lossy(),
+            "--domain",
+            "cmd",
+            "--accept",
+            "fs-1",
+            "--yes",
+        ])
+        .output()
+        .expect("the policy editor binary should run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("--domain は付けないでください"), "{stderr}");
+    assert!(!harness_policy_editor::policy_file::path(ws.path()).exists());
 }

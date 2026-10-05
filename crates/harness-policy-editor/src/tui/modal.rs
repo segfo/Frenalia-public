@@ -47,6 +47,13 @@ pub enum Confirm {
     /// `Transition`と分けてあるのは、指し方と書く関数が違うから（あちらは入口のドメインの辺を`EdgeRef`で足す／消す、
     /// こちらは遷移元が何個でも`transition_approve::plan_removals`で消すだけ）。
     DeclaredTransitions,
+    /// 位置ごとのドメインの記録の`a`（承認待ちのどのタブからでも）。**ドメインごとのファイルの宣言・位置の辺・拒否からの
+    /// 予約・取り消し・却下印を1回の確定で書く**（2026-10-05、`plans/position-domains/P4.md`のP4.5。
+    /// `crate::position_approve`）。
+    ///
+    /// `Approval`・`Transition`と分けてあるのは、書く関数が違い（`policy.json`を1回だけ保存する）、確認の文面に
+    /// 自己ループ辺の置き換えが出るから（`y`は置き換えへの同意でもある。決定65 Q7）。
+    Position,
 }
 
 impl Confirm {
@@ -66,6 +73,7 @@ impl App {
             Confirm::DeclaredChanges => self.commit_declared_changes(),
             Confirm::Transition => self.commit_transition(),
             Confirm::DeclaredTransitions => self.commit_declared_transition_removals(),
+            Confirm::Position => self.commit_position(),
             Confirm::ReadOnly => {}
         }
     }

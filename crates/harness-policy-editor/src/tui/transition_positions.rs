@@ -21,10 +21,11 @@
 //! （判定器）が答える。この画面は並べて予約を持つだけで、名前の検査も入れ物の名前の関数
 //! （[`domain_profile_name_problem`]）を呼ぶ。
 //!
-//! # まだ書かない（寿命: P4.5）
+//! # 書くのは1回の確定（P4.5）
 //!
-//! 位置の辺は、ドメインごとのファイルの宣言と一緒に1回の確定で書く（P4.5 の`position_approve`）。それまで`a`は
-//! 位置の予約があれば理由を言って何も書かない（`B-32`）。
+//! 位置の辺は、ドメインごとのファイルの宣言・拒否からの予約と一緒に1回の確定で書く（`a`は
+//! [`super::position_commit`]の`request_position_commit`。`crate::position_approve`が1つの`policy.json`に重ねて
+//! 1回だけ保存する）。
 //!
 //! # 限界
 //!
@@ -369,22 +370,8 @@ impl App {
                 self.reload_transitions();
                 self.status = "遷移の候補を読み直しました".to_string();
             }
-            KeyCode::Char('a') => {
-                let reserved = self
-                    .pending
-                    .positions
-                    .as_ref()
-                    .map_or(0, |p| p.approve.len());
-                if reserved > 0 {
-                    // 寿命: P4.5 で`position_approve`の1回の確定にまとめたら、この分岐を消す。
-                    self.status = format!(
-                        "位置ごとの承認は P4.5 で1回の確定にまとめます。いまは書けません（位置の予約 {reserved}件は\
-                         残しています。拒否からの予約は「遷移・拒否から」のタブの a で確定できます）"
-                    );
-                } else {
-                    self.request_transition_commit();
-                }
-            }
+            // ファイルの宣言・位置の辺・拒否からの予約を1回の確定で書く（P4.5）。
+            KeyCode::Char('a') => self.request_position_commit(),
             _ => {}
         }
         None

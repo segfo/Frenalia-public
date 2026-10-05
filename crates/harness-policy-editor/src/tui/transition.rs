@@ -490,6 +490,8 @@ impl App {
                 self.reload_transitions();
                 self.status = "遷移の候補を読み直しました".to_string();
             }
+            // 位置ごとのドメインの記録では、拒否からの予約もファイルの宣言・位置の辺と同じ1回の確定で書く（P4.5）。
+            KeyCode::Char('a') if self.is_position_record() => self.request_position_commit(),
             KeyCode::Char('a') => self.request_transition_commit(),
             _ => {}
         }

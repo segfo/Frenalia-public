@@ -107,16 +107,10 @@ impl App {
             let domains = vec![None; proposals.len()];
             SessionView::new(data, notes, tree, proposals, domains)
         } else {
-            // 位置の情報がある記録は候補をドメインごとに作る（決定65(5)、P4.4）。`policy.json`が読めなければ
-            // 位置を割り当てられないので、今までどおりの1つの一覧にして理由を注記に出す（`B-10`）。
-            let candidates = match policy_file::load(&self.workspace_root) {
-                Ok(file) => crate::position_candidates::from_session(&entry.dir, &manifest, &file),
-                Err(e) => crate::position_candidates::whole(
-                    &entry.dir,
-                    &manifest,
-                    Some(format!("policy.json を読めないので、位置ごとのドメインに分けずに見せています: {e}")),
-                ),
-            };
+            // 位置の情報がある記録は候補をドメインごとに作る（決定65(5)、P4.4）。CLI の`show`・`approve`と同じ
+            // 入口を通す（候補の番号が画面と CLI で同じになる。`policy.json`が読めないときの扱いもそこにある）。
+            let candidates =
+                crate::position_candidates::load(&entry.dir, &manifest, &self.workspace_root);
             let aggregate = candidates.fs;
             let mut notes = failure_note_block(&manifest);
             for note in &candidates.notes {
@@ -745,7 +739,13 @@ impl App {
                 continue;
             };
             let path = &self.tree.node(node).path;
-            let domain = self.tree.node(node).domain.clone();
+            // ドメインの段が無い木のノードはドメインを持たない。位置ごとのドメインの記録でドメインが1つだけなら、
+            // 候補の全部がそのドメインなので、それを書く先にする（黙って書く先の無い提案にしない、`B-09`）。
+            let domain = self.tree.node(node).domain.clone().or_else(|| {
+                (!self.tree.has_domain_tier())
+                    .then(|| view.domains.iter().flatten().next().cloned())
+                    .flatten()
+            });
             let keys = self.recursive_keys_for(node);
             let evidence: Vec<_> = self
                 .tree

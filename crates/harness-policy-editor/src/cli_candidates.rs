@@ -3,6 +3,13 @@
 //! 2026-10-05に`main.rs`から**そのまま**移した（`main.rs`は本体1,000行を超えているので、P4.5 で位置ごとの
 //! ドメインの記録を扱う前に置き場を分けた。`plans/position-domains/P4.md`）。引数の解決・確認のプロンプトは
 //! `main.rs`の関数をそのまま使う。
+//!
+//! # 位置の情報がある記録（P4.5）
+//!
+//! 候補は画面（承認待ちの FS/ネットのタブ）と同じ`position_candidates::load`で作るので、同じ記録の`fs-N`が画面と
+//! 同じ候補を指す。`show`は各行に書く先のドメインを添え、`approve`は候補ごとのドメインへファイルの宣言だけを書く
+//! （辺は書かない。辺が要る候補と`--domain`は断る——`position_approve::cli_plan`）。位置の情報は windows 専用の
+//! 部品から読むので、非windowsでは今までの1つの一覧のまま。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -113,17 +120,37 @@ pub(super) fn run_show(
         eprintln!("警告: この記録ではETWセッションが張れていません（何も観測できていません）");
     }
 
-    let aggregate = harness_policy_editor::aggregate::from_session(&dir, &manifest);
-    print!(
-        "{}",
-        harness_policy_editor::aggregate::render(&aggregate, limit)
-    );
-    if tree {
-        println!();
+    // 位置の情報がある記録は候補をドメインごとに作る（画面と同じ入口・同じ番号。P4.5）。
+    #[cfg(windows)]
+    {
+        let candidates =
+            harness_policy_editor::position_candidates::load(&dir, &manifest, &workspace_root);
         print!(
             "{}",
-            harness_policy_editor::aggregate::render_process_tree(&aggregate)
+            harness_policy_editor::position_candidates::render(&candidates, limit)
         );
+        if tree {
+            println!();
+            print!(
+                "{}",
+                harness_policy_editor::aggregate::render_process_tree(&candidates.fs)
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let aggregate = harness_policy_editor::aggregate::from_session(&dir, &manifest);
+        print!(
+            "{}",
+            harness_policy_editor::aggregate::render(&aggregate, limit)
+        );
+        if tree {
+            println!();
+            print!(
+                "{}",
+                harness_policy_editor::aggregate::render_process_tree(&aggregate)
+            );
+        }
     }
     ExitCode::SUCCESS
 }
@@ -158,9 +185,35 @@ pub(super) fn run_approve(
         return ExitCode::FAILURE;
     };
 
-    // idは候補の並びから決まるので、`show`とまったく同じ経路で作り直す。
-    let aggregate = harness_policy_editor::aggregate::from_session(&dir, &manifest);
-    let proposals = aggregate.proposals();
+    // カンマ区切りを展開する（`--accept fs-1,fs-2`と`--accept fs-1 --accept fs-2`の両方を許す）。
+    let accept_ids: Vec<String> = accept
+        .iter()
+        .flat_map(|arg| arg.split(','))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+
+    // idは候補の並びから決まるので、`show`とまったく同じ経路で作り直す。位置の情報がある記録は候補ごとのドメインへ
+    // 書く別の経路（P4.5）。
+    #[cfg(windows)]
+    let proposals = {
+        let candidates =
+            harness_policy_editor::position_candidates::load(&dir, &manifest, &workspace_root);
+        if candidates.by_position() {
+            return approve_by_position(
+                &workspace_root,
+                &manifest,
+                &candidates,
+                domain,
+                &accept_ids,
+                require_sandbox,
+                yes,
+            );
+        }
+        candidates.proposals
+    };
+    #[cfg(not(windows))]
+    let proposals = harness_policy_editor::aggregate::from_session(&dir, &manifest).proposals();
 
     // ドメイン名の既定はコマンドの先頭トークン（`cargo build` → `cargo`）。
     let domain = domain.map(|d| d.to_string()).unwrap_or_else(|| {
@@ -170,14 +223,6 @@ pub(super) fn run_approve(
         eprintln!("ドメイン名を決められませんでした。--domain <name> を指定してください。");
         return ExitCode::FAILURE;
     }
-
-    // カンマ区切りを展開する（`--accept fs-1,fs-2`と`--accept fs-1 --accept fs-2`の両方を許す）。
-    let accept_ids: Vec<String> = accept
-        .iter()
-        .flat_map(|arg| arg.split(','))
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
-        .collect();
 
     let request = ApproveRequest {
         workspace_root: &workspace_root,
@@ -275,6 +320,67 @@ pub(super) fn run_approve(
     println!(
         "次: harness-policy-editor record-net --domain {domain}\n\
          （Tier2aで実行し、接続したドメインを記録します。ここで初めてACEが付きます）"
+    );
+    ExitCode::SUCCESS
+}
+
+/// `approve`の、位置の情報がある記録の経路（P4.5）。候補ごとのドメインへ**ファイルの宣言だけ**を書く。明細は画面の
+/// 確認ダイアログと同じ（`position_approve::confirmation_lines`）。保存は1回、承認台帳はその後。
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn approve_by_position(
+    workspace_root: &std::path::Path,
+    manifest: &harness_policy_editor::RecordManifest,
+    candidates: &harness_policy_editor::position_candidates::SessionCandidates,
+    domain_flag: Option<&str>,
+    accept_ids: &[String],
+    require_sandbox: harness_core::RequireSandbox,
+    yes: bool,
+) -> ExitCode {
+    use harness_policy_editor::position_approve;
+
+    let plan = match position_approve::cli_plan(
+        workspace_root,
+        manifest,
+        candidates,
+        accept_ids,
+        domain_flag,
+        require_sandbox,
+        harness_policy_editor::session_dir::now_unix_ms(),
+    ) {
+        Ok(plan) => plan,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for line in
+        position_approve::confirmation_lines(workspace_root, &plan, &std::collections::BTreeSet::new())
+    {
+        println!("{line}");
+    }
+    if plan.is_empty() {
+        println!();
+        println!("（承認済みの内容に変化はありません。何も書きませんでした）");
+        return ExitCode::SUCCESS;
+    }
+    if !confirm_write(yes) {
+        eprintln!("中止しました。何も書いていません。");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) =
+        position_approve::commit(workspace_root, &plan, &harness_policy_editor::policy_file::save)
+    {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    println!();
+    println!(
+        "書きました: {}",
+        harness_policy_editor::policy_file::path(workspace_root).display()
+    );
+    println!(
+        "次: 新しい位置のドメインと遷移の辺は TUI（F2 の「遷移・観測から」）で承認します（CLI は辺を書きません）"
     );
     ExitCode::SUCCESS
 }

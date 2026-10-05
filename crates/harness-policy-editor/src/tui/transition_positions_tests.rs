@@ -333,12 +333,15 @@ fn an_existing_edge_cannot_be_renamed_and_a_self_loop_name_is_frozen() {
     assert!(app.status.contains("凍結中"), "{}", app.status);
 }
 
-/// `Space`で書ける位置を予約できる。**`a`は P4.5 までは書かずに理由を言う**（寿命: P4.5 で1回の確定にまとめる）。
+/// `Space`で書ける位置を予約し、**`a`で1つの確認ダイアログ（まだ書かない）、`y`で選んだ位置の辺を1回に書く**（P4.5）。
+/// 遷移元の違う辺（`workspace-shell`から pwsh、pwsh から calc）も同じ確定に入る。`n`なら何も書かない。
 /// `x`は位置の行では何もせず理由を言う（却下印は観測した`(exe, 引数)`ごと、P4.md 前例の表の10）。
 #[test]
-fn space_reserves_a_position_and_a_does_not_write_until_p45() {
+fn space_then_a_then_y_writes_the_position_edges_in_one_confirmation() {
     let ws = workspace();
     let mut app = app_with_record(ws.path(), &user_example());
+    select(&mut app, PWSH);
+    press(&mut app, KeyCode::Char(' '));
     select(&mut app, CALC);
     press(&mut app, KeyCode::Char(' '));
     assert!(app
@@ -350,16 +353,88 @@ fn space_reserves_a_position_and_a_does_not_write_until_p45() {
         .contains(&key_of(&app, CALC)));
 
     press(&mut app, KeyCode::Char('a'));
-    assert!(app.modal.is_none(), "確認ダイアログを出してはいけない");
-    assert!(app.status.contains("P4.5"), "{}", app.status);
-    assert!(
-        !policy_file::path(ws.path()).exists(),
-        "policy.json を書いてはいけない"
-    );
+    let modal = app.modal.as_ref().expect("確認ダイアログ");
+    assert_eq!(modal.confirm, crate::tui::state::Confirm::Position);
+    for from in ["遷移元ドメイン workspace-shell", "遷移元ドメイン pwsh"] {
+        assert!(modal.lines.iter().any(|l| l.contains(from)), "{from}: {:?}", modal.lines);
+    }
+    assert!(!policy_file::path(ws.path()).exists(), "ダイアログを出しただけで書いた");
+    press(&mut app, KeyCode::Char('n'));
+    assert!(!policy_file::path(ws.path()).exists(), "n で書いた");
+
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char('y'));
+    let file = policy_file::load(ws.path()).expect("書いたはず");
+    let to = |name: &str| -> Vec<String> {
+        file.domain(name)
+            .map(|d| d.process.transitions.iter().map(|e| e.to.clone()).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(to(ENTRY_DOMAIN), vec!["pwsh".to_string()], "{}", app.status);
+    assert_eq!(to("pwsh"), vec!["calc".to_string()]);
+    assert!(app.pending.positions.as_ref().unwrap().approve.is_empty(), "書いた予約が残っている");
 
     press(&mut app, KeyCode::Char('x'));
     assert!(app.status.contains("却下"), "{}", app.status);
     assert_eq!(app.pending.dismiss.len(), 0);
+}
+
+/// **エディタが前に書いた自己ループ辺は、確認ダイアログに置き換えを出し、`y`のときだけ置き換える**（決定65 Q7・D-42）。
+/// `n`なら`policy.json`は1バイトも変わらない。`y`で自己ループ辺が消えて位置の辺だけが残る。
+#[test]
+fn a_self_loop_replacement_is_shown_in_the_dialog_and_written_only_on_y() {
+    let ws = workspace();
+    let mut entry = PolicyDomain::new(ENTRY_DOMAIN);
+    entry
+        .process
+        .transitions
+        .push(editor_edge(PWSH, ArgvMatcher::Any(AnyMarker), ENTRY_DOMAIN));
+    let mut file = PolicyFile::default();
+    file.domains.push(entry);
+    policy_file::save(ws.path(), &file).expect("手で書いた自己ループ辺");
+    let before = std::fs::read(policy_file::path(ws.path())).unwrap();
+
+    let mut app = app_with_record(ws.path(), &[root(1, CMD), child(2, 1, PWSH)]);
+    select(&mut app, PWSH);
+    let destination = {
+        let positions = app.pending.positions.as_ref().unwrap();
+        let position = positions
+            .view
+            .assignment
+            .positions
+            .iter()
+            .find(|p| p.exe == PWSH)
+            .unwrap();
+        assert_eq!(
+            position.source,
+            harness_policy::position_domains::PositionSource::ReplacesSelfLoop
+        );
+        positions.destination_name(position).to_string()
+    };
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Char('a'));
+    let modal = app.modal.as_ref().expect("確認ダイアログ");
+    assert!(
+        modal.lines.iter().any(|l| l.contains("置き換える自己ループ辺")),
+        "{:?}",
+        modal.lines
+    );
+    assert!(
+        modal.lines.iter().any(|l| l.contains("workspace-shell の")
+            && l.contains("pwsh.exe")
+            && l.contains("→ workspace-shell")),
+        "{:?}",
+        modal.lines
+    );
+    press(&mut app, KeyCode::Char('n'));
+    assert_eq!(std::fs::read(policy_file::path(ws.path())).unwrap(), before);
+
+    press(&mut app, KeyCode::Char('a'));
+    press(&mut app, KeyCode::Char('y'));
+    let file = policy_file::load(ws.path()).expect("load");
+    let edges = &file.domain(ENTRY_DOMAIN).unwrap().process.transitions;
+    assert_eq!(edges.len(), 1, "{edges:?} / {}", app.status);
+    assert_eq!(edges[0].to, destination);
 }
 
 /// 1フレーム描いて描画で分かったこと（押せる場所）を状態へ書き戻し、行ごとの文字列を返す（`tui::run`と同じ）。
@@ -505,4 +580,64 @@ fn a_widening_position_says_it_cannot_be_written_until_p5() {
     press(&mut app, KeyCode::Char(' '));
     assert!(app.pending.positions.as_ref().unwrap().approve.is_empty());
     assert!(app.status.contains("P5まで書けません"), "{}", app.status);
+}
+
+/// **位置ごとのドメインの記録では、「遷移・拒否から」のタブの`a`も、位置の辺と拒否からの予約を1つの確定にまとめる**
+/// （承認待ちのどのタブで`a`を押しても、別のタブの予約を黙って残さない。`B-32`）。拒否からの予約の遷移先は
+/// 平らな一覧の遷移先の欄、遷移元は P4.6 までは入口のドメイン。
+#[test]
+fn a_on_the_denied_tab_of_a_position_record_writes_positions_and_denials_together() {
+    use harness_policy::transition::TransitionDenial;
+    use harness_sandbox::tier2a::spawnd::transitions::{pending_path, Denial, PendingRecord};
+    use harness_sandbox::tier2a::spawnd::DenyReason;
+
+    let ws = workspace();
+    let denial = PendingRecord::DeniedByDaemon(Denial {
+        from_domain: Some(ENTRY_DOMAIN.to_string()),
+        exe: "C:/Users/x/tools/hostname.exe".to_string(),
+        argv: "hostname".to_string(),
+        cwd: None,
+        reason: DenyReason::Transition {
+            denial: TransitionDenial::NoMatchingEdge,
+        },
+        count: 1,
+        first_ts: 1,
+        last_ts: 1,
+        argv_truncation: false,
+    });
+    let queue = pending_path(ws.path());
+    std::fs::create_dir_all(queue.parent().unwrap()).unwrap();
+    std::fs::write(&queue, format!("{}\n", serde_json::to_string(&denial).unwrap())).unwrap();
+
+    let mut app = app_with_record(ws.path(), &[root(1, CMD), child(2, 1, PWSH)]);
+    select(&mut app, PWSH);
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::F(2));
+    assert_eq!(app.pending.tab.0, PendingTab::TransitionsDenied);
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Tab);
+    type_text(&mut app, "hn");
+    press(&mut app, KeyCode::Enter);
+
+    press(&mut app, KeyCode::Char('a'));
+    let modal = app.modal.as_ref().expect("確認ダイアログ");
+    assert_eq!(modal.confirm, crate::tui::state::Confirm::Position, "{:?}", modal.lines);
+    assert!(
+        modal.lines.iter().any(|l| l.contains("hostname.exe") && l.contains("→ hn")),
+        "{:?}",
+        modal.lines
+    );
+    press(&mut app, KeyCode::Char('y'));
+    let file = policy_file::load(ws.path()).expect("書いたはず");
+    let mut to: Vec<String> = file
+        .domain(ENTRY_DOMAIN)
+        .unwrap()
+        .process
+        .transitions
+        .iter()
+        .map(|e| e.to.clone())
+        .collect();
+    to.sort();
+    assert_eq!(to, vec!["hn".to_string(), "pwsh".to_string()], "{}", app.status);
+    assert!(app.pending.approve.is_empty(), "拒否からの予約が残っている");
 }

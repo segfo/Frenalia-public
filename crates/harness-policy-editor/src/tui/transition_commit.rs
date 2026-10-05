@@ -270,7 +270,7 @@ impl App {
     /// **承認を予約した行に却下印があれば、それも外す。** 却下したものを選び直して許したなら、
     /// 最後の判断は「許す」であって、宣言を後で取り消したときに「却下済み」として戻ってくるのは
     /// その判断と食い違う。外すのは**いま印がある行だけ**（確認ダイアログの件数を実際に変わる数に合わせる）。
-    fn reserved_dismissals(&self) -> (BTreeSet<CandidateKey>, BTreeSet<CandidateKey>) {
+    pub(super) fn reserved_dismissals(&self) -> (BTreeSet<CandidateKey>, BTreeSet<CandidateKey>) {
         let dismiss = self.pending.dismiss.clone();
         let mut undismiss = self.pending.undismiss.clone();
         undismiss.extend(
@@ -288,7 +288,7 @@ impl App {
     ///
     /// **予約は候補の同一性で持ち、辺はここで作る**——引数を絞るかどうかは辺の形を変えるが、
     /// ユーザーが指している行は同じだからである（[`CandidateKey`]のdoc）。
-    fn reserved_edges(&self) -> (Vec<EdgeRef>, Vec<EdgeRef>) {
+    pub(super) fn reserved_edges(&self) -> (Vec<EdgeRef>, Vec<EdgeRef>) {
         let approve = self
             .pending
             .observed

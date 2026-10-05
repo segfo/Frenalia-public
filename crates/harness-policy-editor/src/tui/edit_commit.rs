@@ -45,10 +45,10 @@ impl App {
             self.status = "開いている記録がありません".to_string();
             return;
         }
-        // 位置ごとのドメインの記録は、ドメインごとのファイルの宣言と位置の辺を1回の確定で書く（P4.5 の
-        // `position_approve`）。それまでは何も書かずに理由を言う（`B-32`。寿命: P4.5 でこの分岐を消す）。
-        if self.view.as_ref().is_some_and(|view| view.by_position()) {
-            self.status = "位置ごとのドメインの記録の承認は P4.5 で1回の確定にまとめます。いまは書けません".to_string();
+        // 位置ごとのドメインの記録は、ドメインごとのファイルの宣言と位置の辺を1回の確定で書く（P4.5。
+        // `super::position_commit`。書く先はドメイン欄ではなく候補ごとのドメイン）。
+        if self.is_position_record() {
+            self.request_position_commit();
             return;
         }
         // **取り消しだけの確定も通す。** チェックを外す操作は`accepted`を増やさないので、

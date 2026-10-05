@@ -424,7 +424,8 @@ pub fn verdicts(
                 if at.is_none() || verdicts[index].is_some() {
                     continue;
                 }
-                if let Some(detail) = lands_elsewhere(&graph, &edges[index], &workspace) {
+                let add = &edges[index];
+                if let Some(detail) = lands_elsewhere(&graph, &add.from_domain, &add.edge, &workspace) {
                     verdicts[index] = Some(EdgeVerdict::Rejected { detail });
                 }
             }
@@ -437,23 +438,29 @@ pub fn verdicts(
         .collect()
 }
 
-/// 書いた後の判定器で、その辺の起動（引数はリテラルならその綴り、任意なら空）が辺の遷移先に着くか。
-/// 着かなければ理由（`None`は着く）。
-fn lands_elsewhere(graph: &TransitionGraph, add: &EdgeToAdd, workspace: &str) -> Option<String> {
-    let ExeMatcher::Literal(exe) = &add.edge.exe else {
+/// 書いた後の判定器で、`from`から辺`edge`の起動（引数はリテラルならその綴り、任意なら空）が辺の遷移先に着くか。
+/// 着かなければ理由（`None`は着く）。位置の行の判定（[`verdicts`]）と確定（`crate::position_approve`）が同じこれを
+/// 通す（P3b の注意2。`B-05`）。
+pub(crate) fn lands_elsewhere(
+    graph: &TransitionGraph,
+    from: &str,
+    edge: &transition::TransitionEdge,
+    workspace: &str,
+) -> Option<String> {
+    let ExeMatcher::Literal(exe) = &edge.exe else {
         return None;
     };
-    let command_line = match &add.edge.argv {
+    let command_line = match &edge.argv {
         ArgvMatcher::Literal(line) => line.as_str(),
         _ => "",
     };
     match graph.resolve(SpawnAttempt {
-        from_domain: &add.from_domain,
+        from_domain: from,
         exe,
         command_line,
         cwd: workspace,
     }) {
-        Resolution::Allowed(allowed) if allowed.to == add.edge.to => None,
+        Resolution::Allowed(allowed) if allowed.to == edge.to => None,
         Resolution::Allowed(allowed) => Some(format!(
             "書いた後の宣言では {} へ遷移します（既にある辺と重なる）",
             allowed.to

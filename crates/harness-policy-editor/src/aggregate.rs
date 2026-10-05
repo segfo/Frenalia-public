@@ -678,14 +678,29 @@ pub fn render_notes(aggregate: &Aggregate) -> String {
 pub fn render(aggregate: &Aggregate, limit: usize) -> String {
     let mut out = render_notes(aggregate);
     let proposals = aggregate.proposals();
+    render_candidates(&mut out, &proposals, &vec![None; proposals.len()], limit);
+    out
+}
 
+/// 候補一覧（[`render`]の後半）。`domains`は`proposals`と同じ並びで、`Some`の行には書く先のドメインを`[<名前>]`で
+/// 添える（位置ごとのドメインの記録。`crate::position_candidates::render`）。全部`None`なら今までの綴りのまま。
+pub fn render_candidates(
+    out: &mut String,
+    proposals: &[harness_policy::RuleProposal],
+    domains: &[Option<String>],
+    limit: usize,
+) {
     out.push_str("\n許可ルールの候補（観測された値そのまま）:\n");
     if proposals.is_empty() {
         out.push_str("  （候補なし）\n");
     }
-    for proposal in proposals.iter().take(limit) {
+    for (proposal, domain) in proposals.iter().zip(domains).take(limit) {
+        let domain = domain
+            .as_deref()
+            .map(|name| format!("[{name}] "))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "  {:<8} {} = {}  （観測 {}回）\n",
+            "  {:<8} {domain}{} = {}  （観測 {}回）\n",
             proposal.id,
             proposal.key.dotted(),
             proposal.value,
@@ -701,8 +716,6 @@ pub fn render(aggregate: &Aggregate, limit: usize) -> String {
             proposals.len() - limit
         ));
     }
-
-    out
 }
 
 /// 観測したプロセスツリーを整形する（記録対象が何を起動したかの俯瞰）。

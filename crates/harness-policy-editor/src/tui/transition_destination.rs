@@ -136,8 +136,14 @@ impl App {
                 plan.to_domain
             ));
         }
-        lines.extend(outlook_from_table(&self.pending, &plan.to_domain).notice_lines(&plan.to_domain));
+        lines.extend(self.outlook_notice_lines(&plan.to_domain));
         lines
+    }
+
+    /// 遷移先`to_domain`を`harness.exe`が用意する見込みの説明（表を引くだけ）。平らな一覧の確定と、位置ごとのドメインの
+    /// 確定（`tui::position_commit`。拒否からの予約の遷移先）が同じこれを出す。
+    pub(crate) fn outlook_notice_lines(&self, to_domain: &str) -> Vec<String> {
+        outlook_from_table(&self.pending, to_domain).notice_lines(to_domain)
     }
 
     /// 足す辺があるのに遷移先が空なら、理由を言って`None`（**何も書かない**。`B-32`）。
