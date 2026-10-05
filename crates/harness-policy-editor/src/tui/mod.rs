@@ -80,6 +80,8 @@ pub mod record_screen;
 mod scroll;
 /// 画面の文章をマウスで選んでクリップボードへ写す（2026-10-03。部品は`harness_term::select`・`clipboard`）。
 mod select;
+/// 選択中の記録セッションの候補（`SessionView`）。2026-10-05に`state`から移した。
+mod session_view;
 mod text_input;
 /// [段階⑦] 承認待ち画面（`F2`）の遷移2タブの状態遷移。
 pub mod transition;
