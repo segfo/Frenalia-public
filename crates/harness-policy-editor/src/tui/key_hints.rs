@@ -78,10 +78,8 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
         Screen::Edit if app.shows_positions() => {
             let positions = app.pending.positions.as_ref();
             keys.push(press("Space 選ぶ/外す", KeyCode::Char(' ')));
-            match positions.map_or(0, |p| p.approve.len()) {
-                0 => keys.push(press("a 確定", KeyCode::Char('a'))),
-                reserved => keys.push(press(format!("a 確定（{reserved}件）"), KeyCode::Char('a'))),
-            }
+            // 位置の木は位置ごとのドメインの記録にしか出ないので、`a`はいつも全タブの確定（P4.5）。
+            keys.push(position_commit_hint(app));
             keys.push(press("u 引数の広さ", KeyCode::Char('u')));
             keys.push(press("Tab 遷移先", KeyCode::Tab));
             if let Some(positions) = positions {
@@ -98,7 +96,9 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
         Screen::Edit if app.pending.tab.0.is_transition() => {
             keys.push(press("Space 選ぶ/外す", KeyCode::Char(' ')));
             let reserved = app.pending.reserved_count();
-            if reserved == 0 {
+            if app.is_position_record() {
+                keys.push(position_commit_hint(app));
+            } else if reserved == 0 {
                 keys.push(press("a 確定", KeyCode::Char('a')));
             } else {
                 // 予約件数を出す（何件書かれるのかが確定の直前まで見えている必要がある）。
@@ -134,7 +134,11 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
                 KeyCode::Char('f'),
             ));
             keys.push(press("t プロセスツリー", KeyCode::Char('t')));
-            keys.push(press("a 承認", KeyCode::Char('a')));
+            if app.is_position_record() {
+                keys.push(position_commit_hint(app));
+            } else {
+                keys.push(press("a 承認", KeyCode::Char('a')));
+            }
         }
         // 宣言画面の遷移のタブ（2026-10-05、決定65 Q12）。並べ方は承認待ちの遷移タブと同じく、予約を変えるキーと
         // 書くキーを先頭に置く（幅が足りないと末尾から落ちる）。ファイル・通信のタブにしか効かないキー
@@ -155,6 +159,8 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
         Screen::Declared => {
             keys.push(press("Esc 記録画面へ", KeyCode::Esc));
             keys.push(shown("↑↓ 選択"));
+            // 押せば効くのに案内に無かった（説明欄だけが言っていた。2026-10-05、P4.7）。並びは候補画面と同じ。
+            keys.push(shown("→← 展開/折畳"));
             keys.push(press("Space 取り消しを予約", KeyCode::Char(' ')));
             // 一括の操作はクリックに付けない（`tui::pointer`のモジュールdoc）。
             keys.push(shown("A 全件"));
@@ -195,6 +201,16 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
         }
     }
     keys
+}
+
+/// 位置ごとのドメインの記録の`a`——承認待ちの**どのタブでも**、全タブの予約を1つの確認ダイアログにまとめて書く
+/// （`tui::position_commit`）。件数は全タブの合計を出す。そのタブの予約だけを数えると、別のタブの予約も一緒に
+/// 書かれることがキー案内から見えない（予約件数を出すのは、何件書かれるかを確定の直前まで見せるため）。
+fn position_commit_hint(app: &App) -> KeyHint {
+    match app.position_reserved_count() {
+        0 => press("a 確定（全タブ）", KeyCode::Char('a')),
+        reserved => press(format!("a 確定（全タブで{reserved}件）"), KeyCode::Char('a')),
+    }
 }
 
 /// 「記録」の枠の右の枠付きのボタン1つ（[`record_buttons`]。`harness_term::button::Framed`で描く）。

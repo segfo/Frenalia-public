@@ -110,6 +110,16 @@ impl App {
             || self.current_positions().is_some()
     }
 
+    /// 位置ごとのドメインの記録で`a`が1つの確認にまとめる予約の件数（承認待ちの全タブの合計。キー案内に出す）。
+    /// 数えるのは`commit_inputs`が拾う予約と同じもの——候補の選択・`R`・取り消し・遷移の予約と却下・位置。
+    pub(crate) fn position_reserved_count(&self) -> usize {
+        self.accepted.len()
+            + self.recursive.len()
+            + self.unapproved.len()
+            + self.pending.reserved_count()
+            + self.current_positions().map_or(0, |p| p.approve.len())
+    }
+
     /// 選んでいる記録の位置の行（**記録を替えた後の古い状態は返さない**——位置の鍵と付け替えは記録ごとに作り直すので、
     /// 別の記録の行を指しうる）。
     pub(crate) fn current_positions(&self) -> Option<&PositionsState> {

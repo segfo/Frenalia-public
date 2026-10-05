@@ -245,10 +245,14 @@ fn notes_text(app: &App, positions: &PositionsState) -> String {
     if positions.editing.is_some() {
         text.push_str("遷移先の名前を入力中です（Enter で決める・空のまま Enter でやめる）。\n");
     } else if positions.approve.is_empty() {
-        text.push_str("Spaceで選ぶ／Tabで遷移先／uで引数の広さ／fで表示の切替／rで読み直し。\n");
+        text.push_str(
+            "Spaceで選ぶ／Tabで遷移先／uで引数の広さ／fで表示の切替／rで読み直し／aで確定\
+             （承認待ちの全タブの予約をまとめて書きます）。\n",
+        );
     } else {
         text.push_str(&format!(
-            "位置 {}件を予約中（位置ごとの承認は P4.5 で1回の確定にまとめます。いまは a で書けません）。\n",
+            "位置 {}件を予約中（aを押すまで何も書きません。a は FS/ネットのタブで選んだファイルの宣言・\
+             拒否からの予約も一緒に、policy.json へ1回で書きます）。\n",
             positions.approve.len()
         ));
     }

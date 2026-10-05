@@ -2512,7 +2512,9 @@ fn the_help_can_be_scrolled_to_its_last_line_with_the_wheel() {
         "台本の前提が崩れた（ヘルプが入り切っている）"
     );
     let mut grid = first;
-    for _ in 0..60 {
+    // 回す回数はヘルプの長さから決める（1刻みで1行以上送り、1行は折り返しても2行に収まる）。固定の60回だった頃、
+    // P4.7 でヘルプが伸びて最後まで届かなくなった。
+    for _ in 0..HELP_TEXT.lines().count() * 2 {
         grid = wheel_and_draw(&mut app, size, (0, size.1 - 1), false);
     }
     let inner = box_inner(&grid, " ヘルプ");
@@ -2812,6 +2814,556 @@ fn the_same_path_in_two_domains_shows_two_rows() {
         tree_rows(&app.declared_tree, &app.declared_expanded),
         vec![(0, SHARED.to_string())]
     );
+}
+
+// ---------------------------------------------------------------------------
+// キーの説明の3か所（ヘルプ・キー案内・注記）がずれない（`plans/position-domains/P4.md`の P4.7）
+// ---------------------------------------------------------------------------
+
+/// どの画面にも効く操作を書いたヘルプの節（`F1`〜`F3`・タブの巡回・`Esc`・`↑↓`）。
+const HELP_COMMON: &str = "画面の行き来";
+
+/// ヘルプ（`HELP_TEXT`）の節——見出しの行から、次の空行の手前まで。見出しは行頭が`heading`で始まる行で、**ちょうど1つ**。
+fn help_section(heading: &str) -> Vec<&'static str> {
+    let lines: Vec<&'static str> = HELP_TEXT.lines().collect();
+    let starts: Vec<usize> = (0..lines.len())
+        .filter(|i| lines[*i].starts_with(heading))
+        .collect();
+    assert_eq!(
+        starts.len(),
+        1,
+        "ヘルプに見出し「{heading}」で始まる行がちょうど1つではない（{}行）",
+        starts.len()
+    );
+    lines[starts[0]..]
+        .iter()
+        .take_while(|line| !line.is_empty())
+        .copied()
+        .collect()
+}
+
+/// 節に語として出る綴り（空白・句読点・括弧・強調の`*`で切る）。
+fn help_words(section: &[&str]) -> std::collections::BTreeSet<String> {
+    const BREAKS: &str = "／/、。（）()・「」，,：:；;*";
+    section
+        .iter()
+        .flat_map(|line| line.split(|c: char| c.is_whitespace() || BREAKS.contains(c)))
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// 節が**操作として挙げる英字1文字のキー**——行頭が空白2つの行の先頭の語と、その行の中で空白3つ以上の後ろに来る語
+/// （`  f 一覧の範囲   t プロセスツリー   a 承認`なら`f`・`t`・`a`）。説明の文の中で触れただけのキーは数えない。
+fn help_letter_entries(section: &[&str]) -> std::collections::BTreeSet<String> {
+    let mut letters = std::collections::BTreeSet::new();
+    for line in section {
+        let Some(rest) = line.strip_prefix("  ") else {
+            continue;
+        };
+        if rest.starts_with(' ') {
+            continue;
+        }
+        for segment in rest.split("   ") {
+            if let Some(word) = segment.split_whitespace().next() {
+                if word.len() == 1 && word.chars().all(|c| c.is_ascii_alphabetic()) {
+                    letters.insert(word.to_string());
+                }
+            }
+        }
+    }
+    letters
+}
+
+/// キー案内の項目のキーの部分（`a 確定（3件）`→`a`、`↑↓ 選択`→`↑↓`）。
+fn hint_key(label: &str) -> String {
+    label.split_whitespace().next().unwrap_or_default().to_string()
+}
+
+/// `key`が節の語に出るか。`↑↓`・`→←`のような矢印の組は、組のままでも1つずつ（`→`・`←`）でもよい。
+fn help_mentions(words: &std::collections::BTreeSet<String>, key: &str) -> bool {
+    let arrows = key.chars().count() > 1 && key.chars().all(|c| "↑↓→←".contains(c));
+    words.contains(key) || (arrows && key.chars().all(|c| words.contains(&c.to_string())))
+}
+
+fn fresh_app(ws: &std::path::Path) -> App {
+    App::new(ws.to_path_buf(), harness_core::RequireSandbox::None)
+}
+
+/// 位置の情報がある記録（ユーザーの例）を選び、承認待ちの「遷移・観測から」で位置の木を出した状態。
+fn positions_app(ws: &std::path::Path) -> App {
+    let mut app = fresh_app(ws);
+    press(&mut app, KeyCode::F(2));
+    press(&mut app, KeyCode::F(2));
+    assert!(app.shows_positions(), "位置の木が出ていない: {}", app.status);
+    app
+}
+
+/// `alpha`が`C:/data/a`・`C:/data/b`を読み、`workspace-shell`が`pwsh.exe`で`pwsh`へ遷移する`policy.json`。
+/// どちらの宣言もこのマシンでは未承認（試験の承認台帳はスレッドごとの空の一時ファイル）。
+fn seed_declared_policy(ws: &std::path::Path) {
+    use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
+    let mut alpha = crate::policy_file::PolicyDomain::new("alpha");
+    alpha.fs.read = vec!["C:/data/a".to_string(), "C:/data/b".to_string()];
+    let mut shell = crate::policy_file::PolicyDomain::new(crate::policy_file::ENTRY_DOMAIN);
+    shell.process.transitions.push(editor_edge(
+        "C:/Program Files/PowerShell/7/pwsh.exe",
+        ArgvMatcher::Any(AnyMarker),
+        "pwsh",
+    ));
+    let file = crate::policy_file::PolicyFile {
+        schema_version: crate::policy_file::POLICY_SCHEMA_VERSION,
+        domains: vec![alpha, shell, crate::policy_file::PolicyDomain::new("pwsh")],
+    };
+    crate::policy_file::save(ws, &file).expect("policy.json");
+}
+
+/// キー案内の項目が違う状態の全部と、それを説明するヘルプの節の見出し（**表はここ1つ**）。
+///
+/// 同じ画面・タブでも状態で項目が増えるもの（記録を終えた後の`F2`とホイール・未承認の宣言があるときの`y`）は、
+/// 増えた状態も並べる——増えた項目だけがヘルプから漏れても見つけられるように。
+fn help_cases(
+    ws: &std::path::Path,
+    positions_ws: &std::path::Path,
+    declared_ws: &std::path::Path,
+) -> Vec<(&'static str, App, &'static str)> {
+    let record = fresh_app(ws);
+    let mut finished = fresh_app(ws);
+    finished.run = Some(crate::tui::state::RunState::new(crate::tui::state::Pass::One));
+    finished.run.as_mut().expect("run").finished = true;
+    let mut edit = fresh_app(ws);
+    edit.screen = Screen::Edit;
+    let mut observed = fresh_app(ws);
+    observed.screen = Screen::Edit;
+    observed.pending.tab = transition::Tab(transition::PendingTab::TransitionsObserved);
+    let mut denied = fresh_app(ws);
+    denied.screen = Screen::Edit;
+    denied.pending.tab = transition::Tab(transition::PendingTab::TransitionsDenied);
+    crate::position_view::position_view_tests::seed_position_record(
+        positions_ws,
+        "s1",
+        &crate::position_view::position_view_tests::user_example(),
+    );
+    let positions = positions_app(positions_ws);
+    let mut declared = fresh_app(ws);
+    declared.screen = Screen::Declared;
+    seed_declared_policy(declared_ws);
+    let mut not_approved = fresh_app(declared_ws);
+    press(&mut not_approved, KeyCode::F(3));
+    assert!(
+        !not_approved.declared_approval.not_approved.is_empty(),
+        "未承認の宣言が無い（y の案内が出ない）"
+    );
+    let mut declared_transitions = fresh_app(declared_ws);
+    press(&mut declared_transitions, KeyCode::F(3));
+    press(&mut declared_transitions, KeyCode::F(3));
+    assert!(declared_transitions.declared_transitions.tab.is_transitions());
+    vec![
+        ("記録", record, "記録画面（F1）"),
+        ("記録（記録を終えた後）", finished, "記録画面（F1）"),
+        ("承認待ち・FS/ネット", edit, "承認待ちの「FS/ネット」タブ"),
+        ("承認待ち・遷移（観測から）", observed, "承認待ちの「遷移」タブ"),
+        ("承認待ち・遷移（拒否から）", denied, "承認待ちの「遷移」タブ"),
+        ("承認待ち・位置の木", positions, "承認待ちの「遷移・観測から」"),
+        ("宣言・ファイル・通信", declared, "宣言画面（F3）"),
+        ("宣言・ファイル・通信（未承認あり）", not_approved, "宣言画面（F3）"),
+        ("宣言・遷移", declared_transitions, "宣言画面の「遷移」タブ"),
+    ]
+}
+
+/// **キー案内に出るキーは、その画面のヘルプの節にも出る。ヘルプの節が操作として挙げる英字のキーは、その画面の
+/// キー案内にも出る**（両方向）。
+///
+/// # 壊れた状態を一文で
+///
+/// キーの説明は3か所（ヘルプ・キー案内・注記）にあり、どれか1つだけが古くなる。実際に、FS/ネットのタブのヘルプが
+/// 実装の無い`r（読み直し）`を挙げ、宣言画面の`r`はキー案内にだけあってヘルプに無く、P4.2〜P4.6 で増えた宣言画面の
+/// 遷移タブ・位置の木はヘルプのどこにも無かった（2026-10-05に見つけた）。
+///
+/// # 限界
+///
+/// - 逆の向き（ヘルプ→キー案内）は**英字1文字のキー**だけを見る。`Enter`（記録の開始。キー案内ではなく枠の右の
+///   ボタン）・`←`/`→`のように、キー案内に出さないことにした名前のキーがあるため。
+/// - 見ているのはキーの綴りが節に出るかで、説明の中身が実装と合っているかは見ない（中身は各画面の試験が固定する）。
+/// - 注記（説明欄）は状態で文が変わるので、この表には入れていない。
+#[test]
+fn every_key_hint_appears_in_the_help_section_of_its_screen() {
+    let (ws, positions_ws, declared_ws) = (workspace(), workspace(), workspace());
+    let cases = help_cases(ws.path(), positions_ws.path(), declared_ws.path());
+    let common = help_words(&help_section(HELP_COMMON));
+    let mut problems = Vec::new();
+    let mut hinted: std::collections::BTreeMap<&str, std::collections::BTreeSet<String>> =
+        Default::default();
+    for (name, app, heading) in &cases {
+        let words = help_words(&help_section(heading));
+        for hint in screen_keys(app) {
+            let key = hint_key(&hint.label);
+            if !help_mentions(&words, &key) && !help_mentions(&common, &key) {
+                problems.push(format!(
+                    "{name}: キー案内の「{}」の {key} が、ヘルプの節「{heading}」にも「{HELP_COMMON}」にも無い",
+                    hint.label
+                ));
+            }
+            hinted.entry(heading).or_default().insert(key);
+        }
+    }
+    for (heading, keys) in &hinted {
+        for letter in help_letter_entries(&help_section(heading)) {
+            if !keys.contains(&letter) {
+                problems.push(format!(
+                    "ヘルプの節「{heading}」が {letter} を操作として挙げるが、その画面のキー案内のどの状態にも無い"
+                ));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "ヘルプとキー案内がずれている:\n{}",
+        problems.join("\n")
+    );
+}
+
+/// 予約の件数（許可を足す予約, 許可を減らす予約）。
+///
+/// - 足す: 候補の選択（`accepted`）・`R`の再帰・遷移の承認の予約・位置の予約・このマシンでの承認の予約
+/// - 減らす: 宣言の取り消し（`unapproved`）・遷移の辺の取り消し（承認待ちと宣言画面の遷移タブ）
+/// - 数えない: 却下（表示だけの印）・引数の絞り・遷移先の付け替え・種類や`**`の付け替え（宣言を足しも消しもしない。
+///   付け替えが広げる向きかは、付け替えの確認ダイアログが言う）
+fn reservation_sizes(app: &App) -> (usize, usize) {
+    let adds = app.accepted.len()
+        + app.recursive.len()
+        + app.pending.approve.len()
+        + app.pending.positions.as_ref().map_or(0, |p| p.approve.len())
+        + app.declared_approval.reserved.len();
+    let removes =
+        app.unapproved.len() + app.pending.remove.len() + app.declared_transitions.remove.len();
+    (adds, removes)
+}
+
+const TOOL_X: &str = "C:/tools/x.exe";
+const TOOL_Y: &str = "C:/tools/y.exe";
+
+/// 承認待ちの状態（位置の情報が無いパス1の記録）: FS の候補2件（`a.txt`だけ宣言済み）・観測した生成2件と
+/// 入口のドメインからの拒否2件（どちらも`x.exe`だけ宣言済み）。宣言済みの行と未宣言の行の両方を持たせる——
+/// `Space`のように行の状態で向きが変わるキーを、片方の行だけで測らないため。
+fn pending_fixture() -> tempfile::TempDir {
+    use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher, TransitionDenial};
+    use harness_sandbox::tier2a::policy_learnd::observed::{observed_path, ObservedRecord, Spawn};
+    use harness_sandbox::tier2a::spawnd::transitions::{pending_path, Denial, PendingRecord};
+    use harness_sandbox::tier2a::spawnd::DenyReason;
+
+    let ws = workspace();
+    let dir = RecordSessionDir::create(ws.path(), "s1").expect("session dir");
+    let mut manifest = RecordManifest::new("s1", "cargo build", ws.path(), ws.path(), 100);
+    manifest.status = RecordStatus::Finished;
+    manifest.collector_started = true;
+    manifest.etw_available = true;
+    manifest.exit_code = Some(0);
+    dir.write_manifest(&manifest).expect("manifest");
+    let mut log = String::new();
+    for (index, path) in [r"C:\data\a.txt", r"C:\data\b.txt"].iter().enumerate() {
+        let event = harness_policy::FsAuditEvent::observed(
+            harness_policy::FsAuditKind::Etw,
+            *path,
+            harness_config::FsAccess::Read,
+            true,
+            "record_all",
+            index as u64 + 1,
+        );
+        log.push_str(&event.to_jsonl_line().expect("jsonl"));
+        log.push('\n');
+    }
+    std::fs::write(dir.audit_log_path(), log).expect("audit log");
+
+    // 宣言する値は候補の綴りそのもの（候補の綴りの規則に依らない）。ドメインは記録のコマンドから決まる名前。
+    let mut probe = fresh_app(ws.path());
+    press(&mut probe, KeyCode::F(2));
+    let value = probe
+        .view
+        .as_ref()
+        .expect("view")
+        .proposals
+        .iter()
+        .find(|p| p.value.ends_with("a.txt"))
+        .expect("a.txt の候補")
+        .value
+        .clone();
+    let mut cargo = crate::policy_file::PolicyDomain::new("cargo");
+    cargo.fs.read.push(value);
+    let mut shell = crate::policy_file::PolicyDomain::new(crate::policy_file::ENTRY_DOMAIN);
+    shell
+        .process
+        .transitions
+        .push(editor_edge(TOOL_X, ArgvMatcher::Any(AnyMarker), "child"));
+    let file = crate::policy_file::PolicyFile {
+        schema_version: crate::policy_file::POLICY_SCHEMA_VERSION,
+        domains: vec![
+            cargo,
+            shell,
+            crate::policy_file::PolicyDomain::new("child"),
+        ],
+    };
+    crate::policy_file::save(ws.path(), &file).expect("policy.json");
+
+    let observed = observed_path(ws.path());
+    std::fs::create_dir_all(observed.parent().expect("parent")).expect("transitions dir");
+    let mut text = String::new();
+    for exe in [TOOL_X, TOOL_Y] {
+        let record = ObservedRecord::ObservedSpawn(Spawn {
+            parent_exe: Some("C:/pwsh.exe".to_string()),
+            exe: exe.to_string(),
+            argv: "x".to_string(),
+            count: 1,
+            first_ts: 1,
+            last_ts: 1,
+            argv_truncation: false,
+        });
+        text.push_str(&serde_json::to_string(&record).expect("json"));
+        text.push('\n');
+    }
+    std::fs::write(&observed, text).expect("observed.jsonl");
+
+    let mut text = String::new();
+    for exe in [TOOL_X, TOOL_Y] {
+        let record = PendingRecord::DeniedByDaemon(Denial {
+            from_domain: Some(crate::policy_file::ENTRY_DOMAIN.to_string()),
+            exe: exe.to_string(),
+            argv: "x".to_string(),
+            cwd: None,
+            reason: DenyReason::Transition {
+                denial: TransitionDenial::NoMatchingEdge,
+            },
+            count: 1,
+            first_ts: 1,
+            last_ts: 1,
+            argv_truncation: false,
+        });
+        text.push_str(&serde_json::to_string(&record).expect("json"));
+        text.push('\n');
+    }
+    std::fs::write(pending_path(ws.path()), text).expect("pending.jsonl");
+    ws
+}
+
+/// 測るタブ1つ: 画面・タブの名前・行の数・`row`行目を選んだ状態の`App`を作る関数（キーを押すたびに作り直す）。
+type TabProbe<'a> = (&'static str, &'static str, usize, Box<dyn Fn(usize) -> App + 'a>);
+
+fn tab_probe<'a>(
+    screen: &'static str,
+    tab: &'static str,
+    make: impl Fn(usize) -> App + 'a,
+    rows: impl FnOnce(&App) -> usize,
+) -> TabProbe<'a> {
+    let count = rows(&make(0));
+    assert!(count > 0, "{screen}・{tab}: 行が無い（測れない）");
+    (screen, tab, count, Box::new(make))
+}
+
+/// **同じ画面のタブ同士で、同じキーが「許可を足す」と「許可を減らす」の逆の向きを持たない**（決定62の約束——
+/// `plans/POLICY-EDITOR-TOMOYO-DIG.md`の決定62「却下印の永続化を実装した」の表の1が`d`を避けた理由と、同節の問題2）。
+///
+/// # 向きは押して測る
+///
+/// 各タブの各行で、英字と`Space`を1つずつ、**作り直した`App`に**押し、予約の件数（[`reservation_sizes`]）がどちらへ
+/// 増えたかで向きを決める。`Space`のように行の状態で向きが変わるキー（未宣言の行なら足す・宣言済みの行なら取り消す）は
+/// 「行による」で、足すだけのタブとも減らすだけのタブとも衝突しない——逆にするのは、あるタブで足すだけ、別のタブで
+/// 減らすだけのキーである。測った向きは下の表と比べる（表はキーの約束を読むためのもので、押した結果と食い違えば赤）。
+///
+/// # 対象外
+///
+/// 画面をまたぐ食い違い（承認待ちの`a`は足す確定、宣言画面の`a`は取り消しの確定。決定62の問題2）は画面が違うので
+/// 数えない（手付かずのまま）。`a`はどのタブでも確認ダイアログを出すだけで、予約は変えない。
+#[test]
+fn no_key_has_opposite_directions_in_two_tabs_of_one_screen() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const ADDS: &str = "足す";
+    const REMOVES: &str = "減らす";
+    const BY_ROW: &str = "行による";
+    // キーの向きの表（向きを持たないキーは書かない）。
+    const EXPECTED: &[(&str, &str, char, &str)] = &[
+        ("承認待ち", "FS/ネット", ' ', BY_ROW),
+        ("承認待ち", "FS/ネット", 'd', BY_ROW),
+        ("承認待ち", "FS/ネット", 'R', ADDS),
+        ("承認待ち", "遷移・観測から", ' ', BY_ROW),
+        ("承認待ち", "遷移・拒否から", ' ', BY_ROW),
+        ("承認待ち", "位置の木", ' ', ADDS),
+        ("宣言", "ファイル・通信", ' ', REMOVES),
+        ("宣言", "ファイル・通信", 'A', REMOVES),
+        ("宣言", "ファイル・通信", 'y', ADDS),
+        ("宣言", "遷移", ' ', REMOVES),
+    ];
+
+    let pending = pending_fixture();
+    let positions = workspace();
+    crate::position_view::position_view_tests::seed_position_record(
+        positions.path(),
+        "s1",
+        &crate::position_view::position_view_tests::user_example(),
+    );
+    let declared = workspace();
+    seed_declared_policy(declared.path());
+
+    let pending_tab = |presses: usize, row: usize| {
+        let mut app = fresh_app(pending.path());
+        for _ in 0..presses {
+            press(&mut app, KeyCode::F(2));
+        }
+        app.pending.filter = transition::PendingFilter::All;
+        *app.pending.row_mut() = row;
+        app
+    };
+    let probes = vec![
+        tab_probe(
+            "承認待ち",
+            "FS/ネット",
+            |row| {
+                let mut app = fresh_app(pending.path());
+                press(&mut app, KeyCode::F(2));
+                app.edit_focus = crate::tui::state::EditField::Proposals;
+                app.selected_row = row;
+                app
+            },
+            |app| app.tree.rows(&app.expanded).len(),
+        ),
+        tab_probe(
+            "承認待ち",
+            "遷移・観測から",
+            |row| pending_tab(2, row),
+            |app| app.pending.visible().len(),
+        ),
+        tab_probe(
+            "承認待ち",
+            "遷移・拒否から",
+            |row| pending_tab(3, row),
+            |app| app.pending.visible().len(),
+        ),
+        tab_probe(
+            "承認待ち",
+            "位置の木",
+            |row| {
+                let mut app = positions_app(positions.path());
+                app.pending.positions.as_mut().expect("位置の木").row = row;
+                app
+            },
+            |app| app.pending.positions.as_ref().map_or(0, |p| p.visible().len()),
+        ),
+        tab_probe(
+            "宣言",
+            "ファイル・通信",
+            |row| {
+                let mut app = fresh_app(declared.path());
+                press(&mut app, KeyCode::F(3));
+                app.declared_row = row;
+                app
+            },
+            |app| app.declared_tree.rows(&app.declared_expanded).len(),
+        ),
+        tab_probe(
+            "宣言",
+            "遷移",
+            |row| {
+                let mut app = fresh_app(declared.path());
+                press(&mut app, KeyCode::F(3));
+                press(&mut app, KeyCode::F(3));
+                app.declared_transitions.row = row;
+                app
+            },
+            |app| app.declared_transitions.rows().len(),
+        ),
+    ];
+
+    let keys: Vec<char> = std::iter::once(' ').chain('a'..='z').chain('A'..='Z').collect();
+    let mut measured: BTreeMap<(&str, &str, char), BTreeSet<&str>> = BTreeMap::new();
+    for (screen, tab, rows, make) in &probes {
+        for row in 0..*rows {
+            for key in &keys {
+                let mut app = make(row);
+                let before = reservation_sizes(&app);
+                press(&mut app, KeyCode::Char(*key));
+                let after = reservation_sizes(&app);
+                let entry = measured.entry((*screen, *tab, *key)).or_default();
+                if after.0 > before.0 {
+                    entry.insert(ADDS);
+                }
+                if after.1 > before.1 {
+                    entry.insert(REMOVES);
+                }
+            }
+        }
+    }
+    let directions: BTreeSet<(&str, &str, char, &str)> = measured
+        .into_iter()
+        .filter_map(|((screen, tab, key), seen)| {
+            let direction = match (seen.contains(ADDS), seen.contains(REMOVES)) {
+                (true, true) => BY_ROW,
+                (true, false) => ADDS,
+                (false, true) => REMOVES,
+                (false, false) => return None,
+            };
+            Some((screen, tab, key, direction))
+        })
+        .collect();
+
+    // 約束: 同じ画面で、足すだけのタブと減らすだけのタブを持つキーが無い。
+    let mut conflicts = Vec::new();
+    for (screen, tab, key, direction) in &directions {
+        if *direction != ADDS {
+            continue;
+        }
+        for (other_screen, other_tab, other_key, other) in &directions {
+            if other_screen == screen && other_key == key && *other == REMOVES {
+                conflicts.push(format!(
+                    "{screen}: 「{key}」が {tab} では足し、{other_tab} では減らす"
+                ));
+            }
+        }
+    }
+    assert!(
+        conflicts.is_empty(),
+        "同じ画面のタブで逆の向きを持つキーがある（決定62）:\n{}",
+        conflicts.join("\n")
+    );
+    let expected: BTreeSet<(&str, &str, char, &str)> = EXPECTED.iter().copied().collect();
+    assert_eq!(
+        directions, expected,
+        "押して測ったキーの向きが表と違う（キーを変えたなら表も直し、上の約束を満たすか確かめる）"
+    );
+}
+
+/// **位置ごとのドメインの記録では、承認待ちのどのタブのキー案内も`a`を「全タブ」の確定と言い、全タブの予約の
+/// 合計を出す**（`a`はどのタブでも同じ1回の確定。`tui::position_commit`）。
+///
+/// 対の側（`B-35`）: 位置の情報が無い記録のキー案内は今までどおり（FS/ネットは`a 承認`、遷移は`a 確定（N件）`。
+/// `pointer_tests`の`a_key_hint_does_what_its_key_does`が固定している）。
+#[test]
+fn every_pending_tab_of_a_position_record_says_a_commits_all_tabs() {
+    let ws = workspace();
+    crate::position_view::position_view_tests::seed_position_record(
+        ws.path(),
+        "s1",
+        &crate::position_view::position_view_tests::user_example(),
+    );
+    let mut app = positions_app(ws.path());
+    let a_hint = |app: &App| {
+        screen_labels(app)
+            .into_iter()
+            .find(|label| label.starts_with("a "))
+            .unwrap_or_default()
+    };
+    assert_eq!(a_hint(&app), "a 確定（全タブ）");
+    press(&mut app, KeyCode::Char(' '));
+    assert_eq!(
+        app.pending.positions.as_ref().map_or(0, |p| p.approve.len()),
+        1,
+        "位置を予約できていない: {}",
+        app.status
+    );
+    // 観測（位置の木）→ 拒否 → FS/ネット と回り、どのタブでも同じ件数を言う。
+    for tab in ["位置の木", "遷移・拒否から", "FS/ネット"] {
+        assert_eq!(a_hint(&app), "a 確定（全タブで1件）", "{tab}のタブ");
+        press(&mut app, KeyCode::F(2));
+    }
 }
 
 /// マウスのクリック（`tui::pointer`）の試験。このファイルの描画の道具を使うので、子に置く。

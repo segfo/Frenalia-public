@@ -12,12 +12,12 @@ pub(super) fn print_overview() {
     println!("  中間   FS候補をユーザーが承認して policy.json へ書く");
     println!("  パス2  Tier2a（AppContainer＋WFP＋Proxy）で接続したドメインを記録");
     println!();
-    println!("端末から引数なしで起動すると、記録・編集の2画面のTUIが開きます");
+    println!("端末から引数なしで起動すると、記録・承認待ち・宣言の3画面のTUIが開きます");
     println!("（いま概要が出ているのは、標準入出力が端末ではないためです）。");
     println!();
     println!("使えるコマンド:");
     println!("  record -- <コマンド>        隔離せずに実行し、触ったファイルを記録する（UAC 1回）");
-    println!("  approve --domain <name> --accept <id>...");
+    println!("  approve [--domain <name>] --accept <id>...");
     println!("                              候補を承認して .harness/policy.json へ書く");
     println!(
         "  record-net --domain <name>  Tier2aで実行し、接続したドメインを記録する（UAC 最大2回）"
@@ -32,6 +32,12 @@ pub(super) fn print_overview() {
     println!();
     println!("記録と閲覧は独立したコマンドです。記録し終えてから編集へ進む一方通行ではなく、");
     println!("いつでも記録し直す・別の一般化度合いで見直すことができます。");
+    println!();
+    println!("パス1の記録がプロセスの木（process-audit.jsonl）を持つと、候補は記録した木の位置ごとの");
+    println!("ドメインに分かれます（show は各候補に書く先のドメインを添えます）。approve はそれぞれの");
+    println!("ドメインへファイルの宣言だけを書き、--domain は使えません。policy.json にまだ無い");
+    println!("ドメインの候補はそこへ届く遷移の辺も要るので、TUI の承認待ち（F2）で遷移と一緒に");
+    println!("承認してください（遷移の辺を書くのは TUI だけです）。");
     println!();
     println!("approve は policy.json へ宣言を書き、このマシンの承認台帳へ承認を記録するだけで、");
     println!("ACLは触りません。ACEが付くのは、承認済みのファイル宣言を record-net（パス2）か");

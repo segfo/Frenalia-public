@@ -103,7 +103,7 @@ impl App {
                 net: Some(Box::new(net)),
             };
             let proposals = data.proposals();
-            // 位置ごとのドメインはまだ読まない（P4.4）。全部`None`＝ドメインの段の無い木。
+            // パス2は位置を読まない（process-audit.jsonl を書かない。ドメインごとにするのは作業の一覧の P6）。全部`None`。
             let domains = vec![None; proposals.len()];
             SessionView::new(data, notes, tree, proposals, domains)
         } else {

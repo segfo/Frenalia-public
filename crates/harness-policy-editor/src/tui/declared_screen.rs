@@ -202,7 +202,8 @@ fn notes_text(app: &App) -> String {
     if app.unapproved.is_empty() {
         text.push_str(
             "→←で展開／Spaceでこの配下をまとめて取り消し予約／Aで全件／\
-             cで種類・Rで ** を付け替え（1行ずつ）／aで確定。\n",
+             cで種類・Rで ** を付け替え（1行ずつ）／rで読み直し／aで確定。\
+             F3で遷移のタブ（ドメインごとの辺と遷移の形）へ。\n",
         );
         if !app.declared_approval.not_approved.is_empty() {
             text.push_str(&format!(

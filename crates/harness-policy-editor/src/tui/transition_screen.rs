@@ -481,6 +481,13 @@ fn notes_text(app: &App) -> String {
             pending.undismiss.len()
         ));
     }
+    // 位置ごとのドメインの記録では、この一覧の`a`も全タブの予約を1回で書く（`tui::position_commit`）。
+    if app.is_position_record() {
+        text.push_str(
+            "この記録は位置ごとのドメインの記録です。a は承認待ちの全タブの予約（ファイルの宣言・位置の辺・\
+             この一覧の予約・取り消し・却下）を1つの確認にまとめて書きます。\n",
+        );
+    }
 
     // **読めなかった・あふれた事実を黙らせない**（`B-10`）。
     for note in &app.pending.notes {
