@@ -66,6 +66,9 @@ mod checkbox_tree;
 mod declared;
 mod declared_screen;
 mod edit;
+/// 承認待ち画面（`F2`）のFS/ネットのタブの確定（確認ダイアログを出し、`y`で`policy.json`へ書く。
+/// 2026-10-05に`edit`から移した）。
+mod edit_commit;
 mod edit_screen;
 /// 画面の一番下のキー案内（項目はクリックでそのキーを押せる）。
 mod key_hints;
@@ -80,6 +83,9 @@ mod select;
 mod text_input;
 /// [段階⑦] 承認待ち画面（`F2`）の遷移2タブの状態遷移。
 pub mod transition;
+/// [段階⑦] 遷移タブの確定（確認ダイアログを出し、`y`で`policy.json`と却下印へ書く。
+/// 2026-10-05に`transition`から移した）。
+mod transition_commit;
 /// [段階⑦] 遷移タブで却下した候補の印（`dismissed.json`）。**表示だけに効く**
 /// （強制・`policy.json`・ACL・モデルへの注記のどれにも効かない）。読み書きするのはこの画面だけ。
 pub mod transition_dismissed;
