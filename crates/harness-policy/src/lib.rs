@@ -38,6 +38,9 @@ pub mod generalize;
 pub mod insufficient;
 pub mod normalize;
 pub mod policy_file;
+/// 記録したプロセスの木（`process-audit.jsonl`）の1行分レコード（決定23）。**書く側は昇格した
+/// 収集プロセス、読む側はポリシーエディタ**——[`event`]と同じ理由で定義はここだけに置く。
+pub mod process_event;
 pub mod transition;
 /// [段階6e] 「このドメインから、いま何を起こせるか」の一覧（§19.3.8）。**モデルへ答える
 /// ツールと、段階⑦のエディタ表示が同じものを使う**——2つ作ると見えるものがずれる。

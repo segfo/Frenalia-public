@@ -50,6 +50,14 @@ pub struct FsAuditEvent {
     /// （deny-only収集器が書いたもの）を読んでも失敗しない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_process_id: Option<u32>,
+    /// アクセスしたプロセスのインスタンスの通し番号（`ProcessSequenceNumber`。
+    /// `plans/PLAN-MAC-RECURSIVE-DESCENDANTS.md`決定23(6)）。`process-audit.jsonl`の
+    /// [`crate::process_event::ProcessInstance::seq`]と同じ値で、読む側はこれでインスタンスを引く。
+    ///
+    /// **収集プロセスが書くときに付ける**——読む側が`(pid, 時刻)`で引き直す必要を無くすため
+    /// （pid は使い回される）。この欄の無い古い行・番号を引けなかった行は`None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_sequence_number: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_path: Option<String>,
     /// OSが返したNTSTATUS（record-allの収集器だけが埋める）。
@@ -107,6 +115,7 @@ impl FsAuditEvent {
             reason: reason.into(),
             process_id: None,
             parent_process_id: None,
+            process_sequence_number: None,
             image_path: None,
             status: None,
             timestamp_unix_ms,
@@ -123,6 +132,7 @@ impl FsAuditEvent {
             reason: reason.into(),
             process_id: None,
             parent_process_id: None,
+            process_sequence_number: None,
             image_path: None,
             status: None,
             timestamp_unix_ms,
@@ -137,6 +147,12 @@ impl FsAuditEvent {
 
     pub fn with_parent_process(mut self, parent_pid: u32) -> Self {
         self.parent_process_id = Some(parent_pid);
+        self
+    }
+
+    /// アクセスしたプロセスのインスタンスの通し番号を添える（収集プロセスが使う。決定23(6)）。
+    pub fn with_process_sequence_number(mut self, seq: u64) -> Self {
+        self.process_sequence_number = Some(seq);
         self
     }
 
@@ -220,6 +236,41 @@ mod tests {
         assert_eq!(event.parent_process_id, None);
         assert_eq!(event.image_path, None);
         assert_eq!(event.access, Some(FsAccess::Read));
+    }
+
+    /// **欄の無い古い行も読める**（`process_sequence_number`は決定23(6)で足した欄）。
+    /// 2026-10以前の収集プロセスが書いた`fs-audit.jsonl`を、新しいエディタが開いても壊れない。
+    #[test]
+    fn an_old_fs_audit_line_reads_without_a_sequence_number() {
+        let line = r#"{"kind":"etw","path":"C:/x","access":"read","allowed":true,"reason":"observed","process_id":200,"parent_process_id":100,"image_path":"C:/tools/cargo.exe","status":0,"timestamp_unix_ms":7}"#;
+
+        let event: FsAuditEvent = serde_json::from_str(line).unwrap();
+
+        assert_eq!(event.process_sequence_number, None);
+        assert_eq!(event.process_id, Some(200));
+        assert_eq!(event.parent_process_id, Some(100));
+    }
+
+    /// 通し番号は`with_process_sequence_number`で付けられ、往復する。
+    ///
+    /// 対の側（`B-35`）: **付けない行にはキーが出ない**——既存の行の書式を1バイトも変えない
+    /// （deny-onlyの`--policy-learn`など、番号を付けない書き手の行がそのまま残る）。
+    #[test]
+    fn the_process_sequence_number_round_trips_and_is_omitted_when_absent() {
+        let with_seq =
+            FsAuditEvent::observed(FsAuditKind::Etw, r"C:\x.txt", FsAccess::Read, true, "observed", 1)
+                .with_process(200, None)
+                .with_process_sequence_number(665_736);
+        let line = with_seq.to_jsonl_line().unwrap();
+        assert!(line.contains(r#""process_sequence_number":665736"#), "{line}");
+        let round_tripped: FsAuditEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(round_tripped, with_seq);
+
+        let without_seq =
+            FsAuditEvent::observed(FsAuditKind::Etw, r"C:\x.txt", FsAccess::Read, true, "observed", 1)
+                .with_process(200, None);
+        let line = without_seq.to_jsonl_line().unwrap();
+        assert!(!line.contains("process_sequence_number"), "{line}");
     }
 
     /// `parent_process_id`は`with_parent_process`で付与でき、往復する。
