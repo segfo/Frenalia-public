@@ -1,4 +1,5 @@
-//! 遷移先ドメインの見込みと名前の検査の単体試験。**端末もWin32も要らない。**
+//! 遷移先ドメインの見込みの単体試験。**端末もWin32も要らない。**
+//! （名前の検査の試験は`harness-sandbox`の`tier2a::domain_profile`へ移した）
 //!
 //! 見込みは`harness.exe`の判断（`policy_fs::plan`・`domain_provision`）の写しなので、
 //! **分岐ごとに禁止側と許可側を対で**固定する——写しがずれたときに、どの分岐がずれたかが分かるように。
@@ -182,62 +183,5 @@ fn approving_on_this_machine_turns_the_outlook_into_provisioned() {
     assert_eq!(
         outlook(&file, ENTRY_DOMAIN, "iso", &after),
         Outlook::Provisioned { declarations: 1 }
-    );
-}
-
-// --- 名前 -----------------------------------------------------------------
-
-/// **許可側**: 英数字と`-`の短い名前は使える（接頭辞の写しがずれた日にはここが赤くなる——
-/// そのとき検査は全部の名前を断る側へ外れている）。
-#[test]
-fn a_short_plain_name_can_be_a_destination() {
-    for good in ["iso", "cargo-build", "a1"] {
-        assert_eq!(profile_name_problem(good), None, "{good:?} が断られた");
-    }
-}
-
-/// **許可側**: `.`を含む名前も使える（[BUG-189](../../../docs/bugs/BUG-189.md)）。
-///
-/// 持ち主の判定が名前の最後の`.`で印を切っていた間は、ここを暫定で断っていた。既定のドメイン名は
-/// `python3.11.exe`から`python3.11`を作る（`harness_policy::policy_file::default_domain_name`）ので、
-/// 断ると、記録した名前のままでは遷移先にできない。判定が最後の`.`で切る形へ戻ると、ここが赤くなる。
-#[test]
-fn a_dotted_name_can_be_a_destination() {
-    for good in ["a.b", "python3.11"] {
-        assert_eq!(profile_name_problem(good), None, "{good:?} が断られた");
-    }
-}
-
-/// **禁止側**: 入れ物の名前にできない名前は断る。長さの上限は持ち主の判定に聞いて数えるので、
-/// 上限ちょうどは通り、1文字超えると断られる。
-#[test]
-fn names_that_cannot_become_a_profile_name_are_refused() {
-    let longest = longest_accepted_name_len();
-    assert!(longest >= 16, "上限が短すぎる（印の形が変わった？）: {longest}");
-    assert_eq!(profile_name_problem(&"x".repeat(longest)), None);
-    assert!(profile_name_problem(&"x".repeat(longest + 1)).is_some());
-    for bad in ["", "bad name", "a/b", "a*"] {
-        assert!(profile_name_problem(bad).is_some(), "{bad:?} が通った");
-    }
-}
-
-/// 最も長い印の形が、**このプロセスの本物の印と同じ形**（数字-数字）で、それより長くないこと。
-///
-/// 印の形（`session_profile::session_token`）が変わったら赤くなる——`LONGEST_SESSION_TOKEN`を直すこと。
-#[test]
-fn the_longest_session_token_still_has_the_shape_of_a_real_one() {
-    let real = harness_sandbox::tier2a::session_profile::session_token();
-    let shape = |token: &str| {
-        let (pid, secs) = token.split_once('-').expect("印に「-」が無い");
-        !pid.is_empty()
-            && !secs.is_empty()
-            && pid.chars().all(|c| c.is_ascii_digit())
-            && secs.chars().all(|c| c.is_ascii_digit())
-    };
-    assert!(shape(real), "本物の印の形が変わった: {real}");
-    assert!(shape(LONGEST_SESSION_TOKEN));
-    assert!(
-        real.len() <= LONGEST_SESSION_TOKEN.len(),
-        "本物の印が最長の想定より長い: {real}"
     );
 }

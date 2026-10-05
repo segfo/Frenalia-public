@@ -229,8 +229,8 @@ fn a_narrowing_destination_with_declarations_can_be_written() {
 /// **禁止側**: 入れ物（AppContainerプロファイル）の名前にできない遷移先は、**書く前に**断る。
 ///
 /// 編集時検査は50文字で通すが、`harness.exe`はセッションの印を足した名前で入れ物を作るので、
-/// 長い名前は起動時に用意できない（`profile_name_problem`のdoc）。`.`を含む名前はここに入らない
-/// ——持ち主の判定が最初の`.`で切るようになって通る（BUG-189。許可側は`transition_destination_tests`）。
+/// 長い名前は起動時に用意できない（`harness_sandbox::tier2a::domain_profile_name_problem`のdoc）。`.`を含む名前はここに入らない
+/// ——持ち主の判定が最初の`.`で切るようになって通る（BUG-189。許可側は`harness-sandbox`の`tier2a::domain_profile`の試験）。
 #[test]
 fn a_destination_that_cannot_become_a_profile_name_is_refused_before_writing() {
     let tmp = tempfile::tempdir().unwrap();

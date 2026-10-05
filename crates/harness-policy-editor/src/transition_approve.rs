@@ -30,7 +30,7 @@
 //! 用意できるかが`policy.json`と承認台帳から決まるようになったので外し、[`TransitionRequest::to_domain`]で
 //! 受ける。**書く前に断るのは3つ**——遷移元と同じ遷移先（自己ループ辺。凍結中、
 //! `plans/POLICY-EDITOR-TOMOYO-DIG.md` 決定65(3)）、入れ物の名前にできない名前
-//! （[`crate::transition_destination::profile_name_problem`]）、編集時検査に落ちる宣言。
+//! （[`harness_sandbox::tier2a::domain_profile_name_problem`]）、編集時検査に落ちる宣言。
 //! 「宣言の上では用意されない」遷移先（通信を宣言している・許可が付かない宣言がある）は**断らずに書く**
 //! ——警告は画面が[`crate::transition_destination::Outlook`]で出す（`Startable`と同じ姿勢。
 //! 書けるが通らないことを見えるところへ出し、判断はユーザーに残す）。
@@ -232,7 +232,7 @@ pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApp
     // 落とさない」と同じ理由。編集時検査は通るのに、`harness.exe`が起動時に用意できない）。
     // 取り消しだけの確定は見ない（遷移先を使わない）。
     if !req.approve.is_empty() {
-        if let Some(reason) = crate::transition_destination::profile_name_problem(&to_domain) {
+        if let Some(reason) = harness_sandbox::tier2a::domain_profile_name_problem(&to_domain) {
             return Err(TransitionApproveError::DestinationName { to_domain, reason });
         }
     }

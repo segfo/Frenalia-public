@@ -100,6 +100,69 @@ pub fn token_of_domain_profile(name: &str) -> Option<&str> {
     crate::tier2a::mcp_profile::split_session_token(suffix).map(|(token, _domain)| token)
 }
 
+// ---------------------------------------------------------------------------
+// 遷移先の名前の検査（書く前に断るためのもの。2026-10-05 にポリシーエディタから移した）
+// ---------------------------------------------------------------------------
+
+/// `harness.exe`のセッションの印（`<pid>-<unix秒>`）が**最も長くなる形**。pidは`u32`の最大桁。
+///
+/// 印の形の正本は[`crate::tier2a::session_profile::session_token`]で、
+/// 試験`the_longest_session_token_still_has_the_shape_of_a_real_one`がこのプロセスの本物の印と
+/// 形を突き合わせる（形が変わったらその試験が赤くなる）。
+const LONGEST_SESSION_TOKEN: &str = "4294967295-9999999999";
+
+/// 遷移先ドメイン`domain`が、`harness.exe`の入れ物の名前として**どのセッションでも使えるか**。
+/// 使えなければ理由を返す。
+///
+/// # 判定は持ち主の判定そのものに聞く
+///
+/// 最も長いセッションの印で入れ物の名前を組み（[`domain_profile_name_for`]）、
+/// `session_profile::token_of_profile`（GCと「生きている他セッション」の名簿が使う唯一の入口）が
+/// **同じ印を読み戻せるか**を見る。読み戻せないのは、名前に使えない文字がある・長すぎる
+/// （入れ物の名前は64文字まで。`harness.exe`は起動時にその遷移先を用意できない）ときである。
+///
+/// `.`はかつて暫定で断っていた——持ち主の判定が名前の**最後の**`.`で印を切っていたので、
+/// `a.b`の`a`を印の一部と読み違えたためである。2026-10-01に判定が最初の`.`で切るよう直った
+/// （[BUG-189](../../../../docs/bugs/BUG-189.md)）ので、**この関数は何も変えずに通すようになった**
+/// （判定を写さずに聞いているため）。
+///
+/// 編集時検査（`harness_policy::transition`の`check_domain_name`）は50文字で通すので、
+/// 長さはそれより厳しい。**決定63が「自動生成名の検証を『あれば良い』に落とさない——検証が無いと
+/// 承認は通るのにプロファイル生成が実行時に落ちる」と決めた**のと同じ理由で、書く前に断る。
+///
+/// # 誰が呼ぶか
+///
+/// ポリシーエディタ（遷移を書く前の検査・遷移先の欄の表示）。**`harness-policy`（純粋クレート）は
+/// このクレートに依存できない**（依存は逆向き）ので、位置ごとのドメインの割り当て
+/// （`plans/position-domains/P3.md` Task 4）はこの関数をクロージャで受け取る。
+///
+/// かつてはエディタが接頭辞（[`DOMAIN_PROFILE_PREFIX`]）を写して同じ組み立てをしていた。
+/// 写しは片方だけ変わる（`bug-pattern-rules` B-05）ので、組み立てごとここへ移した。
+pub fn domain_profile_name_problem(domain: &str) -> Option<String> {
+    if name_round_trips(domain) {
+        return None;
+    }
+    Some(format!(
+        "harness.exe の入れ物（AppContainerプロファイル）の名前にできません——\
+         使えるのは英数字と「-」「.」だけで、長さは {}文字までです",
+        longest_destination_name_len()
+    ))
+}
+
+fn name_round_trips(domain: &str) -> bool {
+    let name = domain_profile_name_for(LONGEST_SESSION_TOKEN, domain);
+    crate::tier2a::session_profile::token_of_profile(&name) == Some(LONGEST_SESSION_TOKEN)
+}
+
+/// どのセッションでも入れ物の名前にできる最長の名前の長さ（**持ち主の判定に聞いて数える**。
+/// 上限の値をここへ写さない）。
+fn longest_destination_name_len() -> usize {
+    (1..=64)
+        .take_while(|n| name_round_trips(&"x".repeat(*n)))
+        .last()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +270,87 @@ mod tests {
         assert!(!crate::tier2a::session_profile::is_session_profile_name(
             &domain
         ));
+    }
+
+    // --- 遷移先の名前の検査（2026-10-05 にポリシーエディタから移した） -------------
+
+    /// **許可側**: 英数字と`-`の短い名前は使える（組み立てがずれた日にはここが赤くなる——
+    /// そのとき検査は全部の名前を断る側へ外れている）。
+    #[test]
+    fn a_short_plain_name_can_be_a_destination() {
+        for good in ["iso", "cargo-build", "a1"] {
+            assert_eq!(
+                domain_profile_name_problem(good),
+                None,
+                "{good:?} が断られた"
+            );
+        }
+    }
+
+    /// **許可側**: `.`を含む名前も使える（[BUG-189](../../../../docs/bugs/BUG-189.md)）。
+    ///
+    /// 持ち主の判定が名前の最後の`.`で印を切っていた間は、ここを暫定で断っていた。既定のドメイン名は
+    /// `python3.11.exe`から`python3.11`を作る（`harness_policy::policy_file::default_domain_name`）ので、
+    /// 断ると、記録した名前のままでは遷移先にできない。判定が最後の`.`で切る形へ戻ると、ここが赤くなる。
+    #[test]
+    fn a_dotted_name_can_be_a_destination() {
+        for good in ["a.b", "python3.11"] {
+            assert_eq!(
+                domain_profile_name_problem(good),
+                None,
+                "{good:?} が断られた"
+            );
+        }
+    }
+
+    /// **禁止側**: 入れ物の名前にできない名前は断る。長さの上限は持ち主の判定に聞いて数えるので、
+    /// 上限ちょうどは通り、1文字超えると断られる。
+    #[test]
+    fn names_that_cannot_become_a_profile_name_are_refused() {
+        let longest = longest_destination_name_len();
+        assert!(
+            longest >= 16,
+            "上限が短すぎる（印の形が変わった？）: {longest}"
+        );
+        assert_eq!(domain_profile_name_problem(&"x".repeat(longest)), None);
+        assert!(domain_profile_name_problem(&"x".repeat(longest + 1)).is_some());
+        for bad in ["", "bad name", "a/b", "a*"] {
+            assert!(
+                domain_profile_name_problem(bad).is_some(),
+                "{bad:?} が通った"
+            );
+        }
+    }
+
+    /// 最も長い印の形が、**このプロセスの本物の印と同じ形**（数字-数字）で、それより長くないこと。
+    ///
+    /// 印の形（`session_profile::session_token`）が変わったら赤くなる——`LONGEST_SESSION_TOKEN`を直すこと。
+    #[test]
+    fn the_longest_session_token_still_has_the_shape_of_a_real_one() {
+        let real = crate::tier2a::session_profile::session_token();
+        let shape = |token: &str| {
+            let (pid, secs) = token.split_once('-').expect("印に「-」が無い");
+            !pid.is_empty()
+                && !secs.is_empty()
+                && pid.chars().all(|c| c.is_ascii_digit())
+                && secs.chars().all(|c| c.is_ascii_digit())
+        };
+        assert!(shape(real), "本物の印の形が変わった: {real}");
+        assert!(shape(LONGEST_SESSION_TOKEN));
+        assert!(
+            real.len() <= LONGEST_SESSION_TOKEN.len(),
+            "本物の印が最長の想定より長い: {real}"
+        );
+    }
+
+    /// 決定65の細目9（提案するドメイン名は27文字以内。`plans/POLICY-EDITOR-TOMOYO-DIG.md`）の27は、
+    /// **この検査が数えた値**である。
+    ///
+    /// 印の形か上限（`MAX_SUFFIX_LEN`）が変わってここが赤くなったら、決定65の細目9の数字と、
+    /// 位置ごとのドメインの割り当ての試験（`harness_policy::position_domains`。27文字の偽の検査を
+    /// 渡している）を直すこと。
+    #[test]
+    fn the_longest_destination_name_is_the_27_of_decision_65() {
+        assert_eq!(longest_destination_name_len(), 27);
     }
 }

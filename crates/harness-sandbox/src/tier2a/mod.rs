@@ -31,7 +31,7 @@ pub mod session_profile;
 /// **信頼境界が見る統合判定（`is_harness_profile_name`）もここが持つ。**
 ///
 /// クレート外からは使われていないので公開しない（`docs/CODE-STRUCTURE-RULES.md`規則4）。
-/// 下の`domain_profile`・`grant_audit`も同じ。
+/// 下の`grant_audit`も同じ（`domain_profile`は遷移先の名前の検査だけを再公開する）。
 ///
 /// **非Windowsでは未使用の警告を黙らせる。** 本番の呼び出し元（プロファイルの列挙・
 /// 昇格側の名前検証）がすべて`#[cfg(windows)]`の中にあり、非Windowsでは単体テストの
@@ -41,7 +41,11 @@ pub(crate) mod mcp_profile;
 
 /// 遷移先ドメインごとのAppContainerプロファイル名（`plans/DESIGN-MAC-BROKER.md` §22.9）。
 /// `mcp_profile`と同じ形・同じ理由でwindows専用にしない。
+///
+/// **クレート外が使うのは遷移先の名前の検査（[`domain_profile_name_problem`]）だけ**なので、
+/// モジュールは公開せず、その関数だけを再公開する（規則4。`lib.rs`の`manifest`等と同じ形）。
 pub(crate) mod domain_profile;
+pub use domain_profile::domain_profile_name_problem;
 
 /// CoWセッションを起こす前に、Redirector DLL 2本（x64・WOW64用x86）の**版がそろっているか**を
 /// 検算する。`session_profile`と同じ理由でwindows専用にしない（走査と突き合わせは純粋関数で、

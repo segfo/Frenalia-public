@@ -28,9 +28,10 @@
 use crossterm::event::{KeyCode, KeyEvent};
 
 use harness_policy::policy_file::ENTRY_DOMAIN;
+use harness_sandbox::tier2a::domain_profile_name_problem;
 
 use crate::transition_approve::TransitionPlan;
-use crate::transition_destination::{profile_name_problem, Outlook};
+use crate::transition_destination::Outlook;
 use crate::tui::state::{edit_text, App, Screen};
 use crate::tui::text_input::TextInput;
 
@@ -105,7 +106,7 @@ impl App {
                     .to_string(),
             );
         }
-        profile_name_problem(name).map(|problem| format!("この名前は使えません: {problem}"))
+        domain_profile_name_problem(name).map(|problem| format!("この名前は使えません: {problem}"))
     }
 
     /// 遷移先の欄を目立たせるか（名前に問題がある・用意されない見込み）。
