@@ -114,15 +114,76 @@ impl ApprovePlan<'_> {
 }
 
 /// 受理するidを解決し、検査を通し、`policy.json`へのマージ結果まで作る。**何も書かない。**
+///
+/// 中身は[`validate`]（idの照合と2軸の検査）→ `policy_file::load` → `merge_approved` → [`grant_root_warnings`]の
+/// 包みである（2026-10-05、`plans/position-domains/P4.md`のP4.5の準備。位置ごとのドメインの確定が
+/// 同じ部品をドメインごとに通すため）。
 pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveError> {
-    if req.accept_ids.is_empty() {
+    let Validated {
+        accepted,
+        classes,
+        mut warnings,
+    } = validate(
+        req.proposals,
+        req.accept_ids,
+        req.require_sandbox,
+        req.workspace_root,
+    )?;
+
+    let mut file = policy_file::load(req.workspace_root)?;
+    let report = file.merge_approved(
+        &accepted,
+        &ApprovalContext {
+            domain: req.domain,
+            command: req.command,
+            cwd: req.cwd,
+            record_session: req.record_session,
+            now_unix_ms: req.now_unix_ms,
+        },
+    );
+    warnings.extend(grant_root_warnings(
+        &file,
+        req.domain,
+        req.workspace_root,
+        &accepted,
+    ));
+
+    Ok(ApprovePlan {
+        accepted,
+        domain: req.domain,
+        file,
+        report,
+        classes,
+        warnings,
+    })
+}
+
+/// [`validate`]が通したもの。
+pub(crate) struct Validated<'a> {
+    /// 受理した提案（指定の順、重複は1つ）。
+    pub accepted: Vec<&'a RuleProposal>,
+    /// 受理した提案ごとの分類（`accepted`と同じ並び）。
+    pub classes: Vec<PathClass>,
+    /// 拒否ではないが読んでおくべきこと（`gate`の警告）。
+    pub warnings: Vec<String>,
+}
+
+/// 受理するidを解決し、`gate`（`--require-sandbox`との矛盾）と`breadth`（広すぎる値）の2軸の検査を通す
+/// （**何も読まない・書かない**）。1件でも通らなければ何も受理しない（部分適用しない、モジュールdoc）。
+pub(crate) fn validate<'a>(
+    proposals: &'a [RuleProposal],
+    accept_ids: &[String],
+    require_sandbox: RequireSandbox,
+    workspace_root: &Path,
+) -> Result<Validated<'a>, ApproveError> {
+    if accept_ids.is_empty() {
         return Err(ApproveError::NoIds);
     }
 
     let mut accepted: Vec<&RuleProposal> = Vec::new();
     let mut unknown: Vec<&str> = Vec::new();
-    for id in req.accept_ids {
-        match req.proposals.iter().find(|p| &p.id == id) {
+    for id in accept_ids {
+        match proposals.iter().find(|p| &p.id == id) {
             Some(proposal) => {
                 if !accepted.iter().any(|p| p.id == proposal.id) {
                     accepted.push(proposal);
@@ -141,7 +202,7 @@ pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveErro
     let mut refused = Vec::new();
     let mut warnings = Vec::new();
     for proposal in &accepted {
-        match gate::check_proposal(proposal, req.require_sandbox) {
+        match gate::check_proposal(proposal, require_sandbox) {
             GateVerdict::Rejected(message) => refused.push(format!("{}: {message}", proposal.id)),
             GateVerdict::AllowedWithWarning(message) => {
                 warnings.push(format!("{}: {message}", proposal.id))
@@ -164,21 +225,25 @@ pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveErro
 
     let classes = accepted
         .iter()
-        .map(|p| classify(p, req.workspace_root))
+        .map(|p| classify(p, workspace_root))
         .collect();
 
-    let mut file = policy_file::load(req.workspace_root)?;
-    let report = file.merge_approved(
-        &accepted,
-        &ApprovalContext {
-            domain: req.domain,
-            command: req.command,
-            cwd: req.cwd,
-            record_session: req.record_session,
-            now_unix_ms: req.now_unix_ms,
-        },
-    );
+    Ok(Validated {
+        accepted,
+        classes,
+        warnings,
+    })
+}
 
+/// 承認した後にこのドメインのworkspace外のルートが多くなるなら、その警告（多くなければ空）。**何も書かない。**
+///
+/// `file`はマージした**後**の`policy.json`、`accepted`はいま承認する提案（[`validate`]が通したもの）。
+pub(crate) fn grant_root_warnings(
+    file: &PolicyFile,
+    domain: &str,
+    workspace_root: &Path,
+    accepted: &[&RuleProposal],
+) -> Vec<String> {
     // **承認の結果が次のパス2の待ち時間になる、ということをこの瞬間に見せる。**
     // `preflight`はworkspace外のルートを1件ずつ処理するので、準備時間はこの件数にほぼ比例する。
     // 件数はマージ**後**のドメイン全体で数える（この承認で足した分だけでなく、次のパス2が
@@ -188,38 +253,30 @@ pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveErro
     // [D-112] 数えるのは**この承認の後に許可が付くもの**——既に承認済みの宣言と、いま承認する値。
     let approvals = crate::approval_store::approval_store().load();
     let workspace_key =
-        harness_sandbox::tier2a::policy_approval::approval_workspace_key(req.workspace_root);
+        harness_sandbox::tier2a::policy_approval::approval_workspace_key(workspace_root);
     let approved_after_commit = |d: harness_sandbox::tier2a::policy_approval::DeclarationRef<'_>| {
         approvals.is_approved_for_key(&workspace_key, d)
-            || (d.domain == req.domain
+            || (d.domain == domain
                 && accepted
                     .iter()
                     .any(|p| p.value == d.value && p.key.fs_access() == Some(d.access)))
     };
     let grant_roots = file
-        .domain(req.domain)
-        .map(|domain| {
-            harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(req.workspace_root)
-                .domain_grants(domain, &approved_after_commit)
+        .domain(domain)
+        .map(|entry| {
+            harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(workspace_root)
+                .domain_grants(entry, &approved_after_commit)
                 .passthrough
                 .len()
         })
         .unwrap_or(0);
-    if grant_roots >= MANY_GRANT_ROOTS {
-        warnings.push(format!(
-            "このドメインのworkspace外のルートは{grant_roots}件になります。パス2はこれを1件ずつ\
-             処理するので、準備に時間がかかります（承認前に一般化の度合いを上げて畳むと減ります）"
-        ));
+    if grant_roots < MANY_GRANT_ROOTS {
+        return Vec::new();
     }
-
-    Ok(ApprovePlan {
-        accepted,
-        domain: req.domain,
-        file,
-        report,
-        classes,
-        warnings,
-    })
+    vec![format!(
+        "このドメインのworkspace外のルートは{grant_roots}件になります。パス2はこれを1件ずつ\
+         処理するので、準備に時間がかかります（承認前に一般化の度合いを上げて畳むと減ります）"
+    )]
 }
 
 /// 「workspace外のルートが多い」と警告し始める件数。
