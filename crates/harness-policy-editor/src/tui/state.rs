@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use harness_policy::RuleProposal;
 use harness_sandbox::tier2a::win_appcontainer::passthrough_progress::ProgressCell as PassthroughProgressCell;
 
 use crate::child_run::AbortReason;
@@ -1484,63 +1483,6 @@ impl App {
             run.log_line(format!("撤収しました（{revoked}件）"));
         }
         self.status = format!("撤収しました（{revoked}件）。終了します");
-    }
-
-    /// この値が**もう宣言されている**なら、それを取り消すための対象を返す（空なら未宣言）。
-    ///
-    /// # なぜ宣言側のキーで作るのか
-    ///
-    /// 候補が`fs.read`でも宣言は`fs.read_exec`であり得る（ETWは読取と実行を区別しない）。
-    /// 外したときに消すべきは**`policy.json`に書かれている行**なので、候補のキーではなく
-    /// 宣言側のキーで対象を作らなければならない——候補のキーで作ると、存在しない行を
-    /// 消そうとして「無かった」になり、`[x]`が外れないまま確定が通る。
-    pub fn declared_targets_for(&self, value: &str) -> Vec<crate::unapprove::UnapproveTarget> {
-        let Some(domain) = self.declared_domain.as_ref() else {
-            return Vec::new();
-        };
-        domain
-            .declared_keys_for_value(value)
-            .into_iter()
-            .map(|key| crate::unapprove::UnapproveTarget {
-                domain: domain.name.clone(),
-                key,
-                value: value.to_string(),
-            })
-            .collect()
-    }
-
-    /// 候補1件が「確定後に許可されている状態か」＝チェックが入っているか。
-    ///
-    /// 承認予定（`accepted`）だけでなく**既に宣言されているもの**も入る。同じ場所へ二重に
-    /// チェックを付けさせないためで、これが無いと承認済みの実行ファイルが毎回未選択で現れる。
-    pub fn proposal_is_on(&self, proposal: &RuleProposal) -> bool {
-        if self.accepted.contains(&proposal.id) {
-            return true;
-        }
-        // 宣言が複数あるとき（`read`と`read_exec`など）は、**1つでも残るなら許可されている**。
-        self.declared_targets_for(&proposal.value)
-            .iter()
-            .any(|target| !self.unapproved.contains(target))
-    }
-
-    /// 候補一覧へ重ねる宣言（[`Self::declared_domain`]）を、いまのドメイン名で作り直す。
-    ///
-    /// 読めなかった場合は`None`にする。**「宣言が無い」と「読めなかった」を同じ表示にしない**
-    /// ため、読めなかったことは`status`へ出す（D-43）。
-    pub fn refresh_declared_overlay(&mut self) {
-        let name = self.domain.text().trim().to_string();
-        if name.is_empty() {
-            self.declared_domain = None;
-            return;
-        }
-        match crate::policy_file::load(&self.workspace_root) {
-            Ok(file) => self.declared_domain = file.domain(&name).cloned(),
-            Err(e) => {
-                self.declared_domain = None;
-                self.status =
-                    format!("policy.jsonを読めませんでした（宣言済みの重ねは出ません）: {e}");
-            }
-        }
     }
 
     fn request_quit(&mut self) -> Option<Action> {
