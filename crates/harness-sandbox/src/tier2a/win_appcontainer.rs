@@ -853,6 +853,9 @@ mod spawn;
 /// ここで公開しているのは、ポリシーエディタの遷移画面が**同じ判定**を通す必要があるためである
 /// ——別に書くと、画面が「起こせる」と言っているのに実際には断られる形になる（`B-13`）。
 pub use spawn::starts_through_the_app_model;
+/// Tier2aのシェルの候補。ポリシーエディタの昇格E2Eが、連鎖の途中の段のシェルを`harness.exe`と
+/// **同じ判断**で選ぶために公開している（写すと片方だけ変わる、`B-05`）。
+pub use spawn::{shell_candidates_from, ShellChoices};
 mod spawn_session;
 mod traverse;
 /// [D-84] workspaceツリーへ配る**ACEの集合**（モード×宛先SID×マスク）と、それを1回の書込で

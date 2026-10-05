@@ -13,19 +13,25 @@
 //!
 //! ```text
 //! ユーザーの例（決定65）:  cmd → pwsh → calc        ／ cmd → pwsh → mspaint
-//! この試験:               シェル → powershell → hostname ／ シェル → powershell → whoami
+//! この試験:               シェル → 中の段 → hostname ／ シェル → 中の段 → whoami
 //! ```
 //!
 //! - **1段目は入口のドメインのシェルそのもの**である（ユーザーの例の`cmd`に当たる）。記録では
-//!   パス1の`pwsh`、強制では`harness.exe`のシェル（強制の下では`powershell`5.1）で、どちらも
+//!   パス1の`pwsh`、強制では`harness.exe`のシェル（中の段と同じ候補から preflight が起こして選ぶ）で、どちらも
 //!   入口のドメイン`workspace-shell`にいる。根の実行ファイルは位置の鍵に入らない
 //!   （位置の鍵は〔親のドメイン, exe〕、決定65 Q1）ので、根の綴りが違っても同じ位置になる
 //! - `calc`・`mspaint`は Windows 11 ではストアアプリで、遷移の強制を積んだ構成では起こせない
 //!   （`Startable::NotThroughTheAppModel`）。System32 の`hostname.exe`・`whoami.exe`で代える。
 //!   どちらもファイルの候補が出ない（子が親の持たないファイルを触らない）ので、決定65(6)の暫定
 //!   （広がる位置は P5 まで書けない）に当たらない
-//! - 中の段は`powershell.exe`（System32 の 5.1）である。`pwsh`はこの機ではストアアプリ
-//!   （`WindowsApps`の実行エイリアス）で、強制の下では起こせない
+//! - **中の段は、ストアアプリでない`pwsh`があればそれ、無ければ`powershell.exe`（System32 の 5.1）**である
+//!   （[`middle_shell`]。ドメインの名前は葉名で`pwsh`か`powershell`）。選ぶのは`harness_sandbox`の
+//!   `shell_candidates_from`を生成禁止（`ChildProcessPolicy::Restricted`）で呼んだ候補の先頭で、`harness.exe`が
+//!   強制の下で自分のシェルの候補を作るのと**同じ判断**である（写さない、`B-05`）。ストアアプリの`pwsh`
+//!   （`WindowsApps`の実行エイリアス／MSIX の実体）は生成禁止を積んだ子の中から起こせない
+//!   （`plans/mac-spike/RESULTS.md` §S62）ので候補から外れ、外したことを出力に出す。MSI・zip で入れた`pwsh`
+//!   （`C:\Program Files\PowerShell\7\pwsh.exe`等）は普通の exe なので中の段にできるはずだが、
+//!   **この開発機には無く、その枝は一度も撃っていない**（2026-10-05）
 //! - **`cmd.exe`は中の段に使えない（2026-10-05 の実測）。** 入口のドメインから`cmd.exe`を起こすところまでは
 //!   通るのに（検算の腕`control-one-hop`の前身がそれを確かめた）、その`cmd.exe`が次のプログラムを
 //!   起こそうとすると**Spawn Daemon へ要求が1つも届かず**、待ち行列は空のまま`アクセスが拒否されました`で
@@ -36,7 +42,7 @@
 //!
 //! # 何を確かめるか（`B-35`: 通る側と断る側を同じ回で）
 //!
-//! 1. 記録（パス1を2回）: 各記録の`process-audit.jsonl`に「根 → powershell → 葉」の鎖がある
+//! 1. 記録（パス1を2回）: 各記録の`process-audit.jsonl`に「根 → 中の段 → 葉」の鎖がある
 //!    （無ければ収集の失敗として落とす。後の判定の前提）
 //! 2. 承認: エディタの画面（`App`）で観測のタブを開き、鎖の行を`Space`→`a`→`y`。2回目の記録では
 //!    1回目に書いた辺が`ExistingEdge`として引かれ（生成物が入力へ戻る一周、`B-28`）、葉の辺だけを書く。
@@ -45,14 +51,14 @@
 //!
 //! | 腕 | 行が起こす連鎖 | 期待 |
 //! |---|---|---|
-//! | 検算 | シェル → powershell（その中で終わる） | 印が返る・拒否0件（**1段目が通ることを先に確かめる**） |
-//! | 通る1 | シェル → powershell → hostname | 葉の出力が届き、拒否0件 |
-//! | 通る2 | シェル → powershell → whoami | 同上 |
-//! | 断る1 | シェル → powershell → powershell → whoami | `powershell`から`powershell.exe`を`no_matching_edge`で断る（ユーザーの例の`pwsh→pwsh`） |
-//! | 断る2 | シェル → powershell → notepad | `powershell`から`notepad.exe`を断る（記録に無いプログラム） |
+//! | 検算 | シェル → 中の段（その中で終わる） | 印が返る・拒否0件（**1段目が通ることを先に確かめる**） |
+//! | 通る1 | シェル → 中の段 → hostname | 葉の出力が届き、拒否0件 |
+//! | 通る2 | シェル → 中の段 → whoami | 同上 |
+//! | 断る1 | シェル → 中の段 → 中の段 → whoami | 中の段のドメインから中の段の実行ファイルを`no_matching_edge`で断る（ユーザーの例の`pwsh→pwsh`） |
+//! | 断る2 | シェル → 中の段 → notepad | 中の段のドメインから`notepad.exe`を断る（記録に無いプログラム） |
 //! | 断る3 | シェル → hostname | `workspace-shell`から`hostname.exe`を断る（**同じプログラムでも位置が違えば断る**） |
 //!
-//! 断る腕の遷移元が`powershell`であること自体が、中の段がそのドメインで動いていた証拠になる。
+//! 断る腕の遷移元が中の段のドメインであること自体が、中の段がそのドメインで動いていた証拠になる。
 //!
 //! 4. 後始末: `harness.exe`が作った AppContainer プロファイル（セッションの入れ物と遷移先ドメインの入れ物）が
 //!    撃つ前より増えていない（`harness_sandbox::tier2a::session_profile::token_of_profile`で族を見分ける）
@@ -70,6 +76,9 @@
 //! - 待ち行列の読み方: 同`run_arm_collecting_denials_in`（9235行。撃つ前に消す・あふれと読めない行で無効）
 //! - 記録の起こし方: `tests/record_e2e.rs`（`record --workspace <ws> --cwd <ws> --limit 0 -- <行>`と
 //!   `HARNESS_ALLOW_USER_WRITABLE_ELEVATED_HELPERS=1`）
+//! - 中の段のシェルを探す場所（[`middle_shell`]の`which::which("pwsh")`と`SystemRoot`）:
+//!   `harness-sandbox`の`win_appcontainer/spawn.rs`の`shell_candidates`。**どれを外し、どれを最後に積むかの
+//!   判断は写さず**、公開した`shell_candidates_from`を呼ぶ
 //!
 //! # ワークスペースの置き場
 //!
@@ -92,14 +101,15 @@ use harness_policy_editor::position_view::EdgeVerdict;
 use harness_policy_editor::tui::state::{App, Confirm};
 use harness_sandbox::tier2a::spawnd::client::DAEMON_STDERR_ENV;
 use harness_sandbox::tier2a::spawnd::transitions::{pending_path, read_from, PendingRecord};
-use harness_sandbox::tier2a::spawnd::DenyReason;
+use harness_sandbox::tier2a::spawnd::{ChildProcessPolicy, DenyReason};
+use harness_sandbox::tier2a::win_appcontainer::shell_candidates_from;
 
 /// この試験の置き場の根（`tier2a_e2e.rs`の`CASE_ROOT`と同じ）。
 const CASE_ROOT: &str = r"C:\harness-e2e";
 /// ワークスペースの名前。
 const CASE: &str = "policy-editor-position-domains";
 
-/// 1段だけの遷移が通ることを確かめる腕の印（`cmd`の`echo`がそのまま返す）。
+/// 1段だけの遷移が通ることを確かめる腕の印（中の段の`Write-Output`がそのまま返す）。
 const CONTROL_MARKER: &str = "PD_CONTROL_MARKER";
 
 /// e2e-mock でない`harness.exe`を見つけたときの文言（[`harness_exe`]）。
@@ -135,13 +145,53 @@ fn harness_exe() -> PathBuf {
     exe
 }
 
-fn system32(name: &str) -> String {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    format!(r"{root}\System32\{name}")
+fn system_root() -> String {
+    std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())
 }
 
-fn powershell_exe() -> String {
-    system32(r"WindowsPowerShell\v1.0\powershell.exe")
+fn system32(name: &str) -> String {
+    format!(r"{}\System32\{name}", system_root())
+}
+
+/// 連鎖の中の段のシェル（[`middle_shell`]が選ぶ）。
+struct MiddleShell {
+    /// 実行ファイルのフルパス（行にそのまま書く）。
+    path: String,
+    /// 実行ファイル名（`pwsh.exe`／`powershell.exe`。木と辺の照合に使う）。
+    exe: String,
+    /// 割り当てで付くドメインの名前（葉名。`pwsh`／`powershell`）。
+    domain: String,
+}
+
+/// 中の段のシェルを`harness.exe`と**同じ判断**で選ぶ（`B-05`）。強制の下では生成禁止を積むので
+/// `ChildProcessPolicy::Restricted`で聞く——ストアアプリの`pwsh`は`dropped`へ回り（§S62）、
+/// 先頭はストアアプリでない`pwsh`か、無ければ 5.1 になる。**選んだものと外したものを必ず出す**
+/// （黙って 5.1 へ落ちると、`pwsh`の枝を撃ったのかどうかが記録から分からない。`B-10`）。
+/// `harness.exe`の preflight と違って候補を起こして確かめはしない——起こせない先頭なら検算の腕が赤くなる。
+fn middle_shell() -> MiddleShell {
+    let choices = shell_candidates_from(
+        which::which("pwsh").ok(),
+        &system_root(),
+        ChildProcessPolicy::Restricted,
+    );
+    if choices.dropped.is_empty() {
+        println!("[position-domains] 中の段の候補から外した綴り: なし");
+    }
+    for dropped in &choices.dropped {
+        println!(
+            "[position-domains] 中の段の候補から外した綴り: {dropped}\
+             （ストアアプリの綴りは遷移の強制の下で起こせない。§S62）"
+        );
+    }
+    let (path, label) = choices
+        .candidates
+        .into_iter()
+        .next()
+        .expect("shell_candidates_from always yields at least PowerShell 5.1");
+    let exe = file_name(&path);
+    let domain = exe.strip_suffix(".exe").unwrap_or(&exe).to_string();
+    println!("[position-domains] 中の段のシェル: {path}（{label}、ドメイン {domain}）");
+    MiddleShell { path, exe, domain }
 }
 
 /// パスの最後の要素を小文字で（`C:/Windows/System32/cmd.exe` → `cmd.exe`）。
@@ -158,47 +208,52 @@ struct Script {
     line: String,
 }
 
-/// 1段だけの遷移（入口のドメイン → `powershell`）を撃つ腕。**それ以上プロセスを起こさない**
+/// 1段だけの遷移（入口のドメイン → 中の段）を撃つ腕。**それ以上プロセスを起こさない**
 /// （`Write-Output`は PowerShell の中で終わる）。
-fn control_script() -> Script {
+fn control_script(shell: &MiddleShell) -> Script {
     Script {
         name: "control-one-hop",
-        line: ps_run(&format!("Write-Output {CONTROL_MARKER}")),
+        line: ps_run(shell, &format!("Write-Output {CONTROL_MARKER}")),
     }
 }
 
-/// PowerShell に1行を撃たせる綴り。パスに空白が無いので引用符で囲まない
-/// （入れ子にすると引用符の剥がし方が段ごとに変わる）。
-fn ps_run(rest: &str) -> String {
+/// 中の段のシェルに1行を撃たせる綴り。**実行ファイルも1行も PowerShell の単引用符の文字列にし、`&`で呼ぶ**
+/// ——MSI の`pwsh`（`C:\Program Files\PowerShell\7\pwsh.exe`）はパスに空白を含むので、囲まないと割れる。
+/// 単引用符の中で特別な文字は`'`だけ（`''`に重ねる）で、外の段が1重剥がしたものが次の段の`-Command`に届く。
+/// 二重引用符は使わない——子へ渡すときの`"`の扱いが 5.1 と 7 で違う（`$PSNativeCommandArgumentPassing`）。
+/// `-NoProfile -NonInteractive -Command`は`pwsh`と 5.1 で同じ綴りで通る。
+fn ps_run(shell: &MiddleShell, rest: &str) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
     format!(
-        "{} -NoProfile -NonInteractive -Command {rest}",
-        powershell_exe()
+        "& {} -NoProfile -NonInteractive -Command {}",
+        quote(&shell.path),
+        quote(rest)
     )
 }
 
 /// ユーザーの例の「通る」2本（記録する連鎖でもある）と、「断る」3本。
-fn scripts() -> (Script, Script, Vec<(Script, Refusal)>) {
+fn scripts(shell: &MiddleShell) -> (Script, Script, Vec<(Script, Refusal)>) {
     let hostname = system32("hostname.exe");
     let whoami = system32("whoami.exe");
     let notepad = system32("notepad.exe");
     let pass_hostname = Script {
         name: "pass-hostname",
-        line: ps_run(&hostname),
+        line: ps_run(shell, &hostname),
     };
     let pass_whoami = Script {
         name: "pass-whoami",
-        line: ps_run(&whoami),
+        line: ps_run(shell, &whoami),
     };
     let refused = vec![
         (
             // ユーザーの例の`cmd→pwsh→pwsh`（同じプログラムを2段続ける）。
             Script {
                 name: "refuse-ps-ps-whoami",
-                line: ps_run(&ps_run(&whoami)),
+                line: ps_run(shell, &ps_run(shell, &whoami)),
             },
             Refusal {
-                from: "powershell",
-                exe: "powershell.exe",
+                from: shell.domain.clone(),
+                exe: shell.exe.clone(),
                 leaf_output: Some(Leaf::Whoami),
             },
         ),
@@ -206,23 +261,23 @@ fn scripts() -> (Script, Script, Vec<(Script, Refusal)>) {
             // ユーザーの例の`cmd→cmd→notepad`に当たる「記録に無いプログラム」。
             Script {
                 name: "refuse-ps-notepad",
-                line: ps_run(&notepad),
+                line: ps_run(shell, &notepad),
             },
             Refusal {
-                from: "powershell",
-                exe: "notepad.exe",
+                from: shell.domain.clone(),
+                exe: "notepad.exe".to_string(),
                 leaf_output: None,
             },
         ),
         (
-            // **同じプログラムでも位置が違えば断る**（葉の辺は`powershell`から伸びている）。
+            // **同じプログラムでも位置が違えば断る**（葉の辺は中の段のドメインから伸びている）。
             Script {
                 name: "refuse-entry-hostname",
                 line: hostname.clone(),
             },
             Refusal {
-                from: ENTRY_DOMAIN,
-                exe: "hostname.exe",
+                from: ENTRY_DOMAIN.to_string(),
+                exe: "hostname.exe".to_string(),
                 leaf_output: Some(Leaf::Hostname),
             },
         ),
@@ -232,8 +287,8 @@ fn scripts() -> (Script, Script, Vec<(Script, Refusal)>) {
 
 /// 断る腕の期待。**断ったのは誰か（遷移元）と、何を起こそうとしたか**で言う。
 struct Refusal {
-    from: &'static str,
-    exe: &'static str,
+    from: String,
+    exe: String,
     /// 断られたら出ないはずの葉の出力。
     leaf_output: Option<Leaf>,
 }
@@ -281,23 +336,24 @@ impl LeafOutputs {
 #[ignore = "requires administrator rights (records pass 1 with the ETW collector and runs harness.exe with --enforce-transitions); run through dev-elevated-run"]
 fn position_domains_written_by_the_editor_let_only_the_recorded_chains_through_harness() {
     let harness = harness_exe();
+    let shell = middle_shell();
     let leaves = LeafOutputs::capture();
     let ws = case_dir();
     std::fs::create_dir_all(ws.join(".harness").join("sandbox")).unwrap();
-    let (pass_hostname, pass_whoami, refused) = scripts();
+    let (pass_hostname, pass_whoami, refused) = scripts(&shell);
 
     // --- 1・2. 記録して位置ごとに承認する（1回目: hostname の連鎖、2回目: whoami の連鎖） ---
-    let first = record(&ws, &pass_hostname, &leaves.hostname, "hostname.exe");
-    approve_positions(&ws, &first, "hostname.exe", false);
-    let second = record(&ws, &pass_whoami, &leaves.whoami, "whoami.exe");
-    approve_positions(&ws, &second, "whoami.exe", true);
+    let first = record(&ws, &shell, &pass_hostname, &leaves.hostname, "hostname.exe");
+    approve_positions(&ws, &shell, &first, "hostname.exe", false);
+    let second = record(&ws, &shell, &pass_whoami, &leaves.whoami, "whoami.exe");
+    approve_positions(&ws, &shell, &second, "whoami.exe", true);
 
     let edges = written_edges(&ws);
     eprintln!("[position-domains] 書かれた辺: {edges:#?}");
     let expected: BTreeSet<(String, String, String)> = [
-        (ENTRY_DOMAIN, "powershell.exe", "powershell"),
-        ("powershell", "hostname.exe", "hostname"),
-        ("powershell", "whoami.exe", "whoami"),
+        (ENTRY_DOMAIN, shell.exe.as_str(), shell.domain.as_str()),
+        (shell.domain.as_str(), "hostname.exe", "hostname"),
+        (shell.domain.as_str(), "whoami.exe", "whoami"),
     ]
     .into_iter()
     .map(|(f, e, t)| (f.to_string(), e.to_string(), t.to_string()))
@@ -313,19 +369,19 @@ fn position_domains_written_by_the_editor_let_only_the_recorded_chains_through_h
 
     // **計器の検算: 1段だけの遷移が通るか**（`measurement-review`の検問1）。
     //
-    // 記録した連鎖の1段目（入口のドメイン → `powershell`）だけを使い、その子の中で**それ以上
+    // 記録した連鎖の1段目（入口のドメイン → 中の段）だけを使い、その子の中で**それ以上
     // プロセスを起こさない**（`Write-Output`は PowerShell の中で終わる）。ここが通らないなら、後の腕の
     // 「葉の出力が無い」は位置ごとのドメインの話ではなく、**別のドメインで子を1つも
     // 起こせない**ことを測っている——順序を分けないと、断る腕の緑が「全部断る」実装でも
     // 揃ってしまう（`B-35`）。
-    let control = control_script();
+    let control = control_script(&shell);
     let arm = run_arm(&harness, &ws, &control);
     arm.print(control.name);
     if !arm.result.contains(CONTROL_MARKER) {
         failures.push(format!(
-            "{}: **1段目の遷移（入口のドメイン → powershell）が通っていない。** 位置ごとのドメインの\
+            "{}: **1段目の遷移（入口のドメイン → {}）が通っていない。** 位置ごとのドメインの\
              良し悪しではなく、別のドメインで子を起こせていない。拒否: {:?}／本文:\n{}",
-            control.name, arm.denials, arm.result
+            control.name, shell.domain, arm.denials, arm.result
         ));
     }
     if !arm.denials.is_empty() {
@@ -360,8 +416,8 @@ fn position_domains_written_by_the_editor_let_only_the_recorded_chains_through_h
         let arm = run_arm(&harness, &ws, script);
         arm.print(script.name);
         let expected = (
-            Some(refusal.from.to_string()),
-            refusal.exe.to_string(),
+            Some(refusal.from.clone()),
+            refusal.exe.clone(),
             DenyReason::Transition {
                 denial: TransitionDenial::NoMatchingEdge,
             },
@@ -423,9 +479,15 @@ fn scratch_dir() -> PathBuf {
 
 // --- 記録（パス1） ---------------------------------------------------------------
 
-/// パス1で`script`を1回記録し、記録のディレクトリを返す。木に「根 → powershell → `leaf`」の鎖が
+/// パス1で`script`を1回記録し、記録のディレクトリを返す。木に「根 → 中の段 → `leaf`」の鎖が
 /// あることを確かめる（**無ければ収集の失敗**。後の承認と強制の判定の前提が崩れる）。
-fn record(ws: &Path, script: &Script, leaf_output: &str, leaf: &str) -> PathBuf {
+fn record(
+    ws: &Path,
+    shell: &MiddleShell,
+    script: &Script,
+    leaf_output: &str,
+    leaf: &str,
+) -> PathBuf {
     let before = record_dirs(ws);
     let output = Command::new(editor_exe())
         .args([
@@ -474,8 +536,8 @@ fn record(ws: &Path, script: &Script, leaf_output: &str, leaf: &str) -> PathBuf 
         .iter()
         .find(|i| i.is_scope_root)
         .expect("記録の根が木にある");
-    let ps = child_named(&tree.instances, root, "powershell.exe");
-    child_named(&tree.instances, ps, leaf);
+    let middle = child_named(&tree.instances, root, &shell.exe);
+    child_named(&tree.instances, middle, leaf);
     dir
 }
 
@@ -519,12 +581,18 @@ fn press(app: &mut App, code: KeyCode) {
     app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
 }
 
-/// 観測のタブを開き、`record_dir`の記録の鎖の行（cmd・powershell・`leaf`）のうち書くものを`Space`で予約し、
+/// 観測のタブを開き、`record_dir`の記録の鎖の行（中の段・`leaf`）のうち書くものを`Space`で予約し、
 /// `a`→`y`で1回に書く。**ファイルの候補は選ばない**（`hostname`・`whoami`は既定で実行できる場所＝D-58）。
 ///
-/// `reuses_edges`: 1回目の記録で書いた辺が、この記録の cmd・powershell の位置に`ExistingEdge`として引かれるはずか。
-fn approve_positions(ws: &Path, record_dir: &Path, leaf: &str, reuses_edges: bool) {
-    let chain = ["powershell.exe", leaf];
+/// `reuses_edges`: 1回目の記録で書いた辺が、この記録の中の段の位置に`ExistingEdge`として引かれるはずか。
+fn approve_positions(
+    ws: &Path,
+    shell: &MiddleShell,
+    record_dir: &Path,
+    leaf: &str,
+    reuses_edges: bool,
+) {
+    let chain = [shell.exe.as_str(), leaf];
     let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
     press(&mut app, KeyCode::F(2));
     press(&mut app, KeyCode::F(2));
@@ -555,7 +623,7 @@ fn approve_positions(ws: &Path, record_dir: &Path, leaf: &str, reuses_edges: boo
     }
     for position in &positions.view.assignment.positions {
         let name = file_name(&position.exe);
-        if reuses_edges && name == "powershell.exe" {
+        if reuses_edges && name == shell.exe {
             assert_eq!(
                 position.source,
                 PositionSource::ExistingEdge,

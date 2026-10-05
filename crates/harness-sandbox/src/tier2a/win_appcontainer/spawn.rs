@@ -2169,11 +2169,11 @@ static SELECTED_SHELL: std::sync::OnceLock<(String, &'static str)> = std::sync::
 ///
 /// 外した理由を捨てないのは、`preflight`の警告に出すためである——黙って5.1へ落ちると、
 /// 「pwsh 7があるのに使われない」が誰にも説明されない（`B-10`）。
-pub(crate) struct ShellChoices {
+pub struct ShellChoices {
     /// 優先順。**必ず1件以上ある**（5.1は外さない）。
-    pub(crate) candidates: Vec<(String, &'static str)>,
+    pub candidates: Vec<(String, &'static str)>,
     /// 生成禁止を積むために外した綴り（0件が普通）。
-    pub(crate) dropped: Vec<String>,
+    pub dropped: Vec<String>,
 }
 
 /// その綴りは**アプリの仕組みを通って起きる**か（ストアの実行エイリアス／MSIXの実体）。
@@ -2217,7 +2217,7 @@ pub fn starts_through_the_app_model(path: &str) -> bool {
 ///
 /// **トップレベルは通る**（段階⑤の受け入れが実行エイリアスで緑）。だから
 /// 「起動できるか」だけを見て選ぶと、**この失敗は選択の時点では見えない。**
-fn shell_candidates_from(
+pub fn shell_candidates_from(
     pwsh: Option<PathBuf>,
     system_root: &str,
     child_process_policy: crate::tier2a::spawnd::ChildProcessPolicy,
