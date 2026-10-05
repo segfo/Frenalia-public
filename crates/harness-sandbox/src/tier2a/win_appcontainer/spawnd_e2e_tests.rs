@@ -134,6 +134,14 @@ mod page_heap_fault_tests;
 /// 撃つのは`spawn-daemon-cmd-nested`。
 mod cmd_nested_spawn_tests;
 
+/// [実行エイリアスの道のA1] **ストアの実行エイリアスのpwshを、新しい空のJobへ入れられるか**の測定
+/// （使い捨て。寿命は同ファイルのモジュールdoc）。**同じ理由でここに置いてある**——外へ出すと
+/// 0件マッチで黙って走らなくなる（BUG-056）。
+///
+/// **受け入れ`spawn-daemon`からは`--skip`で外れている**（測定であって受け入れではない）。
+/// 撃つのは`spike-spawnd-store-alias-job`。
+mod store_alias_job_spike_tests;
+
 /// [段階6b] このファイルのテストが名乗る**遷移元ドメイン名**。
 ///
 /// **`DomainSpec::name`（プロファイル名の側）とわざと別の綴りにしてある。**
@@ -366,15 +374,33 @@ pub(super) struct TopLevelArm<'a> {
     pub extra_env: Vec<(String, String)>,
 }
 
-/// Daemonに子を起こしてもらい、**その子のstdout/stderrと終了コード**を返す。
+/// 起こしただけの最上位の子。**まだ出力を読んでいない**ので、子は走り続けている。
+///
+/// 読む側の端（`stdout_read`・`stderr_read`）を閉じるのは受け取った側である
+/// （[`crate::win_common::read_two_pipes_to_strings`]が読み切って閉じる）。
+pub(super) struct DetachedTopLevel {
+    pub child: SpawnedChild,
+    pub job: HANDLE,
+    pub stdout_read: HANDLE,
+    pub stderr_read: HANDLE,
+}
+
+/// Daemonに子を起こしてもらい、**出力を読まずに**返す。
 ///
 /// パイプとJobを作るのはこちら（harness役）である（§10.1「子のstdioパイプを作るプロセス」）。
-pub(super) fn start_top_level(
+///
+/// # なぜ読まない版が要るのか
+///
+/// [`start_top_level`]は出力をEOFまで読むので、**子が終わるまで返らない**。
+/// 「走っている最中に何かをする」腕——キャンセルで子孫まで死ぬか（P6）、
+/// Jobの取っ手を閉じたら死ぬか（実行エイリアスの道のA1）——は、そこで止まってしまう。
+/// **写しを作らずにここで割ってある**（`docs/CODE-STRUCTURE-RULES.md`§5.0）。
+pub(super) fn start_top_level_detached(
     daemon: &SpawnDaemonHandle,
     profile: &OwnedContainerSid,
     workspace: &std::path::Path,
     arm: TopLevelArm<'_>,
-) -> (SpawnedChild, HANDLE, String, String) {
+) -> DetachedTopLevel {
     let (stdout_read, stdout_write) =
         appcontainer_pipe(profile.as_psid()).expect("stdout pipe for the daemon-spawned child");
     crate::win_common::clear_inherit(stdout_read);
@@ -404,8 +430,28 @@ pub(super) fn start_top_level(
         })
         .expect("the daemon must spawn the top-level child");
 
-    let (out, err) = crate::win_common::read_two_pipes_to_strings(stdout_read, stderr_read);
-    (child, job, out, err)
+    DetachedTopLevel {
+        child,
+        job,
+        stdout_read,
+        stderr_read,
+    }
+}
+
+/// Daemonに子を起こしてもらい、**その子のstdout/stderrと終了コード**を返す。
+///
+/// 出力をEOFまで読むので、**子が終わるまで返らない**。走っている最中に何かをする腕は
+/// [`start_top_level_detached`]を使う。
+pub(super) fn start_top_level(
+    daemon: &SpawnDaemonHandle,
+    profile: &OwnedContainerSid,
+    workspace: &std::path::Path,
+    arm: TopLevelArm<'_>,
+) -> (SpawnedChild, HANDLE, String, String) {
+    let started = start_top_level_detached(daemon, profile, workspace, arm);
+    let (out, err) =
+        crate::win_common::read_two_pipes_to_strings(started.stdout_read, started.stderr_read);
+    (started.child, started.job, out, err)
 }
 
 /// プローブを、**Redirectorもコンソールも無しで**起こす（段階6bまでの既定の形）。
@@ -749,27 +795,22 @@ fn cancelling_a_daemon_spawned_lineage_still_kills_the_grandchild() {
         prepare_descendant(&workspace, DescendantOutput::RedirectedToFile, true);
     let shell = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string();
 
-    let (stdout_read, stdout_write) = appcontainer_pipe(profile.as_psid()).expect("stdout pipe");
-    crate::win_common::clear_inherit(stdout_read);
-    let (stderr_read, stderr_write) = appcontainer_pipe(profile.as_psid()).expect("stderr pipe");
-    crate::win_common::clear_inherit(stderr_read);
-    let job = crate::win_common::create_job_object().expect("lineage job");
-
-    let child = daemon
-        .spawn_top_level(TopLevelSpawn {
+    // **出力を読まない版で起こす**——読むと子が終わるまで返らず、キャンセルを撃つ機会が無い。
+    let started = start_top_level_detached(
+        daemon,
+        &profile,
+        &workspace,
+        TopLevelArm {
             exe: &shell,
             args: &["-NoProfile", "-NonInteractive", "-Command", &script],
-            cwd: &workspace,
-            env: &crate::secret_env::build_child_env(),
             domain: domain_spec(&profile, &caps, None),
-            job,
-            stdout_write,
-            stderr_write,
-            stdin_read: None,
-            redirector: None,
             console: ConsoleNeed::Required,
-        })
-        .expect("the daemon must spawn the shell");
+            redirector: None,
+            extra_env: Vec::new(),
+        },
+    );
+    let (child, job) = (&started.child, started.job);
+    let (stdout_read, stderr_read) = (started.stdout_read, started.stderr_read);
 
     let descendant = DescendantProbe::wait_for_pid_file(&pid_file);
     // **キャンセル前に孫が確かに生きていたことを、同じテストでassertする**——

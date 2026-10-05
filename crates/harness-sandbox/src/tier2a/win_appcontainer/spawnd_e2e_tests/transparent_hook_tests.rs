@@ -56,7 +56,11 @@ use crate::tier2a::spawnd::RedirectorSpec;
 
 /// この回の腕が必ず使う注入の指定。**ワークスペースは渡すが、誘導も受付も無い**
 /// ——プロセス生成フックを置くためだけの注入である（段階5b）。
-fn process_hooks(workspace: &std::path::Path) -> Option<RedirectorSpec> {
+///
+/// [実行エイリアスの道のA1] `store_alias_job_spike_tests`も同じ注入の指定で撃つので`pub(super)`に
+/// してある。**写しを作らない**（`docs/CODE-STRUCTURE-RULES.md`§5.0）——指定が2つの綴りに分かれると、
+/// 片方だけ直った状態で「同じ条件で測った」と読める記録が残る。
+pub(super) fn process_hooks(workspace: &std::path::Path) -> Option<RedirectorSpec> {
     Some(RedirectorSpec::ProcessHooks {
         workspace_root: Some(workspace.to_string_lossy().into_owned()),
     })
@@ -67,7 +71,12 @@ fn process_hooks(workspace: &std::path::Path) -> Option<RedirectorSpec> {
 /// サンドボックスの中のDLLは、差分層が無い構成では`%TEMP%`へ書こうとして**失敗する**
 /// （AppContainerの子はユーザーの`%TEMP%`にACEを持たない）。**張らないと、
 /// フックが何をしたのかはどこにも残らない**——6f-1でDaemonのstderrに同じ口を作ったのと同じ形。
-const REDIRECTOR_LOG_ENV: &str = "HARNESS_REDIRECTOR_DEBUG_LOG";
+///
+/// [実行エイリアスの道のA1] `store_alias_job_spike_tests`は`run_probe_with_hooks`を通らない子
+/// （シェルを最上位で起こす腕）にも同じ受け皿を張るので`pub(super)`にしてある。
+/// **変数名を2箇所に書かない**——片方だけ変わると、空のファイルを読んで「フックが1行も書いていない」
+/// と見える（`B-13`）。
+pub(super) const REDIRECTOR_LOG_ENV: &str = "HARNESS_REDIRECTOR_DEBUG_LOG";
 
 /// [`run_probe_with_hooks`]が張るDLLの診断の受け皿の置き場。
 ///

@@ -390,6 +390,32 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             // `spawn-daemon-cmd-nested`の項を一緒に消す**（測定ファイルのモジュールdocの寿命）。
             "--skip",
             "cmd_nested_spawn_tests",
+            // [実行エイリアスの道のA1] ストアの実行エイリアスのpwshを新しい空のJobへ入れる測定も
+            // 受け入れではないので外す（`spike-spawnd-store-alias-job`が別に回す）。
+            // **判定が出てA3の実装が入ったら、この2行と`spike-spawnd-store-alias-job`の項を
+            // 一緒に消す**（測定ファイルのモジュールdocの寿命）。
+            "--skip",
+            "store_alias_job_spike_tests",
+        ],
+    ),
+    // [実行エイリアスの道のA1] ストアの実行エイリアス（`WindowsApps\pwsh.exe`）のpwshを、
+    // Daemonと同じ条件で**新しい空のJob**へ入れて動かし、Jobごと終わらせられるかの測定
+    // （条件を1つだけ変えて撃つ測定の一覧は測定ファイルのモジュールdocが持つ。ここに本数を書かない）。
+    // **合否は計器の検算と対照だけで、本命の観測は印字する**。判定の規則は
+    // `plans/mac-spike/RESULTS.md` §S84（測定より前のコミットに在る）。
+    // 寿命は測定ファイル（`spawnd_e2e_tests/store_alias_job_spike_tests.rs`）のモジュールdocが持つ。
+    (
+        "spike-spawnd-store-alias-job",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "win_appcontainer::spawnd_e2e_tests::store_alias_job_spike_tests",
         ],
     ),
     // [BUG-230] 遷移の強制の下で`cmd.exe`が次のプログラムを起こせない件の原因を決める測定

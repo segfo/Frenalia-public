@@ -108,7 +108,11 @@ pub(crate) fn prepare_descendant(
     (script, pid_file)
 }
 
-fn ps_literal(value: &str) -> String {
+/// PowerShellの単一引用符の文字列リテラルへ包む（中の`'`は2つに増やす）。
+///
+/// [実行エイリアスの道のA1] `store_alias_job_spike_tests`も台本を組むので`pub(crate)`にしてある。
+/// **包み方を2箇所に書かない**——引用符の扱いが片方だけ直ると、台本が黙って別のコマンドになる。
+pub(crate) fn ps_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
