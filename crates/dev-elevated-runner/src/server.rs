@@ -182,7 +182,7 @@ fn run_cargo_target(target: &str, repo_root: &std::path::Path) -> dev_elevated_r
             stdout: String::new(),
             stderr: format!(
                 "unknown target {target:?} (this daemon only runs a fixed, hardcoded set of \
-                 cargo invocations, see KNOWN_TARGETS in crates/dev-elevated-runner/src/lib.rs)"
+                 cargo invocations, see KNOWN_TARGETS in crates/dev-elevated-runner/src/targets.rs)"
             ),
         };
     };
