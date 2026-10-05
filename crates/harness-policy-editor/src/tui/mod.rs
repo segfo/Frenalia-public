@@ -72,6 +72,8 @@ mod edit_commit;
 mod edit_screen;
 /// 画面の一番下のキー案内（項目はクリックでそのキーを押せる）。
 mod key_hints;
+/// 確認ダイアログ（`Modal`・`Confirm`）。2026-10-05に`state`から移した。
+mod modal;
 /// マウスのクリックとホイール。押せる場所と送れる枠は描くときに登録する（2026-10-02）。
 mod pointer;
 mod proposal_tree;
