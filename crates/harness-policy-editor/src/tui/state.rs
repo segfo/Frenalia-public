@@ -1511,13 +1511,9 @@ impl App {
             KeyCode::Char('y') | KeyCode::Char('Y') if confirm => {
                 self.modal = None;
                 self.modal_scroll = 0;
-                // **何を書くのかはモーダルが持っている**（開いた画面を推測しない）。
-                match kind {
-                    Some(Confirm::Approval) => self.commit_approval(),
-                    Some(Confirm::DeclaredChanges) => self.commit_declared_changes(),
-                    Some(Confirm::Transition) => self.commit_transition(),
-                    Some(Confirm::DeclaredTransitions) => self.commit_declared_transition_removals(),
-                    Some(Confirm::ReadOnly) | None => {}
+                // **何を書くのかはモーダルが持っている**（開いた画面を推測しない。振り分けは`tui::modal`）。
+                if let Some(kind) = kind {
+                    self.commit_confirmed(kind);
                 }
                 None
             }

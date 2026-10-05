@@ -1,8 +1,11 @@
 //! 確認ダイアログ（[`Modal`]）と、`y`を押したときに何を書くか（[`Confirm`]）。
 //!
 //! 2026-10-05に`tui::state`からそのまま移した（`state.rs`は本体1,000行を超えているので、確認の種類を
-//! 足す前に置き場を分けた。`plans/position-domains/P4.md`のP4.2）。`y`を受けて書く処理を振り分けるのは
-//! `App::on_modal_key`（`tui::state`）、描くのは`tui::draw_modal`である。
+//! 足す前に置き場を分けた。`plans/position-domains/P4.md`のP4.2）。`y`を受けるのは`App::on_modal_key`
+//! （`tui::state`）、受けた後に種類ごとの書く処理を振り分けるのは[`App::commit_confirmed`]（ここ。P4.5 の準備で
+//! `state.rs`から移した）、描くのは`tui::draw_modal`である。
+
+use crate::tui::state::App;
 
 /// 確認ダイアログ。**書く前に必ず差分を見せる**（`approve`のplan/commitの2段をUIで使う）。
 ///
@@ -50,5 +53,20 @@ impl Confirm {
     /// `y`/`n`を聞く形か（枠の色と案内文が使う）。
     pub fn asks(self) -> bool {
         !matches!(self, Confirm::ReadOnly)
+    }
+}
+
+impl App {
+    /// 確認ダイアログで`y`が押されたとき、ダイアログが持つ種類（[`Confirm`]）の書く処理を呼ぶ。
+    ///
+    /// **`_`を書かない**——種類を足した日に、ここで書く処理を必ず選ばされる。
+    pub(crate) fn commit_confirmed(&mut self, kind: Confirm) {
+        match kind {
+            Confirm::Approval => self.commit_approval(),
+            Confirm::DeclaredChanges => self.commit_declared_changes(),
+            Confirm::Transition => self.commit_transition(),
+            Confirm::DeclaredTransitions => self.commit_declared_transition_removals(),
+            Confirm::ReadOnly => {}
+        }
     }
 }
