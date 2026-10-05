@@ -230,9 +230,11 @@ fn an_unregistered_sid_whose_mask_is_not_exactly_one_of_ours_is_not_claimed() {
 /// 巻き戻したいときは`harness fs revoke-traverse`という名前の付いた扉を通る。
 #[test]
 fn the_ancestor_traverse_mask_is_not_part_of_the_fingerprint() {
-    use windows::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_TRAVERSE};
+    use windows::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE};
     let f = Fixture::new();
-    let traverse = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0;
+    // [BUG-230] 実際に付与する値（`traverse::TRAVERSE_ACE_MASK`）と同じく`SYNCHRONIZE`込み。
+    // それでも読み書きの指紋には一致しない（通過用のACEは撤収の指紋に数えない）。
+    let traverse = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0;
     assert_eq!(
         f.classify(SID_ORPHAN, traverse, false),
         SubjectKind::Unidentified { classified: true }

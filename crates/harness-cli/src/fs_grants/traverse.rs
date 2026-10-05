@@ -28,7 +28,7 @@ pub(crate) fn fs_grant_traverse_preview(target: &Path) -> ExitCode {
     println!("(read-only: no ACE has been written, no UAC prompt was shown)");
     for node in &preview {
         let status = if node.already_sufficient {
-            "already has FILE_TRAVERSE|FILE_READ_ATTRIBUTES -- write will be SKIPPED"
+            "already has FILE_TRAVERSE|FILE_READ_ATTRIBUTES|SYNCHRONIZE -- write will be SKIPPED"
         } else {
             match node.existing_mask {
                 Some(_) => "has some sandbox-SID ACE, but not sufficient -- WILL WRITE",
@@ -58,7 +58,7 @@ pub(crate) fn fs_grant_traverse_preview(_target: &Path) -> ExitCode {
 #[cfg(windows)]
 pub(crate) fn fs_grant_traverse(target: &Path) -> ExitCode {
     // 事前チェック（決定2、`TIER1A-PRIVHELPER-HANG.md`「引き継ぎTODO」）: 祖先チェーン全ノードが
-    // 既にFILE_TRAVERSE|FILE_READ_ATTRIBUTESを持っているなら、privhelperもUACも一切呼ばず
+    // 既にFILE_TRAVERSE|FILE_READ_ATTRIBUTES|SYNCHRONIZEを持っているなら、privhelperもUACも一切呼ばず
     // 即座に成功する。`preview_traverse_chain`は`--dry-run`が使うのと同じ読み取り専用ヘルパで、
     // `WRITE_DAC`もUACも要らない。
     if let Ok(sid) = harness_sandbox::tier2a::win_appcontainer::traverse_capability_sid() {
@@ -71,7 +71,7 @@ pub(crate) fn fs_grant_traverse(target: &Path) -> ExitCode {
             harness_sandbox::tier2a::traverse_ledger::record_traverse_grants(&paths);
             println!(
                 "grant-traverse: all {} ancestor node(s) already have \
-                 FILE_TRAVERSE|FILE_READ_ATTRIBUTES -- skipped the privilege-separation helper \
+                 FILE_TRAVERSE|FILE_READ_ATTRIBUTES|SYNCHRONIZE -- skipped the privilege-separation helper \
                  entirely (no UAC prompt): {}",
                 preview.len(),
                 preview
@@ -113,7 +113,7 @@ pub(crate) fn fs_grant_traverse(target: &Path) -> ExitCode {
     match outcome {
         Ok(granted) => {
             println!(
-                "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES via privilege-separation helper \
+                "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES|SYNCHRONIZE via privilege-separation helper \
                  (UAC, one-time) on the full ancestor chain up to the drive root: {} (see \
                  docs/phases/foundation/M12-shell-isolation-tiers.md 追記8・追記13, \
                  plans/DESIGN-SANDBOX-PRIVSEP.md §5). All {} node(s) recorded in the traverse \
@@ -173,7 +173,7 @@ pub(crate) fn fs_grant_traverse_direct(target: &Path) -> ExitCode {
     match result {
         Ok(()) => {
             println!(
-                "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES (admin, one-time; see \
+                "granted FILE_TRAVERSE|FILE_READ_ATTRIBUTES|SYNCHRONIZE (admin, one-time; see \
                  docs/phases/foundation/M12-shell-isolation-tiers.md 追記8・追記13) on the full \
                  ancestor chain up to the drive root: {}. All {} node(s) recorded in the \
                  traverse ledger; use `harness fs revoke-traverse <path>` per-node or \

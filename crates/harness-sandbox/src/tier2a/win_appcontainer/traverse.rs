@@ -6,20 +6,36 @@
 //! 付けるか」の選定と、書込前の読み取り専用プレビューを持つ。
 
 use super::*;
+use windows::Win32::Storage::FileSystem::SYNCHRONIZE;
 
-/// ドライブルート（例`C:\`）へ、`sid`の`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`を単一・非継承で
+/// 祖先ディレクトリへ付与する通行許可のアクセスマスク。
+///
+/// # なぜ`SYNCHRONIZE`が要るのか（[BUG-230](../../../../docs/bugs/BUG-230.md)、2026-10-05にprocmonで確定）
+///
+/// 当初は`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`だけだった（「通過」と「属性の読み取り」）。
+/// しかし`cmd.exe`はサンドボックスの中で外部プログラムを起こす前に、作業フォルダのある
+/// ドライブのルート`C:\`を**同期入出力のハンドルで**開こうとする（ボリュームの情報を読むため）。
+/// `CreateFileW`は同期入出力のハンドルを開くとき、要求へ必ず`SYNCHRONIZE`（開いたハンドルで
+/// 「待つ」ための権利）を足すので、この1ビットが無いと`C:\`のオープンが`ACCESS_DENIED`になり、
+/// `cmd.exe`はプロセスを作る関数を呼ぶ手前で止まる（`plans/mac-spike/RESULTS.md` §S85.1）。
+///
+/// **増えるのは「ハンドルを開いて待てる」ことだけで、中身の一覧（`FILE_LIST_DIRECTORY`）は
+/// 含めていない**——ルートの子を列挙する能力は与えない。
+///
+/// この定数を[`grant_traverse_drive_root`]・[`grant_traverse_chain_with_progress`]の付与と
+/// [`preview_traverse_chain`]の充足判定の3か所で共有する。**充足判定も同じ値を見るので、
+/// `SYNCHRONIZE`を足した結果、旧マスク（`SYNCHRONIZE`抜き）だけを持つ既存の機械は
+/// 「不足」と判定され、次の起動で付与し直される**（付与と判定が同じ定数を通る＝B-13）。
+pub(crate) const TRAVERSE_ACE_MASK: u32 = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0;
+
+/// ドライブルート（例`C:\`）へ、`sid`の通行許可（[`TRAVERSE_ACE_MASK`]）を単一・非継承で
 /// 付与する（D10、`harness fs grant-traverse`本体）。`docs/phases/foundation/
 /// M12-shell-isolation-tiers.md`追記8で判明した根本原因（ドライブルートのtraverse ACE欠如、
 /// `FILE_TRAVERSE`単独では`Read Attributes`アクセス拒否が残り不十分）の修復そのもの。
 /// ドライブルートのDACL変更には`WRITE_DAC`が要るため、非管理者では
 /// `AppContainerError::AclGrant`（access denied）を返す（呼び出し側が「管理者で再実行」を促す）。
 pub fn grant_traverse_drive_root(drive: &Path, sid: PSID) -> Result<(), AppContainerError> {
-    grant_ace_mask(
-        drive,
-        sid,
-        FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0,
-        NO_INHERITANCE,
-    )
+    grant_ace_mask(drive, sid, TRAVERSE_ACE_MASK, NO_INHERITANCE)
 }
 
 /// [D-48] traverse ACEを1ノード撤収する**唯一の正規の扉**（`harness fs revoke-traverse <path>`本体）。
@@ -151,12 +167,7 @@ pub fn grant_traverse_chain_with_progress(
     let mut granted = Vec::with_capacity(chain.len());
     for node in &chain {
         let started = std::time::Instant::now();
-        let result = grant_ace_mask(
-            node,
-            sid,
-            FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0,
-            NO_INHERITANCE,
-        );
+        let result = grant_ace_mask(node, sid, TRAVERSE_ACE_MASK, NO_INHERITANCE);
         on_node(node, &result, started.elapsed());
         if let Err(e) = result {
             return (granted, Err(e));
@@ -179,7 +190,7 @@ pub struct TraversePreviewNode {
 }
 
 pub fn preview_traverse_chain(target: &Path, sid: PSID) -> Vec<TraversePreviewNode> {
-    const REQUIRED: u32 = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0;
+    const REQUIRED: u32 = TRAVERSE_ACE_MASK;
     let chain = traverse_chain_nodes(target);
 
     chain

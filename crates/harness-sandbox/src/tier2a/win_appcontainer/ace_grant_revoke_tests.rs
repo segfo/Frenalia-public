@@ -26,6 +26,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows::Win32::System::Threading::TerminateProcess;
 
 const PROBE_COMMAND: &str = "\
@@ -539,8 +540,8 @@ fn grant_traverse_then_revoke_traverse_on_neutral_dir() {
     let mask = sid_ace_mask(&path, sid.as_psid()).expect("sid_ace_mask after grant");
     assert_eq!(
         mask,
-        Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0),
-        "granted ACE mask must be exactly FILE_TRAVERSE | FILE_READ_ATTRIBUTES"
+        Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0),
+        "granted ACE mask must be exactly FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE (BUG-230)"
     );
 
     revoke_ace(&path, sid.as_psid()).expect("revoke_ace");
@@ -688,8 +689,8 @@ fn traverse_chain_grants_every_ancestor_on_a_test_owned_drive_root() {
     for node in &granted {
         assert_eq!(
             sid_ace_mask(node, sid.as_psid()).expect("read the post-grant mask"),
-            Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0),
-            "node {} must carry exactly FILE_TRAVERSE | FILE_READ_ATTRIBUTES",
+            Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0),
+            "node {} must carry exactly FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE (BUG-230)",
             node.display()
         );
     }
@@ -911,7 +912,7 @@ fn destructive_traverse_write_ahead_recovers_both_crash_windows() {
                 sid_ace_mask(node, sid.as_psid()).expect("read recovered DACL"),
                 point
                     .expects_ace()
-                    .then_some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0),
+                    .then_some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0),
                 "{}: recovery must preserve the actual DACL state at {}",
                 point.name(),
                 node.display()
@@ -1096,7 +1097,7 @@ fn a_second_process_grants_while_the_first_is_parked_inside_its_own_transaction(
     for node in &mover_chain {
         assert_eq!(
             sid_ace_mask(node, sid.as_psid()).expect("read the mover's DACL"),
-            Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0),
+            Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0),
             "the second process's ACE must really be on {}",
             node.display()
         );
@@ -1233,11 +1234,11 @@ fn grant_traverse_chain_then_revoke_each_node_on_neutral_tree() {
 
     for node in &granted {
         match sid_ace_mask(node, sid.as_psid()) {
-            Ok(mask) if mask == Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0) => {}
+            Ok(mask) if mask == Some(FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0) => {}
             other => {
                 cleanup();
                 panic!(
-                    "node {node:?} must have exactly FILE_TRAVERSE | FILE_READ_ATTRIBUTES, got {other:?}"
+                    "node {node:?} must have exactly FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE (BUG-230), got {other:?}"
                 );
             }
         }

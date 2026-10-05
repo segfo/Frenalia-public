@@ -11,13 +11,16 @@
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Storage::FileSystem::{
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
+    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_TRAVERSE, SYNCHRONIZE,
 };
 
 use super::preflight_probe::{describe_passthrough_chain, PassthroughChainFacts};
 
 /// 祖先が「通過できる」状態のマスク（`grant_traverse_chain`が実際に付与する値）。
-const TRAVERSE_OK: u32 = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0;
+/// [BUG-230] `SYNCHRONIZE`を含む——これが無いと`cmd.exe`がドライブのルートを開けない。
+/// 付与側は`traverse::TRAVERSE_ACE_MASK`で同じ値を持つが、ここは**実測で確定した期待値を
+/// 手で綴って**おく（付与側と同じ定数を参照すると、両方同時にずれても気付けない＝歯が無くなる）。
+const TRAVERSE_OK: u32 = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0 | SYNCHRONIZE.0;
 /// `FsAccess::ReadExec`（`--fs-allow`の既定、F8）が要求するマスク。
 const READ_EXEC: u32 = FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0;
 
@@ -125,9 +128,30 @@ fn a_partial_ancestor_mask_still_counts_as_missing() {
 
     assert!(
         message.contains(
-            r"C:\Users (has a traverse-capability ACE but missing FILE_TRAVERSE|FILE_READ_ATTRIBUTES)"
+            r"C:\Users (has a traverse-capability ACE but missing FILE_TRAVERSE|FILE_READ_ATTRIBUTES|SYNCHRONIZE)"
         ),
         "{message}"
+    );
+}
+
+/// [BUG-230] `SYNCHRONIZE`抜きの旧マスク（`FILE_TRAVERSE|FILE_READ_ATTRIBUTES`）も欠落として扱う。
+///
+/// この1本が、`SYNCHRONIZE`を足した修正の歯である——判定が旧マスクを「足りている」と
+/// 読んだままだと、`cmd.exe`がドライブのルートを開けない状態を診断が見逃す。
+#[test]
+fn the_old_mask_without_synchronize_now_counts_as_missing() {
+    let old_mask = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0;
+    let message = describe_passthrough_chain(
+        Path::new(LEAF),
+        "probe error",
+        &facts(Some(READ_EXEC), [Some(old_mask), Some(TRAVERSE_OK), Some(TRAVERSE_OK)]),
+    );
+
+    assert!(
+        message.contains(
+            r"C:\ (has a traverse-capability ACE but missing FILE_TRAVERSE|FILE_READ_ATTRIBUTES|SYNCHRONIZE)"
+        ),
+        "the old mask (no SYNCHRONIZE) must now be reported as missing: {message}"
     );
 }
 

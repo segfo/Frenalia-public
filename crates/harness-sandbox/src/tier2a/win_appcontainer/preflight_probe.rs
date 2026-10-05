@@ -551,7 +551,11 @@ pub(crate) struct PassthroughChainFacts {
     pub(crate) ancestors: Vec<(std::path::PathBuf, Option<u32>)>,
 }
 
-const TRAVERSE_REQUIRED_MASK: u32 = FILE_TRAVERSE.0 | FILE_READ_ATTRIBUTES.0;
+/// 祖先が「通過できる」と判定する基準マスク。**付与側と同じ定数を見る**
+/// （[`super::traverse::TRAVERSE_ACE_MASK`]。[BUG-230](../../../../docs/bugs/BUG-230.md)で
+/// `SYNCHRONIZE`を足したとき、ここが古い値のままだと「付与したのに診断は足りていると言う」ずれが
+/// 残るので、判定を2箇所に書き写さない＝B-13）。
+const TRAVERSE_REQUIRED_MASK: u32 = super::traverse::TRAVERSE_ACE_MASK;
 
 /// D9の診断文を組み立てる（純粋関数）。
 ///
@@ -573,7 +577,7 @@ pub(crate) fn describe_passthrough_chain(
         })
         .map(|(node, mask)| match mask {
             Some(_) => format!(
-                "{} (has a traverse-capability ACE but missing FILE_TRAVERSE|FILE_READ_ATTRIBUTES)",
+                "{} (has a traverse-capability ACE but missing FILE_TRAVERSE|FILE_READ_ATTRIBUTES|SYNCHRONIZE)",
                 node.display()
             ),
             None => format!(
