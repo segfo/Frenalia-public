@@ -33,7 +33,8 @@ const WARMUP: std::time::Duration = std::time::Duration::from_millis(1500);
 /// 対象コマンド終了後、バッファ内のイベントが配送され切るまでの待ち（同上）。
 const DRAIN: std::time::Duration = std::time::Duration::from_secs(4);
 
-fn policy_for(workspace: &Path, sink_dir: &Path, capture_argv: bool) -> LearnPolicy {
+/// `process_audit_e2e_tests`も同じ形で呼ぶ（写さない）。
+pub(super) fn policy_for(workspace: &Path, sink_dir: &Path, capture_argv: bool) -> LearnPolicy {
     LearnPolicy {
         session_profile: crate::tier2a::session_profile::current_profile_name(),
         workspace_root: workspace.to_path_buf(),

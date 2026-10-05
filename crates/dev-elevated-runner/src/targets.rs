@@ -893,6 +893,23 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "policy_learnd::argv_e2e_tests",
         ],
     ),
+    // ポリシーエディタの決定65・決定23（収集プロセスがプロセスの木を書く）の受け入れ（P2e）。
+    // `cmd /c cmd /c cmd /c type <目印>`を2回起こし、process-audit.jsonl の深さ3の鎖・各段の引数・
+    // fs-audit.jsonl の通し番号を実機で確かめる。
+    (
+        "policy-learn-process-tree",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "policy_learnd::process_audit_e2e_tests",
+        ],
+    ),
     // フィルタはモジュールへ絞る。`loopback`の1語で束ねていたときは、証明書ストアのスパイクにある
     // 付与用と撤収用の関数（`n2_loopback_exemption_add`／`_remove`）まで名前順に続けて走らせていた
     // （付与と撤収を別のキーに分ける理由が、フィルタの部分一致で崩れる）。

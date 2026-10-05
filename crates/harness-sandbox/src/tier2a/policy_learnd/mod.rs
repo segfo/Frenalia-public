@@ -49,6 +49,11 @@ mod reuse_tests;
 #[cfg(all(windows, test))]
 mod argv_e2e_tests;
 
+/// [P2e] プロセスの木（`process-audit.jsonl`）の昇格E2E（**要管理者権限**）。深さ3の`cmd`の鎖が
+/// 通し番号で辿れること・各段の引数・`fs-audit.jsonl`の通し番号を実機で測る。
+#[cfg(all(windows, test))]
+mod process_audit_e2e_tests;
+
 /// `process-audit.jsonl`（記録したプロセスの木、決定23(1)）の置き場。
 ///
 /// **`fs-audit.jsonl`と同じディレクトリに置き、そのパスから導出する。** 昇格側はこのパスを

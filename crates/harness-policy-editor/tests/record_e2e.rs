@@ -19,11 +19,16 @@
 //! 2. record-allが**成功したアクセス**を拾う（deny-onlyなら0件になる）——読んだファイルが候補に出る
 //! 3. `.harness`配下が候補に出ない（P-08・自己参照ループの防止）
 //! 4. 記録セッションのマニフェストが`finished`で閉じる（`running`のまま残らない）
+//! 5. 同じ記録のディレクトリにプロセスの木（`process-audit.jsonl`、決定23）が書かれ、記録の根がある。
+//!    読んだファイルの`fs-audit.jsonl`の行は、その木の中のインスタンスの通し番号を持つ（P2e）
 
 #![cfg(windows)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use harness_policy::event::FsAuditEvent;
+use harness_policy::process_event::{parse_process_audit, PROCESS_AUDIT_FILE};
 
 fn editor_exe() -> &'static str {
     env!("CARGO_BIN_EXE_harness-policy-editor")
@@ -142,6 +147,49 @@ fn recording_a_command_captures_the_files_it_read_and_never_proposes_the_control
         manifest["etw_available"].as_bool().unwrap_or(false),
         "the ETW session must have been opened (are we elevated?): {manifest}"
     );
+
+    // 5. プロセスの木が本番の経路で書かれている（決定23。依頼側が先に作り、収集プロセスが書く）。
+    let record_dir = only_record_dir(workspace_root);
+    let audit_path = record_dir.join(PROCESS_AUDIT_FILE);
+    let audit_text = std::fs::read_to_string(&audit_path)
+        .unwrap_or_else(|e| panic!("{} must exist: {e}", audit_path.display()));
+    let tree =
+        parse_process_audit(&audit_text).expect("process-audit.jsonl starts with its header");
+    eprintln!("--- process-audit.jsonl ---\n{audit_text}");
+    assert!(
+        tree.instances.iter().any(|i| i.is_scope_root),
+        "the recording's root process must be in the process tree: {tree:?}"
+    );
+    assert!(
+        tree.controls
+            .iter()
+            .any(|c| c.starts_with("process_tree_summary:")),
+        "the tree writer must have been closed out (summary control record): {tree:?}"
+    );
+    // 読んだファイルの行は、木の中のインスタンスの通し番号を持つ（`fs-audit.jsonl`と木を番号で結べる）。
+    let seqs: std::collections::HashSet<u64> = tree.instances.iter().map(|i| i.seq).collect();
+    let marker_lines: Vec<FsAuditEvent> =
+        std::fs::read_to_string(record_dir.join("fs-audit.jsonl"))
+            .expect("fs-audit.jsonl")
+            .lines()
+            .filter_map(|line| serde_json::from_str::<FsAuditEvent>(line).ok())
+            .filter(|e| {
+                e.path
+                    .as_deref()
+                    .is_some_and(|p| p.ends_with("policy-editor-e2e-marker.txt"))
+            })
+            .collect();
+    assert!(
+        !marker_lines.is_empty(),
+        "the marker read must be in fs-audit.jsonl"
+    );
+    for line in &marker_lines {
+        assert!(
+            line.process_sequence_number
+                .is_some_and(|seq| seqs.contains(&seq)),
+            "the marker read must carry a sequence number found in the process tree: {line:?}"
+        );
+    }
 }
 
 /// 提案1件の行か（`  fs-12    fs.read = ...`）。理由の行（`! ...`）と要約行は除く。
@@ -152,23 +200,27 @@ fn is_proposal_line(line: &str) -> bool {
 
 /// 記録セッションが1つだけあることを前提に、そのマニフェストを読む。
 fn read_only_manifest(workspace_root: &Path) -> serde_json::Value {
+    let path = only_record_dir(workspace_root).join("record-session.json");
+    let text = std::fs::read_to_string(&path).expect("record-session.json");
+    serde_json::from_str(&text).expect("record-session.json is JSON")
+}
+
+/// 記録セッションのディレクトリ（`record-session.json`を持つもの）が1つだけあることを確かめて返す。
+fn only_record_dir(workspace_root: &Path) -> PathBuf {
     let sandbox = workspace_root.join(".harness").join("sandbox");
-    let mut manifests: Vec<serde_json::Value> = std::fs::read_dir(&sandbox)
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&sandbox)
         .expect("sandbox dir")
         .flatten()
-        .filter_map(|entry| {
-            let path = entry.path().join("record-session.json");
-            let text = std::fs::read_to_string(path).ok()?;
-            serde_json::from_str(&text).ok()
-        })
+        .map(|entry| entry.path())
+        .filter(|dir| dir.join("record-session.json").is_file())
         .collect();
     assert_eq!(
-        manifests.len(),
+        dirs.len(),
         1,
         "expected exactly one recording session under {}",
         sandbox.display()
     );
-    manifests.remove(0)
+    dirs.remove(0)
 }
 
 /// テストがassertで落ちても、`C:\`直下に作った読み取り対象を必ず消す（`型F`）。
