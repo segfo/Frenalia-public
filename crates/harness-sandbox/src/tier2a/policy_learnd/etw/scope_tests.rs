@@ -18,6 +18,8 @@ fn start(
         image_name: Some(format!("\\Device\\HarddiskVolume3\\test\\{pid}.exe")),
         package_full_name: package.map(str::to_string),
         process_sequence_number: seq,
+        parent_process_sequence_number: None,
+        timestamp_unix_ms: 0,
     }
 }
 
@@ -294,4 +296,35 @@ fn a_failed_probe_at_process_start_leaves_the_verdict_open() {
 
     // 「対象外」として固定されていない——拒否イベント時にもう一度聞ける。
     assert_eq!(tracker.classify(100, |_| Some(true)), ScopeVerdict::InScope);
+}
+
+/// **記録の根の判定は、短命救済が使う判定と同じ1つである**（`is_scope_root`、決定23(2)）。
+///
+/// プロセスの木（`process-audit.jsonl`）の`is_scope_root`はこの関数の答えをそのまま書く。
+/// 救済と木で式が2つあると、片方だけ直したときに「根として対象にした」と「根として書いた」が
+/// 食い違う（`B-05`）。救済の側が実際にこの関数を通ることは、下の最後の2行で
+/// `on_process_start_probing`の答えと突き合わせて確かめる。
+#[test]
+fn the_scope_root_judgment_is_the_one_the_parentage_rescue_uses() {
+    let tracker = ScopeTracker::new(PROFILE)
+        .with_harness_pid(Some(10))
+        .with_spawn_daemon_pid(Some(20));
+
+    // 根: 親が harness 本体か Spawn Daemon。
+    assert!(tracker.is_scope_root(Some(10)));
+    assert!(tracker.is_scope_root(Some(20)));
+    // 対の側（`B-35`）: ほかの pid・親が分からないものは根ではない。
+    assert!(!tracker.is_scope_root(Some(30)));
+    assert!(!tracker.is_scope_root(None));
+
+    // harness の pid も Daemon の pid も知らない記録では、親が`None`でも根にしない
+    // （`None == None`を一致と読むと、親の分からないプロセスが全部根になる）。
+    let unaware = ScopeTracker::new(PROFILE);
+    assert!(!unaware.is_scope_root(None));
+    assert!(!unaware.is_scope_root(Some(10)));
+
+    // 救済が同じ答えを使っている: 根の子は救われ、根でない親の子は救われない。
+    let mut rescuing = ScopeTracker::new(PROFILE).with_harness_pid(Some(10));
+    assert!(rescuing.on_process_start_probing(&start(101, Some(10), None, Some(1)), |_| None));
+    assert!(!rescuing.on_process_start_probing(&start(102, Some(30), None, Some(2)), |_| None));
 }

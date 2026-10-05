@@ -30,6 +30,9 @@ pub mod etw;
 /// ポリシーエディタの遷移画面**（段階⑦）。
 pub mod observed;
 pub mod server;
+/// 記録1回のあいだに観測したプロセスのインスタンスの表（**昇格側**が使う、決定23(5)）。
+/// pid＋時刻・通し番号・時刻の窓の3通りに引く。
+mod instances;
 
 /// D-56 段階2（要求の連続を捌くプロトコル）のテスト。実daemonを非昇格で起動して検出する
 /// ものを含む——`cargo test -p harness-sandbox`は別パッケージのdaemonをリビルドしないので、

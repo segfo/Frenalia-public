@@ -1307,7 +1307,7 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
     let timestamp_unix_ms = filetime_to_unix_ms(record.EventHeader.TimeStamp);
 
     if record.EventHeader.ProviderId == KERNEL_PROCESS_PROVIDER_GUID {
-        if let Some(info) = super::kernel_process::decode_process_start(record, pid) {
+        if let Some(info) = super::kernel_process::decode_process_start(record, pid, timestamp_unix_ms) {
             if let Ok(mut starts) = sink.process_starts.lock() {
                 starts.push(info);
             }

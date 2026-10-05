@@ -163,10 +163,7 @@ impl ScopeTracker {
                 // 最後の手掛かりとして**親がharness本体かどうか**を見る。`runas`で起こす昇格
                 // ヘルパーの親はAppInfoサービスになるため、harnessの直接の子は実質`run_shell`の
                 // AppContainer子だけである。推定なので件数を数えて可視化する。
-                let parent_is_host = self.harness_pid.is_some() && info.parent_pid == self.harness_pid;
-                let parent_is_daemon =
-                    self.spawn_daemon_pid.is_some() && info.parent_pid == self.spawn_daemon_pid;
-                if parent_is_host || parent_is_daemon {
+                if self.is_scope_root(info.parent_pid) {
                     self.attributed_by_parentage = self.attributed_by_parentage.saturating_add(1);
                     self.tracked.insert(
                         info.pid,
@@ -185,6 +182,18 @@ impl ScopeTracker {
                 false
             }
         }
+    }
+
+    /// 親が harness 本体か Spawn Daemon か——**記録の根**（この記録が直接起こしたプロセス）か。
+    ///
+    /// 短命救済（[`Self::on_process_start_probing`]の`None`の分岐）と、プロセスの木の記録
+    /// （`process-audit.jsonl`の`is_scope_root`、決定23(2)）の**両方がこの1つを使う**——
+    /// 同じ判定を2か所に書くと、片方だけ直したときに「対象と判定した根」と「木に書いた根」が
+    /// 食い違う（`B-05`）。どちらのPIDも分かっていなければ偽（`None`同士を一致と読まない）。
+    pub fn is_scope_root(&self, parent_pid: Option<u32>) -> bool {
+        let parent_is_host = self.harness_pid.is_some() && parent_pid == self.harness_pid;
+        let parent_is_daemon = self.spawn_daemon_pid.is_some() && parent_pid == self.spawn_daemon_pid;
+        parent_is_host || parent_is_daemon
     }
 
     /// `Kernel-Process`の`ProcessStart`を1件取り込む（signal 1 と 2 のみ）。

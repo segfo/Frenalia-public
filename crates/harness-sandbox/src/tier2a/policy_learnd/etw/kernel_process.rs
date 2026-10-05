@@ -42,6 +42,14 @@ pub struct ProcessStartInfo {
     pub image_name: Option<String>,
     pub package_full_name: Option<String>,
     pub process_sequence_number: Option<u64>,
+    /// 親のインスタンスの`ProcessSequenceNumber`（ETWの`ParentProcessSequenceNumber`の欄）。
+    /// **生の値で、0 も入る**——0 を「無い」へ寄せるのは記録する側
+    /// （`harness_policy::process_event::ParentSeqSource::from_etw_field`）である。
+    /// 親は pid で引き直さずにこの欄で引く（`plans/POLICY-EDITOR-TOMOYO-DIG.md`の決定65の追記(1)）。
+    pub parent_process_sequence_number: Option<u64>,
+    /// 通知の時刻（イベントヘッダの`TimeStamp`をUnixミリ秒へ）。同じ pid の使い回しを
+    /// 「どの開始の後のアクセスか」で見分けるのと、MOF側の開始と時刻の窓で結び付けるのに使う。
+    pub timestamp_unix_ms: u64,
 }
 
 /// 2つ目のプロバイダを**同じセッションへ**載せる。`Kernel-Process`のProcessStartが
@@ -75,12 +83,14 @@ pub(super) fn enable_on(session_handle: CONTROLTRACE_HANDLE) -> bool {
 /// **ここでは重い処理をしない**（遅れるとイベント落ちになる）。
 ///
 /// `pid`はイベントヘッダの`ProcessId`。`ProcessID`プロパティが引けなかったときだけ使う。
+/// `timestamp_unix_ms`はイベントヘッダの時刻（呼び出し側が既に換算している値をそのまま載せる）。
 ///
 /// # Safety
 /// `record`はETWコールバックが渡した有効な`EVENT_RECORD`でなければならない（[`tdh`]の要件）。
 pub(super) unsafe fn decode_process_start(
     record: &EVENT_RECORD,
     pid: u32,
+    timestamp_unix_ms: u64,
 ) -> Option<ProcessStartInfo> {
     if record.EventHeader.EventDescriptor.Id != EVENT_ID_PROCESS_START {
         return None;
@@ -92,5 +102,7 @@ pub(super) unsafe fn decode_process_start(
         // v2以降にのみ存在する。無い版では`None`になるだけで壊れない。
         package_full_name: tdh::property_string(record, "PackageFullName"),
         process_sequence_number: tdh::property_u64(record, "ProcessSequenceNumber"),
+        parent_process_sequence_number: tdh::property_u64(record, "ParentProcessSequenceNumber"),
+        timestamp_unix_ms,
     })
 }
