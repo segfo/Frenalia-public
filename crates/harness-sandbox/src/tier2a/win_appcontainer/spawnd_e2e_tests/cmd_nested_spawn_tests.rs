@@ -24,6 +24,14 @@
 //! | `ps-undeclared` | `powershell.exe -Command <葉>` | なし | 対照: この形で待ち行列に1行が書かれる（計器の検算） |
 //! | `cmd-bisect` | `cmd.exe /d /c`＋内部コマンドだけ | — | 観測: `cmd.exe`のどの操作が断られるか（子を起こさない。`Body::Bisect`） |
 //! | `probe-open-rights` | プローブ `--open-rights …` | — | 観測: 同じ経路で起きた子が、どのディレクトリをどの権利で開けるか（`Body::OpenRights`） |
+//! | `cmd-unrestricted` | `cmd.exe /d /c <葉>`（**生成禁止を積まない**） | あり | 観測: 遷移の強制が無くても同じ失敗が出るか（違いはその1点だけ） |
+//!
+//! 3回目（ウイルス対策の除外設定の後）で、`cmd.exe`の`vol C:`と`dir /b`（対象がSystem32でも
+//! 作業フォルダでも）が断られ、`if exist`は通った。同じドメインのプローブは`C:\windows`・System32・
+//! 作業フォルダを一覧の権利で開けたが、**ドライブのルート`C:\`だけはどの権利でも開けなかった**。
+//! `C:\`のDACLは、traverse capability（D-37）へ`FILE_TRAVERSE | FILE_READ_ATTRIBUTES`しか許しておらず、
+//! `CreateFileW`が必ず足す`SYNCHRONIZE`が無い。`cmd-unrestricted`は、これが遷移の強制と無関係に
+//! 効くことを確かめる腕である。
 //!
 //! # 葉を`hostname.exe`にしてある理由（2026-10-05の1回目で分かったこと）
 //!
@@ -134,6 +142,9 @@ struct Arm {
     middle: Middle,
     body: Body,
     declare_leaf: bool,
+    /// 生成禁止を積むか。**積まない腕では、フックは横取りせず中の段が自分で子を作る**
+    /// ——そこでも同じ失敗が出るなら、原因は遷移の強制ではなく、ドメインのトークンそのものにある。
+    restricted: bool,
 }
 
 /// 1本の腕で観測したもの。**表明の前に全腕ぶんを印字する**——1本目の検算で落ちると、
@@ -143,6 +154,7 @@ struct Observed {
     middle: Middle,
     body: Body,
     declare_leaf: bool,
+    restricted: bool,
     leaf_path: String,
     probe_report: String,
     middle_pid: Option<u64>,
@@ -189,10 +201,11 @@ impl Observed {
             Middle::Probe => "tier2a_proc_probe.exe",
         };
         let mut text = format!(
-            "\n===== [bug230 {}] 中の段={middle} させること={:?} 葉への辺={} =====\n",
+            "\n===== [bug230 {}] 中の段={middle} させること={:?} 葉への辺={} 生成禁止={} =====\n",
             self.label,
             self.body,
             if self.declare_leaf { "あり" } else { "なし" },
+            if self.restricted { "あり" } else { "なし" },
         );
         text += &format!(
             "葉が動いたか（中の段の出力にホスト名）: {}\n",
@@ -262,7 +275,11 @@ fn run_arm(arm: &Arm, expected_hostname: &str) -> Observed {
 
     let (mut case, profile, caps) = setup_with_policy_and_transitions(
         &format!("spawnd-bug230-{}", arm.label),
-        ChildProcessPolicy::Restricted,
+        if arm.restricted {
+            ChildProcessPolicy::Restricted
+        } else {
+            ChildProcessPolicy::Unrestricted
+        },
         |_workspace| {
             let mut exes = vec![middle_exe.as_str()];
             if arm.declare_leaf {
@@ -386,6 +403,7 @@ fn run_arm(arm: &Arm, expected_hostname: &str) -> Observed {
         middle: arm.middle,
         body: arm.body,
         declare_leaf: arm.declare_leaf,
+        restricted: arm.restricted,
         leaf_path: leaf_str,
         probe_report: out,
         middle_pid,
@@ -419,6 +437,11 @@ fn instrument_failures(o: &Observed) -> Vec<String> {
         ));
         return failures;
     };
+    // 生成禁止を積まない腕では、プローブのフックは横取りしない（`brokered`の行が出ない）ので、
+    // DLLのログの検算は掛けない。この腕で読むのは中の段の出力だけである。
+    if !o.restricted {
+        return failures;
+    }
     let probe = o.lines_of(o.probe_pid);
     if o.probe_pid.is_none() || !probe.iter().any(|l| l.contains("] init: ")) {
         failures.push(format!(
@@ -489,36 +512,49 @@ fn what_the_hook_inside_cmd_does_when_cmd_starts_the_next_program() {
             middle: Middle::Cmd,
             body: Body::RunLeaf,
             declare_leaf: true,
+            restricted: true,
         },
         Arm {
             label: "ps-declared",
             middle: Middle::WindowsPowerShell,
             body: Body::RunLeaf,
             declare_leaf: true,
+            restricted: true,
         },
         Arm {
             label: "cmd-undeclared",
             middle: Middle::Cmd,
             body: Body::RunLeaf,
             declare_leaf: false,
+            restricted: true,
         },
         Arm {
             label: "ps-undeclared",
             middle: Middle::WindowsPowerShell,
             body: Body::RunLeaf,
             declare_leaf: false,
+            restricted: true,
         },
         Arm {
             label: "cmd-bisect",
             middle: Middle::Cmd,
             body: Body::Bisect,
             declare_leaf: false,
+            restricted: true,
         },
         Arm {
             label: "probe-open-rights",
             middle: Middle::Probe,
             body: Body::OpenRights,
             declare_leaf: false,
+            restricted: true,
+        },
+        Arm {
+            label: "cmd-unrestricted",
+            middle: Middle::Cmd,
+            body: Body::RunLeaf,
+            declare_leaf: true,
+            restricted: false,
         },
     ];
 
