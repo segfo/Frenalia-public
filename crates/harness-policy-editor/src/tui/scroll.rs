@@ -75,11 +75,13 @@ pub enum Panel {
     TransitionNotes,
     /// 宣言画面の「この画面」。
     DeclaredNotes,
+    /// 宣言画面の遷移タブの「この画面」（2026-10-05）。
+    DeclaredTransitionNotes,
 }
 
 impl Panel {
     /// 全部の説明欄。**宣言の順に並べる**（位置の配列の添字が宣言の順番だから。種類を足したらここにも足す）。
-    pub const ALL: [Panel; 8] = [
+    pub const ALL: [Panel; 9] = [
         Panel::Help,
         Panel::RecordNotice,
         Panel::RecordHeader,
@@ -88,6 +90,7 @@ impl Panel {
         Panel::EditProcessTree,
         Panel::TransitionNotes,
         Panel::DeclaredNotes,
+        Panel::DeclaredTransitionNotes,
     ];
 
     fn slot(self) -> usize {
@@ -198,7 +201,8 @@ mod tests {
                 | Panel::EditNotes
                 | Panel::EditProcessTree
                 | Panel::TransitionNotes
-                | Panel::DeclaredNotes => {}
+                | Panel::DeclaredNotes
+                | Panel::DeclaredTransitionNotes => {}
             }
         }
     }

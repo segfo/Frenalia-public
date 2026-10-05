@@ -38,6 +38,12 @@ pub enum Confirm {
     /// （あちらは`fs`/`net`の宣言とACEの予告、こちらは`process`の辺と「ACLは変わらない」）。
     /// 1つにまとめると、確定の腕がどちらの意味だったか判別できなくなる。
     Transition,
+    /// 宣言画面（`F3`）の遷移タブの`a`。**遷移の辺の取り消し**（遷移元ごと、書かれている辺そのもので指す）を書く
+    /// （2026-10-05、`plans/position-domains/P4.md`のP4.2）。
+    ///
+    /// `Transition`と分けてあるのは、指し方と書く関数が違うから（あちらは入口のドメインの辺を`EdgeRef`で足す／消す、
+    /// こちらは遷移元が何個でも`transition_approve::plan_removals`で消すだけ）。
+    DeclaredTransitions,
 }
 
 impl Confirm {

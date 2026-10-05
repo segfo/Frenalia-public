@@ -585,3 +585,58 @@ fn save_refuses_a_policy_that_load_would_reject_and_leaves_the_file_alone() {
     );
     load(ws.path()).expect("the file on disk must still load");
 }
+
+/// **直すために読む口（[`load_for_repair`]）は、遷移の検査に落ちる宣言も読み、落ちた理由を返す。**
+///
+/// [`load`]は同じファイルを断る（`a_hand_written_edge_that_fails_the_checks_is_refused_at_load_time`）ので、
+/// それしか無いとエディタは検査に落ちる宣言を一覧にできず、取り消して直す手段も無い（手でJSONを直すしか
+/// ない）。宣言画面の遷移タブ（`plans/position-domains/P4.md`のP4.2）がこの口で読む。
+///
+/// 対の側: 検査に通る宣言では理由が空。**読めないもの（未来の版・版が足りない）は今までどおり断る**——
+/// 落とすのは遷移の検査だけで、書く側の[`save`]は同じ検査を掛けたまま。
+#[test]
+fn load_for_repair_reads_a_policy_that_fails_the_checks_and_says_why() {
+    let ws = workspace();
+    write_policy(
+        ws.path(),
+        &format!(
+            r#"{{
+              "schema_version": {POLICY_SCHEMA_VERSION},
+              "domains": [
+                {{
+                  "name": "shell",
+                  "process": {{
+                    "transitions": [
+                      {{ "exe": {{ "literal": "git.exe" }}, "argv": {{ "any": true }}, "to": "shell" }}
+                    ]
+                  }}
+                }}
+              ]
+            }}"#
+        ),
+    );
+    let (file, rejections) = load_for_repair(ws.path()).expect("a policy failing the checks reads for repair");
+    assert_eq!(file.domains.len(), 1);
+    assert_eq!(file.domains[0].process.transitions.len(), 1);
+    assert_eq!(rejections.len(), 1, "{rejections:?}");
+    assert!(rejections[0].contains("is not a full path"), "{rejections:?}");
+    load(ws.path()).expect_err("load itself still refuses it");
+
+    write_policy(ws.path(), &policy_with_transition(POLICY_SCHEMA_VERSION));
+    let (_, rejections) = load_for_repair(ws.path()).expect("a valid policy reads");
+    assert!(rejections.is_empty(), "{rejections:?}");
+
+    write_policy(ws.path(), &policy_with_transition(SCHEMA_VERSION_WITHOUT_TRANSITIONS));
+    assert!(matches!(
+        load_for_repair(ws.path()),
+        Err(PolicyFileError::UnversionedTransitions { .. })
+    ));
+    write_policy(
+        ws.path(),
+        &format!(r#"{{"schema_version":{},"domains":[]}}"#, POLICY_SCHEMA_VERSION + 1),
+    );
+    assert!(matches!(
+        load_for_repair(ws.path()),
+        Err(PolicyFileError::FutureSchema { .. })
+    ));
+}

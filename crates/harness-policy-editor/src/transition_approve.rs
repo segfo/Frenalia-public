@@ -263,18 +263,9 @@ pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApp
 
         // **消す方を先にやる。** 同じ`(exe, argv)`を「消してから違う形で足し直す」が
         // 1回の確定でできる——逆順にすると、足したものをその場で消すことになる。
-        for target in req.remove {
-            let before = entry.process.transitions.len();
-            entry
-                .process
-                .transitions
-                .retain(|edge| !refers_to(target, edge));
-            if entry.process.transitions.len() == before {
-                plan.not_found.push(target.clone());
-            } else {
-                plan.removed.push(target.clone());
-            }
-        }
+        let (removed, not_found) = remove_edges(entry, req.remove);
+        plan.removed = removed;
+        plan.not_found = not_found;
 
         for target in req.approve {
             if entry
@@ -356,6 +347,105 @@ pub fn commit(
     plan: &TransitionPlan,
 ) -> Result<bool, TransitionApproveError> {
     if plan.is_empty() {
+        return Ok(false);
+    }
+    policy_file::save(workspace_root, &plan.file)?;
+    Ok(true)
+}
+
+/// `domain`から、`remove`の各指定が指す辺を取り除く。返すのは（消した指定, 宣言に無かった指定）。
+fn remove_edges(domain: &mut PolicyDomain, remove: &[EdgeRef]) -> (Vec<EdgeRef>, Vec<EdgeRef>) {
+    let mut removed = Vec::new();
+    let mut not_found = Vec::new();
+    for target in remove {
+        let before = domain.process.transitions.len();
+        domain
+            .process
+            .transitions
+            .retain(|edge| !refers_to(target, edge));
+        if domain.process.transitions.len() == before {
+            not_found.push(target.clone());
+        } else {
+            removed.push(target.clone());
+        }
+    }
+    (removed, not_found)
+}
+
+/// 宣言画面（`F3`）の遷移タブの取り消し（2026-10-05、`plans/position-domains/P4.md`のP4.2）。
+///
+/// [`plan`]の取り消しと違い、**遷移元ごとに、書かれている辺そのもの**（`(遷移元, TransitionEdge)`）で指す。
+/// 手で書いた辺にはパターン・作業ディレクトリ・環境変数の差分があり、[`EdgeRef`]（リテラルの exe と引数）では
+/// 指せないからである。位置（`transitions`の添字）では指さない——ダイアログを見ている間に別の経路で
+/// 書き換わると、添字は別の辺を指す。
+/// 遷移元のドメイン名と、そこに書かれている辺そのもの（[`RemovalPlan`]の指し方）。
+pub type DomainEdge = (String, TransitionEdge);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovalPlan {
+    /// 書き込む予定の内容（[`commit_removals`]がそのまま保存する）。
+    pub file: PolicyFile,
+    pub removed: Vec<DomainEdge>,
+    /// 消そうとしたが`policy.json`に無かった（別の経路で消えていた）。**黙って落とさない**（`B-09`）。
+    pub not_found: Vec<DomainEdge>,
+}
+
+/// 取り消しの内容を決める（**何も書かない**）。遷移元が違う辺も**1つの`PolicyFile`**に当てる——保存は
+/// [`commit_removals`]の1回だけで、片方の遷移元だけ消えた状態を作らない。
+///
+/// 読むのは[`policy_file::load_for_repair`]——**遷移の検査に落ちる宣言も直せるように**するためである
+/// （検査に落ちる辺を取り消せば、書いた後のファイルは検査に通る）。ここでは検査を掛けない。取り消しは
+/// 権限を減らす向きで、取り消した後もまだ検査に落ちるなら[`policy_file::save`]自身が断る。
+pub fn plan_removals(
+    workspace_root: &Path,
+    removals: &[DomainEdge],
+    now_unix_ms: u64,
+) -> Result<RemovalPlan, TransitionApproveError> {
+    if removals.is_empty() {
+        return Err(TransitionApproveError::NothingSelected);
+    }
+    let (mut file, _rejections) = policy_file::load_for_repair(workspace_root)?;
+    let (removed, not_found) = apply_removals(&mut file, removals, now_unix_ms);
+    Ok(RemovalPlan {
+        file,
+        removed,
+        not_found,
+    })
+}
+
+/// `removals`の各辺を、その遷移元のドメインから取り除く（**入出力なし・検査なし**）。等しい辺（`==`）が2本
+/// 書かれていれば両方消す——画面は同じ中身の辺を1つの予約で指すので、片方だけ残すと「取り消します」と出た行が残る。
+/// 消した遷移元のドメインは`provenance.updated_unix_ms`を進める。返すのは（消したもの, 宣言に無かったもの）。
+pub(crate) fn apply_removals(
+    file: &mut PolicyFile,
+    removals: &[DomainEdge],
+    now_unix_ms: u64,
+) -> (Vec<DomainEdge>, Vec<DomainEdge>) {
+    let mut removed = Vec::new();
+    let mut not_found = Vec::new();
+    for (from, edge) in removals {
+        let Some(domain) = file.domains.iter_mut().find(|d| d.name == *from) else {
+            not_found.push((from.clone(), edge.clone()));
+            continue;
+        };
+        let before = domain.process.transitions.len();
+        domain.process.transitions.retain(|declared| declared != edge);
+        if domain.process.transitions.len() == before {
+            not_found.push((from.clone(), edge.clone()));
+        } else {
+            domain.provenance.updated_unix_ms = now_unix_ms;
+            removed.push((from.clone(), edge.clone()));
+        }
+    }
+    (removed, not_found)
+}
+
+/// 取り消しを書く。**保存は1回**（遷移元が何個でも）。`false`は「消せる辺が無かった」（`B-09`）。
+pub fn commit_removals(
+    workspace_root: &Path,
+    plan: &RemovalPlan,
+) -> Result<bool, TransitionApproveError> {
+    if plan.removed.is_empty() {
         return Ok(false);
     }
     policy_file::save(workspace_root, &plan.file)?;

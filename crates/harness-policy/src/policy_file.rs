@@ -571,6 +571,46 @@ pub fn load_for_session(
     workspace_root: &Path,
     writable_outside_policy: &[String],
 ) -> Result<PolicyFile, PolicyFileError> {
+    let file = read_versioned(workspace_root)?;
+    // **編集時検査をここへ置く理由**: 検査を書いても呼ぶ人が居なければ、手で書いた危険な辺が
+    // 素通りする（`B-01`: 対の片方だけ実装しない）。強制する側（`harness.exe`・Daemon）と、エディタの
+    // 宣言を使う画面はすべてこの関数（[`load`]もここへ委譲する）で読むので、ここを通せば使う側の全経路が通る。
+    // 検査に落ちたファイルを返すのは、直すために一覧にする[`load_for_repair`]だけである。
+    // 書く側は[`save`]が**同じ検査**を掛ける（読めないファイルを書かない）。
+    let rejected = transition_rejections(&file, workspace_root, writable_outside_policy);
+    if !rejected.is_empty() {
+        return Err(PolicyFileError::RejectedTransitions {
+            path: path(workspace_root),
+            reason: rejected.join("; "),
+        });
+    }
+    Ok(file)
+}
+
+/// **直すために読む**（2026-10-05、ポリシーエディタの宣言画面の遷移タブ。`plans/position-domains/P4.md`のP4.2）。
+/// [`load`]と同じだが、遷移の編集時検査に落ちても断らず、落ちた理由（落ちなければ空）と一緒に返す。
+///
+/// # なぜ要るのか
+///
+/// [`load`]しか無いと、手で書いた辺が検査に落ちた`policy.json`は**エディタのどの画面からも見えず、
+/// 取り消して直す手段も無い**（手でJSONを直すしかない）。遷移の形を答える`transition::shape`が
+/// 「検査に落ちる宣言でも答える」作りになっているのは、この画面が直す前の宣言を見せるためである。
+///
+/// # 守るもの・守らないもの
+///
+/// - **使うのは一覧と取り消しの下書きだけ**にすること。ここで読んだファイルを強制や許可の付与に使うと、
+///   検査が止めている危険な辺が効く。書き戻すときは[`save`]が同じ検査を掛けるので、
+///   取り消した後も落ちるなら何も書かれない
+/// - 読めないもの（壊れたJSON・未来の版・版が足りない）は[`load`]と同じく断る。落とすのは遷移の検査だけ
+/// - `policy.json`の外で書込を許した場所は空で検査する（[`load`]と同じ。エディタはそれを知らない）
+pub fn load_for_repair(workspace_root: &Path) -> Result<(PolicyFile, Vec<String>), PolicyFileError> {
+    let file = read_versioned(workspace_root)?;
+    let rejected = transition_rejections(&file, workspace_root, &[]);
+    Ok((file, rejected))
+}
+
+/// `policy.json`を読み、版を確かめる（遷移の検査はしない）。[`load_for_session`]と[`load_for_repair`]が共有する。
+fn read_versioned(workspace_root: &Path) -> Result<PolicyFile, PolicyFileError> {
     let path = path(workspace_root);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -600,21 +640,10 @@ pub fn load_for_session(
             required,
         });
     }
-    // **編集時検査をここへ置く理由**: 検査を書いても呼ぶ人が居なければ、手で書いた危険な辺が
-    // 素通りする（`B-01`: 対の片方だけ実装しない）。この関数は`policy.json`を読む唯一の関数
-    // （[`load`]もここへ委譲する）なので、ここを通せば読む側の全経路が通る。
-    // 書く側は[`save`]が**同じ検査**を掛ける（読めないファイルを書かない）。
-    let rejected = transition_rejections(&file, workspace_root, writable_outside_policy);
-    if !rejected.is_empty() {
-        return Err(PolicyFileError::RejectedTransitions {
-            path,
-            reason: rejected.join("; "),
-        });
-    }
     Ok(file)
 }
 
-/// 遷移の編集時検査に落ちた理由（落ちなければ空）。**[`load_for_session`]と[`save`]が同じものを通る。**
+/// 遷移の編集時検査に落ちた理由（落ちなければ空）。**[`load_for_session`]・[`load_for_repair`]・[`save`]が同じものを通る。**
 fn transition_rejections(
     file: &PolicyFile,
     workspace_root: &Path,

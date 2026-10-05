@@ -115,6 +115,22 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
             keys.push(press("t プロセスツリー", KeyCode::Char('t')));
             keys.push(press("a 承認", KeyCode::Char('a')));
         }
+        // 宣言画面の遷移のタブ（2026-10-05、決定65 Q12）。並べ方は承認待ちの遷移タブと同じく、予約を変えるキーと
+        // 書くキーを先頭に置く（幅が足りないと末尾から落ちる）。ファイル・通信のタブにしか効かないキー
+        // （`A`・`y`・`c`・`R`）は出さない——押すと理由を言うだけである（`tui::declared_transitions`）。
+        Screen::Declared if app.declared_transitions.tab.is_transitions() => {
+            keys.push(press("Space 取り消しを予約", KeyCode::Char(' ')));
+            let reserved = app.declared_transitions.remove.len();
+            if reserved == 0 {
+                keys.push(press("a 確定", KeyCode::Char('a')));
+            } else {
+                keys.push(press(format!("a 確定（{reserved}本を取り消し）"), KeyCode::Char('a')));
+            }
+            keys.push(shown("↑↓ 選択"));
+            keys.push(press("r 読み直し", KeyCode::Char('r')));
+            keys.push(press("F3 タブ切替", KeyCode::F(3)));
+            keys.push(press("Esc 記録画面へ", KeyCode::Esc));
+        }
         Screen::Declared => {
             keys.push(press("Esc 記録画面へ", KeyCode::Esc));
             keys.push(shown("↑↓ 選択"));
@@ -152,6 +168,9 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
                     KeyCode::Char('a'),
                 ));
             }
+            // 遷移のタブへ（2026-10-05）。`a`より後ろ——幅が足りないときに`a`より先に落ちてよい
+            // （タブの行の「F3 で切替」は常に見えている）。
+            keys.push(press("F3 タブ切替", KeyCode::F(3)));
         }
     }
     keys

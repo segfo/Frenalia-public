@@ -65,6 +65,9 @@ pub mod state;
 mod checkbox_tree;
 mod declared;
 mod declared_screen;
+/// 宣言画面（`F3`）の遷移のタブ（ドメインごとの辺と遷移の形・取り消し）の状態と操作（2026-10-05）。
+mod declared_transitions;
+mod declared_transitions_screen;
 mod edit;
 /// 承認待ち画面（`F2`）のFS/ネットのタブの確定（確認ダイアログを出し、`y`で`policy.json`へ書く。
 /// 2026-10-05に`edit`から移した）。
@@ -112,6 +115,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders};
 use ratatui::{Frame, Terminal};
 
+use declared_transitions::DeclaredTab;
 use harness_term::select::{Selectable, Selection};
 use pointer::{Click, Targets};
 use scroll::Wheel;
@@ -142,6 +146,7 @@ pub struct DrawFeedback {
     pub session_list_offset: Option<usize>,
     pub candidate_list_offset: Option<usize>,
     pub declared_list_offset: Option<usize>,
+    pub declared_transitions_list_offset: Option<usize>,
     /// この描画で描いた、押せる場所と送れる枠（重なりは描いた順。後が上）。
     pub targets: Targets,
 }
@@ -378,7 +383,8 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
     // （後が上）なので、画面の上に重ねるヘルプと確認ダイアログは最後に描いて登録する。
     let mut feedback = match app.screen {
         Screen::Record => record_screen::draw(frame, rows.body, app),
-        // 承認待ち画面は3つのタブを持つ（決定62）。タブの行を本体の一番上に置き、遷移の2タブは別の描き手。
+        // 承認待ち画面は3つのタブ（決定62）、宣言画面は2つのタブ（決定65 Q12）を持つ。タブの行を本体の一番上に置き、
+        // タブごとに別の描き手で描く。
         Screen::Edit => {
             let [tabs, body] =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(rows.body);
@@ -387,10 +393,25 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
             } else {
                 edit_screen::draw(frame, body, app)
             };
-            draw_pending_tabs(frame, tabs, app, &mut feedback.targets);
+            let order = sub_tabs(PendingTab::FsNet, PendingTab::next, app.pending.tab.0);
+            let list = order.map(|(tab, selected)| (tab.label(), selected, Click::PendingTab(tab)));
+            draw_sub_tabs(frame, tabs, list, "  F2 で切替", &mut feedback.targets);
             feedback
         }
-        Screen::Declared => declared_screen::draw(frame, rows.body, app),
+        Screen::Declared => {
+            let [tabs, body] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(rows.body);
+            let tab = app.declared_transitions.tab;
+            let mut feedback = if tab.is_transitions() {
+                declared_transitions_screen::draw(frame, body, app)
+            } else {
+                declared_screen::draw(frame, body, app)
+            };
+            let order = sub_tabs(DeclaredTab::default(), DeclaredTab::next, tab);
+            let list = order.map(|(tab, selected)| (tab.label(), selected, Click::DeclaredTab(tab)));
+            draw_sub_tabs(frame, tabs, list, "  F3 で切替", &mut feedback.targets);
+            feedback
+        }
     };
     draw_tabs(frame, rows.tabs, app, &mut feedback.targets);
     draw_status(frame, rows.status, status_text(app));
@@ -443,37 +464,46 @@ fn draw_tabs(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
     );
 }
 
-/// 承認待ち（`F2`）のタブの行（2026-10-02）。並びは`F2`で巡回する順（[`PendingTab`]の`next`）。
+/// 画面の中のタブの並び（`first`から`next`で巡回する順。`bool`は`selected`と同じか）。
 ///
-/// それまでタブは画面に出ておらず、どのタブに居るかは遷移タブの一覧の見出しにしか無かった
-/// （FS/ネットのタブでは何も出ていなかった）。クリックで切り替えるには押す場所が要るので、決定62の図と
-/// 同じく承認待ちの本体の一番上に1行で並べる。押すと`F2`の巡回と同じ処理でそのタブへ移る。
-fn draw_pending_tabs(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
-    // タブの一覧を別に持たない（`F2`の巡回の順そのものを辿る。片方だけ足すと並びがずれる）。
-    let mut order = vec![PendingTab::FsNet];
+/// **タブの一覧を別に持たない**——キー（`F2`・`F3`）の巡回の順そのものを辿る。片方だけ足すと並びがずれる。
+fn sub_tabs<T: Copy + PartialEq>(first: T, next: fn(T) -> T, selected: T) -> impl Iterator<Item = (T, bool)> {
+    let mut order = vec![first];
     loop {
-        let next = order[order.len() - 1].next();
-        if next == PendingTab::FsNet {
+        let after = next(order[order.len() - 1]);
+        if after == first {
             break;
         }
-        order.push(next);
+        order.push(after);
     }
-    let tabs: Vec<_> = order
-        .into_iter()
-        .map(|tab| harness_term::tab::Tab {
-            label: tab.label(),
-            selected: app.pending.tab.0 == tab,
-            target: Click::PendingTab(tab),
+    order.into_iter().map(move |tab| (tab, tab == selected))
+}
+
+/// 画面の中のタブの行——承認待ち（`F2`。2026-10-02）と宣言画面（`F3`。2026-10-05、決定65 Q12）。
+/// 並びと押したときの動きは呼び出し側が渡す（[`sub_tabs`]の巡回の順・`Click`の値）。
+///
+/// それまで承認待ちのタブは画面に出ておらず、どのタブに居るかは遷移タブの一覧の見出しにしか無かった
+/// （FS/ネットのタブでは何も出ていなかった）。クリックで切り替えるには押す場所が要るので、決定62の図と
+/// 同じく本体の一番上に1行で並べる。押すとキーの巡回と同じ処理でそのタブへ移る。
+fn draw_sub_tabs(
+    frame: &mut Frame,
+    area: Rect,
+    list: impl Iterator<Item = (&'static str, bool, Click)>,
+    hint: &'static str,
+    targets: &mut Targets,
+) {
+    let tabs: Vec<_> = list
+        .map(|(label, selected, target)| harness_term::tab::Tab {
+            label,
+            selected,
+            target,
         })
         .collect();
     harness_term::tab::draw(
         frame,
         area,
         &tabs,
-        &[Span::styled(
-            "  F2 で切替",
-            Style::default().fg(Color::DarkGray),
-        )],
+        &[Span::styled(hint, Style::default().fg(Color::DarkGray))],
         targets,
     );
 }

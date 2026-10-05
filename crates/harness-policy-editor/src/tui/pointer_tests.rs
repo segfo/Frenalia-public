@@ -40,7 +40,8 @@ fn snapshot(app: &App) -> String {
          filter={:?} tree={} domain={} unapproved={:?}\n\
          pending: observed={} denied={} approve={:?} narrow={:?} remove={:?} dismiss={:?} \
          undismiss={:?} filter={:?} dest_focused={} dest={}\n\
-         declared: row={} expanded={} approve={:?} reassign={:?}",
+         declared: row={} expanded={} approve={:?} reassign={:?}\n\
+         declared_transitions: tab={:?} row={} remove={:?}",
         app.screen,
         app.pending.tab.0,
         app.help,
@@ -78,6 +79,9 @@ fn snapshot(app: &App) -> String {
         sorted(&app.declared_expanded),
         app.declared_approval.reserved,
         app.declared_reassign.reserved,
+        app.declared_transitions.tab,
+        app.declared_transitions.row,
+        app.declared_transitions.remove,
     );
     // `{:?}`で書いた部分は`\`が`\\`になっているので、その綴りも置き換える。
     let ws = app.workspace_root.display().to_string();
@@ -481,6 +485,38 @@ fn a_pending_tab_switches_to_that_tab() {
             case,
             &make,
             // タブの行は承認待ちの本体の一番上（タブの行の1つ下）。
+            &|grid, _| cell_of(grid, Some(Rect::new(0, 1, SIZE.0, 1)), tab, None),
+            &keys,
+        );
+    }
+}
+
+/// **宣言画面のタブの行が描かれ、押すとそのタブへ移る**（`F3`をもう一度押して着くのと同じ。決定65 Q12、
+/// `plans/position-domains/P4.md`のP4.2）。いまのタブは何もしない。
+#[test]
+fn a_declared_tab_switches_to_that_tab() {
+    type Make = fn(&std::path::Path) -> App;
+    let on_declarations: Make = |ws| {
+        let mut app = record_screen_with_content(ws);
+        press(&mut app, KeyCode::F(3));
+        app
+    };
+    let on_transitions: Make = |ws| {
+        let mut app = record_screen_with_content(ws);
+        press(&mut app, KeyCode::F(3));
+        press(&mut app, KeyCode::F(3));
+        app
+    };
+    let cases: [(&str, Make, &str, Vec<KeyEvent>); 3] = [
+        ("ファイル・通信→遷移", on_declarations, " 遷移 ", vec![k(KeyCode::F(3))]),
+        ("遷移→ファイル・通信", on_transitions, "ファイル・通信", vec![k(KeyCode::F(3))]),
+        ("ファイル・通信でファイル・通信", on_declarations, "ファイル・通信", vec![]),
+    ];
+    for (case, make, tab, keys) in cases {
+        assert_click_is_keys(
+            case,
+            &make,
+            // タブの行は宣言画面の本体の一番上（画面のタブの行の1つ下）。
             &|grid, _| cell_of(grid, Some(Rect::new(0, 1, SIZE.0, 1)), tab, None),
             &keys,
         );

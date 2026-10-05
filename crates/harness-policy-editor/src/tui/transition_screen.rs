@@ -393,15 +393,16 @@ fn source_label(candidate: &Candidate) -> String {
     }
 }
 
-fn file_name(path: &str) -> &str {
+/// パスの最後の要素（宣言画面の遷移タブの行も使う。`tui::declared_transitions_screen`）。
+pub(super) fn file_name(path: &str) -> &str {
     path.rsplit(['\\', '/'])
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or(path)
 }
 
-/// 画面の幅に収める。**切ったことが分かる形**にする（黙って切ると別の値に見える）。
-fn truncate(value: &str, max: usize) -> String {
+/// 画面の幅に収める。**切ったことが分かる形**にする（黙って切ると別の値に見える）。宣言画面の遷移タブの行も使う。
+pub(super) fn truncate(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         return value.to_string();
     }

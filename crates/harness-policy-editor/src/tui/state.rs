@@ -655,6 +655,9 @@ pub struct App {
     pub declared_approval: crate::tui::declared::DeclaredApprovalState,
     /// 宣言画面の付け替え（`c`・`R`）の予約。中身は`tui::declared`の子が持つ（上と同じ理由）。
     pub declared_reassign: crate::tui::declared::declared_reassign::DeclaredReassignState,
+    /// 宣言画面のタブと、遷移のタブ（ドメインごとの辺と遷移の形・取り消しの予約）の状態。中身は
+    /// `tui::declared_transitions`が持つ（上と同じ理由。2026-10-05、`plans/position-domains/P4.md`のP4.2）。
+    pub declared_transitions: crate::tui::declared_transitions::DeclaredTransitionsState,
     /// `Esc`の二度押しの1回目（判定と窓の長さは会話画面と共有する`harness_term::double_esc`）。何もしていない`Esc`の
     /// ときだけ残る——`Esc`以外のキーも、他の働きをした`Esc`も数え直し（[`App::on_key_at`]）。
     pub double_esc: harness_term::double_esc::DoubleEsc,
@@ -725,6 +728,7 @@ impl App {
             unapproved: BTreeSet::new(),
             declared_approval: Default::default(),
             declared_reassign: Default::default(),
+            declared_transitions: Default::default(),
             double_esc: Default::default(),
             declared_domain: None,
         };
@@ -1250,6 +1254,9 @@ impl App {
         if let Some(offset) = feedback.declared_list_offset {
             self.declared_list_offset = offset;
         }
+        if let Some(offset) = feedback.declared_transitions_list_offset {
+            self.declared_transitions.list_offset = offset;
+        }
     }
 
     /// 直近の描画で判明した上限まで各枠のさかのぼり位置を切り詰める。
@@ -1368,9 +1375,9 @@ impl App {
                 }
                 return None;
             }
+            // 宣言画面でも同じく、居ればタブを回す（決定65 Q12。`tui::declared_transitions`の`press_f3`）。
             KeyCode::F(3) => {
-                self.screen = Screen::Declared;
-                self.on_enter_screen();
+                self.press_f3();
                 return None;
             }
             KeyCode::F(4) => {
@@ -1404,7 +1411,7 @@ impl App {
 
     /// 画面へ入ったときの読み込み。**入口を1つにする**ので、F-キーと`Ctrl+N`のどちらで来ても
     /// 同じ準備が走る（片方だけ準備を書くと、もう片方から入ったとき空の画面が出る）。
-    fn on_enter_screen(&mut self) {
+    pub(super) fn on_enter_screen(&mut self) {
         match self.screen {
             // 遷移のタブに居るなら、そちらを読み直す（`F2`は3つのタブを持つ。決定62）。
             Screen::Edit if self.pending.tab.0.is_transition() => self.reload_transitions(),
@@ -1423,6 +1430,8 @@ impl App {
                 // 宣言画面で取り消した直後にこちらへ来ることがあるので、重ねを作り直す。
                 self.refresh_declared_overlay();
             }
+            // 宣言画面も最後に居たタブを読み直す（`F3`は2つのタブを持つ。決定65 Q12）。
+            Screen::Declared if self.declared_transitions.tab.is_transitions() => self.reload_declared_transitions(),
             Screen::Declared => self.reload_declared(),
             Screen::Record => {}
         }
@@ -1565,6 +1574,7 @@ impl App {
                     Some(Confirm::Approval) => self.commit_approval(),
                     Some(Confirm::DeclaredChanges) => self.commit_declared_changes(),
                     Some(Confirm::Transition) => self.commit_transition(),
+                    Some(Confirm::DeclaredTransitions) => self.commit_declared_transition_removals(),
                     Some(Confirm::ReadOnly) | None => {}
                 }
                 None

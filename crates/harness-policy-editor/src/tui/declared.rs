@@ -148,6 +148,10 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return None;
         }
+        // 遷移のタブは操作が違う（`tui::declared_transitions`。2026-10-05、決定65 Q12）。
+        if self.declared_transitions.tab.is_transitions() {
+            return self.on_declared_transition_key(key);
+        }
         // キーの割り当ても候補画面に揃える（→/←で展開・Spaceで配下をまとめて・aで確定）。
         let rows = self.declared_tree.rows(&self.declared_expanded).len();
         match key.code {

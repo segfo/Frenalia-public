@@ -24,7 +24,8 @@
 //!   読むことになるためである。
 //!
 //! 承認待ちのタブ（FS/ネット・遷移・観測から・遷移・拒否から）は、`F2`の巡回が使う
-//! `App::select_pending_tab`を、選んだタブで呼ぶ。
+//! `App::select_pending_tab`を、宣言画面のタブ（ファイル・通信・遷移）は`F3`の巡回が使う
+//! `App::select_declared_tab`を、選んだタブで呼ぶ。
 //!
 //! # 押せないもの（決めたこと）
 //!
@@ -105,6 +106,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Span;
 
 use crate::tui::checkbox_tree;
+use crate::tui::declared_transitions::DeclaredTab;
 use crate::tui::scroll::Wheel;
 use crate::tui::state::{Action, App, EditField, RecordField, Screen};
 use crate::tui::transition::PendingTab;
@@ -119,6 +121,8 @@ pub enum Click {
     Screen(Screen),
     /// 承認待ちのタブ。いまのタブなら何もしない。
     PendingTab(PendingTab),
+    /// 宣言画面のタブ。いまのタブなら何もしない。
+    DeclaredTab(DeclaredTab),
     /// 一覧の行を選ぶ。
     Row(ListId, usize),
     /// 行の`[x]`/`[ ]`。その行を選んで`Space`。
@@ -196,6 +200,8 @@ pub enum ListId {
     Transitions,
     /// 宣言画面の木。
     Declared,
+    /// 宣言画面の遷移タブの一覧（ドメインの見出しと辺の行）。
+    DeclaredTransitions,
 }
 
 /// 押せる入力欄。
@@ -339,6 +345,12 @@ impl App {
                 }
                 None
             }
+            Click::DeclaredTab(tab) => {
+                if self.declared_transitions.tab != tab {
+                    self.select_declared_tab(tab);
+                }
+                None
+            }
             Click::Field(field) => {
                 self.focus_field(field);
                 None
@@ -447,6 +459,11 @@ impl App {
                 let rows = self.declared_tree.rows(&self.declared_expanded).len();
                 let by = delta(self.declared_row);
                 checkbox_tree::move_row(&mut self.declared_row, rows, by);
+            }
+            ListId::DeclaredTransitions => {
+                let rows = self.declared_transitions.rows().len();
+                let by = delta(self.declared_transitions.row);
+                checkbox_tree::move_row(&mut self.declared_transitions.row, rows, by);
             }
         }
     }

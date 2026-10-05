@@ -304,8 +304,8 @@ impl App {
     }
 }
 
-/// 承認に添える時刻。**測定にも判定にも使わない**（由来の記録だけ）。
-fn now_unix_ms() -> u64 {
+/// 承認に添える時刻。**測定にも判定にも使わない**（由来の記録だけ）。宣言画面の遷移タブの取り消しも使う。
+pub(super) fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
