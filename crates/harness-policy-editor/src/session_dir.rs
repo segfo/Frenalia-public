@@ -337,6 +337,14 @@ impl RecordSessionDir {
         self.path.join(MANIFEST_FILE_NAME)
     }
 
+    /// 記録したプロセスの木（パス1。決定65）。**収集器が書く場所と同じ**——書く側
+    /// （`harness_sandbox::tier2a::policy_learnd::process_audit_path`）は`fs-audit.jsonl`の隣から導く
+    /// （試験`a_session_dir_finds_process_audit_where_the_collector_writes_it`が同じ場所を指すことを固定する）。
+    pub fn process_audit_path(&self) -> PathBuf {
+        self.path
+            .join(harness_policy::process_event::PROCESS_AUDIT_FILE)
+    }
+
     /// マニフェストを書く（上書き）。**失敗しても記録そのものは止めない**が、
     /// 呼び出し側が事実を表示できるよう`Err`は返す（握り潰さない、B-10）。
     pub fn write_manifest(&self, manifest: &RecordManifest) -> std::io::Result<()> {

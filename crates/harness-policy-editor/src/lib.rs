@@ -104,6 +104,11 @@ pub mod exclusion;
 /// パス2の実行前に「そのコマンドの実行ファイルへ届くか」を測る（純粋関数、警告のみ）。
 pub mod exec_reach;
 pub mod net_aggregate;
+/// 記録したプロセスの木から、承認待ちの「遷移・観測から」に出す**位置の木**と、各位置の辺を書けるかの見込み
+/// （決定65、P4.3）。判定は`harness_policy`の判定器に聞く。行ごとの「起こせるか」が[`transition_candidates`]の
+/// 型なので**windows専用**。
+#[cfg(windows)]
+pub mod position_view;
 /// `policy.json`の型と読み書き。**実体は[`harness_policy::policy_file`]へ移した**
 /// （2026-09-12、段階6b）——`harness.exe`とSpawn Daemonも同じ`load`を通す必要が生じ、
 /// このクレートは`harness-sandbox`に依存しているのであちら側から見えないためである。

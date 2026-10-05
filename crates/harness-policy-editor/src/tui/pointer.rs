@@ -198,6 +198,8 @@ pub enum ListId {
     Proposals,
     /// 承認待ちの遷移タブの一覧。
     Transitions,
+    /// 承認待ちの「遷移・観測から」の位置の行（選んでいる記録に位置の情報があるとき。P4.3）。
+    Positions,
     /// 宣言画面の木。
     Declared,
     /// 宣言画面の遷移タブの一覧（ドメインの見出しと辺の行）。
@@ -397,7 +399,7 @@ impl App {
             return;
         }
         let in_field = if self.pending.tab.0.is_transition() {
-            self.pending.destination.focused
+            self.pending.text_field_focused()
         } else {
             self.edit_focus == EditField::Domain
         };
@@ -430,7 +432,7 @@ impl App {
             }
             Field::Domain => self.focus_edit(EditField::Domain),
             Field::Destination => {
-                if !self.pending.destination.focused {
+                if !self.pending.text_field_focused() {
                     self.on_key(key(KeyCode::Tab));
                 }
             }
@@ -454,6 +456,12 @@ impl App {
                 let rows = self.pending.visible().len();
                 let current = self.pending.row();
                 checkbox_tree::move_row(self.pending.row_mut(), rows, delta(current));
+            }
+            ListId::Positions => {
+                let positions = self.pending.positions.as_ref();
+                let rows = positions.map_or(0, |p| p.visible().len());
+                let current = positions.map_or(0, |p| p.row);
+                self.move_position_row(rows, delta(current));
             }
             ListId::Declared => {
                 let rows = self.declared_tree.rows(&self.declared_expanded).len();

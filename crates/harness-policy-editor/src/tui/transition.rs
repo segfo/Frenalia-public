@@ -40,6 +40,8 @@
 //! - **確定（確認ダイアログを出し、`y`で`policy.json`と却下印へ書く）**: [`super::transition_commit`]
 //! - **却下印（`dismissed.json`）の読み書き**: [`super::transition_dismissed`]
 //! - **描画**: [`super::transition_screen`]
+//! - **選んでいる記録の位置の木（観測のタブ、P4.3）**: [`super::transition_positions`]（状態とキー）・
+//!   [`super::transition_positions_screen`]（描画）
 
 use std::collections::BTreeSet;
 
@@ -210,6 +212,9 @@ pub struct PendingState {
     pub destination: super::transition_destination::DestinationField,
     /// `policy.json`の各ドメインを`harness.exe`が用意する見込み（読み直すたびに作り直す）。
     pub outlooks: std::collections::BTreeMap<String, crate::transition_destination::Outlook>,
+    /// 「遷移・観測から」の位置の行（選んでいる記録が`process-audit.jsonl`を持つときだけ`Some`。P4.3）。
+    /// `Some`の間、観測のタブは平らな一覧の代わりにこれを出す（[`super::transition_positions`]）。
+    pub positions: Option<super::transition_positions::PositionsState>,
 }
 
 /// [`PendingState::tab`]の既定を`FsNet`にするための薄い包み。
@@ -310,6 +315,11 @@ impl PendingState {
         }
     }
 
+    /// 入力欄（平らな一覧の遷移先の欄か、位置の行の遷移先の欄）に居るか（`tui::pointer`がクリックで欄を出入りする）。
+    pub fn text_field_focused(&self) -> bool {
+        self.destination.focused || self.positions.as_ref().is_some_and(|p| p.editing.is_some())
+    }
+
     /// 予約の件数（承認・取り消し・却下・却下の取り消し）。**キーの案内と下の枠が同じ数を出す。**
     pub fn reserved_count(&self) -> usize {
         self.approve.len() + self.remove.len() + self.dismiss.len() + self.undismiss.len()
@@ -333,6 +343,7 @@ impl App {
                 self.pending.denied.clear();
                 self.pending.declared_rows.clear();
                 self.pending.outlooks.clear();
+                self.pending.positions = None;
                 self.pending.notes = vec![format!("policy.jsonを読めませんでした: {e}")];
                 return;
             }
@@ -349,13 +360,18 @@ impl App {
                 self.pending.observed.clear();
                 self.pending.denied.clear();
                 self.pending.declared_rows.clear();
+                self.pending.positions = None;
                 self.pending.notes = vec![format!("遷移の宣言を読めませんでした: {e}")];
                 return;
             }
         };
         self.pending.declared_rows = declared.rows().to_vec();
 
-        self.pending.observed =
+        // 選んでいる記録に位置の情報があれば、観測のタブは位置の木で見せ、平らな一覧（`observed.jsonl`）は読まない
+        // （決定65の細目6。P4.8 で`observed.jsonl`ごと消える）。
+        self.pending.observed = if self.reload_positions(&file, &mut notes) {
+            Vec::new()
+        } else {
             match harness_sandbox::tier2a::policy_learnd::observed::read_folded(&workspace_root) {
                 Ok(read) => {
                     push_read_notes(&mut notes, "観測", read.dropped, read.skipped);
@@ -365,7 +381,8 @@ impl App {
                     notes.push(format!("observed.jsonlを読めませんでした: {e}"));
                     Vec::new()
                 }
-            };
+            }
+        };
         self.pending.denied =
             match harness_sandbox::tier2a::spawnd::transitions::read_folded(&workspace_root) {
                 Ok(read) => {
@@ -437,6 +454,10 @@ impl App {
     pub(crate) fn on_transition_key(&mut self, key: KeyEvent) -> Option<Action> {
         if key.kind != KeyEventKind::Press {
             return None;
+        }
+        // 位置の行（P4.3）は自分のキーを持つ（遷移先の欄も位置ごと）。
+        if self.shows_positions() {
+            return self.on_position_key(key);
         }
         // 遷移先の欄に居る間は、文字キーを名前の入力に回す（FS/ネットタブのドメイン欄と同じ）。
         if self.pending.destination.focused {

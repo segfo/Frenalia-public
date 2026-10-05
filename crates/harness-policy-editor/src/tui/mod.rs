@@ -98,6 +98,9 @@ mod transition_commit;
 pub mod transition_dismissed;
 /// [段階⑦] 遷移タブの遷移先ドメインの欄（2026-10-01。それまでは遷移先を呼び出し元に固定していた）。
 mod transition_destination;
+/// 「遷移・観測から」を選んでいる記録のプロセスの木の位置ごとに見せる行の状態とキー（2026-10-05、決定65・P4.3）。
+mod transition_positions;
+mod transition_positions_screen;
 mod transition_screen;
 mod worker;
 /// 折り返す枠の行数を数え、入り切らなかった分を送って読ませる部品（BUG-192）。
@@ -388,7 +391,9 @@ fn draw(frame: &mut Frame, app: &App) -> DrawFeedback {
         Screen::Edit => {
             let [tabs, body] =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(rows.body);
-            let mut feedback = if app.pending.tab.0.is_transition() {
+            let mut feedback = if app.shows_positions() {
+                transition_positions_screen::draw(frame, body, app)
+            } else if app.pending.tab.0.is_transition() {
                 transition_screen::draw(frame, body, app)
             } else {
                 edit_screen::draw(frame, body, app)

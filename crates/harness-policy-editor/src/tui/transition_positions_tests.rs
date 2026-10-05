@@ -1,0 +1,435 @@
+//! 承認待ち（`F2`）の「遷移・観測から」を位置の木で見せる画面の試験（P4.3）。
+//!
+//! **端末は要らない**（描画は`TestBackend`で1フレーム描いてセルを読む）。記録セッションは一時ディレクトリに
+//! 作り、`process-audit.jsonl`を実際に書く（補助は`position_view_tests`と共有する）。`F2`を2回押して
+//! 観測のタブに入る——利用者と同じ道を通す（記録の一覧を読むのは FS/ネットのタブに入ったとき）。
+
+use std::path::Path;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::backend::TestBackend;
+use ratatui::Terminal;
+
+use harness_policy::policy_file::{self, PolicyDomain, PolicyFile, ENTRY_DOMAIN};
+use harness_policy::process_event::ProcessInstance;
+use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
+use harness_sandbox::tier2a::policy_learnd::observed::{observed_path, ObservedRecord, Spawn};
+
+use crate::position_view::position_view_tests::{
+    child, root, seed_position_record, seed_record, user_example, with_command_line, workspace,
+    CALC, CMD, MSPAINT, PWSH,
+};
+use crate::position_view::{position_edges, PositionKey};
+use crate::tui::state::App;
+use crate::tui::transition::PendingTab;
+
+fn press(app: &mut App, code: KeyCode) {
+    app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+}
+
+fn type_text(app: &mut App, text: &str) {
+    for c in text.chars() {
+        press(app, KeyCode::Char(c));
+    }
+}
+
+/// `F2`で承認待ち（FS/ネット）に入り、もう一度`F2`で「遷移・観測から」へ。
+fn open_observed_tab(ws: &Path) -> App {
+    let mut app = App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
+    press(&mut app, KeyCode::F(2));
+    press(&mut app, KeyCode::F(2));
+    assert_eq!(app.pending.tab.0, PendingTab::TransitionsObserved);
+    app
+}
+
+fn app_with_record(ws: &Path, instances: &[ProcessInstance]) -> App {
+    seed_position_record(ws, "s1", instances);
+    open_observed_tab(ws)
+}
+
+/// 見えている行の（字下げ, 実行ファイル, 遷移先）。
+fn rows(app: &App) -> Vec<(usize, String, String)> {
+    let positions = app.pending.positions.as_ref().expect("位置の木が出ている");
+    positions
+        .visible()
+        .into_iter()
+        .map(|row| {
+            let position = &positions.view.assignment.positions[row.position];
+            (
+                row.depth,
+                position.exe.clone(),
+                positions.destination_name(position).to_string(),
+            )
+        })
+        .collect()
+}
+
+fn key_of(app: &App, exe: &str) -> PositionKey {
+    let positions = app.pending.positions.as_ref().expect("位置の木");
+    let position = positions
+        .view
+        .assignment
+        .positions
+        .iter()
+        .find(|p| p.exe == exe)
+        .expect("その実行ファイルの位置");
+    crate::position_view::key_of(position)
+}
+
+/// 見えている行の中で`exe`の行を選ぶ。
+fn select(app: &mut App, exe: &str) {
+    let index = rows(app)
+        .iter()
+        .position(|(_, e, _)| e == exe)
+        .expect("その行が見えている");
+    app.pending.positions.as_mut().expect("位置の木").row = index;
+}
+
+/// 描いた画面の行。**全角文字の後ろのセルは空白として読める**ので、比べる側は[`squash`]で空白を落とす。
+fn screen(app: &App) -> Vec<String> {
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).expect("test terminal");
+    terminal
+        .draw(|frame| {
+            crate::tui::draw(frame, app);
+        })
+        .expect("描画は落ちてはいけない");
+    let buffer = terminal.backend().buffer();
+    (0..40)
+        .map(|y| {
+            (0..160)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+/// 空白を落とす（全角文字の後ろのセルと、桁をそろえる空白を無視して比べるため）。
+fn squash(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn write_observed(ws: &Path, spawns: &[(&str, &str)]) {
+    let path = observed_path(ws);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut text = String::new();
+    for (exe, argv) in spawns {
+        let record = ObservedRecord::ObservedSpawn(Spawn {
+            parent_exe: Some(CMD.to_string()),
+            exe: exe.to_string(),
+            argv: argv.to_string(),
+            count: 1,
+            first_ts: 1,
+            last_ts: 1,
+            argv_truncation: false,
+        });
+        text.push_str(&serde_json::to_string(&record).unwrap());
+        text.push('\n');
+    }
+    std::fs::write(&path, text).unwrap();
+}
+
+/// **位置の情報がある記録は、位置の木で見せる**（決定65の困りごと2）。行は木の順・字下げは段数・遷移先と
+/// 出どころと回数が出る。見出しにどの記録かを出す。
+#[test]
+fn a_position_record_is_shown_as_an_indented_tree_with_destinations() {
+    let ws = workspace();
+    let app = app_with_record(ws.path(), &user_example());
+
+    assert_eq!(
+        rows(&app),
+        vec![
+            (0, PWSH.to_string(), "pwsh".to_string()),
+            (1, CALC.to_string(), "calc".to_string()),
+            (1, MSPAINT.to_string(), "mspaint".to_string()),
+        ]
+    );
+
+    let lines = screen(&app);
+    assert!(
+        lines
+            .iter()
+            .any(|l| squash(l).contains("位置ごとの遷移（記録:s1）")),
+        "見出しに記録が出ていない:\n{}",
+        lines.join("\n")
+    );
+    let pwsh = lines
+        .iter()
+        .find(|l| l.contains("pwsh.exe") && l.contains("[ ]"))
+        .expect("pwsh の行");
+    assert!(squash(pwsh).contains("2回→pwsh新規"), "{pwsh}");
+    let calc = lines
+        .iter()
+        .find(|l| l.contains("calc.exe") && l.contains("[ ]"))
+        .expect("calc の行");
+    assert!(squash(calc).contains("→calc新規"), "{calc}");
+    // 子の行は親の行より1段（2桁）深く字下げされる。
+    let indent = |line: &str| line.find('[').expect("チェックの記号");
+    assert_eq!(indent(calc), indent(pwsh) + 2, "{pwsh}\n{calc}");
+}
+
+/// ストアアプリの仕組みを通る綴りは、行に理由を出し、`Space`で予約できない（理由を言う、`B-32`）。
+#[test]
+fn a_store_app_position_says_why_it_cannot_start() {
+    let ws = workspace();
+    const STORE: &str =
+        "C:/Program Files/WindowsApps/Microsoft.WindowsCalculator_11.0_x64/CalculatorApp.exe";
+    let mut app = app_with_record(ws.path(), &[root(1, CMD), child(2, 1, STORE)]);
+
+    let lines = screen(&app);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("CalculatorApp.exe") && squash(l).contains("起こせない")),
+        "{}",
+        lines.join("\n")
+    );
+    press(&mut app, KeyCode::Char(' '));
+    assert!(app.pending.positions.as_ref().unwrap().approve.is_empty());
+    assert!(app.status.contains("ストアアプリ"), "{}", app.status);
+}
+
+/// `u`で記録どおりに絞ると相対パスの引数が検査に落ちるなら、**判定器の理由を言って絞らない**（任意の引数のまま。
+/// DESIGN-MAC §5.1(5)。相対かどうかはエディタが判定しない＝`check_all`の文言をそのまま出す）。
+/// 対の側: 絶対パスだけの引数なら絞れる。
+#[test]
+fn narrowing_a_position_with_a_relative_argument_is_refused_with_the_reason() {
+    const TOOL: &str = "C:/x/tool.exe";
+    let ws = workspace();
+    let relative = with_command_line(child(2, 1, TOOL), "\"C:/x/tool.exe\" ./input.txt");
+    let mut app = app_with_record(ws.path(), &[root(1, CMD), relative]);
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Char('u'));
+    let positions = app.pending.positions.as_ref().unwrap();
+    assert!(positions.narrow.is_empty(), "絞ってはいけない");
+    assert!(
+        positions.approve.contains(&key_of(&app, TOOL)),
+        "予約は残す"
+    );
+    assert!(app.status.contains("絞れません"), "{}", app.status);
+    assert!(app.status.contains("relative path"), "{}", app.status);
+
+    let ws = workspace();
+    let absolute = with_command_line(child(2, 1, TOOL), "\"C:/x/tool.exe\" C:/x/input.txt");
+    let mut app = app_with_record(ws.path(), &[root(1, CMD), absolute]);
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Char('u'));
+    assert!(
+        app.pending
+            .positions
+            .as_ref()
+            .unwrap()
+            .narrow
+            .contains(&key_of(&app, TOOL)),
+        "{}",
+        app.status
+    );
+}
+
+/// **位置の情報が無い記録は今の平らな一覧に注記を添える**（決定65の細目6）。
+/// 対の側: 位置の情報がある記録では平らな一覧の行が出ない（同じ`observed.jsonl`があっても）。
+#[test]
+fn an_old_record_without_process_audit_shows_the_flat_list_with_a_note() {
+    let ws = workspace();
+    seed_record(ws.path(), "old");
+    write_observed(ws.path(), &[(PWSH, "pwsh -c x")]);
+    let app = open_observed_tab(ws.path());
+    assert!(app.pending.positions.is_none());
+    assert_eq!(app.pending.visible().len(), 1, "平らな一覧が出る");
+    assert!(
+        app.pending
+            .notes
+            .iter()
+            .any(|n| n.contains("この記録には位置の情報がありません")),
+        "{:?}",
+        app.pending.notes
+    );
+
+    let ws = workspace();
+    write_observed(ws.path(), &[(PWSH, "pwsh -c x")]);
+    let app = app_with_record(ws.path(), &user_example());
+    assert!(app.pending.positions.is_some());
+    assert!(app.pending.visible().is_empty(), "平らな一覧の行が出ている");
+    assert!(!app
+        .pending
+        .notes
+        .iter()
+        .any(|n| n.contains("この記録には位置の情報がありません")));
+}
+
+/// **遷移先の欄は選んだ位置の遷移先を直す。名前を変えると、子の行の遷移元も一緒に変わる**（名前ごと置き換える）。
+#[test]
+fn the_destination_field_renames_the_selected_position_and_its_children_follow() {
+    let ws = workspace();
+    let mut app = app_with_record(ws.path(), &user_example());
+    select(&mut app, PWSH);
+    press(&mut app, KeyCode::Tab);
+    type_text(&mut app, "ps");
+    press(&mut app, KeyCode::Enter);
+
+    let positions = app.pending.positions.as_ref().unwrap();
+    assert!(positions.editing.is_none(), "Enter で欄から出る");
+    assert_eq!(
+        rows(&app),
+        vec![
+            (0, PWSH.to_string(), "ps".to_string()),
+            (1, CALC.to_string(), "calc".to_string()),
+            (1, MSPAINT.to_string(), "mspaint".to_string()),
+        ],
+        "{}",
+        app.status
+    );
+    // 書く辺: pwsh の辺は ps へ、calc・mspaint の辺は ps から。
+    let edges = position_edges(
+        &positions.view.assignment,
+        &positions.renamed,
+        &positions.narrow,
+    );
+    let edge_of = |exe: &str| {
+        edges
+            .iter()
+            .find(|e| {
+                e.edge.exe == harness_policy::transition::ExeMatcher::Literal(exe.to_string())
+            })
+            .expect("辺")
+    };
+    assert_eq!(edge_of(PWSH).edge.to, "ps");
+    assert_eq!(edge_of(PWSH).from_domain, ENTRY_DOMAIN);
+    assert_eq!(edge_of(CALC).from_domain, "ps");
+    assert_eq!(edge_of(MSPAINT).from_domain, "ps");
+}
+
+/// 既にある辺の行は、遷移先の欄で名前を変えず理由を言う（遷移先は`policy.json`の辺が決めている）。
+/// 呼び出し元と同じ名前は「凍結中（決定65）」で断る。
+#[test]
+fn an_existing_edge_cannot_be_renamed_and_a_self_loop_name_is_frozen() {
+    let ws = workspace();
+    let mut file = PolicyFile::default();
+    let mut entry = PolicyDomain::new(ENTRY_DOMAIN);
+    entry
+        .process
+        .transitions
+        .push(editor_edge(PWSH, ArgvMatcher::Any(AnyMarker), "pwsh"));
+    file.domains.push(entry);
+    file.domains.push(PolicyDomain::new("pwsh"));
+    policy_file::save(ws.path(), &file).expect("保存");
+    let mut app = app_with_record(ws.path(), &user_example());
+
+    // 既にある辺の行は「書くもの」に入らないので、全部を出してから選ぶ。
+    press(&mut app, KeyCode::Char('f'));
+    select(&mut app, PWSH);
+    press(&mut app, KeyCode::Tab);
+    assert!(app.pending.positions.as_ref().unwrap().editing.is_none());
+    assert!(app.status.contains("既にある辺"), "{}", app.status);
+    press(&mut app, KeyCode::Char(' '));
+    assert!(app.pending.positions.as_ref().unwrap().approve.is_empty());
+    assert!(app.status.contains("宣言済みです"), "{}", app.status);
+
+    // calc の遷移元は pwsh。同じ名前は自己ループ辺になるので断る。
+    select(&mut app, CALC);
+    press(&mut app, KeyCode::Tab);
+    type_text(&mut app, "pwsh");
+    press(&mut app, KeyCode::Enter);
+    assert!(app.pending.positions.as_ref().unwrap().renamed.is_empty());
+    assert!(app.status.contains("凍結中"), "{}", app.status);
+}
+
+/// `Space`で書ける位置を予約できる。**`a`は P4.5 までは書かずに理由を言う**（寿命: P4.5 で1回の確定にまとめる）。
+/// `x`は位置の行では何もせず理由を言う（却下印は観測した`(exe, 引数)`ごと、P4.md 前例の表の10）。
+#[test]
+fn space_reserves_a_position_and_a_does_not_write_until_p45() {
+    let ws = workspace();
+    let mut app = app_with_record(ws.path(), &user_example());
+    select(&mut app, CALC);
+    press(&mut app, KeyCode::Char(' '));
+    assert!(app
+        .pending
+        .positions
+        .as_ref()
+        .unwrap()
+        .approve
+        .contains(&key_of(&app, CALC)));
+
+    press(&mut app, KeyCode::Char('a'));
+    assert!(app.modal.is_none(), "確認ダイアログを出してはいけない");
+    assert!(app.status.contains("P4.5"), "{}", app.status);
+    assert!(
+        !policy_file::path(ws.path()).exists(),
+        "policy.json を書いてはいけない"
+    );
+
+    press(&mut app, KeyCode::Char('x'));
+    assert!(app.status.contains("却下"), "{}", app.status);
+    assert_eq!(app.pending.dismiss.len(), 0);
+}
+
+/// 1フレーム描いて描画で分かったこと（押せる場所）を状態へ書き戻し、行ごとの文字列を返す（`tui::run`と同じ）。
+fn frame(app: &mut App) -> Vec<String> {
+    let mut feedback = crate::tui::DrawFeedback::default();
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).expect("test terminal");
+    terminal
+        .draw(|f| feedback = crate::tui::draw(f, app))
+        .expect("描画は落ちてはいけない");
+    let buffer = terminal.backend().buffer();
+    let lines = (0..40)
+        .map(|y| {
+            (0..160)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    app.apply_draw_feedback(feedback);
+    lines
+}
+
+/// `exe`の行のチェックの記号の位置（記号の前は枠線と空白だけなので、文字の位置＝桁）。
+fn mark_cell(lines: &[String], exe: &str) -> (u16, u16) {
+    let (y, line) = lines
+        .iter()
+        .enumerate()
+        .find(|(_, l)| l.contains(exe) && l.contains("[ ]"))
+        .expect("その行が描かれている");
+    let x = line.chars().position(|c| c == '[').expect("チェックの記号");
+    (x as u16, y as u16)
+}
+
+fn click(app: &mut App, (column, row): (u16, u16)) {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let now = std::time::Instant::now();
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.on_mouse(
+            MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            now,
+        );
+    }
+}
+
+/// 位置の行を押すとその行が選ばれ、`[ ]`を押すと`Space`と同じ（`tui::pointer`の`ListId::Positions`）。
+#[test]
+fn clicking_a_position_row_and_its_mark_does_what_the_keys_do() {
+    let ws = workspace();
+    let mut app = app_with_record(ws.path(), &user_example());
+    let lines = frame(&mut app);
+    let (x, y) = mark_cell(&lines, "mspaint.exe");
+    click(&mut app, (x + 6, y));
+    let positions = app.pending.positions.as_ref().unwrap();
+    assert_eq!(positions.row, 2, "押した行が選ばれていない");
+    assert!(positions.approve.is_empty(), "行を押しただけで予約した");
+
+    let lines = frame(&mut app);
+    click(&mut app, mark_cell(&lines, "calc.exe"));
+    let positions = app.pending.positions.as_ref().unwrap();
+    assert_eq!(positions.row, 1);
+    assert!(
+        positions.approve.contains(&key_of(&app, CALC)),
+        "{}",
+        app.status
+    );
+}

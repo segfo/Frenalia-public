@@ -74,6 +74,27 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
         // 文言も短くしてある。切り捨てそのものは全画面に共通の性質で、ここでは直していない。
         // 却下（`x`）も予約を変えるキーなので`a`の直後に置く。まとめての却下（`X`）は頻度が
         // 低いので`f`の後ろ——**まとめて承認するキーは無い**（決定62・決定51）。
+        // 「遷移・観測から」の位置の行（P4.3）。`x`（却下）は押しても理由を言うだけなので出さない（`B-32`）。
+        Screen::Edit if app.shows_positions() => {
+            let positions = app.pending.positions.as_ref();
+            keys.push(press("Space 選ぶ/外す", KeyCode::Char(' ')));
+            match positions.map_or(0, |p| p.approve.len()) {
+                0 => keys.push(press("a 確定", KeyCode::Char('a'))),
+                reserved => keys.push(press(format!("a 確定（{reserved}件）"), KeyCode::Char('a'))),
+            }
+            keys.push(press("u 引数の広さ", KeyCode::Char('u')));
+            keys.push(press("Tab 遷移先", KeyCode::Tab));
+            if let Some(positions) = positions {
+                keys.push(press(
+                    format!("f 表示: {}", positions.filter.label()),
+                    KeyCode::Char('f'),
+                ));
+            }
+            keys.push(shown("↑↓ 選択"));
+            keys.push(press("r 読み直し", KeyCode::Char('r')));
+            keys.push(press("F2 タブ切替", KeyCode::F(2)));
+            keys.push(press("Esc 戻る", KeyCode::Esc));
+        }
         Screen::Edit if app.pending.tab.0.is_transition() => {
             keys.push(press("Space 選ぶ/外す", KeyCode::Char(' ')));
             let reserved = app.pending.reserved_count();
