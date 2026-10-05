@@ -39,6 +39,14 @@ use super::parse::{
 use super::tdh;
 use crate::win_common::wide;
 
+// プロセスの通知（`Kernel-Process`）の定数・型・解読は`kernel_process.rs`へ移した
+// （本体が1,000行を超えていたため。`docs/CODE-STRUCTURE-RULES.md`規則1・規則3）。
+// 呼び出し側の綴り（`super::session::ProcessStartInfo`等）はそのまま通す。
+pub use super::kernel_process::{
+    ProcessStartInfo, EVENT_ID_PROCESS_START, KERNEL_PROCESS_KEYWORD_PROCESS,
+    KERNEL_PROCESS_PROVIDER_GUID,
+};
+
 /// Kernel-Fileのキーワード。`Create`（要求）と`OperationEnd`（結果）だけを開ける。
 const KERNEL_FILE_KEYWORD_OP_END: u64 = 0x40;
 const KERNEL_FILE_KEYWORD_CREATE: u64 = 0x80;
@@ -129,31 +137,6 @@ struct ExtraCapture {
 
 /// 結果待ちにできる`Create`の上限。超えた分は古いものから捨てる（[`Correlator`]）。
 const PENDING_CREATE_CAPACITY: usize = 4096;
-
-/// `Microsoft-Windows-Kernel-Process`（`{22FB2CD6-0E7B-422B-A0C7-2FAD1FD0E716}`）。
-/// **同じセッションへ2つ目のプロバイダとして載せる**（`EnableTraceEx2`をもう1回呼ぶだけ）。
-pub const KERNEL_PROCESS_PROVIDER_GUID: GUID =
-    GUID::from_u128(0x22FB_2CD6_0E7B_422B_A0C7_2FAD_1FD0_E716);
-/// `WINEVENT_KEYWORD_PROCESS`。ProcessStart/ProcessStopだけを開ける
-/// （THREAD・IMAGE・JOB等は要らない）。
-pub const KERNEL_PROCESS_KEYWORD_PROCESS: u64 = 0x10;
-/// `ProcessStart`のevent id。
-pub const EVENT_ID_PROCESS_START: u16 = 1;
-
-/// `ProcessStart`から取り出す、収集器がスコープ判定に使う情報。
-///
-/// **`package_full_name`が本命**（v2以降）。これが取れれば、AppContainer子プロセスかどうかを
-/// *プロセス開始時点で*判定でき、`OpenProcess`+`TokenAppContainerSid`の事後照会が要らなくなる
-/// ——短命なプロセスでも取りこぼさない。`process_sequence_number`（v3以降）はPID再利用に対する
-/// 本来の識別子で、`(pid, 生成時刻)`より厳密である。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProcessStartInfo {
-    pub pid: u32,
-    pub parent_pid: Option<u32>,
-    pub image_name: Option<String>,
-    pub package_full_name: Option<String>,
-    pub process_sequence_number: Option<u64>,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum EtwError {
@@ -363,25 +346,9 @@ impl EtwFsSession {
             return Err(EtwError::EnableProvider(enable));
         }
 
-        // 2つ目のプロバイダを**同じセッションへ**載せる。`Kernel-Process`のProcessStartが
-        // 運ぶ`PackageFullName`で、AppContainer子かどうかをプロセス開始時点で判定できる
-        // （`OpenProcess`の事後照会は短命プロセスで失敗するため、そちらに頼らない）。
-        //
-        // **失敗しても致命的にしない**。これはスコープ判定の精度を上げるための補助であって、
-        // 拒否の収集そのものは`Kernel-File`だけで成立する（D-43 fail-open）。
-        let process_enable = unsafe {
-            EnableTraceEx2(
-                session_handle,
-                &KERNEL_PROCESS_PROVIDER_GUID as *const GUID,
-                EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
-                TRACE_LEVEL_INFORMATION as u8,
-                KERNEL_PROCESS_KEYWORD_PROCESS,
-                0,
-                0,
-                None,
-            )
-        };
-        let kernel_process_enabled = process_enable == ERROR_SUCCESS;
+        // 2つ目のプロバイダ（`Kernel-Process`）を同じセッションへ載せる。失敗しても致命的に
+        // しない理由は`kernel_process::enable_on`のdoc。
+        let kernel_process_enabled = super::kernel_process::enable_on(session_handle);
 
         // 3本目のプロバイダ（測定M3）。**同じ`session_handle`へ`EnableTraceEx2`をもう1回**
         // 呼ぶだけで、セッションは増えない——それが「相乗りできるか」の問いの実体である。
@@ -1340,15 +1307,7 @@ unsafe extern "system" fn event_record_callback(record: *mut EVENT_RECORD) {
     let timestamp_unix_ms = filetime_to_unix_ms(record.EventHeader.TimeStamp);
 
     if record.EventHeader.ProviderId == KERNEL_PROCESS_PROVIDER_GUID {
-        if event_id == EVENT_ID_PROCESS_START {
-            let info = ProcessStartInfo {
-                pid: tdh::property_u64(record, "ProcessID").unwrap_or(pid as u64) as u32,
-                parent_pid: tdh::property_u64(record, "ParentProcessID").map(|v| v as u32),
-                image_name: tdh::property_string(record, "ImageName"),
-                // v2以降にのみ存在する。無い版では`None`になるだけで壊れない。
-                package_full_name: tdh::property_string(record, "PackageFullName"),
-                process_sequence_number: tdh::property_u64(record, "ProcessSequenceNumber"),
-            };
+        if let Some(info) = super::kernel_process::decode_process_start(record, pid) {
             if let Ok(mut starts) = sink.process_starts.lock() {
                 starts.push(info);
             }

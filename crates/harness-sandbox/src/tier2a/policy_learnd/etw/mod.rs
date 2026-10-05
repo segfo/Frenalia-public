@@ -6,6 +6,7 @@
 //! | [`parse`] | `Create`↔`OperationEnd`の相関・access種別の推定・NTパス変換 | 単体テスト（純粋関数） |
 //! | [`tdh`] | イベントプロパティを名前で引く（マニフェスト解決） | 実機（TDHはETWレコードを要求する） |
 //! | [`session`] | **本番経路**。マニフェストベース(Modern ETW)のセッションのライフサイクル | 実機E2E（`#[ignore]`） |
+//! | `kernel_process` | 本番セッションへ`Kernel-Process`を載せ、`ProcessStart`を解読する（名前は[`session`]から再公開） | 実機E2E（`#[ignore]`） |
 //! | [`mof`] | Classic ETW(MOF / System Logger系)のセッション。**本番では使わないが対照群として意図的に残す**（規則2の例外、モジュールdoc参照） | 実機E2E（`#[ignore]`） |
 //! | [`scope`] | 「このイベントは自分のサンドボックス配下か」の3段構え判定 | 単体テスト（純粋関数＋probe注入） |
 //! | [`volumes`] | `\Device\HarddiskVolumeN` → `C:` の対応表 | 実機 |
@@ -13,6 +14,9 @@
 //! 判断（相関・分類）と副作用（Win32）を分けているのは、提案の質そのものである前者を
 //! 管理者権限なしに全数テストできる形に保つためである（`docs/CODE-STRUCTURE-RULES.md`規則3）。
 
+/// `Kernel-Process`の有効化と`ProcessStart`の解読（2026-10-05に`session.rs`からそのまま移した）。
+/// **非公開**——外からは`session`が再公開する名前（`session::ProcessStartInfo`等）で引く。
+mod kernel_process;
 /// Classic ETW（MOF / System Logger系）。**本番経路ではない**——マニフェスト側が捉えきれない
 /// 事象に当たったときに対比するための対照群として意図的に残している（モジュールdocに理由、
 /// 実測比較は`plans/etw-spike/RESULTS.md` §8）。
