@@ -392,7 +392,8 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "cmd_nested_spawn_tests",
         ],
     ),
-    // [BUG-230] 遷移の強制の下で`cmd.exe`が次のプログラムを起こせない件の原因を決める測定（4本の腕）。
+    // [BUG-230] 遷移の強制の下で`cmd.exe`が次のプログラムを起こせない件の原因を決める測定
+    // （腕の一覧は測定ファイルのモジュールdocが持つ。ここに本数を書かない）。
     // **合否は計器の検算と対照（中の段がPowerShellの腕）だけで、`cmd.exe`の腕は観測を印字する**。
     // 寿命は測定ファイル（`spawnd_e2e_tests/cmd_nested_spawn_tests.rs`）のモジュールdocが持つ。
     (

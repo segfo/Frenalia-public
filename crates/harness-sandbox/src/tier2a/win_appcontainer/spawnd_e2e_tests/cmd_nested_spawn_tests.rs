@@ -11,7 +11,7 @@
 //! ```text
 //! プローブ（DLL入り・生成禁止）
 //!    └─ CreateProcessW「<中の段> … <葉>」 ─フック→Daemon─▶ 中の段（cmd.exe / powershell.exe 5.1）
-//!                                                          └─ 葉を起こす ─フック→Daemon─▶ 葉（プローブ --emit）
+//!                                                          └─ 葉を起こす ─フック→Daemon─▶ 葉（hostname.exe）
 //! ```
 //!
 //! # 腕（1本ごとにワークスペースとDaemonを作り直す）
@@ -22,6 +22,17 @@
 //! | `ps-declared` | `powershell.exe -Command <葉>` | あり | 対照: 中の段を替えれば葉が動く（形が正しい） |
 //! | `cmd-undeclared` | `cmd.exe /d /c <葉>` | なし | 本命: `cmd.exe`の要求がDaemonへ届くか |
 //! | `ps-undeclared` | `powershell.exe -Command <葉>` | なし | 対照: この形で待ち行列に1行が書かれる（計器の検算） |
+//! | `cmd-dir` | `cmd.exe /d /c dir <プローブ> & dir <葉>` | — | 観測: ドメインの中から2つのファイルが**見えるか**（`dir`は内部コマンドで子を起こさない） |
+//!
+//! # 葉を`hostname.exe`にしてある理由（2026-10-05の1回目で分かったこと）
+//!
+//! 1回目は葉を試験用のプローブ（`target\debug\deps`）にした。**PowerShellの対照の腕まで失敗した**
+//! ——PowerShellは葉を「コマンドとして認識できない」と言い、`cmd.exe`は「アクセスが拒否されました。」
+//! と言い、どちらの中の段でもフックの行は1行も出なかった。プローブは外（Daemon）から起こす分には
+//! 動くが、**ドメインの中のプログラムがそのファイルを探すと見えない**らしい（`cmd-dir`はこの読みを
+//! 確かめる腕）。葉の置き場で失敗を作ると、P4.8の失敗とは別のものを測ってしまうので、
+//! P4.8と同じ置き場（System32）の`hostname.exe`にした。葉が動いたかは、中の段の標準出力に
+//! この機のホスト名が出たかで見る。
 //!
 //! **合否にするのは計器の検算と対照の腕だけ。** `cmd.exe`の腕は観測を決まった形で印字する
 //! ——ここで知りたいのは「どう壊れているか」であって、壊れていること自体は既に分かっている。
@@ -53,19 +64,31 @@
 //! `spawn-daemon`の`--skip`を一緒に消す**。結論は`docs/bugs/BUG-230.md`と
 //! `plans/mac-spike/RESULTS.md`が持つ（`docs/CODE-STRUCTURE-RULES.md`規則2の使い捨ての側）。
 
-use std::time::Duration;
-
 use crate::tier2a::spawnd::transitions::PendingRecord;
 
 use super::transition_acceptance_tests::{
-    ask_daemon, cmd_exe, policy_with_edges, wait_for_file, windows_powershell_51,
+    ask_daemon, cmd_exe, policy_with_edges, windows_powershell_51,
 };
 use super::transition_queue_tests::{daemon_denial, queue_records};
 use super::transparent_hook_tests::{redirector_log_path, run_probe_with_hooks};
 use super::*;
 
-/// 葉が動いたことの印（葉のプローブが`--report-file`へ書く報告に載る）。
-const LEAF_MARKER: &str = "HARNESS-BUG230-LEAF";
+/// 葉（`hostname.exe`）のフルパス。**`%SystemRoot%`から組む**（`cmd_exe`と同じ理由）。
+fn hostname_exe() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\hostname.exe")
+}
+
+/// 葉が動いたときに中の段の標準出力に出るはずの文字列。**サンドボックスの外で同じ葉を走らせて得る**
+/// ——`COMPUTERNAME`はNetBIOS名なので、`hostname.exe`が出すDNSのホスト名と一致する保証が無い。
+fn expected_hostname() -> String {
+    let out = std::process::Command::new(hostname_exe())
+        .output()
+        .expect("hostname.exe must run outside the sandbox");
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
+    assert!(!name.is_empty(), "サンドボックスの外でhostname.exeが何も出さなかった");
+    name
+}
 
 /// Daemonの標準エラーの受け皿に必ず1行書かせるための、**JSONとして読めない**要求。
 const UNREADABLE_REQUEST: &str = "BUG-230: this is not a spawn request";
@@ -80,9 +103,19 @@ enum Middle {
     WindowsPowerShell,
 }
 
+/// 中の段に何をさせるか。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Body {
+    /// 葉を起こす。
+    RunLeaf,
+    /// [1回目の読みの確かめ] プローブと葉の両方を`dir`する（子を起こさない）。
+    ListBoth,
+}
+
 struct Arm {
     label: &'static str,
     middle: Middle,
+    body: Body,
     declare_leaf: bool,
 }
 
@@ -91,6 +124,7 @@ struct Arm {
 struct Observed {
     label: &'static str,
     middle: Middle,
+    body: Body,
     declare_leaf: bool,
     leaf_path: String,
     probe_report: String,
@@ -137,11 +171,15 @@ impl Observed {
             Middle::WindowsPowerShell => "powershell.exe 5.1",
         };
         let mut text = format!(
-            "\n===== [bug230 {}] 中の段={middle} 葉への辺={} =====\n",
+            "\n===== [bug230 {}] 中の段={middle} させること={:?} 葉への辺={} =====\n",
             self.label,
+            self.body,
             if self.declare_leaf { "あり" } else { "なし" },
         );
-        text += &format!("葉が動いたか（印のファイル）: {}\n", self.leaf_ran);
+        text += &format!(
+            "葉が動いたか（中の段の出力にホスト名）: {}\n",
+            self.leaf_ran
+        );
         text += &format!("プローブの報告: {}\n", self.probe_report.trim());
         text += &format!(
             "中の段の標準出力・標準エラー:\n{}\n",
@@ -194,9 +232,10 @@ fn pid_of(line: &str) -> Option<u64> {
     rest.split_once(']')?.0.parse().ok()
 }
 
-fn run_arm(arm: &Arm) -> Observed {
-    let leaf = super::super::mac_spike_tests::probe_exe();
-    let leaf_str = leaf.to_str().expect("probe path is utf-8").to_string();
+fn run_arm(arm: &Arm, expected_hostname: &str) -> Observed {
+    let leaf_str = hostname_exe();
+    let probe = super::super::mac_spike_tests::probe_exe();
+    let probe_str = probe.to_str().expect("probe path is utf-8").to_string();
     let middle_exe = match arm.middle {
         Middle::Cmd => cmd_exe(),
         Middle::WindowsPowerShell => windows_powershell_51(),
@@ -219,26 +258,29 @@ fn run_arm(arm: &Arm) -> Observed {
         .expect("case owns the dir")
         .path()
         .to_path_buf();
-    let leaf_report = workspace.join("leaf.json");
-    let leaf_report_str = leaf_report.to_string_lossy().into_owned();
     let middle_output = workspace.join("middle-output.txt");
     let middle_output_str = middle_output.to_string_lossy().into_owned();
 
     // **引用符を使わない前提を確かめる。** `cmd /c`は引用符を取り除く規則を持つので、
     // 引用符を書くと「`cmd.exe`が起こせない」と「`cmd`が引用符を剥がして別の行にした」が混ざる。
-    for path in [&leaf_str, &middle_exe, &leaf_report_str] {
+    for path in [&leaf_str, &middle_exe, &probe_str] {
         assert!(
             !path.contains(' '),
             "この測定は引用符を使わずに行を組むので、空白を含むパスでは成立しない: {path}"
         );
     }
-    let leaf_line = format!("{leaf_str} --emit {LEAF_MARKER} --report-file {leaf_report_str}");
-    let command_line = match arm.middle {
+    let command_line = match (arm.middle, arm.body) {
         // `/d`はAutoRun（`cmd`起動時にレジストリのコマンドを走らせる設定）を切るだけで、
         // 子の起こし方は変えない。P4.8と同じ形にそろえる。
-        Middle::Cmd => format!("{middle_exe} /d /c {leaf_line}"),
-        Middle::WindowsPowerShell => {
-            format!("{middle_exe} -NoProfile -NonInteractive -Command {leaf_line}")
+        (Middle::Cmd, Body::RunLeaf) => format!("{middle_exe} /d /c {leaf_str}"),
+        (Middle::Cmd, Body::ListBoth) => {
+            format!("{middle_exe} /d /c dir {probe_str} & dir {leaf_str}")
+        }
+        (Middle::WindowsPowerShell, Body::RunLeaf) => {
+            format!("{middle_exe} -NoProfile -NonInteractive -Command {leaf_str}")
+        }
+        (Middle::WindowsPowerShell, Body::ListBoth) => {
+            unreachable!("`dir`で見え方を確かめる腕は`cmd.exe`だけに置く")
         }
     };
 
@@ -260,15 +302,16 @@ fn run_arm(arm: &Arm) -> Observed {
     );
     eprintln!("[bug230 {}] probe stdout={out}\nprobe stderr={err}", arm.label);
 
-    // プローブは中の段を待ってから終わり、中の段（`cmd /c`・`-Command`）は葉を待ってから終わる。
-    // ここで待つのは、葉が別の理由で遅れたときに「動かなかった」と読まないための余裕である。
-    let leaf_ran = wait_for_file(&leaf_report, Duration::from_secs(5))
-        && std::fs::read_to_string(&leaf_report)
-            .map(|t| t.contains(LEAF_MARKER))
-            .unwrap_or(false);
+    // プローブは中の段を待ってから終わり、中の段（`cmd /c`・`-Command`）は葉を待ってから終わる
+    // ので、ここでは中の段の出力は書き終わっている。
     let middle_output_text = std::fs::read(&middle_output)
         .map(|bytes| crate::win_common::decode_console_bytes(&bytes))
         .unwrap_or_else(|e| format!("（読めない: {e}）"));
+    let leaf_ran = arm.body == Body::RunLeaf
+        && middle_output_text
+            .to_lowercase()
+            .lines()
+            .any(|l| l.trim() == expected_hostname);
     let log = std::fs::read_to_string(redirector_log_path(&workspace)).unwrap_or_default();
     let log_lines: Vec<String> = log.lines().map(str::to_string).collect();
 
@@ -293,6 +336,7 @@ fn run_arm(arm: &Arm) -> Observed {
     Observed {
         label: arm.label,
         middle: arm.middle,
+        body: arm.body,
         declare_leaf: arm.declare_leaf,
         leaf_path: leaf_str,
         probe_report: out,
@@ -387,7 +431,8 @@ fn instrument_failures(o: &Observed) -> Vec<String> {
     failures
 }
 
-/// **測定**: 中の段を`cmd.exe`とPowerShellで入れ替え、葉への辺の有無を振った4本を撃ち、
+/// **測定**: 中の段を`cmd.exe`とPowerShellで入れ替え、葉への辺の有無を振った4本と、
+/// `cmd.exe`の中から2つのファイルの見え方を確かめる1本を撃ち、
 /// `cmd.exe`の腕で中の段のフックが何をしたかを印字する。
 #[test]
 #[ignore = "starts a real spawn daemon and AppContainer children; run through spawn-daemon-cmd-nested"]
@@ -396,26 +441,41 @@ fn what_the_hook_inside_cmd_does_when_cmd_starts_the_next_program() {
         Arm {
             label: "cmd-declared",
             middle: Middle::Cmd,
+            body: Body::RunLeaf,
             declare_leaf: true,
         },
         Arm {
             label: "ps-declared",
             middle: Middle::WindowsPowerShell,
+            body: Body::RunLeaf,
             declare_leaf: true,
         },
         Arm {
             label: "cmd-undeclared",
             middle: Middle::Cmd,
+            body: Body::RunLeaf,
             declare_leaf: false,
         },
         Arm {
             label: "ps-undeclared",
             middle: Middle::WindowsPowerShell,
+            body: Body::RunLeaf,
+            declare_leaf: false,
+        },
+        Arm {
+            label: "cmd-dir",
+            middle: Middle::Cmd,
+            body: Body::ListBoth,
             declare_leaf: false,
         },
     ];
 
-    let observed: Vec<Observed> = arms.iter().map(run_arm).collect();
+    let expected_hostname = expected_hostname();
+    eprintln!("[bug230] 葉が動いたら出るはずのホスト名: {expected_hostname}");
+    let observed: Vec<Observed> = arms
+        .iter()
+        .map(|arm| run_arm(arm, &expected_hostname))
+        .collect();
     for o in &observed {
         o.print();
     }
