@@ -22,17 +22,22 @@
 //! | `ps-declared` | `powershell.exe -Command <葉>` | あり | 対照: 中の段を替えれば葉が動く（形が正しい） |
 //! | `cmd-undeclared` | `cmd.exe /d /c <葉>` | なし | 本命: `cmd.exe`の要求がDaemonへ届くか |
 //! | `ps-undeclared` | `powershell.exe -Command <葉>` | なし | 対照: この形で待ち行列に1行が書かれる（計器の検算） |
-//! | `cmd-dir` | `cmd.exe /d /c dir <プローブ> & dir <葉>` | — | 観測: ドメインの中から2つのファイルが**見えるか**（`dir`は内部コマンドで子を起こさない） |
+//! | `cmd-bisect` | `cmd.exe /d /c`＋内部コマンドだけ | — | 観測: `cmd.exe`のどの操作が断られるか（子を起こさない。`Body::Bisect`） |
+//! | `probe-open-rights` | プローブ `--open-rights …` | — | 観測: 同じ経路で起きた子が、どのディレクトリをどの権利で開けるか（`Body::OpenRights`） |
 //!
 //! # 葉を`hostname.exe`にしてある理由（2026-10-05の1回目で分かったこと）
 //!
 //! 1回目は葉を試験用のプローブ（`target\debug\deps`）にした。**PowerShellの対照の腕まで失敗した**
 //! ——PowerShellは葉を「コマンドとして認識できない」と言い、`cmd.exe`は「アクセスが拒否されました。」
 //! と言い、どちらの中の段でもフックの行は1行も出なかった。プローブは外（Daemon）から起こす分には
-//! 動くが、**ドメインの中のプログラムがそのファイルを探すと見えない**らしい（`cmd-dir`はこの読みを
-//! 確かめる腕）。葉の置き場で失敗を作ると、P4.8の失敗とは別のものを測ってしまうので、
-//! P4.8と同じ置き場（System32）の`hostname.exe`にした。葉が動いたかは、中の段の標準出力に
-//! この機のホスト名が出たかで見る。
+//! 動くが、**ドメインの中のプログラムがそのファイルを探すと見えない**らしい。葉の置き場で
+//! 失敗を作ると、P4.8の失敗とは別のものを測ってしまうので、P4.8と同じ置き場（System32）の
+//! `hostname.exe`にした。葉が動いたかは、中の段の標準出力にこの機のホスト名が出たかで見る。
+//!
+//! 2回目（葉＝`hostname.exe`）では、PowerShellの対照は葉まで動き、`cmd.exe`は同じ
+//! 「アクセスが拒否されました。」でフックに1度も入らなかった。さらに`cmd.exe`の内部コマンド
+//! `dir`が**System32の`hostname.exe`でさえ**断られた（System32のDACLはAppContainerに
+//! 読み取りと実行を許している）。どの操作が断られているかを`cmd-bisect`と`probe-open-rights`で分ける。
 //!
 //! **合否にするのは計器の検算と対照の腕だけ。** `cmd.exe`の腕は観測を決まった形で印字する
 //! ——ここで知りたいのは「どう壊れているか」であって、壊れていること自体は既に分かっている。
@@ -101,6 +106,9 @@ const UNREADABLE_LINE: &str = "[spawnd] unreadable spawn request from the sandbo
 enum Middle {
     Cmd,
     WindowsPowerShell,
+    /// 試験用のプローブ。**`cmd.exe`と同じ経路（フック→Daemon→自己ループ）で起きた子の中から**、
+    /// どのファイル・ディレクトリをどの権利で開けるかをOSに直接聞くために置く。
+    Probe,
 }
 
 /// 中の段に何をさせるか。
@@ -108,8 +116,17 @@ enum Middle {
 enum Body {
     /// 葉を起こす。
     RunLeaf,
-    /// [1回目の読みの確かめ] プローブと葉の両方を`dir`する（子を起こさない）。
-    ListBoth,
+    /// [2回目の読みの確かめ] `cmd.exe`の内部コマンドだけ（子を起こさない）で、
+    /// どの操作が断られるのかを切り分ける。各操作の前に`[名前]`を出すので、出力の行で対応が取れる。
+    ///
+    /// 2回目の`dir <葉>`は、**System32の`hostname.exe`でさえ**「アクセスが拒否されました。」だった。
+    /// ただし`dir`は一覧の前にドライブの情報（ボリュームラベル）を読むので、どちらで断られたかは
+    /// `dir`1つでは分からない——`vol`（ドライブの情報だけ）・`if exist`（属性の読み取りだけ）・
+    /// `dir /b`（見出しを出さない一覧）に分ける。
+    Bisect,
+    /// [2回目の読みの確かめ] プローブの`--open-rights`で、一覧・通過・属性の読み取りを
+    /// ディレクトリごとに要求して開き、OSの答え（`last_error`）を出す。
+    OpenRights,
 }
 
 struct Arm {
@@ -169,6 +186,7 @@ impl Observed {
         let middle = match self.middle {
             Middle::Cmd => "cmd.exe",
             Middle::WindowsPowerShell => "powershell.exe 5.1",
+            Middle::Probe => "tier2a_proc_probe.exe",
         };
         let mut text = format!(
             "\n===== [bug230 {}] 中の段={middle} させること={:?} 葉への辺={} =====\n",
@@ -239,6 +257,7 @@ fn run_arm(arm: &Arm, expected_hostname: &str) -> Observed {
     let middle_exe = match arm.middle {
         Middle::Cmd => cmd_exe(),
         Middle::WindowsPowerShell => windows_powershell_51(),
+        Middle::Probe => probe_str.clone(),
     };
 
     let (mut case, profile, caps) = setup_with_policy_and_transitions(
@@ -263,25 +282,54 @@ fn run_arm(arm: &Arm, expected_hostname: &str) -> Observed {
 
     // **引用符を使わない前提を確かめる。** `cmd /c`は引用符を取り除く規則を持つので、
     // 引用符を書くと「`cmd.exe`が起こせない」と「`cmd`が引用符を剥がして別の行にした」が混ざる。
-    for path in [&leaf_str, &middle_exe, &probe_str] {
+    let workspace_str = workspace.to_string_lossy().into_owned();
+    for path in [&leaf_str, &middle_exe, &probe_str, &workspace_str] {
         assert!(
             !path.contains(' '),
             "この測定は引用符を使わずに行を組むので、空白を含むパスでは成立しない: {path}"
         );
     }
+    let system32 = leaf_str
+        .rsplit_once('\\')
+        .map(|(dir, _)| dir.to_string())
+        .expect("hostname.exe has a parent");
+    let windows = system32
+        .rsplit_once('\\')
+        .map(|(dir, _)| dir.to_string())
+        .expect("System32 has a parent");
+    let probe_dir = probe_str
+        .rsplit_once('\\')
+        .map(|(dir, _)| dir.to_string())
+        .expect("the probe has a parent");
     let command_line = match (arm.middle, arm.body) {
         // `/d`はAutoRun（`cmd`起動時にレジストリのコマンドを走らせる設定）を切るだけで、
         // 子の起こし方は変えない。P4.8と同じ形にそろえる。
         (Middle::Cmd, Body::RunLeaf) => format!("{middle_exe} /d /c {leaf_str}"),
-        (Middle::Cmd, Body::ListBoth) => {
-            format!("{middle_exe} /d /c dir {probe_str} & dir {leaf_str}")
-        }
+        (Middle::Cmd, Body::Bisect) => format!(
+            "{middle_exe} /d /c echo [cd] & cd \
+             & echo [vol] & vol C: \
+             & echo [if-exist] & (if exist {leaf_str} (echo EXISTS) else (echo MISSING)) \
+             & echo [dir-b] & dir /b {leaf_str} \
+             & echo [dir-b-wildcard] & dir /b {system32}\\hostnam*.exe \
+             & echo [dir-b-workspace] & dir /b {workspace_str} \
+             & echo [dir-b-probe] & dir /b {probe_str} \
+             & echo [dir-full] & dir {leaf_str} \
+             & echo [end]"
+        ),
         (Middle::WindowsPowerShell, Body::RunLeaf) => {
             format!("{middle_exe} -NoProfile -NonInteractive -Command {leaf_str}")
         }
-        (Middle::WindowsPowerShell, Body::ListBoth) => {
-            unreachable!("`dir`で見え方を確かめる腕は`cmd.exe`だけに置く")
+        (Middle::Probe, Body::OpenRights) => {
+            let mut specs = Vec::new();
+            for dir in ["C:\\", &windows, &system32, &workspace_str, &probe_dir] {
+                for right in ["list_directory", "traverse", "read_attributes"] {
+                    specs.push(format!("--open-rights {right}:{dir}"));
+                }
+            }
+            specs.push(format!("--open-rights read_attributes:{leaf_str}"));
+            format!("{middle_exe} {}", specs.join(" "))
         }
+        (middle, body) => unreachable!("組み合わせない腕: {middle:?} × {body:?}"),
     };
 
     let (out, err) = run_probe_with_hooks(
@@ -400,30 +448,29 @@ fn instrument_failures(o: &Observed) -> Vec<String> {
                  **この形そのものが壊れている**ので、`cmd.exe`の腕の「葉が動かない」は読めない"
             ));
         }
+        // **「ちょうど1件」にしない。** 2回目の実測で、PowerShell 5.1は断られると綴りを変えて
+        // 計3回`CreateProcessW`を呼び直した（コマンドラインが違うので待ち行列では別の行になる）。
+        // 計器の検算として要るのは「断られた要求が1件以上書かれ、どれも期待した拒否であること」である。
         if !o.declare_leaf {
-            let denials: Vec<_> = o
-                .queue
-                .iter()
-                .filter(|r| matches!(r, PendingRecord::DeniedByDaemon(_)))
-                .map(daemon_denial)
-                .filter(|d| {
+            let expected = |r: &PendingRecord| {
+                matches!(r, PendingRecord::DeniedByDaemon(_)) && {
+                    let d = daemon_denial(r);
                     d.from_domain.as_deref() == Some(E2E_POLICY_DOMAIN)
+                        && d.exe.eq_ignore_ascii_case(&o.leaf_path)
                         && d.reason
                             == crate::tier2a::spawnd::DenyReason::Transition {
                                 denial:
                                     harness_policy::transition::TransitionDenial::NoMatchingEdge,
                             }
-                })
-                .collect();
-            if denials.len() != 1 {
+                }
+            };
+            if o.queue.is_empty() || !o.queue.iter().all(expected) {
                 failures.push(format!(
-                    "{label}: 対照の腕（中の段がPowerShell・葉への辺なし）で、待ち行列に\
-                     `({E2E_POLICY_DOMAIN}, 葉, NoMatchingEdge)`がちょうど1件ではない（{}件）。\
+                    "{label}: 対照の腕（中の段がPowerShell・葉への辺なし）で、待ち行列が空か、\
+                     `({E2E_POLICY_DOMAIN}, 葉, NoMatchingEdge)`でない行がある。\
                      **待ち行列という計器が壊れている**ので、`cmd.exe`の腕の「待ち行列が空」は読めない。\
                      葉={} 全行={:?}",
-                    denials.len(),
-                    o.leaf_path,
-                    o.queue
+                    o.leaf_path, o.queue
                 ));
             }
         }
@@ -432,8 +479,7 @@ fn instrument_failures(o: &Observed) -> Vec<String> {
 }
 
 /// **測定**: 中の段を`cmd.exe`とPowerShellで入れ替え、葉への辺の有無を振った4本と、
-/// `cmd.exe`の中から2つのファイルの見え方を確かめる1本を撃ち、
-/// `cmd.exe`の腕で中の段のフックが何をしたかを印字する。
+/// 断られている操作を切り分ける2本を撃ち、`cmd.exe`の腕で中の段のフックが何をしたかを印字する。
 #[test]
 #[ignore = "starts a real spawn daemon and AppContainer children; run through spawn-daemon-cmd-nested"]
 fn what_the_hook_inside_cmd_does_when_cmd_starts_the_next_program() {
@@ -463,9 +509,15 @@ fn what_the_hook_inside_cmd_does_when_cmd_starts_the_next_program() {
             declare_leaf: false,
         },
         Arm {
-            label: "cmd-dir",
+            label: "cmd-bisect",
             middle: Middle::Cmd,
-            body: Body::ListBoth,
+            body: Body::Bisect,
+            declare_leaf: false,
+        },
+        Arm {
+            label: "probe-open-rights",
+            middle: Middle::Probe,
+            body: Body::OpenRights,
             declare_leaf: false,
         },
     ];

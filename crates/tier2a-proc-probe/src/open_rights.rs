@@ -13,8 +13,18 @@
 use serde_json::{json, Value};
 
 /// 名前→アクセスマスク。`AccessCheck`の答えと1ビットずつ比べられるよう、単独の権利だけを並べる。
+///
+/// **`CreateFileW`は要求に`SYNCHRONIZE | FILE_READ_ATTRIBUTES`を必ず足して開く**ので、
+/// どの名前で開いても属性の読み取りは同時に要求している（`read_attributes`はその2つだけの要求になる）。
 pub fn right_mask(name: &str) -> Option<u32> {
     Some(match name {
+        // [BUG-230] 読み取り側。`cmd.exe`が実行ファイルを探すときの「ディレクトリの一覧」が
+        // ドメインの中から許されているかを、OSの答えとして測るために足した。
+        // ファイルでは FILE_READ_DATA と同じビット
+        "list_directory" => 0x0000_0001,
+        // ファイルでは FILE_EXECUTE と同じビット
+        "traverse" => 0x0000_0020,
+        "read_attributes" => 0x0000_0080,
         // ディレクトリでは FILE_ADD_FILE と同じビット
         "write_data" => 0x0000_0002,
         // ディレクトリでは FILE_ADD_SUBDIRECTORY と同じビット
