@@ -37,8 +37,9 @@ use super::etw::scope::{ScopeTracker, ScopeVerdict};
 use super::etw::session::EtwFsSession;
 use super::etw::volumes::drive_letter_map;
 use super::instances::{self, ProcessIdentity, ProcessInstances};
-use super::observed::{ArgvEvent, ObservedCandidates, Resolution};
-use super::{LearnError, LearnPolicy, LearnRequest, LearnResponse};
+use super::observed::ObservedCandidates;
+use super::process_audit::ProcessAudit;
+use super::{process_audit_path, LearnError, LearnPolicy, LearnRequest, LearnResponse};
 use crate::elevated_launch::validate_audit_sink_path;
 use crate::win_common::wide;
 use crate::win_pipe_ipc::{read_framed_timeout, write_framed_timeout};
@@ -119,8 +120,10 @@ struct Generation {
     /// argv観測のセッション（段階6d、§10.3）。**`capture_argv`のときだけ`Some`**で、
     /// **張れなければこの世代は作られない**（fail-open のFS側とは逆。§10.3）。
     argv_session: Option<MofFsSession>,
-    /// 観測した候補の積み先。`argv_session`と対で`Some`になる。
-    candidates: Option<ObservedCandidates>,
+    /// プロセスの木（`process-audit.jsonl`）と遷移の辺の候補（`observed.jsonl`）の書き手
+    /// （P2c、決定23）。`argv_session`と対で`Some`になる——コマンドラインを結び付ける相手が
+    /// 居ない世代は木を書かない。
+    process_audit: Option<ProcessAudit>,
     sink_path: std::path::PathBuf,
     tracker: ScopeTracker,
     instances: ProcessInstances,
@@ -186,7 +189,7 @@ impl Generation {
             );
         }
 
-        let (argv_session, candidates) = if policy.capture_argv {
+        let (argv_session, process_audit) = if policy.capture_argv {
             // **exeのフルパスはマニフェスト側からしか来ない**（`observed`のモジュールdoc）。
             // プロセス生成のプロバイダが載っていないと、argvが取れても突き合わせる相手が
             // 居らず候補が1件も出ない——**「張れたが何も出ない記録」を作らない**ので、
@@ -208,10 +211,15 @@ impl Generation {
                 Ok(session) => {
                     append_control(&sink_path, "argv_capture_started: fail-closed (a recording is \
                                                 refused when this session cannot be started)");
-                    (
-                        Some(session),
-                        Some(ObservedCandidates::new(&policy.workspace_root)),
-                    )
+                    // **書き先は検証済みの`sink_path`から導出する**（親からは受け取らない、決定23(1)）。
+                    // ファイルは依頼側が先に作ってある（`client::start_collect_bytes`、BUG-109）。
+                    let audit_path = process_audit_path(&sink_path);
+                    let audit = ProcessAudit::start(
+                        audit_path.clone(),
+                        ObservedCandidates::new(&policy.workspace_root),
+                        &|line| append_line(&audit_path, line),
+                    );
+                    (Some(session), Some(audit))
                 }
                 Err(e) => {
                     // **黙って続けない。** 制御レコードにも残す——応答だけに書くと、
@@ -231,7 +239,7 @@ impl Generation {
         Ok(Self {
             session,
             argv_session,
-            candidates,
+            process_audit,
             sink_path,
             tracker: ScopeTracker::new(policy.session_profile.clone())
                 .with_harness_pid(policy.harness_pid)
@@ -254,11 +262,11 @@ impl Generation {
 
     /// 溜まったイベントを1バッチ書き出す。
     fn drain(&mut self, volumes: &[(String, String)]) {
-        // **FS側を先に回す。** 候補の突き合わせはマニフェスト側が埋める台帳
-        // （`tracker`・`instances`）を引くので、順序を逆にすると同じバッチで届いた生成が
-        // 毎回1回ぶん持ち越される（結果は変わらないが、持ち越しが常に満杯になる）。
+        // **FS側を先に回す。** 引数の結び付けはマニフェスト側が埋める表（`instances`）を
+        // 引くので、順序を逆にすると同じバッチで届いた生成が毎回1回ぶん持ち越される
+        // （持ち越しは1回だけなので、引数が「観測されなかった」側へ倒れやすくなる）。
         self.drain_fs(volumes);
-        self.drain_argv(volumes);
+        self.drain_argv();
     }
 
     fn drain_fs(&mut self, volumes: &[(String, String)]) {
@@ -290,48 +298,28 @@ impl Generation {
         };
     }
 
-    /// argv観測の1バッチを候補へ落とす（段階6d）。
+    /// argv観測の1バッチを、プロセスの木と候補へ落とす（段階6d・P2c）。
     ///
-    /// **exeのフルパスと親はマニフェスト側の台帳から引く**——MOFの`ImageFileName`は
+    /// **exeのフルパスと親はマニフェスト側の表から引く**——MOFの`ImageFileName`は
     /// 葉の名前しか持たず、`argv[0]`は呼び出し元が書いた綴りのままだからである
-    /// （実測、`plans/etw-spike/RESULTS.md` §22.4）。
-    fn drain_argv(&mut self, _volumes: &[(String, String)]) {
-        // 台帳（`tracker`・`instances`）と積み先（`candidates`）を同時に可変で借りるので、
-        // フィールドごとに分解して借りる。
-        let Generation {
-            argv_session: Some(session),
-            candidates: Some(candidates),
-            tracker,
-            instances,
-            sink_path,
-            ..
-        } = self
+    /// （実測、`plans/etw-spike/RESULTS.md` §22.4）。結び付けは`process_audit.rs`が
+    /// 時刻の窓で行う（pid だけでは引かない。決定65の追記(4)）。
+    fn drain_argv(&mut self) {
+        let (Some(session), Some(audit)) = (self.argv_session.as_ref(), self.process_audit.as_mut())
         else {
             return;
         };
-
-        let mut events = Vec::new();
-        for start in session.drain_process_starts() {
-            match (start.pid, start.command_line) {
-                (Some(pid), Some(argv)) => events.push(ArgvEvent { pid, argv }),
-                // **コマンドラインが無い版が届いた**（`Process_V2`未満）か、pidが無い。
-                // どちらも突き合わせようがないので数える（黙って捨てない）。
-                _ => candidates.count_missing_command_line(),
-            }
-        }
-        if events.is_empty() {
-            return;
-        }
-
         let now = harness_policy::event::now_unix_ms();
-        let result = candidates.observe(
-            events,
-            |pid| resolve_for_candidate(pid, tracker, instances),
+        let audit_path = audit.path().to_path_buf();
+        let result = audit.drain(
+            &self.instances,
+            session.drain_process_starts(),
             now,
+            &|line| append_line(&audit_path, line),
         );
         if let Err(e) = result {
             // **記録の失敗で収集を止めない**（`P-07`）。事実は制御レコードへ残す。
-            append_control(sink_path, &format!("argv_candidate_write_failed: {e}"));
+            append_control(&self.sink_path, &format!("argv_candidate_write_failed: {e}"));
         }
     }
 
@@ -348,64 +336,34 @@ impl Generation {
             let outcome = session.stop();
             // **止めたあとに最後の1バッチが残っている。** `stop`は溜まっている分を
             // `MofFsOutcome`で返すので、そこから拾わないと**記録の末尾が丸ごと落ちる**。
-            if let Some(candidates) = self.candidates.as_mut() {
+            if let Some(audit) = self.process_audit.take() {
                 let now = harness_policy::event::now_unix_ms();
-                let mut events = Vec::new();
-                for start in outcome.process_starts {
-                    match (start.pid, start.command_line) {
-                        (Some(pid), Some(argv)) => events.push(ArgvEvent { pid, argv }),
-                        _ => candidates.count_missing_command_line(),
-                    }
-                }
-                let tracker = &mut self.tracker;
-                let instances = &self.instances;
-                let _ = candidates.observe(
-                    events,
-                    |pid| resolve_for_candidate(pid, tracker, instances),
+                let audit_path = audit.path().to_path_buf();
+                let (argv_stats, audit_stats, result) = audit.finish(
+                    &self.instances,
+                    outcome.process_starts,
                     now,
+                    &|line| append_line(&audit_path, line),
                 );
-                if let Err(e) = candidates.finish(now) {
+                if let Err(e) = result {
                     append_control(&self.sink_path, &format!("argv_candidate_write_failed: {e}"));
                 }
-                record_argv_stats(&self.sink_path, candidates.stats(), dropped);
+                record_argv_stats(&self.sink_path, argv_stats, dropped);
+                // 木を書けなかったことは**木の側ではなくこちらにも**残す——書けないファイルへ
+                // 「書けなかった」と書いても読まれない（`B-10`）。
+                if audit_stats.write_failed > 0 {
+                    append_control(
+                        &self.sink_path,
+                        &format!(
+                            "process_audit_write_failed: {} line(s) could not be written to {}",
+                            audit_stats.write_failed,
+                            audit_path.display()
+                        ),
+                    );
+                }
             }
         }
         self.written
-    }
-}
-
-/// 観測したpidを、候補の1行にできるかどうかへ畳む（段階6d）。
-///
-/// **スコープ判定は既存の[`ScopeTracker`]に任せる**——同じ判定を2つ作ると、直したときに
-/// FSの記録と候補の記録で「対象」の意味が食い違う。`probe`を渡さないのは、record-allの
-/// 経路では`OpenProcess`照会がTier1のプロセスに対して確定的に「AppContainerではない」と
-/// 答えてしまい、**対象を永久に除外する**ためである（`LearnPolicy::record_all`のdoc）。
-///
-/// スコープは分かるが素性が台帳に無い場合は[`Resolution::Unknown`]を返す——
-/// **マニフェスト側のイベントがまだ届いていないだけ**かもしれないので、
-/// 呼び出し側（[`ObservedCandidates::observe`]）が1度だけ持ち越してやり直す。
-fn resolve_for_candidate(
-    pid: u32,
-    tracker: &mut ScopeTracker,
-    instances: &ProcessInstances,
-) -> Resolution {
-    match tracker.classify(pid, |_| None) {
-        ScopeVerdict::OutOfScope => Resolution::OutOfScope,
-        ScopeVerdict::Unknown => Resolution::Unknown,
-        // 時刻を`u64::MAX`にして「その pid の最も新しい開始」を引く＝旧`ProcessTree::get`と同じ
-        // （P2c-1 では振る舞いを変えない。P2c-2 でこの関数ごと`process_audit.rs`の結び付けに替える）。
-        ScopeVerdict::InScope => match instances.at(pid, u64::MAX) {
-            // 実行像が未知のボリュームだったものは`exe: None`になり、候補にせず数えられる
-            // （生のNTパスを載せない——読む側で「宣言へ書ける値」と誤解され得るため）。
-            Some(identity) => Resolution::InScope {
-                exe: identity.image_name.clone(),
-                parent_exe: identity
-                    .parent_pid
-                    .and_then(|parent| instances.at(parent, u64::MAX))
-                    .and_then(|parent| parent.image_name.clone()),
-            },
-            None => Resolution::Unknown,
-        },
     }
 }
 
@@ -559,6 +517,7 @@ fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
                 };
                 let etw_available = generation.etw_available();
                 let argv_capture = generation.argv_capture();
+                let process_audit = generation.process_audit.is_some();
                 current = Some(generation);
                 send(
                     pipe,
@@ -568,6 +527,8 @@ fn serve_inner(pipe: HANDLE) -> Result<(), LearnError> {
                         // **要求のechoではなく、実際に張れたかを返す。** echoにすると
                         // 「頼まれたから true と書いただけ」の実装でも呼び出し側が通してしまう。
                         argv_capture: Some(argv_capture),
+                        // 同じく実際に書き手を作れたか（P2c）。古い収集器は欄ごと無いので`None`になる。
+                        process_audit: Some(process_audit),
                     },
                 )?;
             }
@@ -884,10 +845,11 @@ fn record_collection_stats(
     }
 }
 
-fn append_event(sink_path: &Path, event: &FsAuditEvent) -> bool {
-    let Ok(mut line) = event.to_jsonl_line() else {
-        return false;
-    };
+/// 1行追記して成否を返す。**追記の実装はここ1つ**——`fs-audit.jsonl`（[`append_event`]）と
+/// `process-audit.jsonl`（`ProcessAudit`へ閉包で渡す）の両方が通る（`docs/CODE-STRUCTURE-RULES.md` §5.0）。
+/// 改行まで含めて1回の`write_all`で書く（読む側は最後の改行より後を書きかけとして読まない）。
+fn append_line(sink_path: &Path, line: &str) -> bool {
+    let mut line = line.to_string();
     line.push('\n');
     if let Some(parent) = sink_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -900,6 +862,13 @@ fn append_event(sink_path: &Path, event: &FsAuditEvent) -> bool {
         Ok(mut f) => f.write_all(line.as_bytes()).is_ok(),
         Err(_) => false,
     }
+}
+
+fn append_event(sink_path: &Path, event: &FsAuditEvent) -> bool {
+    let Ok(line) = event.to_jsonl_line() else {
+        return false;
+    };
+    append_line(sink_path, &line)
 }
 
 fn append_control(sink_path: &Path, reason: &str) {

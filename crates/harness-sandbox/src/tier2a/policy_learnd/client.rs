@@ -501,6 +501,14 @@ fn start_collect_bytes(policy: &LearnPolicy) -> Result<Vec<u8>, LearnError> {
             &super::observed::observed_path(&policy.workspace_root),
             "observed transition candidates",
         );
+        // **プロセスの木（`process-audit.jsonl`、決定23）も先に作る**（P2c）。書き手は同じ昇格
+        // プロセスで、置き場は`fs-audit.jsonl`と同じ記録のディレクトリ＝制御面なので、理由は
+        // 上と同じ（BUG-109・`B-36`）。名前は共有の定数から導出するので、昇格側にパスを
+        // 渡さなくても両側が同じファイルを指す。
+        crate::elevated_launch::precreate_audit_sink(
+            &super::process_audit_path(&policy.fs_audit_log_path),
+            "process audit log",
+        );
     }
     serde_json::to_vec(&LearnRequest::StartCollect(policy.clone()))
         .map_err(|e| LearnError::Ipc(format!("failed to serialize StartCollect: {e}")))
@@ -530,11 +538,13 @@ fn handshake(pipe: HANDLE, policy: &LearnPolicy) -> Result<bool, LearnError> {
 /// （2回目以降。D-56段階2でUACを出さないために足した経路）。かつては同じ照合が両方へ
 /// 複製されており、**新しい検問を足すときに片方だけへ足せてしまう形**だった（`B-06`）。
 ///
-/// # 断る3つの理由（いずれも「この記録は始めさせない」）
+/// # 断る4つの理由（いずれも「この記録は始めさせない」）
 ///
 /// 1. **Spawn Daemon PIDをechoしない**——Daemonが親になった子をスコープ判定が拾えない
 /// 2. **argv観測を頼んだのに「張っていない」と答えた**——候補が1件も出ない記録になる（§10.3）
 /// 3. **argv観測を頼んだのに何も答えない**——古い収集器が欄ごと捨てている
+/// 4. **argv観測を頼み「張った」と答えたのに、プロセスの木を書くと答えない**——P2c より前の
+///    収集器で、`process-audit.jsonl`が空のまま記録が進む（エディタは位置を組めない）
 ///
 /// **2と3を同じ文面で断らない。** 運用者の打つ手が違う——2は枠を空ける、
 /// 3は常駐している収集器を畳んで起こし直す。
@@ -544,6 +554,7 @@ fn accept_started(response: &[u8], policy: &LearnPolicy) -> Result<bool, LearnEr
             etw_available,
             spawn_daemon_pid,
             argv_capture,
+            process_audit,
         }) => {
             if spawn_daemon_pid != policy.spawn_daemon_pid {
                 return Err(LearnError::Ipc(
@@ -573,6 +584,18 @@ fn accept_started(response: &[u8], policy: &LearnPolicy) -> Result<bool, LearnEr
                                 .to_string(),
                         ))
                     }
+                }
+                // **プロセスの木を書くと答えない収集器は断る**（P2c）。`argv_capture`の照合の
+                // 後に置くのは、「枠が無い」（打つ手: 枠を空ける）と区別するため。打つ手は
+                // 引数の観測の版ずれと同じ（常駐を畳んで起こし直す）なので、変種も同じにする。
+                if process_audit != Some(true) {
+                    return Err(LearnError::ArgvCaptureUnavailable(
+                        "the collector did not report writing the process tree \
+                         (process-audit.jsonl); it is an older build that captures argv but not \
+                         the tree (stop the resident collector and let this session start a \
+                         fresh one)"
+                            .to_string(),
+                    ));
                 }
             }
             Ok(etw_available)
@@ -686,10 +709,16 @@ mod client_tests {
     }
 
     fn started(etw: bool, argv_capture: Option<bool>) -> Vec<u8> {
+        started_with(etw, argv_capture, argv_capture)
+    }
+
+    /// プロセスの木の欄（P2c）まで指定する形。上の`started`は「両方とも同じ答え」の現行の収集器。
+    fn started_with(etw: bool, argv_capture: Option<bool>, process_audit: Option<bool>) -> Vec<u8> {
         serde_json::to_vec(&LearnResponse::Started {
             etw_available: etw,
             spawn_daemon_pid: None,
             argv_capture,
+            process_audit,
         })
         .unwrap()
     }
@@ -817,5 +846,84 @@ mod client_tests {
             std::fs::read_to_string(&sink).unwrap(),
             "{\"already\":\"recorded\"}\n"
         );
+    }
+
+    /// **[P2c] プロセスの木（`process-audit.jsonl`）も、依頼する側（非昇格）が先に作る。**
+    ///
+    /// 書き手は昇格した収集器なので、先に作らなければ所有者が`BUILTIN\Administrators`になり、
+    /// 制御面（`.harness/sandbox/<記録>/`）の保護が完成せずTier2aが丸ごと中止する（BUG-109・`B-36`）。
+    /// 置き場は`fs-audit.jsonl`の隣で、名前は共有の定数（`process_audit_path`）。
+    ///
+    /// **測る対象は`start_collect_bytes`**（送信点2つが通る関数）。`precreate_audit_sink`を
+    /// 直接呼ぶと「配線されていなくても緑」になる。
+    #[test]
+    fn the_process_audit_file_exists_before_the_collector_is_asked_to_open_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = tmp.path().join("sandbox").join("s-1").join("fs-audit.jsonl");
+        let mut policy = policy(sink.clone());
+        policy.workspace_root = tmp.path().to_path_buf();
+        policy.capture_argv = true;
+        let tree = sink.with_file_name(harness_policy::process_event::PROCESS_AUDIT_FILE);
+        assert!(!tree.exists());
+
+        start_collect_bytes(&policy).expect("serialize StartCollect");
+
+        assert!(
+            tree.exists(),
+            "収集器へ渡す前にプロセスの木のファイルが無ければ、作るのは昇格側になる: {}",
+            tree.display()
+        );
+        // 依頼のバイト列にこのパスは載らない（昇格側は fs-audit のパスから導出する。決定23(1)）。
+        assert!(!String::from_utf8_lossy(&start_collect_bytes(&policy).unwrap())
+            .contains("process-audit"));
+    }
+
+    /// **対の側**（`B-35`）: 引数の観測を頼んでいない記録は、プロセスの木のファイルを作らない。
+    ///
+    /// 常に作ると、木を書かない記録（パス2・通常運用）のディレクトリに空のファイルが現れ、
+    /// 「木を記録したが空だった」と読めてしまう。
+    #[test]
+    fn a_recording_without_argv_capture_does_not_create_the_process_audit_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sink = tmp.path().join("sandbox").join("s-1").join("fs-audit.jsonl");
+        let mut policy = policy(sink.clone());
+        policy.workspace_root = tmp.path().to_path_buf();
+        policy.capture_argv = false;
+
+        start_collect_bytes(&policy).expect("serialize StartCollect");
+
+        assert!(sink.exists(), "fs-audit のシンクは作る（既存の振る舞い）");
+        assert!(!sink
+            .with_file_name(harness_policy::process_event::PROCESS_AUDIT_FILE)
+            .exists());
+    }
+
+    /// **[P2c] 引数の観測を頼んだ記録は、プロセスの木を書くと答えない収集器では始めない。**
+    ///
+    /// P2c より前の収集器は`argv_capture: true`と答えて記録を始めるが`process-audit.jsonl`を
+    /// 書かない——黙って進めると、エディタは位置を組めない記録を「取れた」ものとして扱う。
+    /// `accept_started`を直接測るのは、`StartCollect`を送る経路が2つあるから（`B-06`）。
+    #[test]
+    fn a_recording_that_asked_for_argv_is_refused_when_the_collector_does_not_write_the_process_tree()
+    {
+        let mut asked = policy(PathBuf::from("C:/x/fs-audit.jsonl"));
+        asked.capture_argv = true;
+
+        // 書くと答えた → 通る。
+        assert!(accept_started(&started_with(true, Some(true), Some(true)), &asked).is_ok());
+
+        // 答えない（P2c より前）→ 断る。打つ手は常駐を畳んで起こし直す。
+        let stale = accept_started(&started_with(true, Some(true), None), &asked).unwrap_err();
+        assert!(matches!(stale, LearnError::ArgvCaptureUnavailable(_)), "{stale:?}");
+        assert!(stale.to_string().contains("process tree"), "{stale}");
+        assert!(!daemon_is_dead(&stale), "答えが返っている＝生きている。UACを増やさない");
+        // 書かないと答えた → 断る。
+        assert!(accept_started(&started_with(true, Some(true), Some(false)), &asked).is_err());
+
+        // 対の側（`B-35`）: 引数の観測を頼んでいない記録は、木の欄が無くても通る
+        // （通常運用・パス2の FS 収集を巻き込まない）。
+        let not_asked = policy(PathBuf::from("C:/x/fs-audit.jsonl"));
+        assert!(accept_started(&started_with(true, None, None), &not_asked).is_ok());
+        assert!(accept_started(&started_with(true, Some(false), Some(false)), &not_asked).is_ok());
     }
 }

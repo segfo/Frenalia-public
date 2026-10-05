@@ -59,7 +59,7 @@ pub const MAX_DISTINCT_KEYS: usize = 1_024;
 /// 「切られた」のかが区別できないので、**リテラルの辺の候補にしてはいけない**
 /// （`plans/DESIGN-MAC.md` §5.1(6)）。判定をここに置くのは、書く側と読む側で
 /// 閾値が食い違わないようにするためである。
-const ARGV_TRUNCATION_UTF16_UNITS: usize = 1_024;
+pub(crate) const ARGV_TRUNCATION_UTF16_UNITS: usize = 1_024;
 
 /// 待ち行列のディレクトリ。
 pub fn transitions_dir(workspace_root: &Path) -> PathBuf {
@@ -72,6 +72,29 @@ pub fn transitions_dir(workspace_root: &Path) -> PathBuf {
 /// ちょうどになる）ので、`>=`ではなく`==`である。
 pub fn argv_is_possibly_truncated(argv: &str) -> bool {
     argv.encode_utf16().count() == ARGV_TRUNCATION_UTF16_UNITS
+}
+
+/// 切り詰めを**UTF-16のまま**判定する（`plans/etw-spike/RESULTS.md` §23.3）。
+///
+/// 1,024単位ちょうどなら疑い（[`argv_is_possibly_truncated`]と同じ閾値・同じ`==`）。さらに
+/// 末尾が高位サロゲート（`0xD800..=0xDBFF`）なら**確定**——高位サロゲートの後ろには必ず低位が
+/// 続くので、それが最後の単位なら対の片割れが切り落とされている。
+///
+/// **`String`へ落としてから判定しない。** `from_utf16_lossy`は対にならないサロゲートを
+/// 置換文字（`U+FFFD`）へ潰すので、痕跡が消え、単位数も変わる。だから書く側（昇格した
+/// 収集プロセス）が生の単位で判定して`process-audit.jsonl`に書き、読む側は判定し直さない。
+pub fn argv_truncation_from_utf16(
+    utf16_len: usize,
+    last_unit: Option<u16>,
+) -> harness_policy::process_event::ArgvTruncation {
+    use harness_policy::process_event::ArgvTruncation;
+    if utf16_len != ARGV_TRUNCATION_UTF16_UNITS {
+        return ArgvTruncation::None;
+    }
+    match last_unit {
+        Some(unit) if (0xD800..=0xDBFF).contains(&unit) => ArgvTruncation::Certain,
+        _ => ArgvTruncation::Suspected,
+    }
 }
 
 /// 1種類ぶんの数え上げ。**行を組み立てる側（[`FoldedLine::line`]）が読む。**

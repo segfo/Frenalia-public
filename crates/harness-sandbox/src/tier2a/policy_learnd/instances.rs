@@ -45,10 +45,8 @@ pub(super) struct ProcessIdentity {
     /// `ProcessSequenceNumber`（同一性）。`ProcessStart` v0〜v2 には無い。
     pub(super) seq: Option<u64>,
     /// 親の番号（ETWの`ParentProcessSequenceNumber`の欄。0 は`None`へ寄せた後）。
-    #[allow(dead_code)] // P2c-2 の process_audit.rs が読む（c2 で外す）
     pub(super) parent_seq: Option<u64>,
     /// `parent_seq`の出どころ（[`ParentSeqSource::from_etw_field`]の結果）。
-    #[allow(dead_code)] // P2c-2 の process_audit.rs が読む（c2 で外す）
     pub(super) parent_seq_source: ParentSeqSource,
     pub(super) pid: u32,
     pub(super) parent_pid: Option<u32>,
@@ -57,10 +55,8 @@ pub(super) struct ProcessIdentity {
     /// `ProcessStart`の時刻（Unixミリ秒）。
     pub(super) start_unix_ms: u64,
     /// 開始の時点でこの記録の対象と判定したか（`ScopeTracker::on_process_start_probing`の戻り値）。
-    #[allow(dead_code)] // P2c-2 の process_audit.rs が読む（c2 で外す）
     pub(super) in_scope: bool,
     /// 記録の根か（`ScopeTracker::is_scope_root(parent_pid)`）。
-    #[allow(dead_code)] // P2c-2 の process_audit.rs が読む（c2 で外す）
     pub(super) is_scope_root: bool,
 }
 
@@ -113,13 +109,11 @@ impl ProcessInstances {
     }
 
     /// 番号で引く（親の実行ファイル。親は pid では引き直さない、決定65の追記(3)）。
-    #[allow(dead_code)] // P2c-2 の process_audit.rs が使う（c2 で外す）
     pub(super) fn by_seq(&self, seq: u64) -> Option<&ProcessIdentity> {
         self.by_seq.get(&seq).map(|&index| &self.all[index])
     }
 
     /// **引数の結び付け用**: pid が同じで、開始が`at_unix_ms ± window_ms`（両端を含む）のものの添字。
-    #[allow(dead_code)] // P2c-2 の process_audit.rs が使う（c2 で外す）
     pub(super) fn near(&self, pid: u32, at_unix_ms: u64, window_ms: u64) -> Vec<usize> {
         let Some(same_pid) = self.by_pid.get(&pid) else {
             return Vec::new();
@@ -133,12 +127,10 @@ impl ProcessInstances {
             .collect()
     }
 
-    #[allow(dead_code)] // P2c-2 の process_audit.rs が使う（c2 で外す）
     pub(super) fn get(&self, index: usize) -> &ProcessIdentity {
         &self.all[index]
     }
 
-    #[allow(dead_code)] // P2c-2 の process_audit.rs が使う（c2 で外す）
     pub(super) fn len(&self) -> usize {
         self.all.len()
     }

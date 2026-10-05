@@ -20,7 +20,7 @@
 //! 決めない——グローバル`CLAUDE.md`が禁じる「`%TEMP%`のキューを監視する常駐昇格プロセス」は
 //! 認証なしのローカル特権昇格になるため、そのパターンは踏まない。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +33,10 @@ pub mod server;
 /// 記録1回のあいだに観測したプロセスのインスタンスの表（**昇格側**が使う、決定23(5)）。
 /// pid＋時刻・通し番号・時刻の窓の3通りに引く。
 mod instances;
+/// `process-audit.jsonl`（記録したプロセスの木）を書く部品（**昇格側**、決定23(3)(4)）。
+/// MOF側のコマンドラインを 2ms の時刻の窓でインスタンスへ結び付け、`observed.jsonl`も
+/// 同じ結び付けの結果から書く。
+mod process_audit;
 
 /// D-56 段階2（要求の連続を捌くプロトコル）のテスト。実daemonを非昇格で起動して検出する
 /// ものを含む——`cargo test -p harness-sandbox`は別パッケージのdaemonをリビルドしないので、
@@ -44,6 +48,19 @@ mod reuse_tests;
 /// 「実際に起こしたコマンドが候補の行になる」と「枠が無ければ始まらない」を実機で測る。
 #[cfg(all(windows, test))]
 mod argv_e2e_tests;
+
+/// `process-audit.jsonl`（記録したプロセスの木、決定23(1)）の置き場。
+///
+/// **`fs-audit.jsonl`と同じディレクトリに置き、そのパスから導出する。** 昇格側はこのパスを
+/// 親から受け取らない——受け取ると、昇格プロセスが追記する先が非特権の親の指定になる
+/// （管理者権限での任意パス追記プリミティブ、`P-01`）。昇格側は**検証済みの**`fs-audit.jsonl`の
+/// パス（`validate_audit_sink_path`の戻り値）からこれを呼ぶので、ディレクトリの検証が共有される。
+///
+/// **呼ぶ側は2つで、どちらもこの関数を通る**——依頼側の先行作成（`client::start_collect_bytes`。
+/// BUG-109・`B-36`）と、昇格側の書き先（`server::Generation::start`）。綴りを写すと片方だけ変わる。
+pub fn process_audit_path(fs_audit_log_path: &Path) -> PathBuf {
+    fs_audit_log_path.with_file_name(harness_policy::process_event::PROCESS_AUDIT_FILE)
+}
 
 /// 収集器へ渡すポリシー一式（`StartCollect`のペイロード）。
 ///
@@ -150,6 +167,16 @@ pub enum LearnResponse {
         /// 「版が古くて答えていない」が同じ値になり、断る理由が消える（`B-10`）。
         #[serde(default)]
         argv_capture: Option<bool>,
+        /// プロセスの木（`process-audit.jsonl`、決定23）を書くか（P2c）。**`argv_capture`と同じ形で、
+        /// 実際に書く部品を作れたかを返す**——引数の観測を張れた世代だけが書く（同じ結び付けの結果から
+        /// 書くため）ので、`capture_argv`が偽なら`Some(false)`、真で張れたなら`Some(true)`。
+        ///
+        /// **`default`が要る理由と、`bool`にしてはいけない理由は`argv_capture`と同じ。** 引数の観測までは
+        /// 知っていてプロセスの木を知らない古い収集器（P2c より前の版）は、`argv_capture: true`と答えて
+        /// 記録を始めるが`process-audit.jsonl`を書かない。欄が無ければ`None`として読め、呼び出し側は
+        /// 「書くとは言っていない」と断れる。`bool`だと「書かない」と「答えていない」が同じ値になる（`B-10`）。
+        #[serde(default)]
+        process_audit: Option<bool>,
     },
     /// 現世代を畳んだ。**この世代で**書けた件数を返す（累積ではない——累積にすると
     /// UIが「今回の記録で観測した件数」として出す数と食い違う）。
@@ -323,9 +350,10 @@ mod tests {
                 etw_available: true,
                 spawn_daemon_pid: Some(77),
                 argv_capture: Some(true),
+                process_audit: Some(true),
             })
             .unwrap(),
-            r#"{"Started":{"etw_available":true,"spawn_daemon_pid":77,"argv_capture":true}}"#
+            r#"{"Started":{"etw_available":true,"spawn_daemon_pid":77,"argv_capture":true,"process_audit":true}}"#
         );
         assert_eq!(
             serde_json::to_string(&LearnResponse::TornDown { denials_written: 7 }).unwrap(),
@@ -353,6 +381,7 @@ mod tests {
                 etw_available: true,
                 spawn_daemon_pid: None,
                 argv_capture: None,
+                process_audit: None,
             }
         ));
     }
@@ -437,5 +466,44 @@ mod tests {
 
         // パス1・Tier1経路（Daemon PIDを要求しない）では、古い収集器で構わない。
         assert_eq!(echoed(&older), None, "要求していない側は一致として通る");
+    }
+
+    /// **プロセスの木を知らない古い収集器（P2c より前）の応答が「読める」こと**と、
+    /// 「書かない」と「答えていない」が区別できることを固定する（`argv_capture`の前例と同じ形）。
+    ///
+    /// P2c より前の収集器は`argv_capture: true`と答えて記録を始めるが、`process-audit.jsonl`を書かない。
+    /// ここが読めないと版ずれが「電文が壊れている」に化け、`bool`だと「書かない」と区別できず
+    /// 断る理由が消える（`B-10`）。**読めたあと断るのは`client`の仕事**（`accept_started`の試験）。
+    #[test]
+    fn process_audit_distinguishes_not_written_from_unanswered() {
+        let started = |wire: &str| match serde_json::from_str::<LearnResponse>(wire).expect("parse")
+        {
+            LearnResponse::Started { process_audit, .. } => process_audit,
+            _ => unreachable!("Startedを読ませている"),
+        };
+        let before_p2c = started(r#"{"Started":{"etw_available":true,"argv_capture":true}}"#);
+        let not_written =
+            started(r#"{"Started":{"etw_available":true,"argv_capture":false,"process_audit":false}}"#);
+        let written =
+            started(r#"{"Started":{"etw_available":true,"argv_capture":true,"process_audit":true}}"#);
+
+        assert_eq!(before_p2c, None, "答えていない");
+        assert_eq!(not_written, Some(false), "引数の観測を頼まれていないので書かない");
+        assert_eq!(written, Some(true), "書く");
+        assert_ne!(before_p2c, not_written);
+    }
+
+    /// 置き場は`fs-audit.jsonl`の隣で、名前は共有の定数（依頼側と昇格側が同じ関数を通る）。
+    #[test]
+    fn the_process_audit_file_sits_next_to_the_fs_audit_log() {
+        let fs_audit = PathBuf::from(r"C:\work\.harness\sandbox\g1\fs-audit.jsonl");
+        assert_eq!(
+            process_audit_path(&fs_audit),
+            PathBuf::from(r"C:\work\.harness\sandbox\g1\process-audit.jsonl")
+        );
+        assert_eq!(
+            process_audit_path(&fs_audit).file_name().unwrap(),
+            harness_policy::process_event::PROCESS_AUDIT_FILE
+        );
     }
 }

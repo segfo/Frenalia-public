@@ -21,6 +21,10 @@
 //! ——測定では呼び出し元が書いた綴りそのまま（`"powershell"`）で届いており、
 //! **実行ファイルの同一性を`argv[0]`から取ってはならない**（同§22.4の1）。
 //!
+//! （2026-10-05 の P2c-2 から、突き合わせそのものは`super::process_audit`が**pid＋開始の時刻の窓**で行い、
+//! 本モジュールは結果を答えの決まった[`Resolution`]で1件ずつ受け取って積むだけになった。
+//! 下の「持ち越し」はその前の形の説明で、いまの持ち越しは`process_audit`が持つ。）
+//!
 //! # 突き合わせに失敗したものを、黙って捨てない
 //!
 //! 2つのセッションは別々に配送されるので、**MOF側が先に届く**ことがある。そのときpidは
@@ -240,6 +244,14 @@ impl ObservedCandidates {
     /// **戻り値は書込の失敗だけ。** 観測が対象外だった・解けなかったは失敗ではないので
     /// [`ArgvStats`]に数えて`Ok`を返す——ここでエラーにすると、収集そのものが
     /// 記録の都合で止まる（`P-07`: 記録は境界ではない）。
+    ///
+    /// # 限界（[BUG-228](../../../../docs/bugs/BUG-228.md)の層1。直さずに残している）
+    ///
+    /// 持ち越した観測は、次の呼び出しでも解けなければ**上限まで何度でも持ち越される**——
+    /// モジュールdocの「1度だけやり直し」は意図であって、このコードは強制していない。
+    /// P2c-2 以降、収集プロセスは`Resolution::Unknown`を渡さない（引数の結び付けは
+    /// `process_audit.rs`が済ませる）ので、本番の経路はここを通らない。本モジュールは
+    /// 読む側ごと P4.8 で消える暫定の記録（決定65の寿命）なので、形を変えずに残した。
     pub fn observe(
         &mut self,
         events: Vec<ArgvEvent>,
@@ -329,6 +341,16 @@ impl ObservedCandidates {
     /// コマンドラインの欄が空だった観測を数える（呼び出し側が判定する）。
     pub fn count_missing_command_line(&mut self) {
         self.stats.without_command_line = self.stats.without_command_line.saturating_add(1);
+    }
+
+    /// 実行像と結び付けられなかった観測を数える（呼び出し側が判定する）。
+    ///
+    /// 収集プロセスは引数の結び付けを`process_audit.rs`の時刻の窓で済ませてから
+    /// [`Self::observe`]へ**答えの決まった`Resolution`だけ**を渡す（P2c-2）。持ち越しても
+    /// 相手のインスタンスが見つからなかった開始・窓の中に候補が2つ以上あった開始は
+    /// `observe`へ渡らないので、ここで数える（制御レコード`argv_without_image`の数）。
+    pub fn count_unresolved(&mut self) {
+        self.stats.unresolved = self.stats.unresolved.saturating_add(1);
     }
 }
 
