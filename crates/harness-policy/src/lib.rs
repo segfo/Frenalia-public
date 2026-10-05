@@ -38,6 +38,10 @@ pub mod generalize;
 pub mod insufficient;
 pub mod normalize;
 pub mod policy_file;
+/// 記録したプロセスの木（`process-audit.jsonl`）の位置ごとに遷移先のドメインを割り当て、ファイル操作を
+/// ドメインへ振り分ける（決定65(1)）。**書かない**——辺を`policy.json`へ書くのはポリシーエディタで、
+/// 既にある辺は Spawn Daemon と同じ判定器（[`transition::TransitionGraph::resolve`]）で引く。
+pub mod position_domains;
 /// 記録したプロセスの木（`process-audit.jsonl`）の1行分レコード（決定23）。**書く側は昇格した
 /// 収集プロセス、読む側はポリシーエディタ**——[`event`]と同じ理由で定義はここだけに置く。
 pub mod process_event;

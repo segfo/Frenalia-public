@@ -525,11 +525,17 @@ impl PolicyFile {
 pub fn default_domain_name(command: &str) -> String {
     let token = command.split_whitespace().next().unwrap_or("");
     let token = token.trim_matches(['"', '\'']);
-    let name = token.rsplit(['\\', '/']).next().unwrap_or(token);
-    name.rsplit_once('.')
-        .map(|(s, _)| s)
-        .unwrap_or(name)
-        .to_string()
+    file_stem(token).to_string()
+}
+
+/// パスのbasenameから最後の拡張子を除いたもの（`C:\tools\gh.exe` → `gh`、`python3.11.exe` → `python3.11`）。
+///
+/// **[`default_domain_name`]と、位置ごとのドメインの割り当てが提案する名前の葉名
+/// （`crate::position_domains`）が同じ規則を通る**——2つ書くと、記録のドメイン名と提案の名前が
+/// 別の規則で切られる（`docs/CODE-STRUCTURE-RULES.md` §5.0）。
+pub(crate) fn file_stem(path: &str) -> &str {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name)
 }
 
 /// `<workspace>/.harness/policy.json`。
