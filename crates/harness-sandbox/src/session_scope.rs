@@ -710,12 +710,15 @@ pub fn remove_overlay_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// オーバーレイのコピー（fork）で**持っていってはいけない**ファイル名。
+/// オーバーレイのコピー（fork）で**持っていってはいけない**ファイル名の全部。
 ///
 /// - `net-audit.jsonl` / `fs-audit.jsonl`: 昇格ヘルパー（`harness-netfilterd`・
 ///   `harness-policy-learnd`）が起動時に`canonicalize`して掴んだままのシンクである。
 ///   **プロセスの持ち物であって、変更の持ち物ではない。** 複製すると「このセッションの
 ///   通信/FS監査」のつもりで読んだものが、実際には別セッションの記録の写しになる。
+/// - `process-audit.jsonl`: 昇格した収集プロセスがポリシーエディタのパス1で書くプロセスの木
+///   （決定23(7)）。理由は監査ログと同じ。決定23(7)は決定17(1)の名前（許可した生成の記録）も
+///   同時に足すとしていたが、その名前はまだ無い（Spawn Daemonの着地時に決める）。
 /// - `.harness-cow-session.json`: diff_layer_dirの由来（セッションID・workspace）。コピー先では
 ///   [`prepare_scope`]が新しいIDで書き直しており、それを上書きしてはならない。
 ///
@@ -723,11 +726,16 @@ pub fn remove_overlay_dir(dir: &Path) -> std::io::Result<()> {
 /// `.harness-cow-ops.jsonl`・`.harness-cow-baseline/`…）。除外を列挙する側にしてあるのは、
 /// オーバーレイへ新しいファイルが増えたとき、既定が「持っていく」＝変更が失われない側に
 /// 倒れるようにするためである。
+const OVERLAY_COPY_EXCLUDED: [&str; 4] = [
+    "net-audit.jsonl",
+    "fs-audit.jsonl",
+    harness_policy::process_event::PROCESS_AUDIT_FILE,
+    ".harness-cow-session.json",
+];
+
+/// [`OVERLAY_COPY_EXCLUDED`]に載っている名前か。
 fn is_excluded_from_overlay_copy(file_name: &str) -> bool {
-    matches!(
-        file_name,
-        "net-audit.jsonl" | "fs-audit.jsonl" | ".harness-cow-session.json"
-    )
+    OVERLAY_COPY_EXCLUDED.contains(&file_name)
 }
 
 /// `scope`のオーバーレイをこのプロセスが使える状態にする。**切替の唯一の副作用点**。
@@ -996,6 +1004,24 @@ mod tests {
         assert!(is_excluded_from_overlay_copy("net-audit.jsonl"));
         assert!(is_excluded_from_overlay_copy("fs-audit.jsonl"));
         assert!(is_excluded_from_overlay_copy(".harness-cow-session.json"));
+        assert!(is_excluded_from_overlay_copy(
+            harness_policy::process_event::PROCESS_AUDIT_FILE
+        ));
+    }
+
+    /// 除外の一覧は昇格ヘルパーのシンク3つとセッションメタだけで、順序まで固定する。
+    /// 増やす（減らす）人がこの試験を直すことになり、黙って増減しない（決定23(7)）。
+    #[test]
+    fn the_overlay_copy_exclusion_list_is_exactly_the_helpers_sinks_and_the_session_meta() {
+        assert_eq!(
+            OVERLAY_COPY_EXCLUDED,
+            [
+                "net-audit.jsonl",
+                "fs-audit.jsonl",
+                "process-audit.jsonl",
+                ".harness-cow-session.json",
+            ]
+        );
     }
 
     /// 変更の実体・台帳・baselineミラーは必ず持っていく（既定が「持っていく」側）。
