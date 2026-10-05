@@ -110,12 +110,8 @@ mod argv_capture_spike_tests;
 #[path = "logger_slot_spike_tests.rs"]
 mod logger_slot_spike_tests;
 
-/// 親の通し番号（`ParentProcessSequenceNumber`）が親自身の`ProcessSequenceNumber`を指すかの実測
-/// （ポリシーエディタの決定65、`plans/PLAN-POLICY-EDITOR-POSITION-DOMAINS.md` P1b。結果は
-/// `plans/etw-spike/RESULTS.md` §24）。
-///
-/// **モジュール名は`KNOWN_TARGETS`の`spike-etw-process-lineage`のフィルタ文字列と一致していなければ
-/// ならない**（改名するとBUG-056と同じ「0件マッチ」が再発する）。P2fでキーと一緒に消す。
-#[cfg(all(windows, test))]
-#[path = "process_lineage_spike_tests.rs"]
-mod process_lineage_spike_tests;
+// **削除済み（2026-10-05）**: 親の通し番号（`ParentProcessSequenceNumber`）が親自身の番号を指すかの
+// 測定（ポリシーエディタの作業の一覧 P1b のスパイク試験。判定は「欄を使う」。結果は
+// `plans/etw-spike/RESULTS.md` §24、決定は`plans/POLICY-EDITOR-TOMOYO-DIG.md`「決定65の追記: 親の
+// 通し番号の取り方」）と、その昇格キーを P2f で外した。本番の経路での確かめは
+// `policy_learnd::process_audit_e2e_tests`が引き継ぐ。復元が要るならこのコミットの親から取る。
