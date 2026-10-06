@@ -1,5 +1,7 @@
 //! 入力欄のキーボード操作（カーソル・選択・undo/redo・改行と送信）。
 //!
+//! ↑↓は行の移動のほか、1行目の↑と（履歴を見ている間の）最終行の↓で入力履歴を動かす（`app::input_history`）。
+//!
 //! crosstermの[`KeyEvent`]だけを入力とし、確定した意図を[`Action`]として返す。
 //! エンジンからのイベント消費（[`super::events`]）とは逆向きの経路であり、両者は
 //! [`AppState`]のフィールドを介してのみ交わる。
@@ -36,6 +38,9 @@ impl AppState {
         // prompt, Thinking indicator, and following deltas stay visible.
         self.scroll.reset();
         let text = std::mem::take(&mut self.input);
+        // `/`の命令も積む（打ち間違いを直して送り直せるように）。呼び戻した文を送ったら、退避した書きかけは捨てる
+        // （`app::input_history`）。
+        self.input_history.record(&text);
         self.input_cursor = 0;
         self.input_selection_anchor = None;
         self.input_undo_stack.clear();
@@ -134,7 +139,11 @@ impl AppState {
 
     /// 変更前に現在の入力状態をUndo履歴に積む。`coalesce_insert`が真かつ直前も単純挿入
     /// だった場合は、連続タイピングを1つのUndo単位にまとめるため何もしない。
+    ///
+    /// 入力欄を変える編集はどれもここを通るので、呼び戻した文の編集もここで知る——履歴を見るのをやめ、その文が
+    /// 新しい書きかけになる（`app::input_history`）。
     pub(super) fn push_undo_snapshot(&mut self, coalesce_insert: bool) {
+        self.input_history.stop_browsing();
         if coalesce_insert && self.input_last_edit_was_insert {
             return;
         }
@@ -471,6 +480,7 @@ impl AppState {
             // Up/Downは行をまたいだカーソル移動（「列」= 現在行開始からの文字数を維持し、
             // 移動先の行の長さでクランプする）。単純移動なので選択は伴わない
             // （Shift+Up/Downによる複数行選択は今回のスコープ外）。
+            // 行を移れない端（1行目の↑・最終行の↓）では入力履歴を動かす（`app::input_history`）。
             KeyCode::Up => {
                 let (line_start, _) = self.current_line_bounds();
                 let column = self.input_cursor - line_start;
@@ -480,6 +490,9 @@ impl AppState {
                     let prev_start = starts[line_idx - 1];
                     let prev_len = line_start - 1 - prev_start; // `\n`の1つ前まで
                     self.input_cursor = prev_start + column.min(prev_len);
+                } else {
+                    // 1行目: 1つ古い文を呼び戻す（無ければ今までどおり何もしない）。
+                    self.recall_older();
                 }
                 self.input_selection_anchor = None;
                 None
@@ -501,6 +514,9 @@ impl AppState {
                         .unwrap_or(char_count);
                     let next_len = next_end - next_start;
                     self.input_cursor = next_start + column.min(next_len);
+                } else {
+                    // 最終行: 履歴を見ているときだけ1つ新しい文へ（最も新しい文を過ぎたら書きかけへ戻る）。
+                    self.recall_newer();
                 }
                 self.input_selection_anchor = None;
                 None

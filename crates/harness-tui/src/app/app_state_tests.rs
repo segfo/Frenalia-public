@@ -235,7 +235,8 @@ fn home_end_operate_on_current_line_in_multiline_input() {
 }
 
 /// Up/Downで行をまたいでカーソルが移動し、列(行頭からの文字数)を可能な限り維持する
-/// （短い行へ移動するときはその行の長さでクランプする）。
+/// （短い行へ移動するときはその行の長さでクランプする）。入力履歴が空なので、1行目のUp・最終行のDownは
+/// 今までどおり何もしない（履歴があるときは`app::input_history`の試験）。
 #[test]
 fn up_down_arrows_move_between_lines_preserving_column() {
     let mut app = AppState::new("mock".into(), "mock-model".into());
@@ -260,9 +261,10 @@ fn up_down_arrows_move_between_lines_preserving_column() {
     app.on_key(code(KeyCode::Up));
     assert_eq!(app.input_cursor, 1);
 
-    // 先頭行でのUpは何もしない。
+    // 先頭行でのUpは何もしない（履歴が空）。
     app.on_key(code(KeyCode::Up));
     assert_eq!(app.input_cursor, 1);
+    assert_eq!(app.input, "abcde\nxy\nz");
 
     // Endで1行目の末尾(列5)へ行ってからDownすると、2行目("xy"、長さ2)の列はクランプされ2になる。
     app.on_key(code(KeyCode::End));
@@ -274,10 +276,11 @@ fn up_down_arrows_move_between_lines_preserving_column() {
     app.on_key(code(KeyCode::Down));
     assert_eq!(app.input_cursor, app.input.chars().count());
 
-    // 最終行でのDownは何もしない。
+    // 最終行でのDownは何もしない（履歴を見ていない）。
     let cursor_at_last_line = app.input_cursor;
     app.on_key(code(KeyCode::Down));
     assert_eq!(app.input_cursor, cursor_at_last_line);
+    assert_eq!(app.input, "abcde\nxy\nz");
 }
 
 /// 左矢印は先頭で、Backspace/Deleteは範囲外では何もせずパニックしない
