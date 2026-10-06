@@ -622,15 +622,7 @@ pub fn rights_summary(
     domain: &str,
 ) -> Result<crate::transition_listing::Rights, GraphError> {
     let facts = GraphFacts::new(input)?;
-    let rights = facts.rights_of(facts.reachable_from(domain, None));
-    Ok(crate::transition_listing::Rights {
-        fs: rights
-            .fs
-            .into_iter()
-            .map(|(value, access)| (value.to_string(), access.settings_key()))
-            .collect(),
-        net: rights.net.into_iter().collect(),
-    })
+    Ok(facts.rights_of(facts.reachable_from(domain, None)).listed())
 }
 
 /// 検査と向きの判定が共有する、グラフから導かれる事実。
@@ -644,6 +636,21 @@ struct GraphFacts<'a> {
 struct Rights<'a> {
     fs: BTreeSet<(&'a str, FsAccess)>,
     net: BTreeSet<String>,
+}
+
+impl Rights<'_> {
+    /// 表示とモデル向けの形（[`crate::transition_listing::Rights`]）へ。**並べ方はここ1か所**
+    /// ——[`rights_summary`]と[`newly_usable`]が同じ綴り（設定キー名）・同じ順で並べる。
+    fn listed(self) -> crate::transition_listing::Rights {
+        crate::transition_listing::Rights {
+            fs: self
+                .fs
+                .into_iter()
+                .map(|(value, access)| (value.to_string(), access.settings_key()))
+                .collect(),
+            net: self.net.into_iter().collect(),
+        }
+    }
 }
 
 impl<'a> GraphFacts<'a> {
@@ -853,6 +860,15 @@ mod transition_check;
 #[path = "transition_shape.rs"]
 mod transition_shape;
 pub use transition_shape::{self_loops, shape, LongestChain, SelfLoop, TransitionShape};
+
+/// 遷移で呼び出し元が子を通して新しく使えるようになる権限と、ポリシーの書き方で生じる組み合わせの対
+/// （決定66。`plans/position-domains/P5.md` の P5.2）。**検査に落ちる宣言でも答える**（[`shape`]と同じ）。
+#[path = "transition_exposure.rs"]
+mod transition_exposure;
+pub use transition_exposure::{
+    exposure_delta, newly_usable, provisional_net_capable, CombinationPair, EdgeExposure,
+    ExposureDelta, PairUse,
+};
 
 #[cfg(test)]
 #[path = "transition_tests.rs"]
