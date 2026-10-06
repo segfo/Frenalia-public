@@ -60,6 +60,9 @@ pub mod console_holder;
 /// 呼び出し元のトークンでOSに聞く（`plans/DESIGN-MAC.md` §19.1）。
 #[cfg(windows)]
 pub(crate) mod fixed_inputs;
+/// 入れ子の子へ渡す入力（環境変数・要求受付パイプの名前）を組む関数。`server`から移した（P5.1）。
+#[cfg(windows)]
+mod nested_inputs;
 #[cfg(windows)]
 pub mod server;
 #[cfg(windows)]
