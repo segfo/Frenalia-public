@@ -1,5 +1,6 @@
 //! 端末の生モード/オルタネートスクリーンをRAII+panic hookで必ず復帰させる
-//! （`plans/DESIGN.md` §リッチTUI「端末復帰」）。
+//! （`plans/DESIGN.md` §リッチTUI「端末復帰」）。例外は、呼び出し側が[`contain_panic`]で「この中のpanicは
+//! 受け止めて続ける」と宣言した範囲だけ。
 //!
 //! `harness-tui`（会話TUI）と`harness-policy-editor`（ポリシーエディタTUI）が共有する。
 //! 前者から後者を参照させないのは、ポリシーエディタが**会話エージェントとは独立した
@@ -152,13 +153,97 @@ fn leave_screen() -> io::Result<()> {
 }
 
 /// panicで`TerminalGuard::drop`が走らない経路（unwind前にprintされる等）に備え、
-/// デフォルトのpanic hookの前に端末復帰を差し込む。
+/// デフォルトのpanic hookの前に端末復帰を差し込む。**[`contain_panic`]の範囲の中で起きたpanicでは戻さない**
+/// （受け止めて続けるため。[`on_panic`]）。
 fn install_panic_hook() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
+    chain_panic_hook(|| {
         let _ = leave_screen();
-        default_hook(info);
+    });
+}
+
+/// いまのpanicのフックの前に`restore`（端末を戻す）を差し込む。呼ぶ順と、戻すかどうかは[`on_panic`]が決める。
+/// 製品の`restore`は端末を戻す（[`install_panic_hook`]）。試験は戻した回数を数えるものを渡す。
+fn chain_panic_hook(restore: impl Fn() + Send + Sync + 'static) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        on_panic(&restore, || previous(info));
     }));
+}
+
+/// panicのフックの中身。[`contain_panic`]の範囲の外なら端末を戻し（`restore`）、それから元のフックに報告させる
+/// （`report`）。範囲の中では戻さずに報告だけさせる（[`contain_panic`]の「止めるのは端末を戻すことだけ」）。
+///
+/// 戻してから報告するのは、報告の文面（既定では標準エラー）をオルタネートスクリーンの上に書くと、画面を返した
+/// 瞬間に消えて読めないため（今までの順）。
+fn on_panic(restore: impl FnOnce(), report: impl FnOnce()) {
+    if !panic_is_contained() {
+        restore();
+    }
+    report();
+}
+
+thread_local! {
+    /// このスレッドで[`contain_panic`]の中にいる深さ（入れ子を数える）。0なら範囲の外。
+    static CONTAINED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`contain_panic`]の範囲。作ると印を1つ立て、捨てると1つ倒す——`f`がpanicしても、しなくても倒れる。
+struct Contained;
+
+impl Contained {
+    fn enter() -> Self {
+        CONTAINED.with(|depth| depth.set(depth.get() + 1));
+        Self
+    }
+}
+
+impl Drop for Contained {
+    fn drop(&mut self) {
+        let _ = CONTAINED.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// `f`を呼び、中で起きたpanicを受け止めて`Err`（panicの中身）で返す。**範囲の中で起きたpanicでは、panicのフック
+/// （[`TerminalGuard::enter`]が差し込むもの）が端末を戻さない**——TUIは画面を握ったまま描き続けられる。
+///
+/// # 何のためにあるのか
+///
+/// 端末を戻すフックはpanicの**巻き戻しより前**に走る。だから`catch_unwind`で受け止めても、受け止める前に端末は
+/// 戻っていて（生モード・オルタネートスクリーン・マウスの取り込みが外れる）、TUIは壊れた画面のまま続くことになる。
+/// そこで「この中のpanicは受け止める」という印をこのスレッドに立ててから`f`を呼び、フックはその印を見て端末を
+/// 戻すのを止める（[`on_panic`]）。会話TUIが、外から持ち込んだ部品（Markdownの解析器）が落ちても、その返答だけを
+/// 原文のまま描く形へ落として続けるのに使う。**ポリシーエディタは使わない**——使わない限り、フックは今までどおり
+/// 必ず端末を戻す。
+///
+/// # 止めるのは端末を戻すことだけ
+///
+/// panicの報告（元のフック。既定では標準エラーへの文面と場所）は、範囲の中でも呼ぶ。TUIが画面を握っている間は、
+/// 標準エラーは[`stderr_capture`]が預かって画面の中に`[stderr]`の行として出す（「panicのメッセージもここを
+/// 通る」）ので、受け止めたpanicも黙らない。
+///
+/// # 呼び出し側の約束
+///
+/// - **受け止めた後は、`f`が触っていた状態を使わずに捨てる。** panicは処理の途中で起きるので、状態は途中までしか
+///   変わっていないことがある（`f`に`UnwindSafe`を求めない代わりの約束）
+/// - 印はスレッドごと。別のスレッドで起きたpanicは受け止めない
+///
+/// # 限界
+///
+/// - **`panic = "abort"`でビルドすると受け止められない。** そのときは印を見ず（[`panic_is_contained`]が常に偽）、
+///   今までどおり端末を戻してから終わる——戻さずに終わると、端末が生モードのまま残るため
+/// - `f`の中の値の後始末（`Drop`）が、巻き戻しの途中でさらにpanicすると、プロセスはabortする（Rustの規則）。
+///   そのときは印が立ったままなので、**端末を戻さずに終わる**
+pub fn contain_panic<R>(f: impl FnOnce() -> R) -> std::thread::Result<R> {
+    let _contained = Contained::enter();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+}
+
+/// このスレッドがいま[`contain_panic`]の中にいるか（いまpanicが起きたら、フックが端末を戻さないか）。
+///
+/// `panic = "abort"`のビルドでは常に偽（受け止められないので、端末を戻す側へ倒す）。スレッドの後始末の途中で
+/// 印が読めないときも偽。
+pub fn panic_is_contained() -> bool {
+    cfg!(panic = "unwind") && CONTAINED.try_with(|depth| depth.get() > 0).unwrap_or(false)
 }
 
 /// [BUG-200] ratatuiの単語折り返しが`width`桁の場所で1桁はみ出す1行（試験用）。
@@ -173,3 +258,7 @@ pub(crate) fn spilling_line(width: u16) -> String {
     let wide = (width - head.len()) / 2;
     format!("{head} {}", "あ".repeat(wide))
 }
+
+#[cfg(test)]
+#[path = "contain_tests.rs"]
+mod contain_tests;

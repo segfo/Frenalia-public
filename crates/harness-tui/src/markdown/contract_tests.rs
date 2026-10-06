@@ -12,7 +12,7 @@ use super::{Rendered, StreamingMarkdown};
 
 /// 契約を確かめる文章。Markdownの記号・入れ子・空行・フェンス・引用・全角文字・`\r\n`・リンクを含める
 /// （区切る場所の候補を増やすため。リンクは[`links_stay_inside_their_lines`]が見る）。
-const SAMPLE: &str = "# 見出し\n**太字**と`code`\r\n- 項目 1\n  - 入れ子の項目\n\n```rust\nlet x = 1;\n```\n> 引用\nこれは長い日本語の段落です。[リンクの文字](https://example.com)も含みます。";
+pub(super) const SAMPLE: &str = "# 見出し\n**太字**と`code`\r\n- 項目 1\n  - 入れ子の項目\n\n```rust\nlet x = 1;\n```\n> 引用\nこれは長い日本語の段落です。[リンクの文字](https://example.com)も含みます。";
 
 /// 確かめる幅。広い幅・狭い幅に加えて、1桁と0桁（落ちないこと）。
 const WIDTHS: [u16; 5] = [120, 80, 20, 1, 0];
@@ -36,27 +36,33 @@ fn every_width<M: StreamingMarkdown>(m: &mut M) -> Vec<Rendered> {
     WIDTHS.iter().map(|&w| m.render(w)).collect()
 }
 
-/// どの実装も通すべき性質（モジュールdoc）。`make`は作ったばかりの実装を返す。
+/// どの実装も通すべき性質（モジュールdoc）。`make`は作ったばかりの実装を返す。確かめる文章は[`SAMPLE`]。
 pub(super) fn port_contract<M: StreamingMarkdown>(make: impl Fn() -> M) {
-    any_split_renders_the_same(&make);
-    the_width_is_not_state(&make);
-    reset_renders_like_a_new_one(&make);
-    finish_is_idempotent_and_push_after_finish_continues(&make);
-    lines_and_joins_have_the_same_length(&make);
-    links_stay_inside_their_lines(&make);
+    port_contract_with(make, SAMPLE);
+}
+
+/// [`port_contract`]を文章`sample`で確かめる。実装が途中で落ちる（panicする）文章でも契約を守るかを、その実装の
+/// 試験から確かめるため（Portの「描画の経路は失敗しない」。[`StreamingMarkdown`]のdoc）。
+pub(super) fn port_contract_with<M: StreamingMarkdown>(make: impl Fn() -> M, sample: &str) {
+    any_split_renders_the_same(&make, sample);
+    the_width_is_not_state(&make, sample);
+    reset_renders_like_a_new_one(&make, sample);
+    finish_is_idempotent_and_push_after_finish_continues(&make, sample);
+    lines_and_joins_have_the_same_length(&make, sample);
+    links_stay_inside_their_lines(&make, sample);
 }
 
 /// **どの文字の境界で2つに分けて足しても、1回で足したのと同じに描く**（流入中も、終わった後も）。
-fn any_split_renders_the_same<M: StreamingMarkdown>(make: &impl Fn() -> M) {
-    let mut whole = fed(make, &[SAMPLE]);
+fn any_split_renders_the_same<M: StreamingMarkdown>(make: &impl Fn() -> M, sample: &str) {
+    let mut whole = fed(make, &[sample]);
     let streaming = every_width(&mut whole);
     let done = every_width(&mut finished(whole));
-    let boundaries = SAMPLE
+    let boundaries = sample
         .char_indices()
         .map(|(at, _)| at)
-        .chain([SAMPLE.len()]);
+        .chain([sample.len()]);
     for at in boundaries {
-        let (head, tail) = SAMPLE.split_at(at);
+        let (head, tail) = sample.split_at(at);
         let mut split = fed(make, &[head, tail]);
         assert_eq!(
             every_width(&mut split),
@@ -72,10 +78,10 @@ fn any_split_renders_the_same<M: StreamingMarkdown>(make: &impl Fn() -> M) {
 }
 
 /// **幅は状態ではない**——別の幅で描いた後に元の幅で描くと最初と同じ。作ったばかりのものを同じ幅で描いたのとも同じ。
-fn the_width_is_not_state<M: StreamingMarkdown>(make: &impl Fn() -> M) {
+fn the_width_is_not_state<M: StreamingMarkdown>(make: &impl Fn() -> M, sample: &str) {
     for finish in [false, true] {
         let prepare = || {
-            let m = fed(make, &[SAMPLE]);
+            let m = fed(make, &[sample]);
             if finish {
                 finished(m)
             } else {
@@ -95,9 +101,9 @@ fn the_width_is_not_state<M: StreamingMarkdown>(make: &impl Fn() -> M) {
 }
 
 /// **空に戻すと、作ったばかりのものと同じに描く**（その後に足せば、作ったばかりのものへ足したのと同じ）。
-fn reset_renders_like_a_new_one<M: StreamingMarkdown>(make: &impl Fn() -> M) {
+fn reset_renders_like_a_new_one<M: StreamingMarkdown>(make: &impl Fn() -> M, sample: &str) {
     for finish in [false, true] {
-        let mut m = fed(make, &[SAMPLE]);
+        let mut m = fed(make, &[sample]);
         if finish {
             m.finish();
         }
@@ -107,10 +113,10 @@ fn reset_renders_like_a_new_one<M: StreamingMarkdown>(make: &impl Fn() -> M) {
             every_width(&mut make()),
             "空に戻した後が、作ったばかりのものと違う（終わった後={finish}）"
         );
-        m.push(SAMPLE);
+        m.push(sample);
         assert_eq!(
             every_width(&mut m),
-            every_width(&mut fed(make, &[SAMPLE])),
+            every_width(&mut fed(make, &[sample])),
             "空に戻してから足した結果が、作ったばかりのものへ足したのと違う（終わった後={finish}）"
         );
     }
@@ -120,21 +126,27 @@ fn reset_renders_like_a_new_one<M: StreamingMarkdown>(make: &impl Fn() -> M) {
 /// もう一度終えれば、全部を足して終えたのと同じ）。
 fn finish_is_idempotent_and_push_after_finish_continues<M: StreamingMarkdown>(
     make: &impl Fn() -> M,
+    sample: &str,
 ) {
-    let mut once = finished(fed(make, &[SAMPLE]));
-    let mut twice = finished(finished(fed(make, &[SAMPLE])));
+    let mut once = finished(fed(make, &[sample]));
+    let mut twice = finished(finished(fed(make, &[sample])));
     assert_eq!(
         every_width(&mut twice),
         every_width(&mut once),
         "2回目の`finish`で描画が変わった"
     );
 
-    let (head, tail) = SAMPLE.split_at(SAMPLE.len() / 2);
+    // 真ん中に一番近い、手前の文字の境目で分ける。
+    let middle = (0..=sample.len() / 2)
+        .rev()
+        .find(|&at| sample.is_char_boundary(at))
+        .unwrap_or(0);
+    let (head, tail) = sample.split_at(middle);
     let mut resumed = finished(fed(make, &[head]));
     resumed.push(tail);
     assert_eq!(
         every_width(&mut resumed),
-        every_width(&mut fed(make, &[SAMPLE])),
+        every_width(&mut fed(make, &[sample])),
         "終わった後に足した文章が、流入中に足したのと同じに描かれない"
     );
     assert_eq!(
@@ -145,8 +157,8 @@ fn finish_is_idempotent_and_push_after_finish_continues<M: StreamingMarkdown>(
 }
 
 /// **行と印は同じ数**（[`Rendered`]の不変条件）。空の文章・1桁・0桁でも落ちない。
-fn lines_and_joins_have_the_same_length<M: StreamingMarkdown>(make: &impl Fn() -> M) {
-    for text in ["", "a", "\n\n", SAMPLE] {
+fn lines_and_joins_have_the_same_length<M: StreamingMarkdown>(make: &impl Fn() -> M, sample: &str) {
+    for text in ["", "a", "\n\n", sample] {
         for finish in [false, true] {
             let mut m = fed(make, &[text]);
             if finish {
@@ -166,9 +178,9 @@ fn lines_and_joins_have_the_same_length<M: StreamingMarkdown>(make: &impl Fn() -
 /// **リンクの区間は、指す行の文字の中に収まる**（[`Rendered`]の`links`）。行の外や文字の外を指す区間は、使う側が
 /// 位置から引いたときに何にも当たらないか、別の文字を指してしまう。区間の文字は`Line::styled_graphemes`で数える
 /// （範囲選択の位置と同じ数え方）。
-fn links_stay_inside_their_lines<M: StreamingMarkdown>(make: &impl Fn() -> M) {
+fn links_stay_inside_their_lines<M: StreamingMarkdown>(make: &impl Fn() -> M, sample: &str) {
     for finish in [false, true] {
-        let mut m = fed(make, &[SAMPLE]);
+        let mut m = fed(make, &[sample]);
         if finish {
             m.finish();
         }

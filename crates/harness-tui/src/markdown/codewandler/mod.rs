@@ -50,6 +50,26 @@
 //!
 //! 写しのほかに、解析の結果（出来事の列）と描いた結果（行）も持つ。どちらも文章より大きい（測っていない）。
 //!
+//! # 落ちたとき（解析器・描画部品のpanic）
+//!
+//! 解析器はある入力で落ちる（panicする）ことが分かっている（知っている形は`guard`が渡す前に避ける）。ほかの入力で
+//! 落ちない保証は無く、写した描画部品も同じである。描画の経路で落ちると会話そのものが見えなくなるので、Portの約束
+//! （描画の経路は失敗しない。`super::StreamingMarkdown`）を守るために、`finish`と`render`の中身を
+//! `harness_term::contain_panic`の中で呼ぶ。その範囲の中では、panicのフックが端末を戻さない——`catch_unwind`だけ
+//! では、受け止める前にフックが端末を戻し、TUIの画面が壊れる。
+//!
+//! 落ちたら、**その返答は以後ずっと原文のまま描く**（原文を整形しない実装`super::plain::PlainText`へ移し、それに
+//! 描かせる。`reset`で整形する形へ戻る）。持っていた結果（確定した塊・描いた行・末尾・全文）は途中まで更新されている
+//! かもしれないので、全部捨てる。解析し直さないのは、同じ文章ではまた落ちるからで、描くたびに（約30回/秒）落ちて
+//! 報告を積まないため。
+//!
+//! 黙らない形は2つ。
+//!
+//! - panicの報告（文面と場所）は、今までどおり標準エラーへ出る。会話TUIは画面を握っている間、標準エラーを預かって
+//!   `[stderr]`の行としてtranscriptに出す（`harness_term::stderr_capture`）。流れ込んでいる途中なら、その行の後に
+//!   届いた文章は新しい返答の項目として始まり、そちらは整形して描く（BUG-232の直し方）
+//! - 原文のまま描く形へ落ちたことを、ログ（会話TUIではログファイル）へ警告として1回書く
+//!
 //! # 持っている結果と、捨てる条件
 //!
 //! どの結果も、**それを作った材料が変わったら使わない**——材料を鍵として一緒に持ち、使う前に比べる。
@@ -77,7 +97,8 @@
 //! - `finish`は流入中の結果（確定した塊と末尾）を捨てる（終えた返答は多く、二重に持たないため）。終えた後に足すと、
 //!   次の描画で文章の頭から境界を探し直して塊を作り直す（その1回だけ、文章の長さに比例する）。
 //! - 解析器は、表の区切り行として読む行のセルが`:`だけだと落ちる（表を流している途中の`|:`で起きる）。落ちる形の行は
-//!   渡す前に`\:`へ書き換える（`guard`。描く文字は`:`のまま）。解析器がほかの入力で落ちるかは分からない。
+//!   渡す前に`\:`へ書き換える（`guard`。描く文字は`:`のまま）。ほかの入力で落ちたら、その返答は原文のまま描く
+//!   （上の「落ちたとき」）。
 //! - 空の文章・空行だけの文章は0行で描く（描画部品が何も描かない）。整形しない実装は空の1行を返す
 //!   （`super::plain`）——transcriptでの見え方の違いはT9で扱う。
 //! - 写した描画部品は、**元の出力が幅に左右されず、T7bで直した構造を含まない入力では、今も元と1文字も違わない**
@@ -85,10 +106,12 @@
 //!   リンクの区間（`link_tests`）はそれぞれの試験が固定する。
 //! - 画像は、代わりの文字（alt）をリンクと同じ書式で描くが、リンクの区間は返さない（`link_tests`のモジュールdoc）。
 
+use std::any::Any;
 use std::ops::Range;
 
 use markdown_stream::{BlockKind, Event, Parser, StreamParser};
 
+use super::plain::PlainText;
 use super::{Rendered, StreamingMarkdown};
 
 /// 解析器が落ちる形の行を、渡す前に書き換える（モジュールdoc）。
@@ -108,6 +131,9 @@ mod characterization_tests;
 #[cfg(test)]
 #[path = "equivalence_tests.rs"]
 mod equivalence_tests;
+#[cfg(test)]
+#[path = "fallback_tests.rs"]
+mod fallback_tests;
 #[cfg(test)]
 #[path = "link_tests.rs"]
 mod link_tests;
@@ -143,6 +169,9 @@ pub(crate) struct CodewandlerMarkdown {
     tail: Option<Tail>,
     /// `finish`で全文を解析した出来事と、それを描いた行。
     whole: Option<Whole>,
+    /// 解析器か描画部品が落ちた後に、原文をそのまま描く実装（モジュールdocの「落ちたとき」）。`Some`の間は、原文は
+    /// こちらだけが持ち（`source`は空）、ほかの結果も持たない。`reset`で`None`に戻る。
+    fallen: Option<PlainText>,
     /// 解析と描画の回数（試験だけが数える）。
     #[cfg(test)]
     counts: Counts,
@@ -209,6 +238,11 @@ impl CodewandlerMarkdown {
     /// 確定した塊の数。
     pub(super) fn sealed_chunks(&self) -> usize {
         self.sealed.len()
+    }
+
+    /// 解析器か描画部品が落ちて、原文のまま描く形へ落ちたか。
+    pub(super) fn has_fallen_back(&self) -> bool {
+        self.fallen.is_some()
     }
 }
 
@@ -294,18 +328,9 @@ impl CodewandlerMarkdown {
     }
 }
 
-impl StreamingMarkdown for CodewandlerMarkdown {
-    /// 写しへ足す。解析は描くときまで待つ（描くまでに何回足されても、解析は1回で済む）。終えた後なら、全文の結果を
-    /// 捨てて流入へ戻る（流入中の結果は`finish`が捨てたので、次の描画で文章の頭から作り直す）。
-    fn push(&mut self, chunk: &str) {
-        self.source.push_str(chunk);
-        self.whole = None;
-    }
-
-    /// 全文を1回だけ解析し直す（塊に分けて解析したことによる違いを正す。計画書§1.4(3)の4）。文章が前の`finish`から
-    /// 変わっていなければ何もしない——画面は流入中でない返答の全部へ、描くたびに呼ぶ（計画書§0のT8の条件）。
-    /// 流入中の結果は捨てる（モジュールdocの限界）。
-    fn finish(&mut self) {
+impl CodewandlerMarkdown {
+    /// 全文を1回だけ解析し直す（[`StreamingMarkdown::finish`]の中身。落ちたら呼び出し側が受け止める）。
+    fn finish_formatting(&mut self) {
         if self
             .whole
             .as_ref()
@@ -330,13 +355,8 @@ impl StreamingMarkdown for CodewandlerMarkdown {
         self.tail = None;
     }
 
-    /// 作ったばかりの状態に戻す。解析器は解析のたびに`StreamParser::new_gfm`で作るので、GFMの設定は失われない
-    /// （解析器の`reset`はGFMの設定まで消すので使わない。計画書§1.3）。
-    fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    fn render(&mut self, width: u16) -> Rendered {
+    /// `width`桁で整形して描く（[`StreamingMarkdown::render`]の中身。落ちたら呼び出し側が受け止める）。
+    fn render_formatted(&mut self, width: u16) -> Rendered {
         if let Some(whole) = self
             .whole
             .as_mut()
@@ -357,6 +377,76 @@ impl StreamingMarkdown for CodewandlerMarkdown {
         render::append(&mut rendered, self.tail_view(width, follows));
         rendered
     }
+
+    /// 落ちた（panicした）ことをログへ書き、持っている結果を全部捨てて、原文を整形しない実装へ移す。以後はそれが
+    /// 描く（モジュールdocの「落ちたとき」）。
+    fn fall_back(&mut self, payload: &(dyn Any + Send)) -> &mut PlainText {
+        tracing::warn!(
+            panic = panic_message(payload),
+            bytes = self.source.len(),
+            "the Markdown parser or renderer panicked; this reply is drawn as plain text from now on"
+        );
+        let source = std::mem::take(&mut self.source);
+        *self = Self::default();
+        let plain = self.fallen.insert(PlainText::default());
+        plain.push(&source);
+        plain
+    }
+}
+
+impl StreamingMarkdown for CodewandlerMarkdown {
+    /// 写しへ足す。解析は描くときまで待つ（描くまでに何回足されても、解析は1回で済む）。終えた後なら、全文の結果を
+    /// 捨てて流入へ戻る（流入中の結果は`finish`が捨てたので、次の描画で文章の頭から作り直す）。落ちた後は、原文の
+    /// まま描く実装へ足す。
+    fn push(&mut self, chunk: &str) {
+        if let Some(plain) = &mut self.fallen {
+            plain.push(chunk);
+            return;
+        }
+        self.source.push_str(chunk);
+        self.whole = None;
+    }
+
+    /// 全文を1回だけ解析し直す（塊に分けて解析したことによる違いを正す。計画書§1.4(3)の4）。文章が前の`finish`から
+    /// 変わっていなければ何もしない——画面は流入中でない返答の全部へ、描くたびに呼ぶ（計画書§0のT8の条件）。
+    /// 流入中の結果は捨てる（モジュールdocの限界）。解析器が落ちたら、原文のまま描く形へ落ちる（モジュールdocの
+    /// 「落ちたとき」）。落ちた後は何もしない。
+    fn finish(&mut self) {
+        if self.fallen.is_some() {
+            return;
+        }
+        if let Err(payload) = harness_term::contain_panic(|| self.finish_formatting()) {
+            self.fall_back(payload.as_ref());
+        }
+    }
+
+    /// 作ったばかりの状態に戻す（落ちた後なら、整形して描く形へも戻る）。解析器は解析のたびに
+    /// `StreamParser::new_gfm`で作るので、GFMの設定は失われない（解析器の`reset`はGFMの設定まで消すので使わない。
+    /// 計画書§1.3）。
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// 整形して描く。解析器か描画部品が落ちたら、原文のまま描く形へ落ちて、その形で描いた結果を返す（モジュールdocの
+    /// 「落ちたとき」）。
+    fn render(&mut self, width: u16) -> Rendered {
+        if let Some(plain) = &mut self.fallen {
+            return plain.render(width);
+        }
+        match harness_term::contain_panic(|| self.render_formatted(width)) {
+            Ok(rendered) => rendered,
+            Err(payload) => self.fall_back(payload.as_ref()).render(width),
+        }
+    }
+}
+
+/// panicの中身の文面（`panic!`へ渡した文字列）。文字列でなければその旨。
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(the panic payload is not a string)")
 }
 
 /// 確定していない部分の頭から候補の行の前までの文章`chunk`を、塊として区切ってよいかを解析器で確かめる。
@@ -400,6 +490,13 @@ fn body(events: &[Event]) -> impl Iterator<Item = &Event> {
 /// 文章は文書の頭か確定の境界から始まり、`parts`の境目は行の境目である（最後の部分だけが改行で終わらなくてよい）——
 /// `guard`が行を1行ずつ順に見るため。
 fn parse(parts: &[&str]) -> Vec<Event> {
+    #[cfg(test)]
+    if parts
+        .iter()
+        .any(|part| part.contains(fallback_tests::PARSER_BOMB))
+    {
+        fallback_tests::explode("解析器");
+    }
     let mut parser = StreamParser::new_gfm();
     let mut guard = Guard::default();
     let mut events = Vec::new();
@@ -415,5 +512,11 @@ fn parse(parts: &[&str]) -> Vec<Event> {
 /// 出来事を、既定の書式で`width`桁で描く。`follows`なら、既に何か描いた文書の続きとして描く（最初のブロックの前にも
 /// ブロックの間の空行を置く。`render::render_lines_following`）。
 fn draw(events: &[Event], width: u16, follows: bool) -> Rendered {
+    #[cfg(test)]
+    if events.iter().any(
+        |event| matches!(event, Event::Text { text, .. } if text.contains(fallback_tests::DRAW_BOMB)),
+    ) {
+        fallback_tests::explode("描画部品");
+    }
     render::render_lines_following(events, &Theme::default(), usize::from(width), follows)
 }
