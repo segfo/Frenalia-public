@@ -1,12 +1,48 @@
-//! 入れ子の子へ渡す入力（環境変数・要求受付パイプの名前）を組む関数。
+//! 入れ子の子へ渡す入力（環境変数・要求受付パイプの名前・呼び出し元の標準入出力）を組む関数。
 //!
 //! 2026-10-06 に`server.rs`からそのまま移した——`server.rs`は本体1,000行を超えており、
 //! P5 の後続の段（子の出力の扱い・環境変数の作り方の統一。決定66）がこの1か所を直せるように、
 //! 先に置き場を分けた（`plans/position-domains/P5.md` P5.1）。
 
+use harness_policy::transition::ChildOutput;
+
+use super::CallerHandles;
 use crate::tier2a::win_appcontainer::{
     harness_owned_env_names, os_rewritten_env_names, redirector_env,
 };
+
+/// [P5.4b] 呼び出し元が載せてきた標準入出力（`requested`）のうち、**子へ渡してよいものだけ**を残す
+/// （判定器の[`harness_policy::transition::Allowed::output`]と[`harness_policy::transition::Allowed::strict`]に従う）。
+///
+/// | 何 | 渡す条件 | 根拠 |
+/// |---|---|---|
+/// | 標準入力 | **Strict の辺でない**とき | 決定66(3)は普通の辺で渡す。Strict の辺は断つ——固定argvのシェルは、stdinが端末でなければそこからコマンドを読む（BUG-161） |
+/// | 標準出力・標準エラー | 出力の設定が**返す**とき | 決定66(4)。捨てる辺では`None`にし、子は`NUL`へ書く |
+///
+/// **渡さないものは`None`へ差し替える**——`None`のハンドルは Daemon が引き抜かないので、呼び出し元の持ち物は
+/// 1つも子へ行かない（`pull_caller_stdio`が`NUL`を開く）。
+///
+/// # 限界
+///
+/// 決めるのは呼び出し元の標準入出力だけである。**出力を捨てても、子が呼び出し元の読める場所へ書いたファイル**は
+/// 呼び出し元へ届く（組み合わせの対＝決定66の Limit 1 の側の問題）。
+pub(super) fn caller_handles_for(
+    output: ChildOutput,
+    strict: bool,
+    requested: CallerHandles,
+) -> CallerHandles {
+    let CallerHandles {
+        stdin,
+        stdout,
+        stderr,
+    } = requested;
+    let returns = output.is_return();
+    CallerHandles {
+        stdin: stdin.filter(|_| !strict),
+        stdout: stdout.filter(|_| returns),
+        stderr: stderr.filter(|_| returns),
+    }
+}
 
 /// [段階6f-2] **窓口の名前を、起こす子のenvへDaemonの値で書き込む**（[`Shared::request_pipe`]のdoc）。
 ///

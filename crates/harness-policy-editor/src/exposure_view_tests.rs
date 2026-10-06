@@ -4,7 +4,7 @@
 //! 何でも出す実装でも緑になる。
 
 use harness_policy::policy_file::{PolicyDomain, PolicyFile, ENTRY_DOMAIN};
-use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
+use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher, ChildOutput};
 use harness_policy::transition_listing::Rights;
 
 use super::*;
@@ -61,6 +61,7 @@ fn a_new_widening_edge_is_listed_with_what_it_hands_over() {
                 fs: vec![("C:/Users/x/secret/**".to_string(), "read")],
                 net: Vec::new(),
             },
+            output: ChildOutput::Return,
         }]
     );
     assert_eq!(widening.uncounted, None);
@@ -70,6 +71,33 @@ fn a_new_widening_edge_is_listed_with_what_it_hands_over() {
     assert!(text.contains(&format!("{ENTRY_DOMAIN} → secret")), "{text}");
     assert!(text.contains(PEEK), "{text}");
     assert!(text.contains("fs.read") && text.contains("C:/Users/x/secret/**"), "{text}");
+    // [P5.4b] 出力を返す（既定）辺は、いちばん太い持ち出しの経路を言う（決定66(4)。P5.3 は Daemon が出力を
+    // 返していなかったので出さなかった）。
+    assert!(
+        text.contains("出力を返すので、子が読めるものは呼び出し元へ渡ります"),
+        "{text}"
+    );
+}
+
+/// [P5.4b] 対: 出力を捨てる辺は「返すので渡る」とは言わず、捨てる設定であることを出す——ただし捨てても子が書いた
+/// ファイルは残るので、「渡らない」とは言わない（言い過ぎない、`B-32`）。
+#[test]
+fn a_widening_edge_that_discards_its_output_does_not_claim_it_returns_it() {
+    let before = file(vec![
+        PolicyDomain::new(ENTRY_DOMAIN),
+        reading("secret", "C:/Users/x/secret/**"),
+    ]);
+    let mut entry = with_edge(PolicyDomain::new(ENTRY_DOMAIN), PEEK, "secret");
+    entry.process.transitions[0].output = ChildOutput::Discard;
+    let after = file(vec![entry, reading("secret", "C:/Users/x/secret/**")]);
+
+    let widening = widening(&before, &after, &ws());
+
+    assert_eq!(widening.edges.len(), 1, "{widening:?}");
+    assert_eq!(widening.edges[0].output, ChildOutput::Discard);
+    let text = lines(&widening).join("\n");
+    assert!(!text.contains("出力を返すので"), "{text}");
+    assert!(text.contains("子の出力は捨てる設定です"), "{text}");
 }
 
 /// 対: 遷移元が自分で持っている権限しか渡さない辺（狭める辺）と、変更の前から同じだけ渡していた辺は出さず、

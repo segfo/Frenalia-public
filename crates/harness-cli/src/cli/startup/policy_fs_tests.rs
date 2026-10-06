@@ -3,6 +3,7 @@
 //! 守っているのは3つ——**入口の子に他ドメインの宛先が渡らない**こと、**書込の印が他の一覧へ移らない**
 //! こと、**付与する範囲の条件（遷移先・通信なし・強制有効）**。どれも禁止側と許可側を対にする（`B-35`）。
 
+use harness_policy::transition::ChildOutput;
 use std::path::{Path, PathBuf};
 
 use harness_core::GrantedPassthrough;
@@ -33,6 +34,7 @@ fn edge_to(to: &str) -> TransitionEdge {
         cwd: None,
         to: to.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }
 }
 

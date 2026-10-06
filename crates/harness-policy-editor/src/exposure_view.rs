@@ -26,9 +26,8 @@
 //!
 //! - **組み合わせの対**（Limit 1。あるドメインが書ける場所を、外部と通信できる別のドメインが読む／実行する）は
 //!   まだ出さない（P5.6）
-//! - **子の出力の行は出さない**——この段では、固定していない広げる辺の子へ Daemon は呼び出し元の標準入出力を
-//!   渡さない（`harness_policy::transition::Allowed::inherit_handles`の式を据え置いた）。出力を返す既定が入る
-//!   P5.4b で「子が読めるものは出力で呼び出し元へ渡る」を足す（入る前に言うと嘘になる、`B-32`）
+//! - **子の出力の行は、広がる辺にだけ出す**（P5.4b。Daemon が出力を返すようになった段で足した——P5.3 は返して
+//!   いなかったので、入る前に言うと嘘になった、`B-32`）。広がらない辺の出力の設定（「出力:捨てる」の表示）は P5.5
 //! - 1つの確認に2つの`plan`が並ぶ画面（承認待ちの「承認＋チェックを外した取り消し」、宣言画面の
 //!   「付け替え＋取り消し」）は、`plan`ごとに「いまの`policy.json`からの差」を出す。**2つを重ねて初めて広がる辺**
 //!   （片方が足した値を、もう片方が遷移元から外す）は数えない
@@ -37,7 +36,7 @@
 use std::path::Path;
 
 use harness_policy::policy_file::PolicyFile;
-use harness_policy::transition::{self, ExeMatcher};
+use harness_policy::transition::{self, ChildOutput, ExeMatcher};
 use harness_policy::transition_listing::Rights;
 
 /// 変更で広がる遷移（[`widening`]の答え）。
@@ -65,6 +64,9 @@ pub struct WidenedEdge {
     pub to: String,
     /// この変更で増えた、呼び出し元が子を通して使えるようになる権限。
     pub newly_usable: Rights,
+    /// 辺の出力の設定（[`harness_policy::transition::ChildOutput`]。P5.4b）。返す辺なら、子が読めるものは出力で
+    /// 呼び出し元へ渡る——明細はそれを言う。
+    pub output: ChildOutput,
 }
 
 /// `before` → `after`の変更で広がる遷移。`after`は書く予定の内容、`before`は読み込んだ`policy.json`。
@@ -80,17 +82,23 @@ pub fn widening(before: &PolicyFile, after: &PolicyFile, workspace_root: &Path) 
             edges: delta
                 .edges
                 .into_iter()
-                .map(|edge| WidenedEdge {
-                    exe: after
+                .map(|edge| {
+                    let written = after
                         .domain(&edge.from)
-                        .and_then(|d| d.process.transitions.get(edge.edge_index))
-                        .map(|e| match &e.exe {
-                            ExeMatcher::Literal(exe) | ExeMatcher::Pattern(exe) => exe.clone(),
-                        })
-                        .unwrap_or_default(),
-                    from: edge.from,
-                    to: edge.to,
-                    newly_usable: edge.newly_usable,
+                        .and_then(|d| d.process.transitions.get(edge.edge_index));
+                    WidenedEdge {
+                        exe: written
+                            .map(|e| match &e.exe {
+                                ExeMatcher::Literal(exe) | ExeMatcher::Pattern(exe) => exe.clone(),
+                            })
+                            .unwrap_or_default(),
+                        // 辺が見つからないことは無い（`edge_index`は変更後の宣言での位置）。見つからなければ
+                        // 既定の「返す」——渡る側へ倒して言う（言わないより言い過ぎる側）。
+                        output: written.map(|e| e.output).unwrap_or_default(),
+                        from: edge.from,
+                        to: edge.to,
+                        newly_usable: edge.newly_usable,
+                    }
                 })
                 .collect(),
             uncounted: None,
@@ -124,6 +132,14 @@ pub fn lines(widening: &Widening) -> Vec<String> {
     for edge in &widening.edges {
         lines.push(format!("  {} → {}（{}）", edge.from, edge.to, edge.exe));
         lines.extend(rights_lines(&edge.newly_usable, "      "));
+        // [P5.4b] 出力の行き先（決定66(4)）。返す辺は、子が読めるものが出力を通って呼び出し元へ渡る
+        // ——いちばん太い持ち出しの経路なので明細で言う。捨てても子が書いたファイルは残るので「渡らない」とは言わない。
+        lines.push(match edge.output {
+            ChildOutput::Return => {
+                "      出力を返すので、子が読めるものは呼び出し元へ渡ります".to_string()
+            }
+            ChildOutput::Discard => "      子の出力は捨てる設定です".to_string(),
+        });
     }
     lines
 }

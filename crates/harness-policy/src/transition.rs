@@ -77,6 +77,37 @@ pub struct TransitionEdge {
     /// §19.1が塞いだ穴が名前ごとに開き直る。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<EnvOverride>,
+    /// 子の出力（標準出力・標準エラー）を呼び出し元へ返すか（決定66(4)。**辺ごとに決める・既定は返す**）。
+    /// JSON の綴りは`"output": "discard"`だけで、返す辺には欄を書かない（[`ChildOutput`]）。
+    #[serde(default, skip_serializing_if = "ChildOutput::is_return")]
+    pub output: ChildOutput,
+}
+
+/// 子の出力（標準出力・標準エラー）の行き先（[`TransitionEdge::output`]。決定66(4)）。
+///
+/// # 何を守り、何を守らないか
+///
+/// **返す**（既定）なら、Daemon は呼び出し元が渡した標準出力・標準エラーをそのまま子へ渡す——子が読めるものは
+/// 出力を通って呼び出し元へ渡る（いちばん太い持ち出しの経路。エディタの確定の明細がこれを言う）。**捨てる**なら、
+/// Daemon は子へ`NUL`を渡す。**捨てても、子が書いたファイルを呼び出し元が読む経路は残る**（子のドメインが
+/// 呼び出し元の読める場所へ書けるなら、その組は組み合わせの対＝Limit 1 の問題である）。
+///
+/// 標準入力はこの設定に関わらず、Strict の辺でだけ断つ（[`Allowed::strict`]。決定66(3)と追記）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildOutput {
+    /// 呼び出し元へ返す（既定）。
+    #[default]
+    Return,
+    /// 捨てる（Daemon が子の標準出力・標準エラーに`NUL`を渡す）。
+    Discard,
+}
+
+impl ChildOutput {
+    /// 既定（返す）か。`policy.json`に欄を書かない条件（`skip_serializing_if`）。
+    pub fn is_return(&self) -> bool {
+        matches!(self, ChildOutput::Return)
+    }
 }
 
 /// 実行ファイルの照合方法。`{"literal": …}` または `{"pattern": …}`。
@@ -142,6 +173,7 @@ impl EnvOverride {
 }
 
 /// ポリシーエディタが書く辺の形: `exe`はリテラル（観測した綴りそのまま）、`cwd`と`env`は書かない。
+/// 子の出力は既定の「返す」（[`ChildOutput::Return`]。捨てる切り替えはエディタの操作が持つ——P5.5）。
 ///
 /// **この形の持ち主はここ1か所である**（`B-05`）。エディタの遷移の承認（`harness_policy_editor`の
 /// `transition_approve`）と位置ごとの割り当て（[`crate::position_domains::Assignment::edges_to_add`]）が
@@ -156,6 +188,7 @@ pub fn editor_edge(exe: &str, argv: ArgvMatcher, to: &str) -> TransitionEdge {
         cwd: None,
         to: to.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }
 }
 
@@ -181,7 +214,7 @@ pub struct DomainView<'a> {
     pub process: &'a TransitionRules,
     /// **Strict の印**（`policy.json`のドメインの`strict`。決定66の追記）。真なら、このドメインへ入る辺は
     /// 入力を固定しなければ書けず（編集時検査）、固定した値を呼び出し元が書き換えられないことを読み込み時（規則(i)）と
-    /// 起こす直前（[`Allowed::fixed`]）に確かめ、固定した辺は到達閉包で辿らない（呼び出し元が子を操れないので、
+    /// 起こす直前（[`Allowed::strict`]）に確かめ、固定した辺は到達閉包で辿らない（呼び出し元が子を操れないので、
     /// 子の権限が呼び出し元へ渡らない）。印の効かせ方はここ（[`GraphFacts::enters_strict`]）が唯一の持ち主である。
     pub strict: bool,
 }
@@ -273,8 +306,8 @@ impl std::error::Error for GraphError {}
 /// # 何に使うか（**決定66で「広げる」は書けなくなる理由ではなくなった**）
 ///
 /// 広げる辺も入力を固定せずに書ける（守る線は子のドメインの権限。決定66）。向きを使うのは、規則(g)
-/// （実行ファイルのパターンは広げる辺で断る。決定66(7)）・表示（エディタ）・ハンドルの引き継ぎの式
-/// （[`Allowed::inherit_handles`]。P5.4b で辺ごとの出力の設定へ付け替える）である。
+/// （実行ファイルのパターンは広げる辺で断る。決定66(7)）と表示（エディタ）である。Daemon へ渡す標準入出力は
+/// 向きでは決まらない（P5.4b で[`Allowed::output`]・[`Allowed::strict`]へ付け替えた）。
 ///
 /// **Strict の辺も向きはそのまま数える**——呼び出し元が子を通して使える権限（[`newly_usable`]）には数えないが、
 /// 子のドメインが広いことに変わりはなく、規則(g)の理由（パターンが覆う場所に置いた別の exe が広いドメインで走る）は
@@ -314,42 +347,39 @@ pub struct Allowed<'a> {
     /// （§8.3。決定66(6): 作業ディレクトリを宣言しない辺は、広げる辺でも呼び出し元の場所を引き継ぐ）。
     pub cwd: Option<&'a str>,
     pub env: &'a EnvPolicy,
-    /// 呼び出し元のハンドル（stdioを含む）を引き継がせてよいか。
+    /// 子の出力（標準出力・標準エラー）を呼び出し元へ返すか（辺の[`TransitionEdge::output`]そのまま。決定66(4)）。
     ///
-    /// **`false`なら、Daemonは自分で作ったもの以外を1つも渡してはならない**（§19.1）。
-    /// stdinも同様に断つ——固定argvのシェルは、stdinが端末でなければそこからコマンドを読む。
+    /// [`ChildOutput::Discard`]なら、Daemonは呼び出し元が渡した標準出力・標準エラーを子へ渡さず`NUL`を渡す。
+    /// 標準入力はこの欄では決まらない（[`Allowed::strict`]）。
     ///
-    /// 式は「固定していない、かつ広げない」（[`TransitionGraph::build`]）で、**P5.3（決定66）では据え置いた**——
-    /// 固定していない広げる辺も書けるようになったが、その辺の子には呼び出し元の標準入出力を渡さない（安全側）。
-    /// P5.4b で辺ごとの出力の設定と Strict の印へ付け替える（`plans/position-domains/P5.md`）。
-    ///
-    /// # 誰が従うのか（**2026-09-20まで誰も従っていなかった**）
+    /// # 誰が従うのか（**かつての`inherit_handles`は2026-09-20まで誰も従っていなかった**）
     ///
     /// `harness_sandbox::tier2a::spawnd::server::serve_spawn_request`が唯一の読み手で、
-    /// `false`なら`CallerHandles::default()`へ差し替えてから子を起こす。
+    /// `spawnd::nested_inputs::caller_handles_for`で子へ渡すハンドルを組む。
     ///
-    /// **この欄は2026-09-17に入ったが、読み手は2026-09-20まで存在しなかった**
+    /// P5.4b まではここに`inherit_handles`（呼び出し元のハンドルを全部引き継がせてよいか）があった。
+    /// **その欄は2026-09-17に入ったが、読み手は2026-09-20まで存在しなかった**
     /// （[BUG-161](../../../docs/bugs/BUG-161.md)）。計算されていることと効いていることは
     /// 別の事実で、**判定器側のテストはどちらも緑にする**。再発を止めているのは読み手側の
     /// 完全分解（`..`を書かない）で、欄が増えるとあちらがコンパイルできなくなる。
-    pub inherit_handles: bool,
+    pub output: ChildOutput,
     pub direction: Direction,
     /// **Strict の辺か**（Strict の印が付いたドメインへ入り、argvがリテラルで、cwdが宣言されている。
-    /// [`GraphFacts::is_strict_edge`]）。**P5.4a で鍵を書き方の形から印へ付け替えた**（決定66の追記）——
-    /// 印の無いドメインへ入る辺は、固定した形で書いてあっても偽（普通のモードは入力を固定しない）。
-    /// 欄の名前は P5.4b で`strict`へ替える（`plans/position-domains/P5.md`）。
+    /// [`GraphFacts::is_strict_edge`]。決定66の追記）。印の無いドメインへ入る辺は、固定した形で書いてあっても偽
+    /// （普通のモードは入力を固定しない）。P5.4a で鍵を書き方の形から印へ付け替え、P5.4b で欄の名前を`fixed`から替えた。
     ///
-    /// 真なら、Daemonは起こす直前に「固定したファイルを呼び出し元が書き換えられないか」を
-    /// 呼び出し元のトークンでOSに聞く（`plans/DESIGN-MAC.md` §19.1）。読み込み時の検査（規則(i)。同じく Strict の辺
-    /// だけ）は綴りで比べるので別名（8.3形式の短い名前・リンク・ハードリンク）に弱く、それを実体の側で補う。
+    /// 真なら、Daemonは (1) **呼び出し元の標準入力を子へ渡さない**——固定argvのシェルは、stdinが端末でなければ
+    /// そこからコマンドを読む（決定66(3)は普通の辺で標準入力を渡すが、Strict の辺はこれを断つ）。(2) 起こす直前に
+    /// 「固定したファイルを呼び出し元が書き換えられないか」を呼び出し元のトークンでOSに聞く（`plans/DESIGN-MAC.md`
+    /// §19.1）。読み込み時の検査（規則(i)。同じく Strict の辺だけ）は綴りで比べるので別名（8.3形式の短い名前・
+    /// リンク・ハードリンク）に弱く、それを実体の側で補う。
     ///
-    /// # なぜ`inherit_handles`から読み取らせないのか
+    /// # なぜ出力の設定から読み取らせないのか
     ///
-    /// かつては「`inherit_handles == false` ⇔ 固定辺」が成り立っていたが、それは編集時検査が
-    /// 「広げる辺は固定必須」を課していた**結果**であって、型が保証していなかった。**実際に P5.3（決定66）で
-    /// 崩れた**——固定していない広げる辺も書けるようになり、その辺は`inherit_handles == false`かつ`fixed == false`
-    /// である。読み手が裏の事情に頼っていたら、ここで黙って外れていた。
-    pub fixed: bool,
+    /// 2つは独立している——Strict の辺でも出力は辺ごとの設定に従い（ログ分析は結果を返すのが目的。決定66の追記の
+    /// 束の表）、捨てる設定は普通の辺にも書ける。かつての`inherit_handles == false` ⇔ 固定辺は、編集時検査が
+    /// 「広げる辺は固定必須」を課していた**結果**であって型が保証しておらず、P5.3（決定66）で実際に崩れた。
+    pub strict: bool,
 }
 
 /// 拒否の理由。**「拒否された」だけでは、宣言が無いのか曖昧なのかが区別できない。**
@@ -448,8 +478,8 @@ struct CompiledEdge {
     to: String,
     env: EnvPolicy,
     direction: Direction,
-    inherit_handles: bool,
-    fixed: bool,
+    output: ChildOutput,
+    strict: bool,
 }
 
 #[derive(Debug)]
@@ -492,8 +522,6 @@ impl TransitionGraph {
             let mut edges = Vec::with_capacity(view.process.transitions.len());
             for edge in &view.process.transitions {
                 let direction = facts.direction(view.name, &edge.to);
-                // [P5.4a] 起こす直前の検査は Strict の辺だけ（[`Allowed::fixed`]）。ハンドルの式は P5.4b まで形のまま。
-                let fixed = facts.is_strict_edge(view.name, edge);
                 edges.push(CompiledEdge {
                     // `compile_matcher`は検査が通った後にしか呼ばれないので、
                     // ここでの失敗は起こり得ない（起きたら検査とコンパイルがずれている）。
@@ -503,8 +531,10 @@ impl TransitionGraph {
                     to: edge.to.clone(),
                     env: env_policy(edge),
                     direction,
-                    inherit_handles: !is_fully_fixed(edge) && direction != Direction::WiderOrUnknown,
-                    fixed,
+                    // 標準入出力の扱いは向きでは決めない（決定66(3)(4)）。出力は辺の設定、標準入力と
+                    // 起こす直前の検査は Strict の辺かどうか（印の判定は`is_strict_edge`の1か所、B-13）。
+                    output: edge.output,
+                    strict: facts.is_strict_edge(view.name, edge),
                 });
             }
             domains.insert(view.name.to_string(), CompiledDomain { edges });
@@ -569,9 +599,9 @@ impl TransitionGraph {
             to: &chosen.to,
             cwd: chosen.cwd.as_deref(),
             env: &chosen.env,
-            inherit_handles: chosen.inherit_handles,
+            output: chosen.output,
             direction: chosen.direction,
-            fixed: chosen.fixed,
+            strict: chosen.strict,
         })
     }
 
@@ -617,9 +647,9 @@ pub fn edge_direction(
 /// 固定辺で**固定したファイル**（起こす実行ファイルと、`argv[0]`以降の絶対パスらしいトークン）を、
 /// 書かれた綴りのまま返す。
 ///
-/// Daemonは Strict の辺（[`Allowed::fixed`]）の子を起こす直前に、これらを**実際に`CreateProcessW`へ渡す値**
+/// Daemonは Strict の辺（[`Allowed::strict`]）の子を起こす直前に、これらを**実際に`CreateProcessW`へ渡す値**
 /// （要求された実行ファイルとコマンドライン）から取り、呼び出し元のトークンで
-/// 書き換えられないかをOSに聞く（[`Allowed::fixed`]）。読み込み時の検査も同じ関数で
+/// 書き換えられないかをOSに聞く（[`Allowed::strict`]）。読み込み時の検査も同じ関数で
 /// 候補を集めるので、2層の検査が別のファイルを見ることはない。
 pub fn fixed_file_paths(image: &str, command_line: &str) -> Vec<String> {
     transition_check::fixed_file_paths(image, command_line)
@@ -707,7 +737,7 @@ impl<'a> GraphFacts<'a> {
 
     /// `from`から`to`へ入る辺が**Strict の印が付いたドメインへ入る**か（決定66の追記。印の判定の唯一の持ち主——
     /// 規則(e)・閉包・呼び出し元が使える権限の3つと、[`GraphFacts::is_strict_edge`]を通して規則(i)・
-    /// [`Allowed::fixed`]がこれを呼ぶ）。
+    /// [`Allowed::strict`]がこれを呼ぶ）。
     ///
     /// **自己ループ辺は入る辺に数えない**——呼び出し元は既にそのドメインに居て、印が守る権利を自分で持っている
     /// （[`Direction::Same`]・[`newly_usable`]の自己ループと同じ扱い）。
@@ -716,7 +746,7 @@ impl<'a> GraphFacts<'a> {
     }
 
     /// **Strict の辺**＝Strict のドメインへ入り、入力（引数・作業ディレクトリ）を固定した辺。到達閉包はこれを辿らず、
-    /// 規則(i)（固定値の書込可否）と[`Allowed::fixed`]（起こす直前の検査）はこれにだけ掛かる（P5.4a）。
+    /// 規則(i)（固定値の書込可否）と[`Allowed::strict`]（起こす直前の検査）はこれにだけ掛かる（P5.4a）。
     ///
     /// 固定していない Strict のドメインへの辺は編集時検査が断る（規則(e)）が、検査に落ちる宣言でも答える関数
     /// （[`shape`]・[`rights_summary`]）のために、ここでも固定を確かめる——入力が本当に固定されていなければ
@@ -831,11 +861,10 @@ fn path_covered_by(root: &str, path: &str) -> bool {
 /// 使う。固定は構文だけで決める（向きを知るには閉包が要り、閉包はどの辺を辿るかを知る必要があるので、
 /// 形を構文で決めて循環を断つ）。
 ///
-/// 規則(i)（固定値の書込可否）と[`Allowed::fixed`]（Daemon の起こす直前の検査）は P5.4a で印へ付け替えた
-/// （[`GraphFacts::is_strict_edge`]を通る）。**形そのものを鍵にしている箇所は[`Allowed::inherit_handles`]の式だけ
-/// 残る**——この条件を満たす辺は向きに関わらずstdinと継承ハンドルも断つ（Strict の辺で閉包の除外を健全にするため
-/// ——呼び出し元がstdinでコードを渡せるなら、その辺は権限を受け渡している）。P5.4b で Strict の印と辺ごとの出力の
-/// 設定へ付け替える（`plans/position-domains/P5.md`）。
+/// **形だけを鍵にしている箇所はもう無い**——規則(i)（固定値の書込可否）・[`Allowed::strict`]（Daemon が標準入力を
+/// 断ち、起こす直前に固定したファイルを検査する）は P5.4a・P5.4b で印へ付け替え、[`GraphFacts::is_strict_edge`]
+/// （印＋この形）を通る。Strict の辺で標準入力を断つのは、閉包の除外を健全にするためでもある——呼び出し元が
+/// stdinでコードを渡せるなら、その辺は権限を受け渡している。
 fn is_fully_fixed(edge: &TransitionEdge) -> bool {
     matches!(edge.argv, ArgvMatcher::Literal(_)) && edge.cwd.is_some()
 }

@@ -1,11 +1,12 @@
-//! [`env_for_nested`]・[`force_request_pipe`]の単体テスト（`mod nested_env_tests`）。
+//! [`env_for_nested`]・[`force_request_pipe`]・[`caller_handles_for`]の単体テスト（`mod nested_env_tests`）。
 //!
 //! 2026-10-06 に`server.rs`のインラインの試験からそのまま移した（`plans/position-domains/P5.md` P5.1）。
 //! モジュールの名前は`nested_env_tests`のまま残した——試験の絞り込みの文字列と、
 //! 後続の段（P5.4c）がこの名前で試験を足す。
 
 use super::*;
-use harness_policy::transition::{EnvOverride, EnvPolicy};
+use harness_policy::transition::{ChildOutput, EnvOverride, EnvPolicy};
+use crate::tier2a::spawnd::CallerHandles;
 use windows::Win32::Foundation::HANDLE;
 
 use crate::tier2a::spawnd::child_plan::ChildPlan;
@@ -466,5 +467,58 @@ fn a_cross_domain_child_gets_no_ext_roots_but_a_self_loop_child_gets_exactly_one
         occurrences(&self_loop, redirector_env::DIFF_LAYER),
         1,
         "{self_loop:?}"
+    );
+}
+
+/// 呼び出し元が載せてきた3本（値は区別できるように別々にする）。
+fn requested() -> CallerHandles {
+    CallerHandles {
+        stdin: Some(0x10),
+        stdout: Some(0x20),
+        stderr: Some(0x30),
+    }
+}
+
+/// [P5.4b] **普通の辺は、呼び出し元の標準入力・標準出力・標準エラーを3本とも子へ渡す**（決定66(3)(4)。
+/// 出力の既定は返す）。P5.3 までは「固定していない、かつ広げない」辺でしか渡しておらず、広げる辺の子は
+/// 何も受け取れなかった——その巻き戻りをここで止める。
+#[test]
+fn an_ordinary_edge_hands_all_three_stdio_handles_to_the_child() {
+    assert_eq!(
+        caller_handles_for(ChildOutput::Return, false, requested()),
+        requested()
+    );
+}
+
+/// [P5.4b] **Strict の辺は標準入力だけを断つ**（決定66の追記の束。固定argvのシェルは、stdinが端末でなければ
+/// そこからコマンドを読む）。出力は辺の設定に従うので、返す辺なら標準出力・標準エラーは渡す（対）
+/// ——3本まとめて断つ旧来の形（BUG-161 の`CallerHandles::default()`）へ戻すと、Strict のログ分析が結果を返せない。
+#[test]
+fn a_strict_edge_cuts_only_the_callers_stdin() {
+    assert_eq!(
+        caller_handles_for(ChildOutput::Return, true, requested()),
+        CallerHandles {
+            stdin: None,
+            stdout: Some(0x20),
+            stderr: Some(0x30),
+        }
+    );
+}
+
+/// [P5.4b] **捨てる辺は標準出力・標準エラーを渡さない**（`None`＝子は`NUL`へ書く）。標準入力は普通の辺なら渡す（対）。
+/// Strict かつ捨てる辺は3本とも渡さない（2つの指示は独立している）。
+#[test]
+fn a_discarding_edge_cuts_stdout_and_stderr_but_not_stdin() {
+    assert_eq!(
+        caller_handles_for(ChildOutput::Discard, false, requested()),
+        CallerHandles {
+            stdin: Some(0x10),
+            stdout: None,
+            stderr: None,
+        }
+    );
+    assert_eq!(
+        caller_handles_for(ChildOutput::Discard, true, requested()),
+        CallerHandles::default()
     );
 }

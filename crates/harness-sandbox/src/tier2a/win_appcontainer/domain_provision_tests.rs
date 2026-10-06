@@ -3,6 +3,7 @@
 //! **実資源を作る腕だけが`#[ignore]`である**——用意できない側の判断（宣言が許可済みでない・
 //! 通信を宣言している・定義が無い）は入れ物を1つも作らないので、通常の`cargo test`で回る。
 
+use harness_policy::transition::ChildOutput;
 use super::*;
 use harness_policy::policy_file::{PolicyDomain, PolicyFile, ENTRY_DOMAIN};
 use harness_policy::transition::{AnyMarker, ArgvMatcher, ExeMatcher, TransitionEdge};
@@ -16,6 +17,7 @@ fn policy_with_edge(to: &str, target: Option<PolicyDomain>) -> PolicyFile {
         cwd: None,
         to: to.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }];
     let mut file = PolicyFile {
         domains: vec![entry],
@@ -52,6 +54,7 @@ fn each_target_domain_is_listed_once() {
         cwd: None,
         to: "cargo".to_string(),
         env: None,
+        output: ChildOutput::Return,
     });
 
     assert_eq!(policy.transition_target_domains(), vec!["cargo".to_string()]);

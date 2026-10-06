@@ -7,6 +7,7 @@
 //!
 //! 名前の検査は偽物（[`limit_27`]）を渡す。`harness-policy`は`harness-sandbox`に依存できない（依存は逆向き）。
 
+use crate::transition::ChildOutput;
 use std::path::Path;
 
 use harness_config::FsAccess;
@@ -198,6 +199,7 @@ fn any_edge(exe: &str, to: &str) -> TransitionEdge {
         cwd: None,
         to: to.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }
 }
 
@@ -445,6 +447,7 @@ fn a_position_partly_on_a_self_loop_reports_the_self_loop() {
         cwd: None,
         to: ENTRY_DOMAIN.to_string(),
         env: None,
+        output: ChildOutput::Return,
     };
     let policy = file(vec![domain(ENTRY_DOMAIN, vec![self_loop_for_one_argv])]);
     let other_argv = ProcessInstance {
@@ -722,6 +725,7 @@ fn an_existing_edge_the_resolver_cannot_answer_is_left_unassigned() {
         cwd: Some("C:/elsewhere".to_string()),
         to: "fixed".to_string(),
         env: None,
+        output: ChildOutput::Return,
     };
     let policy = file(vec![
         domain(ENTRY_DOMAIN, vec![fixed]),

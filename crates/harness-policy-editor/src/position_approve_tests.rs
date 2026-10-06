@@ -8,6 +8,7 @@
 //! データのパスは`C:/Users/x/...`の架空の場所（`C:/Windows`・`C:/Program Files`は既定で実行できる場所として
 //! 候補から外れる。D-58）。
 
+use harness_policy::transition::ChildOutput;
 use std::cell::Cell;
 use std::path::Path;
 
@@ -313,6 +314,7 @@ fn self_loop(exe: ExeMatcher) -> TransitionEdge {
         cwd: None,
         to: ENTRY_DOMAIN.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }
 }
 
@@ -392,6 +394,7 @@ fn an_edge_that_resolves_elsewhere_after_writing_is_refused() {
         cwd: None,
         to: "tools".to_string(),
         env: None,
+        output: ChildOutput::Return,
     });
     seed(ws.path(), vec![entry, PolicyDomain::new("tools")]);
     let before = bytes(ws.path());

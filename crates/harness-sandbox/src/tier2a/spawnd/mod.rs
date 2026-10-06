@@ -56,7 +56,7 @@ pub mod client;
 /// windows専用。**Daemon側だけが使う**——harness本体はコンソールを借りない。
 #[cfg(windows)]
 pub mod console_holder;
-/// 固定辺の起動直前に、固定したファイルを呼び出し元が書き換えられないかを
+/// Strict の辺の起こす直前に、固定したファイルを呼び出し元が書き換えられないかを
 /// 呼び出し元のトークンでOSに聞く（`plans/DESIGN-MAC.md` §19.1）。
 #[cfg(windows)]
 pub(crate) mod fixed_inputs;
@@ -140,7 +140,10 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// 古いDaemonのバイナリはこの欄を読まないので、**Daemonの遷移の検査だけがその場所を
 /// 「書けない」と見る**——固定した遷移の先を呼び出し元が書き換えられても通してしまう向きで、
 /// 検査が黙って緩くなるので版の一致で止める。
-pub const PROTOCOL_VERSION: u32 = 8;
+/// **9へ上げたのは P5.4b（決定66(3)(4)）である。** `Hello`が運ぶ`policy.json`の辺に**子の出力の設定**
+/// （`"output": "discard"`）が載るようになり、Daemonが子へ渡す標準入出力の決め方も変わった。古いDaemonは
+/// 欄を捨てて**捨てたつもりの出力を返し**、普通の辺の標準入力も断ったままになる——黙って意味が変わるので止める。
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// 相手が名乗った制御プロトコルの版を判定する。合わなければ理由の文面を返す。
 ///
@@ -733,13 +736,12 @@ pub enum ControlResponse {
 ///
 /// # ただし**渡してよい辺かどうかは別の話**である（BUG-161、2026-09-20）
 ///
-/// 増えないのは**呼び出し元の**権限で、**子の**側は増える——狭いドメインへ移したはずの子へ、
-/// 呼び出し元が自分の持ち物を手渡せる。§19.1は固定辺（広げる／完全に固定した辺）について
-/// **stdinと継承ハンドル全体を断つ**ことを要求しており、判定器が辺ごとに
-/// `harness_policy::transition::Allowed::inherit_handles`で答えを出している。
+/// 増えないのは**呼び出し元の**権限で、**子の**側は増える——遷移先の子へ呼び出し元が自分の持ち物を手渡せる。
+/// 判定器が辺ごとに答える（P5.4b）: 標準入力は Strict の辺で断ち（`Allowed::strict`。固定argvのシェルは
+/// stdinからコマンドを読む）、標準出力・標準エラーは辺の出力の設定（`Allowed::output`）に従う。
 ///
-/// **この欄を読むのは`server::serve_spawn_request`ただ1箇所である。** 断つと決めた辺では、
-/// ここに何が載っていても`CallerHandles::default()`に差し替えてから`spawn_nested`へ渡す。
+/// **この欄を読むのは`server::serve_spawn_request`ただ1箇所である。** 渡さないと決めたものは、ここに何が
+/// 載っていても`nested_inputs::caller_handles_for`で`None`に差し替えてから`spawn_nested`へ渡す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CallerHandles {
     /// 子の標準入力にしたいハンドル（**呼び出し元の中の値**）。`None`なら標準入力を持たない。

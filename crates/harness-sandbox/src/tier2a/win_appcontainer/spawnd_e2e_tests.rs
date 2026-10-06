@@ -92,10 +92,14 @@ mod child_process_restricted_tests;
 /// 外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
 mod transition_acceptance_tests;
 
-/// 固定辺の起動直前の検査（`spawnd::fixed_inputs`）の受け入れ（対で3本）。**同じ理由でここに置いてある**——
+/// Strict の辺の起こす直前の検査（`spawnd::fixed_inputs`）の受け入れ（対で4本）。**同じ理由でここに置いてある**——
 /// 昇格の的`spawn-daemon`のフィルタが`win_appcontainer::spawnd_e2e_tests`なので、
 /// 外へ出すと0件マッチで黙って走らなくなる（BUG-056）。
 mod fixed_input_tests;
+
+/// [P5.4b] 辺ごとの出力の設定と Strict の印で、子へ渡る標準入出力が変わることの受け入れ（対で3本）。
+/// **同じ理由でここに置いてある**（上と同じ。フィルタに入らないと0件マッチで黙って走らない）。
+mod edge_stdio_tests;
 
 /// [段階6c] 拒否の待ち行列の受け入れ（対で4本）。**同じ理由でここに置いてある**——
 /// 昇格の的`spawn-daemon`のフィルタが`win_appcontainer::spawnd_e2e_tests`なので、

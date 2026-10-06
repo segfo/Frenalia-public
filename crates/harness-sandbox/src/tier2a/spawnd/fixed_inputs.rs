@@ -402,7 +402,7 @@ pub(crate) fn rewritable(fixed_path: &Path, token: &CallerToken) -> Result<Optio
     Ok(None)
 }
 
-/// 固定辺を起こしてよいか。**断るべきなら、その理由**（Daemonの標準エラー用）を返す。
+/// Strict の辺を起こしてよいか。**断るべきなら、その理由**（Daemonの標準エラー用）を返す。
 ///
 /// 見るのは**実際に`CreateProcessW`へ渡す値**——要求された実行ファイルと、呼び出し元の
 /// コマンドライン——から`harness_policy::transition::fixed_file_paths`が取り出したファイルである。

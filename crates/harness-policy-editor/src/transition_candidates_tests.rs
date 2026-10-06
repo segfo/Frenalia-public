@@ -6,7 +6,7 @@
 use super::*;
 
 use harness_policy::policy_file::{PolicyDomain, ENTRY_DOMAIN};
-use harness_policy::transition::AnyMarker;
+use harness_policy::transition::{AnyMarker, ChildOutput};
 use harness_sandbox::tier2a::spawnd::transitions::Denial;
 use harness_sandbox::tier2a::spawnd::DenyReason;
 
@@ -19,6 +19,7 @@ fn edge(exe: ExeMatcher, argv: ArgvMatcher, to: &str) -> TransitionEdge {
         cwd: None,
         to: to.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }
 }
 

@@ -37,7 +37,42 @@ fn control_request_hello_keeps_its_wire_shape() {
     // （P5.3、Strict の印）に 2 → 3。Daemon はこの値を見ずにグラフを組むので、欄の形は変わっていない。
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":8,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"]}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":9,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"]}"#
+    );
+}
+
+/// [P5.4b] **`Hello`が運ぶ`policy.json`に、辺の出力の設定が載る**（`"output":"discard"`）。
+///
+/// これが[`PROTOCOL_VERSION`]を9へ上げた理由の現物である——欄を知らない古いDaemonは捨てて読み、
+/// 捨てたつもりの子の出力を呼び出し元へ返す。往復して設定が残ることまで見る。
+#[test]
+fn a_hello_carries_the_output_setting_of_an_edge() {
+    let mut policy = harness_policy::policy_file::PolicyFile::default();
+    let mut shell = harness_policy::policy_file::PolicyDomain::new("shell");
+    shell.process = serde_json::from_str(
+        r#"{"transitions":[{"exe":{"literal":"C:/x/git.exe"},"argv":{"any":true},"to":"shell","output":"discard"}]}"#,
+    )
+    .expect("the edge parses");
+    policy.domains.push(shell);
+    let json = serde_json::to_string(&ControlRequest::Hello {
+        harness_process: 4660,
+        protocol_version: PROTOCOL_VERSION,
+        policy: Box::new(policy),
+        workspace_root: "C:/w".to_string(),
+        domains: Vec::new(),
+        writable_outside_policy: Vec::new(),
+    })
+    .expect("serialize");
+    assert!(json.contains(r#""output":"discard""#), "{json}");
+
+    let ControlRequest::Hello { policy, .. } =
+        serde_json::from_str::<ControlRequest>(&json).expect("the hello parses back")
+    else {
+        panic!("not a hello: {json}");
+    };
+    assert_eq!(
+        policy.domains[0].process.transitions[0].output,
+        harness_policy::transition::ChildOutput::Discard
     );
 }
 
@@ -138,7 +173,7 @@ fn control_responses_keep_their_wire_shape() {
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":8}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":9}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {

@@ -3,6 +3,7 @@
 //! **端末もWin32も要らない**（`cargo test -p harness-policy-editor`に入る）。
 //! 実際に`policy.json`をtempdirへ書いて読み直すので、**書いたものが読めること**まで測る。
 
+use harness_policy::transition::ChildOutput;
 use super::*;
 
 use harness_policy::policy_file::ENTRY_DOMAIN;
@@ -111,6 +112,7 @@ fn an_existing_self_loop_can_still_be_removed() {
         cwd: None,
         to: ENTRY_DOMAIN.to_string(),
         env: None,
+        output: ChildOutput::Return,
     });
     file.domains.push(entry);
     policy_file::save(tmp.path(), &file).expect("手で書いた自己ループ辺が保存できない");
@@ -325,6 +327,7 @@ fn an_edge_this_editor_writes_survives_the_writable_places_harness_adds() {
         cwd: Some(ws),
         to: "sealed".to_string(),
         env: None,
+        output: ChildOutput::Return,
     });
     policy_file::save(tmp.path(), &file).expect("エディタの検査（書ける場所を知らない）は通る");
     assert!(
@@ -355,6 +358,7 @@ fn approving_a_file_declaration_into_the_destination_cannot_break_the_transition
         cwd: None,
         to: "iso".to_string(),
         env: None,
+        output: ChildOutput::Return,
     });
     file.domains.push(entry);
     file.domains.push(PolicyDomain::new("iso"));

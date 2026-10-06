@@ -303,6 +303,7 @@ fn reassign_lines_list_the_transitions_a_reassignment_widens() {
                     fs: vec![(SSH.to_string(), "read")],
                     net: Vec::new(),
                 },
+                output: harness_policy::transition::ChildOutput::Return,
             }],
             uncounted: None,
         },

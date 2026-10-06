@@ -750,3 +750,57 @@ fn a_strict_domain_under_schema_version_2_is_refused_by_this_reader() {
     write_policy(ws.path(), &text(3));
     assert!(load(ws.path()).expect("version 3 loads").domains[0].strict);
 }
+
+// ---------------------------------------------------------------------------
+// 辺ごとの出力の設定（決定66(4)。`plans/position-domains/P5.md` の P5.4b）
+// ---------------------------------------------------------------------------
+
+/// 子の出力を捨てる辺を1本だけ持つ`policy.json`（自己ループ）。
+fn policy_with_discarding_edge(version: u32) -> String {
+    format!(
+        r#"{{"schema_version":{version},"domains":[{{"name":"shell","process":{{"transitions":[{{"exe":{{"literal":"C:\\x\\git.exe"}},"argv":{{"any":true}},"to":"shell","output":"discard"}}]}}}}]}}"#
+    )
+}
+
+/// 捨てる辺が1本でもあれば版3（Strict の印と同じ版。決定66の追記）。返す辺だけなら2のまま（対）。
+///
+/// 捨てる設定を知らない古いバイナリは欄を黙って捨てるので、**捨てたつもりの子の出力が呼び出し元へ返る**。
+#[test]
+fn a_discarding_edge_requires_schema_version_3_while_returning_edges_stay_at_2() {
+    let mut file = PolicyFile::default();
+    let mut shell = PolicyDomain::new("shell");
+    shell.process = serde_json::from_str(
+        r#"{"transitions":[{"exe":{"literal":"C:\\x\\git.exe"},"argv":{"any":true},"to":"shell"}]}"#,
+    )
+    .unwrap();
+    file.domains.push(shell);
+    assert_eq!(file.required_schema_version(), 2, "returning edges keep version 2");
+
+    file.domains[0].process.transitions[0].output = crate::transition::ChildOutput::Discard;
+    assert_eq!(file.required_schema_version(), 3);
+}
+
+/// 読む側の対（`B-01`）: 手で捨てる辺を書いて版を2のままにしたファイルは、このバイナリが断る。版3は読め、
+/// 保存すると版3を名乗り、版2までしか知らない読み手（[`check_schema_version`]を`supported = 2`で通す）は断る。
+#[test]
+fn a_discarding_edge_needs_version_3_on_both_the_writing_and_the_reading_side() {
+    let ws = workspace();
+    write_policy(ws.path(), &policy_with_discarding_edge(SUPPORTED_BEFORE_THE_STRICT_MARK));
+    let err = load(ws.path()).expect_err("version 2 cannot carry the output setting");
+    assert!(
+        matches!(err, PolicyFileError::UnversionedTransitions { found: 2, required: 3, .. }),
+        "unexpected error: {err}"
+    );
+    assert!(err.to_string().contains("output"), "the message must name the setting: {err}");
+
+    write_policy(ws.path(), &policy_with_discarding_edge(3));
+    let file = load(ws.path()).expect("version 3 loads");
+    save(ws.path(), &file).expect("save");
+    let written: PolicyFile =
+        serde_json::from_str(&std::fs::read_to_string(path(ws.path())).unwrap()).unwrap();
+    assert_eq!(written.schema_version, 3);
+    assert!(matches!(
+        check_schema_version(&written, path(ws.path()), SUPPORTED_BEFORE_THE_STRICT_MARK),
+        Err(PolicyFileError::FutureSchema { found: 3, supported: 2, .. })
+    ));
+}

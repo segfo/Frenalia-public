@@ -3,6 +3,7 @@
 //! `policy.json`を一時ディレクトリへ書き、`App`へ製品と同じ入口（`App::on_key`）からキーを入れる。
 //! 描いた見た目は`TestBackend`で1フレーム描いて、画面のセルから読む（レイアウトの関数を期待値に使わない）。
 
+use harness_policy::transition::ChildOutput;
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -38,6 +39,7 @@ fn edge(exe: &str, to: &str) -> TransitionEdge {
         cwd: None,
         to: to.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }
 }
 

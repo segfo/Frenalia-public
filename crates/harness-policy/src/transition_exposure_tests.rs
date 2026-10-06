@@ -7,6 +7,7 @@
 //! **数える側と数えない側を対で測る**（`bug-pattern-rules` B-35）——「新しく使える権限がある」だけを
 //! 測ると、何でも広げると答える実装でも緑になる。
 
+use crate::transition::ChildOutput;
 use super::*;
 
 use crate::policy_file::{PolicyDomain, PolicyFile, ENTRY_DOMAIN};
@@ -55,6 +56,7 @@ impl Decl {
             cwd: Some("C:/t".to_string()),
             to: to.to_string(),
             env: None,
+            output: ChildOutput::Return,
         });
         self
     }
@@ -67,6 +69,7 @@ impl Decl {
             cwd: None,
             to: to.to_string(),
             env: None,
+            output: ChildOutput::Return,
         });
         self
     }

@@ -80,7 +80,7 @@ use crate::win_pipe_ipc::{
 
 use super::child_plan::ChildPlan;
 use super::console_holder::ConsoleHolders;
-use super::nested_inputs::{env_for_nested, force_request_pipe};
+use super::nested_inputs::{caller_handles_for, env_for_nested, force_request_pipe};
 use super::table::ProcessTable;
 use super::transitions::TransitionQueue;
 use super::{
@@ -781,11 +781,11 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
         to,
         cwd: declared_cwd,
         env: env_policy,
-        inherit_handles,
-        // 向きは判定器の中で使い終わっている（`inherit_handles`の計算に入っている）。
+        output,
+        // 向きは判定器の中で使い終わっている（規則(g)と表示に使う。標準入出力は向きで決めない、P5.4b）。
         // ここで再判定しない——同じ規則を2箇所に置くと、片方だけ直る。
         direction: _,
-        fixed,
+        strict,
     } = allowed;
 
     // [#55] **遷移先ドメインの実体を表から引く。**
@@ -824,24 +824,16 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
     // [段階6f-1] 呼び出し元の申告を使うが、**harnessが所有する名前だけは系統の値で強制する**。
     let env = env_for_nested(&caller.base_env, request.env.as_deref(), env_policy);
 
-    // [BUG-161] **固定辺では、呼び出し元由来のハンドルを1本も渡さない**（§19.1）。
+    // [P5.4b] **呼び出し元の標準入出力は、判定器の2つの指示で絞ってから渡す**（[`caller_handles_for`]の表）。
     //
-    // 判定器が`false`を返すのは「辺が完全に固定されている」か「広げる／証明できない辺」で、
-    // どちらも**呼び出し元が子へ入力を渡せてはいけない**辺である。
-    // `CallerHandles::default()`を渡すと`pull_caller_stdio`は`(None, NUL, NUL)`を返す
-    // ——Daemonが自分で開いた物しか子へ行かない、という§19.1の要求そのものになる。
+    // 標準入力は Strict の辺でだけ断つ——固定argvのシェルは、stdinが端末でなければ**そこからコマンドを読んで
+    // 実行する**ので、引数を固定しても呼び出し元がスクリプトを流し込めばその辺の権限で任意コードが走る（BUG-161）。
+    // 普通の辺では渡す（決定66(3)。守る線は子のドメインの権限）。標準出力・標準エラーは辺の出力の設定に従う
+    // （決定66(4)。捨てる辺では`None`＝`pull_caller_stdio`が`NUL`を開く）。
     //
-    // **stdinを断つのが要点である。** 固定argvのシェルは、stdinが端末でなければ
-    // **そこからコマンドを読んで実行する**——引数を固定しても、呼び出し元が
-    // ワークスペースに置いたスクリプトをstdinで流し込めば広いドメインで任意コードが走る。
-    //
-    // **代償**: 固定辺では子の出力が呼び出し元へ返らない。§19.1がそう書いており、
-    // 逃げ道も書いてある（`argv: any`の辺にする）。
-    let handles = if inherit_handles {
-        request.handles
-    } else {
-        super::CallerHandles::default()
-    };
+    // BUG-161〜P5.4a は`inherit_handles`が偽の辺で3本まとめて`CallerHandles::default()`へ差し替えていた。
+    // **その代償だった「固定辺では子の出力が返らない」は、Strict の辺でも出力の設定に従う形で解けた。**
+    let handles = caller_handles_for(output, strict, request.handles);
 
     // **Strict の辺なら、固定したファイルを呼び出し元が書き換えられないかをOSに聞く**（P5.4a で鍵を印へ。
     // 決定66の追記・`plans/DESIGN-MAC.md` §19.1）。読み込み時の検査は綴りで比べるので、8.3形式の短い名前・
@@ -853,7 +845,7 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
     //
     // **理由はサンドボックスへ返さない**（パスと権利の名前を含むので、`SpawnFailed`と同じ扱い）。
     // Daemonの標準エラーにだけ出す（B-10）。
-    if fixed {
+    if strict {
         if let Some(reason) = super::fixed_inputs::refusal(
             HANDLE(caller.process as *mut _),
             caller.pid,
@@ -1426,7 +1418,7 @@ fn spawn_top_level(
 /// **残っているのはフック側**（`CreateProcessW`を横取りしてここへ頼む）で、それが6f-2である。
 // **引数は多いが、まとめない。** 出どころが全部違う（上の表）ので、1つの構造体へ畳むと
 // 「誰が決めた値か」が呼び出し側からも見えなくなる。とくに`handles`は
-// **判定の結果を当てたあとの値**で、`request.handles`と取り違えると固定辺の約束が消える。
+// **判定の結果を当てたあとの値**で、`request.handles`と取り違えると辺ごとの約束が消える。
 #[allow(clippy::too_many_arguments)]
 fn spawn_nested(
     shared: &Arc<Shared>,
@@ -1437,7 +1429,7 @@ fn spawn_nested(
     target_domain: &DomainSpec,
     request: &NestedRequest<'_>,
     // [BUG-161] **この子へ実際に渡すハンドル。** `request.handles`ではない
-    // ——固定辺では呼び出し元由来を1本も渡さないので、判定の結果を当てたあとの値が来る
+    // ——Strict の辺は標準入力を、捨てる辺は標準出力と標準エラーを渡さないので、絞ったあとの値が来る
     // （`serve_spawn_request`）。**`request.handles`を直接読まないこと**：読むと、
     // 「渡してよいか」の判断がここで消える。
     handles: &super::CallerHandles,
