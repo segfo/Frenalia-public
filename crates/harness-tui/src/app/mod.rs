@@ -598,6 +598,16 @@ impl AppState {
         }
     }
 
+    /// 起動時に再開した会話（`--resume`・`--continue`・起動時のピッカー）を画面へ積み（[`Self::restore_transcript`]）、
+    /// 入力欄の履歴をその会話の人が書いた文から作る（`app::input_history`）。
+    ///
+    /// **起動時の1か所からだけ呼ぶ。** `/sessions`・`/fork`での切り替えは[`Self::restore_transcript`]だけを呼ぶ——
+    /// `/fork`は同じ会話の続きなので、ここを通すと同じ文が履歴に2回並ぶ。
+    pub(crate) fn restore_resumed_conversation(&mut self, messages: &[harness_core::Message]) {
+        self.restore_transcript(messages);
+        self.seed_input_history(messages);
+    }
+
     /// 画面のトランスクリプトを空にする（[BUG-072](../../../docs/bugs/BUG-072.md)）。
     ///
     /// **会話そのものが別物に入れ替わる経路からだけ呼ぶ**——`/sessions`での別セッションへの

@@ -2,9 +2,10 @@
 //! [`AppState::on_key`]へ入れて確かめる。
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use harness_core::AgentEvent;
+use harness_core::human_turns::FOLD_SUMMARY_PREFIX;
+use harness_core::{AgentEvent, ContentBlock, Message, Role};
 
-use super::super::{Action, MODAL_INPUT_GRACE};
+use super::super::{Action, TranscriptItem, MODAL_INPUT_GRACE};
 use super::*;
 
 fn app() -> AppState {
@@ -333,4 +334,73 @@ fn a_history_step_clears_the_selection_anchor() {
     press(&mut app, KeyCode::Down);
     assert_eq!(app.input, "ab");
     assert_eq!(app.input_selection_anchor, None);
+}
+
+// ---- 再開時に作る（D2） ----
+
+fn text(role: Role, text: &str) -> Message {
+    Message {
+        role,
+        content: vec![ContentBlock::Text(text.to_string())],
+    }
+}
+
+/// 再開した会話の人が書いた文だけから作る——ツールの結果を運ぶ文と、会話の古い側を置き換えた要約の文は入らない。
+/// 積み方の規則（空白・直前と同じ）も送った文と同じ。画面へ会話を積むのも今までどおり。
+#[test]
+fn resuming_seeds_the_history_from_human_written_messages_only() {
+    let messages = vec![
+        text(
+            Role::User,
+            &format!("{FOLD_SUMMARY_PREFIX}3 earlier messages]\nsummary"),
+        ),
+        text(Role::User, "first"),
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text("answer".into()),
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "run_shell".into(),
+                    input: serde_json::json!({"command": "ls"}),
+                },
+            ],
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: "tool output".into(),
+                is_error: false,
+            }],
+        },
+        text(Role::User, "second"),
+        text(Role::User, "second"),
+        text(Role::User, "  "),
+    ];
+    let mut app = app();
+    app.restore_resumed_conversation(&messages);
+
+    assert_eq!(app.input_history.entries(), ["first", "second"]);
+    assert!(app
+        .transcript
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::User(t) if t == "first")));
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input, "second", "↑で最も新しい文から出る");
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input, "first");
+    press(&mut app, KeyCode::Up);
+    assert_eq!(app.input, "first", "要約もツールの結果も呼び戻さない");
+}
+
+/// 再開時に積む数も上限までで、古い側から捨てる。
+#[test]
+fn seeding_keeps_at_most_max_entries() {
+    let texts: Vec<String> = (0..MAX_ENTRIES + 5).map(|i| i.to_string()).collect();
+    let mut history = InputHistory::default();
+    history.seed(texts.iter().map(String::as_str));
+    let entries = history.entries();
+    assert_eq!(entries.len(), MAX_ENTRIES);
+    assert_eq!(entries[0], "5");
 }

@@ -718,8 +718,8 @@ pub async fn run(
         app.note_resumed_session(resumed_messages);
     }
     // BUG-069: 件数の通知だけでは「何を再開したのか」が分からない。通知行の**後ろ**へ
-    // 実際のやりとりを積む（通知行が復元分の見出しになる）。
-    app.restore_transcript(&restored_messages);
+    // 実際のやりとりを積む（通知行が復元分の見出しになる）。入力欄の↑の履歴も、ここで人が書いた文から作る。
+    app.restore_resumed_conversation(&restored_messages);
 
     // `Recall`: セッション開始時に未レビュー件数を1行通知する（TUIのみ、headlessは
     // 無人実行に通知の受け手がいないため通知しない、`plans/PLAN-RECALL-MEMORY.md`）。

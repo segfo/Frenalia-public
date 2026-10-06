@@ -20,6 +20,10 @@
 //! 送った文をそのまま積む（`/`で始まる命令も——打ち間違いを直して送り直せるように）。**空白だけの文と、直前に
 //! 積んだ文と同じ文は積まない**（離れた位置の同じ文は積む）。最大[`MAX_ENTRIES`]件で、超えたら古い側から捨てる。
 //!
+//! 会話を再開して起動したとき（`--resume`・`--continue`・起動時のピッカー）は、復元した会話の**人が書いた文**から
+//! 作る（[`AppState::seed_input_history`]）。見分けは`harness_core::human_turns`（D-127 と同じ判定）で、ツールの
+//! 結果を運ぶ文と、会話の古い側を置き換えた要約の文は入らない。積み方の規則（空白・直前と同じ・上限）は送った文と同じ。
+//!
 //! # 書きかけを失わない
 //!
 //! 初めて↑で呼び戻すとき、それまでの書きかけ・カーソル・undo/redo を退避し（[`InputDraft`]）、↓で最も新しい文を
@@ -35,6 +39,8 @@
 //! # 限界
 //!
 //! - 履歴はこのプロセスの中だけで持ち、ファイルへ書かない。
+//! - 再開で戻せるのは会話に残った文だけ——`/`の命令（会話へ入らない）と、要約へ畳まれて消えた文は戻らない。
+//!   起動した後の`/sessions`・`/fork`での切り替えでは作り直さない（その時点までに送った文がそのまま残る）。
 //! - 呼び戻した文の上の`Ctrl+Z`は何もしない（呼び戻した文は編集の履歴を持たない）。
 
 use std::collections::VecDeque;
@@ -93,6 +99,13 @@ impl InputHistory {
             self.entries.pop_front();
         }
         self.entries.push_back(text.to_string());
+    }
+
+    /// 古い順の文を、送った文と同じ規則で積む（再開時。↑で最も新しい文から出る）。
+    pub(super) fn seed<'a>(&mut self, texts: impl IntoIterator<Item = &'a str>) {
+        for text in texts {
+            self.record(text);
+        }
     }
 
     /// 1つ古い文。無ければ`None`（何も変えない）。履歴を見ていなかったときは、`save`が返す書きかけを退避して
@@ -188,6 +201,16 @@ impl AppState {
         self.input_undo_stack.clear();
         self.input_redo_stack.clear();
         self.input_last_edit_was_insert = false;
+    }
+
+    /// 再開した会話の人が書いた文（`harness_core::human_turns`。ツールの結果を運ぶ文と要約の文を除く）から
+    /// 履歴を作る。古い順に積むので、↑で最も新しい文から出る。
+    pub(super) fn seed_input_history(&mut self, messages: &[harness_core::Message]) {
+        self.input_history.seed(
+            harness_core::human_turns::human_turns(messages)
+                .into_iter()
+                .map(|turn| turn.text),
+        );
     }
 }
 
