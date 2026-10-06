@@ -61,17 +61,19 @@ fn a_mismatch_between_lines_and_joins_stops_a_debug_build() {
     render_in(&mut probe, 80);
 }
 
-/// Facadeは選んだ実装へ足す・終える・空に戻すをそのまま渡す（いまの実装は原文をそのまま描く）。
+/// Facadeは選んだ実装へ足す・終える・空に戻すをそのまま渡す——選んだ実装（[`Engine`]）へ同じことをして、狭めた幅で
+/// 描いたのと同じになる。T9で選ぶ実装がビルドで変わるようになったので、見た目を書かずに選んだ実装と比べる形へ
+/// 意図して書き換えた（どちらの実装を選んだビルドでも同じ試験が通る）。
 #[test]
 fn the_view_draws_what_was_pushed_with_the_chosen_engine() {
     let mut view = MarkdownView::new();
     view.push("**a**\n");
     view.push("b");
     view.finish();
-    assert_eq!(
-        view.render(80).lines,
-        vec![Line::from("**a**"), Line::from("b")]
-    );
+    let mut engine = Engine::default();
+    engine.push("**a**\nb");
+    engine.finish();
+    assert_eq!(view.render(80), engine.render(79));
     view.reset();
     assert_eq!(view.render(80).lines, vec![Line::from("")]);
 }
@@ -117,4 +119,21 @@ fn a_link_span_fits_only_inside_the_characters_of_its_line() {
     );
     assert!(!link_fits(&lines, &link(2, 0, 1)), "行の外");
     assert!(!link_fits(&lines, &link(0, 1, 1)), "空の区間");
+}
+
+/// **実装が1行も描かない返答は、空の1行として使用側へ渡す**（どの実装でも同じ。返答の場所を画面に残すため）。
+/// 印は`Break`。1行でも描けば、そのまま渡す。
+#[test]
+fn an_engine_that_draws_nothing_is_shown_as_one_empty_line() {
+    let mut nothing = WidthProbe::default();
+    let rendered = render_in(&mut nothing, 80);
+    assert_eq!(rendered.lines, vec![Line::from("")]);
+    assert_eq!(rendered.joins, vec![LineJoin::Break]);
+
+    let mut one = WidthProbe {
+        lines: 1,
+        joins: 1,
+        ..WidthProbe::default()
+    };
+    assert_eq!(render_in(&mut one, 80).lines, vec![Line::from("xyz")]);
 }

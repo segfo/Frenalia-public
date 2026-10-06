@@ -11,13 +11,13 @@
 //! |---|---|
 //! | [`StreamingMarkdown`] | Port。表示に要る能力だけ |
 //! | [`MarkdownView`] | Facade。**どの実装を使うかと、描く幅をどう決めるかを、ここ1か所で決める** |
-//! | [`plain::PlainText`] | 原文を1行ずつそのまま描く実装（整形しない。付け替える前のtranscriptと同じ見た目） |
-//! | `codewandler`（feature `markdown-codewandler`。既定で有効） | codewandlerで整形して描く実装（Adapter`codewandler::CodewandlerMarkdown`と写した描画部品）の置き場。**製品はまだ使わない**（切り替えは計画書のT9） |
+//! | [`plain::PlainText`] | 原文を1行ずつそのまま描く実装（整形しない。付け替える前のtranscriptと同じ見た目）。feature `markdown-codewandler`を切ったビルドの実装で、整形する実装が落ちた（panicした）ときの受け皿でもある |
+//! | `codewandler`（feature `markdown-codewandler`。既定で有効） | codewandlerで整形して描く実装（Adapter`codewandler::CodewandlerMarkdown`と写した描画部品）の置き場。**既定のビルドはこれで描く**（計画書のT9で切り替えた） |
 //!
 //! # 限界
 //!
-//! - いまの実装は`PlainText`だけで、**まだ整形しない**（画面は付け替える前と1文字も変わらない）。
-//!   codewandlerで整形する実装は`codewandler/`にあり（計画書のT8）、[`Engine`]を`cfg`で選ぶ形でそちらへ切り替える（T9）。
+//! - どの実装で描くかはビルドで決まる（[`Engine`]を`cfg`で選ぶ。`cfg`を書くのは、このファイルの実装の選択・
+//!   Adapterのモジュールの宣言・試験を選ぶ口`formatting_only`と`plain_only`（試験のビルドだけ）だけ）。実行中には切り替えない。
 //! - codewandlerの名前は`codewandler/`と、実装を選ぶこのファイルの外には書かない。ソースを読んで数える試験
 //!   （`leak_tests`）が止める。
 //! - 対象はassistantの返答だけ。thinking・ツール出力・ユーザー入力は今までどおり`crate::ui`がそのまま描く。
@@ -39,6 +39,35 @@ mod leak_tests;
 #[cfg(test)]
 #[path = "view_tests.rs"]
 mod view_tests;
+
+/// 試験の項目（`#[test]`の関数・試験のモジュール）を、**整形する実装を選んだビルドでだけ**置く。画面の試験のうち、
+/// 整形した見た目（太字・見出し・継続インデント等）を確かめるものに使う。
+///
+/// 実装を選ぶのはこのファイルだけなので、試験が実装の名前（featureの名前）を書かずに済むよう、ここで選ぶ
+/// （`leak_tests`——実装を差し替えるときに、使用側の試験まで直さずに済む）。整形しない実装を選んだビルドで
+/// 同じ場面を確かめる試験は[`plain_only`]に入れる。
+#[cfg(all(test, feature = "markdown-codewandler"))]
+macro_rules! formatting_only {
+    ($($item:item)*) => { $($item)* };
+}
+#[cfg(all(test, not(feature = "markdown-codewandler")))]
+macro_rules! formatting_only {
+    ($($item:item)*) => {};
+}
+#[cfg(test)]
+pub(crate) use formatting_only;
+
+/// [`formatting_only`]の逆。**整形しない実装を選んだビルドでだけ**置く（原文のまま描く見た目を確かめる試験）。
+#[cfg(all(test, feature = "markdown-codewandler"))]
+macro_rules! plain_only {
+    ($($item:item)*) => {};
+}
+#[cfg(all(test, not(feature = "markdown-codewandler")))]
+macro_rules! plain_only {
+    ($($item:item)*) => { $($item)* };
+}
+#[cfg(test)]
+pub(crate) use plain_only;
 
 /// Port: 流れ込む返答を描くのに要る能力だけ（モジュールdoc）。
 ///
@@ -93,13 +122,21 @@ pub(crate) struct LinkSpan {
     pub url: String,
 }
 
-/// どの実装で描くか。**ここ1か所で決める**（モジュールdoc）。
+/// どの実装で描くか。**ここ1か所で決める**（モジュールdoc）。feature `markdown-codewandler`（既定で有効）なら整形する
+/// 実装、切ったビルドでは原文をそのまま描く実装。
+#[cfg(feature = "markdown-codewandler")]
+type Engine = codewandler::CodewandlerMarkdown;
+#[cfg(not(feature = "markdown-codewandler"))]
 type Engine = plain::PlainText;
 
 /// Facade: 使用側から見える唯一の入口（モジュールdoc）。
 #[derive(Debug, Default)]
 pub(crate) struct MarkdownView {
-    engine: Engine,
+    /// 選んだ実装。**`Box`に入れてあるのは、整形する実装が結果の置き場をいくつも持って大きく（約500バイト）、
+    /// transcriptの項目（`crate::app::TranscriptItem`）のうちassistantの返答だけが桁違いに大きくなるため**
+    /// （`clippy::large_enum_variant`。項目の列は、どの種類の項目も一番大きい種類の大きさを取る）。項目の側で包むと
+    /// 使用側の全部の箇所が変わるので、ここで包む。
+    engine: Box<Engine>,
 }
 
 impl MarkdownView {
@@ -130,7 +167,7 @@ impl MarkdownView {
 
     /// transcriptの枠の**内側の幅**`inner_width`で描く（実装へ渡す幅は[`render_in`]が決める）。
     pub(crate) fn render(&mut self, inner_width: u16) -> Rendered {
-        render_in(&mut self.engine, inner_width)
+        render_in(self.engine.as_mut(), inner_width)
     }
 }
 
@@ -147,6 +184,10 @@ impl MarkdownView {
 ///   `Break`とみなすのと同じ扱い）
 /// - `links`の区間: 行の文字の中に収まらない区間（[`link_fits`]）を捨てる（使う側が位置から引いたときに、別の文字を
 ///   リンクと取り違えないように）
+///
+/// **実装が1行も描かなかったら、空の1行にして渡す**（印は`Break`）。空の返答や、Markdownとしては何も描かない返答
+/// （参照リンクの定義だけ等）でも、返答の場所を画面に残すため——0行にすると、そこに返答があったことが画面から消える。
+/// 付け替える前のtranscriptが空の返答を空の1行で描いていたのに倣い、どの実装でも同じになるようにここで決める。
 fn render_in(engine: &mut impl StreamingMarkdown, inner_width: u16) -> Rendered {
     let mut rendered = engine.render(harness_term::wrap::text_width(inner_width));
     debug_assert_eq!(
@@ -155,6 +196,10 @@ fn render_in(engine: &mut impl StreamingMarkdown, inner_width: u16) -> Rendered 
         "Markdownの実装が、行と印の数が違う結果を返した"
     );
     rendered.joins.resize(rendered.lines.len(), LineJoin::Break);
+    if rendered.lines.is_empty() {
+        rendered.lines.push(Line::from(""));
+        rendered.joins.push(LineJoin::Break);
+    }
     let returned = rendered.links.len();
     let lines = &rendered.lines;
     rendered.links.retain(|link| link_fits(lines, link));

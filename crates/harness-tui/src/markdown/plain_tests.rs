@@ -26,11 +26,12 @@ fn each_source_line_becomes_one_unstyled_line_and_every_join_is_a_break() {
     assert_eq!(r.joins, vec![LineJoin::Break; 4]);
 }
 
-/// 空の文章は空の1行（0行にしない）。
+/// 空の文章は0行（空の1行にするのはFacade。どの実装でも同じ規則にするため、T9でこの実装からFacadeへ移した——
+/// 画面での見え方は`super::super::view_tests::an_engine_that_draws_nothing_is_shown_as_one_empty_line`が確かめる）。
 #[test]
-fn an_empty_text_is_one_empty_line() {
-    assert_eq!(rendered("", 80).lines, vec![Line::from("")]);
-    assert_eq!(PlainText::default().render(80).lines, vec![Line::from("")]);
+fn an_empty_text_draws_no_lines() {
+    assert!(rendered("", 80).lines.is_empty());
+    assert!(PlainText::default().render(80).lines.is_empty());
 }
 
 /// 行の割り方は`str::lines`と同じ——末尾の改行は空の行を足さず、`\r\n`も区切る。改行だけの文章は空の1行。

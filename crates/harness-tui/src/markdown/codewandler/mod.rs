@@ -88,7 +88,6 @@
 //!
 //! # 限界
 //!
-//! - **製品はまだこの実装を使わない**。Facade（`super::MarkdownView`）が切り替わるのは計画書のT9。
 //! - **参照リンクの定義と使う所が、間に別の塊を挟んで離れていると、流入中は定義が見えない**——リンクにならず
 //!   `[文字][label]`のまま描き、`finish`で全文を解析し直すとリンクになる（計画書§1.7。隣の塊なら、境界を確かめる
 //!   解析が退けるので、流入中からリンクになる）。
@@ -99,8 +98,8 @@
 //! - 解析器は、表の区切り行として読む行のセルが`:`だけだと落ちる（表を流している途中の`|:`で起きる）。落ちる形の行は
 //!   渡す前に`\:`へ書き換える（`guard`。描く文字は`:`のまま）。ほかの入力で落ちたら、その返答は原文のまま描く
 //!   （上の「落ちたとき」）。
-//! - 空の文章・空行だけの文章は0行で描く（描画部品が何も描かない）。整形しない実装は空の1行を返す
-//!   （`super::plain`）——transcriptでの見え方の違いはT9で扱う。
+//! - 空の文章・空行だけの文章は0行で描く（描画部品が何も描かない）。画面では、Facade（`super::MarkdownView`）が
+//!   空の1行にする（どの実装でも同じ規則）。
 //! - 写した描画部品は、**元の出力が幅に左右されず、T7bで直した構造を含まない入力では、今も元と1文字も違わない**
 //!   （`equivalence_tests`）。行の分け方（`wrap_tests`）・構造（`characterization_tests`・`structure_tests`）・
 //!   リンクの区間（`link_tests`）はそれぞれの試験が固定する。
@@ -150,12 +149,8 @@ mod structure_tests;
 #[path = "wrap_tests.rs"]
 mod wrap_tests;
 
-/// codewandlerで整形して描くAdapter（モジュールdoc）。
-///
-/// **製品からの呼び出しはまだ無い**——Facade（`super::MarkdownView`）がこの実装へ切り替わるのは計画書のT9で、
-/// それまでは試験だけが使う。試験でないビルドの「使われていない」の警告を止める（`super::MarkdownView::reset`と
-/// 同じ扱い）。T9でFacadeから使ったら外す。
-#[cfg_attr(not(test), allow(dead_code))]
+/// codewandlerで整形して描くAdapter（モジュールdoc）。feature `markdown-codewandler`のビルドでは、Facade
+/// （`super::MarkdownView`）がこれで描く。
 #[derive(Debug, Default)]
 pub(crate) struct CodewandlerMarkdown {
     /// 足された文章の全部（原文の写し。モジュールdocの「原文の持ち方」）。

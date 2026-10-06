@@ -218,8 +218,11 @@ fn text_streaming_in_does_not_change_what_was_selected() {
         estimated_input_tokens: 0,
     });
     for i in 0..15 {
+        // 1行ずつリストの項目にする（T9で整形する実装に替えたので、改行1つで続く行は1つの段落に入り、表示が動くほど
+        // 行が増えなくなった。項目ならどちらの実装でも1行ずつ増える。試験の意味——流れ込みで表示が動いても、選んだ
+        // 文章は変わらない——を保つために書き換えた）。
         app.apply(AgentEvent::TextDelta {
-            text: format!("streamed {i}\n"),
+            text: format!("- streamed {i}\n"),
         });
         draw(&mut app);
     }
@@ -527,64 +530,72 @@ const MARKDOWN_LOOKING: &str = "# 見出し\n\
 ```rust\n    let x = 1;\n```\n\
 これは画面の幅を超える長い日本語の行です。これは画面の幅を超える長い日本語の行です。これは画面の幅を超える長い日本語の行です。これは画面の幅を超える長い日本語の行です。";
 
-/// **[今の見え方の固定] Markdownに見える記号を含むassistantの返答は、記号のまま1行ずつ、色も飾りも付けずに描かれ、
-/// 選んで写すと原文がそのまま書かれる**（行の間は`CRLF`、空行も字下げも残り、折り返した長い行は1行に戻る）。
-///
-/// T5で返答の描き方を`crate::markdown`のPort越しにした。中身は今までと同じ描き方の`PlainText`なので、画面とコピーが
-/// 1文字も変わらないことをこれで固定する（`plans/PLAN-TUI-IMPROVEMENTS.md`§0のT5）。Markdownとして整形する実装へ
-/// 差し替える段（T9）では、この試験を**意図して**書き換える。
-#[test]
-fn markdown_looking_assistant_text_is_drawn_and_copied_verbatim() {
-    let mut app = app_with_items(&[MARKDOWN_LOOKING]);
-    let screen = draw(&mut app);
-    let source: Vec<&str> = MARKDOWN_LOOKING.lines().collect();
-    let (long, short) = source.split_last().expect("行がある");
+crate::markdown::plain_only! {
+    /// **[整形しない実装での見え方] Markdownに見える記号を含むassistantの返答は、記号のまま1行ずつ、色も飾りも付けずに
+    /// 描かれ、選んで写すと原文がそのまま書かれる**（行の間は`CRLF`、空行も字下げも残り、折り返した長い行は1行に戻る）。
+    ///
+    /// T5で付け替える前の見え方を固定した試験。T9で既定の実装を整形する実装へ替えたので、**整形しない実装を選んだ
+    /// ビルドでだけ置く**ように意図して書き換えた（`crate::markdown::plain_only`）。整形する実装での見え方は
+    /// `markdown_screen_tests::markdown_looking_assistant_text_is_formatted_and_copied_as_drawn`が確かめる。
+    #[test]
+    fn markdown_looking_assistant_text_is_drawn_and_copied_verbatim() {
+        let mut app = app_with_items(&[MARKDOWN_LOOKING]);
+        let screen = draw(&mut app);
+        let source: Vec<&str> = MARKDOWN_LOOKING.lines().collect();
+        let (long, short) = source.split_last().expect("行がある");
 
-    // 原文の行は枠の中の左上から1行ずつ、記号のまま並ぶ（枠線の`│`の内側を、行末の空白を除いて読む）。
-    assert_eq!(screen.find("# 見出し"), (1, 1), "{}", screen.text());
-    let inner = |y: u16| {
-        let row = screen.row(y);
-        let row = row.strip_prefix('│').unwrap_or(&row);
-        row.strip_suffix('│').unwrap_or(row).trim_end().to_string()
-    };
-    for (k, line) in short.iter().enumerate() {
-        assert_eq!(inner(1 + k as u16), *line, "{k}行目\n{}", screen.text());
-    }
-    // 長い行は2行に折り返して描かれ、つなぐと原文の1行になる（全角48文字＝96桁で折り返す）。
-    let first = 1 + short.len() as u16;
-    assert_eq!(inner(first).chars().count(), 48, "{}", screen.text());
-    assert_eq!(format!("{}{}", inner(first), inner(first + 1)), *long);
-    assert_eq!(inner(first + 2), "", "折り返しが2行より多い");
+        // 原文の行は枠の中の左上から1行ずつ、記号のまま並ぶ（枠線の`│`の内側を、行末の空白を除いて読む）。
+        assert_eq!(screen.find("# 見出し"), (1, 1), "{}", screen.text());
+        let inner = |y: u16| {
+            let row = screen.row(y);
+            let row = row.strip_prefix('│').unwrap_or(&row);
+            row.strip_suffix('│').unwrap_or(row).trim_end().to_string()
+        };
+        for (k, line) in short.iter().enumerate() {
+            assert_eq!(inner(1 + k as u16), *line, "{k}行目\n{}", screen.text());
+        }
+        // 長い行は2行に折り返して描かれ、つなぐと原文の1行になる（全角48文字＝96桁で折り返す）。
+        let first = 1 + short.len() as u16;
+        assert_eq!(inner(first).chars().count(), 48, "{}", screen.text());
+        assert_eq!(format!("{}{}", inner(first), inner(first + 1)), *long);
+        assert_eq!(inner(first + 2), "", "折り返しが2行より多い");
 
-    // 記号のセルに色も飾りも付いていない（整形していない）。
-    for mark in [
-        "#",
-        "**",
-        "`code`",
-        "_斜体_",
-        "- item",
-        "  - 入れ子",
-        "1.",
-        "> 引用",
-        "```rust",
-        "    let",
-    ] {
-        let at = screen.find(mark);
-        let look = screen.style(at);
+        // 記号のセルに色も飾りも付いていない（整形していない）。
+        for mark in [
+            "#",
+            "**",
+            "`code`",
+            "_斜体_",
+            "- item",
+            "  - 入れ子",
+            "1.",
+            "> 引用",
+            "```rust",
+            "    let",
+        ] {
+            let at = screen.find(mark);
+            let look = screen.style(at);
+            assert_eq!(
+                (look.fg, look.bg, look.add_modifier),
+                (Some(Color::Reset), Some(Color::Reset), Modifier::empty()),
+                "「{mark}」に見た目が付いた"
+            );
+        }
+
+        // 左上から長い行の終わりまで選んで写すと、原文がそのまま（行の間は`CRLF`）。
+        let (x, y) = screen.find_last("行です。");
+        drag(&mut app, (1, 1), (x + 10, y));
+        let (copied, other) = ctrl_c(&mut app);
         assert_eq!(
-            (look.fg, look.bg, look.add_modifier),
-            (Some(Color::Reset), Some(Color::Reset), Modifier::empty()),
-            "「{mark}」に見た目が付いた"
+            copied.as_deref(),
+            Some(MARKDOWN_LOOKING.replace('\n', "\r\n").as_str()),
+            "{other}"
         );
     }
+}
 
-    // 左上から長い行の終わりまで選んで写すと、原文がそのまま（行の間は`CRLF`）。
-    let (x, y) = screen.find_last("行です。");
-    drag(&mut app, (1, 1), (x + 10, y));
-    let (copied, other) = ctrl_c(&mut app);
-    assert_eq!(
-        copied.as_deref(),
-        Some(MARKDOWN_LOOKING.replace('\n', "\r\n").as_str()),
-        "{other}"
-    );
+// 整形する実装で描いた画面の試験（整形する実装を選んだビルドでだけ置く。`crate::markdown::formatting_only`）。
+crate::markdown::formatting_only! {
+    #[path = "markdown_screen_tests.rs"]
+    mod markdown_screen_tests;
 }

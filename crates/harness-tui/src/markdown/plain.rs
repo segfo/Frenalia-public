@@ -11,8 +11,8 @@
 //!
 //! - 折り返さない。長い行も1つの`Line`で返し、折り返しは`harness_term::wrap`が受け持つ（だから印は全部`Break`）。
 //! - リンクを見分けないので、リンクの区間（`Rendered::links`）を返さない（Markdownのリンクも原文の文字のまま描く）。
-//! - 行の割り方は`str::lines`のまま（`\r\n`も区切り、末尾の改行は空の行を足さない）。空の文章は空の1行にする
-//!   （0行にすると、流れ込み始めた返答の場所が画面に無くなる）。
+//! - 行の割り方は`str::lines`のまま（`\r\n`も区切り、末尾の改行は空の行を足さない）。空の文章は0行で返す——画面で
+//!   空の1行にするのは、どの実装でも同じ規則としてFacade（`super::MarkdownView`）が受け持つ。
 
 use harness_term::select::LineJoin;
 use ratatui::text::Line;
@@ -43,14 +43,11 @@ impl StreamingMarkdown for PlainText {
 
     /// 幅は使わない（折り返さない。モジュールdocの限界）。
     fn render(&mut self, _width: u16) -> Rendered {
-        let mut lines: Vec<Line<'static>> = self
+        let lines: Vec<Line<'static>> = self
             .source
             .lines()
             .map(|line| Line::from(line.to_string()))
             .collect();
-        if self.source.is_empty() {
-            lines.push(Line::from(""));
-        }
         let joins = vec![LineJoin::Break; lines.len()];
         Rendered {
             lines,
