@@ -7,6 +7,7 @@ pub mod config_injection;
 pub mod decision;
 pub mod event;
 pub mod git;
+pub mod human_turns;
 pub mod interpreter;
 pub mod message;
 pub mod net_policy;
