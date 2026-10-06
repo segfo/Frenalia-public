@@ -14,14 +14,21 @@
 //! ② 判定モデル（Ollaya。設定で有効なときだけ）に2回を同時に聞く（harness-core の decision の「測った2つの形」）
 //!    ・危険度だけ                  → コマンドの危険度
 //!    ・流れと一緒に4問              → 解読が要るか・ファイルからコードを読むか・流れと合わせた危険度
+//!    この2つの危険度は保留し、③で行が「解けた包み」と分かれば数えない（D-126。下）
 //! ③ 必要なときだけ追加で聞く
 //!    ・「解読が要る」と出たのに機械の解読が何も取れていなければ、LLM に場所を選ばせてハーネスが解読する（encoded_span）
 //!    ・解読できた各段（機械の解読・LLM が場所を示したもの）の中身を、機械の判定と判定モデルに通す
+//!      （「解けた包み」の途中の段は判定モデルへ聞かない。D-126）
 //!    ・ファイルからコードを読む（または run_program でコードを走らせる）なら、縛ったファイルの中身の危険度
 //! ④ どれか1つでも高なら「高」、それ以外は「要確認」
 //! ```
 //!
 //! 判定モデルが無い・落ちているときは①だけで決め、画面には「機械判定のみ」と添える（[`RiskBasis`]）。
+//!
+//! **解けた包み**（D-126）は、中で見つけた塊（直下の段）が1つ以上あり、全部が文字として解けた文字列（行か段）。
+//! 符号化した塊を含む文字列への判定モデルの点数は中身でなく外側の綴りに反応する（無害で 1.20〜1.55、危険で
+//! 0.82〜1.58。`plans/risk-judge-spike/RESULTS.md` §1.10）ので、その点数は数えず、解いた段への点数と機械の判定で決める。
+//! 解けない塊が1つでも混じれば、今どおり数える。縛ったファイルの中で見つけた段は、行を解けた包みにしない。
 //!
 //! # これは境界ではない
 //!
@@ -37,6 +44,8 @@
 //! - 判定モデルへ送るソースコードは先頭[`harness_core::MAX_SOURCE_CHARS`]字だけ。機械の判定はファイル全体を見る
 //! - 解読が要りそうなのに、機械の解読も LLM が示した箇所の解読も何も取れなかったときは、注記を出すだけである
 //!   （LLM が場所を示さなかった・示した文字列が行に無かった・示された符号化として読めなかった）
+//! - 解けた包みの行では、塊の**外**にある平文を判定モデルが読まない（D-126）。システムの場所への被害は
+//!   機械の判定が拾うが、それ以外は要確認に落ちる
 
 use async_trait::async_trait;
 use futures::future::join;
@@ -434,24 +443,61 @@ fn origin_of(layer: &DecodedLayer) -> Origin {
     }
 }
 
-/// 解読できた段の中身の危険度を判定モデルに聞く（上限[`MAX_DECODED_TO_ASK`]段）。
+/// `layers[i]` が解けた包み（D-126）か。直下の段は、前順でその後ろに続く深い段のうち深さがちょうど1つ深いもの
+/// （深さが戻るか、見つけたファイルが変わったところで終わる）。
+fn wraps_decoded_text(layers: &[DecodedLayer], i: usize) -> bool {
+    let parent = &layers[i];
+    matches!(parent.outcome, DecodeOutcome::Text { .. })
+        && all_text(
+            layers[i + 1..]
+                .iter()
+                .take_while(|l| l.depth > parent.depth && l.in_file == parent.in_file)
+                .filter(|l| l.depth == parent.depth + 1),
+        )
+}
+
+/// 行が解けた包み（D-126）か。行の直下の段は、行から見つけた1段目と LLM が場所を示した1段目
+/// （縛ったファイルの中で見つけた段は、ファイルごとに深さ1から並ぶので含めない）。
+fn line_wraps_decoded_text(decoded: &[DecodedLayer], extra: &[DecodedLayer]) -> bool {
+    all_text(
+        decoded
+            .iter()
+            .filter(|l| l.in_file.is_none())
+            .chain(extra)
+            .filter(|l| l.depth == 1),
+    )
+}
+
+/// 1つ以上あり、全部が文字として解けた。
+fn all_text<'a>(layers: impl Iterator<Item = &'a DecodedLayer>) -> bool {
+    let mut layers = layers.peekable();
+    layers.peek().is_some() && layers.all(|l| matches!(l.outcome, DecodeOutcome::Text { .. }))
+}
+
+/// 解読できた段の中身の危険度を判定モデルに聞く（上限[`MAX_DECODED_TO_ASK`]段）。解けた包みの途中の段は
+/// 聞かない（D-126）——上限は内側の段に使う。
 async fn model_on_decoded(
     out: &mut RiskOutcome,
     layers: &[DecodedLayer],
     model: &dyn DecisionModel,
 ) {
-    let texts = layers.iter().filter_map(|layer| match &layer.outcome {
-        DecodeOutcome::Text { text, .. } => Some((layer.depth, text)),
-        _ => None,
-    });
-    for (depth, text) in texts.take(MAX_DECODED_TO_ASK) {
+    let texts = layers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, layer)| match &layer.outcome {
+            DecodeOutcome::Text { text, .. } if !wraps_decoded_text(layers, i) => {
+                Some((layer, text))
+            }
+            _ => None,
+        });
+    for (layer, text) in texts.take(MAX_DECODED_TO_ASK) {
         match assess_command_risk(model, text).await {
             Ok(verdict) => {
                 out.basis = RiskBasis::WithModel;
                 if verdict.level == RiskLevel::Danger {
                     out.push_reason(RiskReason::Model {
                         verdict,
-                        origin: Origin::Decoded { depth },
+                        origin: origin_of(layer),
                     });
                 }
             }
@@ -488,11 +534,13 @@ pub async fn assess(
         model.decide(&context_state, &context_questions),
     )
     .await;
+    // 行と流れの危険度は保留する。行が解けた包みかは③の LLM の解読まで決まらない（D-126）。
+    let mut line_reasons = Vec::new();
     match risk {
         Ok(verdict) => {
             out.basis = RiskBasis::WithModel;
             if verdict.level == RiskLevel::Danger {
-                out.push_reason(RiskReason::Model {
+                line_reasons.push(RiskReason::Model {
                     verdict,
                     origin: Origin::Command,
                 });
@@ -508,7 +556,7 @@ pub async fn assess(
             if !history.is_empty() {
                 if let Ok(verdict) = questions::read_sequence_risk(&answers) {
                     if verdict.level == RiskLevel::Danger {
-                        out.push_reason(RiskReason::Sequence(verdict));
+                        line_reasons.push(RiskReason::Sequence(verdict));
                     }
                 }
             }
@@ -547,6 +595,12 @@ pub async fn assess(
         }
         damage_in_decoded(&mut out, &located);
         out.extra_decoded = located;
+    }
+    // 解けた包みの行への点数は、中身でなく綴りに反応するので数えない（D-126）。
+    if !line_wraps_decoded_text(decoded_layers(subject), &out.extra_decoded) {
+        for reason in line_reasons {
+            out.push_reason(reason);
+        }
     }
 
     // ③ 解読できた段の中身（機械の解読と、LLM が場所を示したもの）。

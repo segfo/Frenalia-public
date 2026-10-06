@@ -851,3 +851,335 @@ fn the_mock_fallback_does_not_change_the_outcome() {
     assert_eq!(with_mock.severity(), without.severity());
     assert_eq!(with_mock.reasons, without.reasons);
 }
+
+// ---- D-126: 解けた包みへの判定モデルの点数は数えない ----
+
+/// 包みの行（塊は手で組んだ段で置く。中身を新しく符号化しない）。
+const WRAPPER: &str = "powershell -NoP -Enc AAAA";
+/// 既存のフィクスチャ（`decoded_content_is_judged_by_both`）の危険な中身。
+const DANGEROUS: &str = r"Remove-Item C:\Windows\System32\drivers -Recurse";
+
+fn text_layer(depth: u32, text: &str) -> DecodedLayer {
+    DecodedLayer {
+        depth,
+        source: EncodedSource::EncodedCommand,
+        outcome: DecodeOutcome::Text {
+            encoding: TextEncoding::Utf16Le,
+            text: text.into(),
+        },
+        in_file: None,
+    }
+}
+
+fn not_text_layer(depth: u32) -> DecodedLayer {
+    DecodedLayer {
+        depth,
+        source: EncodedSource::EncodedCommand,
+        outcome: DecodeOutcome::NotText,
+        in_file: None,
+    }
+}
+
+fn in_file(mut layer: DecodedLayer, path: &str) -> DecodedLayer {
+    layer.in_file = Some(path.into());
+    layer
+}
+
+fn with_layers(line: &str, layers: Vec<DecodedLayer>) -> PermissionSubject {
+    let mut c = CommandSubject::line_only(line);
+    c.decoded = layers;
+    PermissionSubject::Command(c)
+}
+
+fn has_model_reason(out: &RiskOutcome, origin: &Origin) -> bool {
+    out.reasons
+        .iter()
+        .any(|r| matches!(r, RiskReason::Model { origin: o, .. } if o == origin))
+}
+
+fn asked_risk_of(model: &FakeModel, text: &str) -> bool {
+    model
+        .calls()
+        .contains(&(json!({ "command": text }), vec!["risk"]))
+}
+
+/// **包みの行への点数は数えず、解いた中身で決める。** 実測（RESULTS.md §1.10）で `Write-Host hello` を包んだ行は
+/// 1.513 だった——中身ではなく綴りに反応した点数で「高」にしない。対照: 中身が危険なら、解いた段の点数で高。
+#[test]
+fn a_wrapper_line_is_judged_by_what_it_decodes_to() {
+    let harmless = FakeModel::quiet()
+        .with_risk(WRAPPER, 1.55)
+        .with_risk("Write-Host hello", 0.05);
+    let out = run(
+        &with_layers(WRAPPER, vec![text_layer(1, "Write-Host hello")]),
+        &[],
+        Some(&harmless),
+    );
+    assert_eq!(out.severity(), Severity::NeedsReview, "{:?}", out.reasons);
+    assert_eq!(out.basis, RiskBasis::WithModel);
+    assert!(
+        !has_model_reason(&out, &Origin::Command),
+        "{:?}",
+        out.reasons
+    );
+    assert!(
+        asked_risk_of(&harmless, "Write-Host hello"),
+        "解いた中身を聞いていない"
+    );
+    assert!(
+        asked_risk_of(&harmless, WRAPPER),
+        "行への問いは今どおり出す"
+    );
+
+    let dangerous = FakeModel::quiet()
+        .with_risk(WRAPPER, 1.55)
+        .with_risk(DANGEROUS, 1.9);
+    let out = run(
+        &with_layers(WRAPPER, vec![text_layer(1, DANGEROUS)]),
+        &[],
+        Some(&dangerous),
+    );
+    assert_eq!(out.severity(), Severity::High);
+    assert!(
+        has_model_reason(&out, &Origin::Decoded { depth: 1 }),
+        "{:?}",
+        out.reasons
+    );
+    assert!(
+        !has_model_reason(&out, &Origin::Command),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// 解けない塊しか無い行は、行への点数を残す（判定モデルが使えると D-124 ルール1が掛からず、塊に触れる判定は行しか無い）。
+#[test]
+fn a_line_with_only_an_undecodable_blob_keeps_its_score() {
+    let model = FakeModel::quiet().with_risk(WRAPPER, 1.6);
+    let out = run(
+        &with_layers(WRAPPER, vec![not_text_layer(1)]),
+        &[],
+        Some(&model),
+    );
+    assert_eq!(out.severity(), Severity::High);
+    assert!(
+        has_model_reason(&out, &Origin::Command),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// 解けた塊と解けない塊が混じる行も、行への点数を残す（「全部解けた」ときだけ数えない）。
+#[test]
+fn a_line_with_a_mix_of_decoded_and_undecodable_blobs_keeps_its_score() {
+    let model = FakeModel::quiet()
+        .with_risk(WRAPPER, 1.6)
+        .with_risk("Write-Host hello", 0.05);
+    let out = run(
+        &with_layers(
+            WRAPPER,
+            vec![text_layer(1, "Write-Host hello"), not_text_layer(1)],
+        ),
+        &[],
+        Some(&model),
+    );
+    assert_eq!(out.severity(), Severity::High);
+    assert!(
+        has_model_reason(&out, &Origin::Command),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// 包みの行では、流れと合わせた危険度も数えない。4問の呼び出しそのものは残す（解読要否・ファイル読みに使う）。
+/// 対照（流れがあれば数える）は `the_sequence_counts_only_when_there_is_a_history`。
+#[test]
+fn the_sequence_does_not_count_for_a_wrapper_line() {
+    let mut model = FakeModel::quiet().with_risk("Write-Host hello", 0.05);
+    model.sequence = 1.8;
+    let out = run(
+        &with_layers(WRAPPER, vec![text_layer(1, "Write-Host hello")]),
+        &["git status".into()],
+        Some(&model),
+    );
+    assert!(
+        !out.reasons
+            .iter()
+            .any(|r| matches!(r, RiskReason::Sequence(_))),
+        "{:?}",
+        out.reasons
+    );
+    assert_eq!(out.severity(), Severity::NeedsReview);
+    assert!(
+        model.calls().contains(&(
+            json!({"command": WRAPPER, "history": ["git status"]}),
+            vec!["risk", "needs_decoding", "reads_source", "sequence_risk"]
+        )),
+        "{:?}",
+        model.calls()
+    );
+}
+
+/// **途中の段（中にさらに解けた塊を持つ段）は判定モデルへ聞かない。** 一番内側の段で決める。
+/// 対照: 内側が危険なら、その段（2段目）の点数で高。
+#[test]
+fn a_middle_layer_that_wraps_decoded_text_is_not_asked() {
+    let middle = "pwsh --enc BBBB";
+    let model = FakeModel::quiet()
+        .with_risk(WRAPPER, 1.55)
+        .with_risk(middle, 1.6)
+        .with_risk("Write-Host hello", 0.05);
+    let out = run(
+        &with_layers(
+            WRAPPER,
+            vec![text_layer(1, middle), text_layer(2, "Write-Host hello")],
+        ),
+        &[],
+        Some(&model),
+    );
+    assert!(!asked_risk_of(&model, middle), "途中の段を聞いた");
+    assert!(asked_risk_of(&model, "Write-Host hello"));
+    assert_eq!(out.severity(), Severity::NeedsReview, "{:?}", out.reasons);
+
+    let model = FakeModel::quiet()
+        .with_risk(middle, 1.6)
+        .with_risk(DANGEROUS, 1.9);
+    let out = run(
+        &with_layers(
+            WRAPPER,
+            vec![text_layer(1, middle), text_layer(2, DANGEROUS)],
+        ),
+        &[],
+        Some(&model),
+    );
+    assert_eq!(out.severity(), Severity::High);
+    assert!(
+        has_model_reason(&out, &Origin::Decoded { depth: 2 }),
+        "{:?}",
+        out.reasons
+    );
+    assert!(
+        !has_model_reason(&out, &Origin::Decoded { depth: 1 }),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// LLM が場所を示してハーネスが解いた段でも、行は解けた包みになる（無害な Get-Date の文字コード）。
+#[test]
+fn a_line_decoded_through_the_locator_is_a_wrapper_too() {
+    let codes = "71,101,116,45,68,97,116,101";
+    let line = format!("iex ([char[]]({codes}) -join '')");
+    let mut model = FakeModel::quiet().with_risk(&line, 1.55);
+    model.needs_decoding = 0.9;
+    let locator = FakeLocator::answering(vec![LocatedSpan {
+        text: codes.to_string(),
+        encoding: PayloadEncoding::CharCodes,
+    }]);
+    let out = run_with(&shell(&line), &[], Some(&model), Some(&locator));
+    assert!(
+        matches!(&out.extra_decoded[..], [DecodedLayer { outcome: DecodeOutcome::Text { text, .. }, .. }] if text == "Get-Date"),
+        "{:?}",
+        out.extra_decoded
+    );
+    assert_eq!(out.severity(), Severity::NeedsReview, "{:?}", out.reasons);
+    assert!(!has_model_reason(&out, &Origin::Command));
+    assert!(asked_risk_of(&model, "Get-Date"));
+}
+
+/// 縛ったファイルの中で見つけた段は、行を解けた包みにしない（行の段の子ではない）。
+#[test]
+fn a_layer_found_in_a_file_does_not_make_the_line_a_wrapper() {
+    let model = FakeModel::quiet().with_risk("python run.py", 1.7);
+    let out = run(
+        &with_layers(
+            "python run.py",
+            vec![in_file(text_layer(1, "Write-Host hello"), "run.py")],
+        ),
+        &[],
+        Some(&model),
+    );
+    assert_eq!(out.severity(), Severity::High);
+    assert!(
+        has_model_reason(&out, &Origin::Command),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// ファイルの中で見つけた塊への判定モデルの理由は、**そのファイルの名前で言う**（機械の理由と揃える。D-122）。
+#[test]
+fn a_model_reason_for_a_blob_in_a_file_names_the_file() {
+    let model = FakeModel::quiet().with_risk(DANGEROUS, 1.9);
+    let out = run(
+        &with_layers(
+            "uv run test.py",
+            vec![in_file(text_layer(1, DANGEROUS), "test.py")],
+        ),
+        &[],
+        Some(&model),
+    );
+    assert!(
+        has_model_reason(
+            &out,
+            &Origin::File {
+                path: "test.py".into()
+            }
+        ),
+        "{:?}",
+        out.reasons
+    );
+    assert!(
+        !out.reasons.iter().any(|r| matches!(
+            r,
+            RiskReason::Model {
+                origin: Origin::Decoded { .. },
+                ..
+            }
+        )),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// 直下の段の読み方: 前順で後ろに続き、深さがちょうど1つ深いもの。深さが戻るか、見つけたファイルが変わったら終わる。
+#[test]
+fn wrapping_is_read_from_the_direct_children_in_the_same_place() {
+    let layers = vec![
+        text_layer(1, "pwsh --enc BBBB"),  // 0 行: 子 1 が文字 → 包み
+        text_layer(2, "Write-Host hello"), // 1 行: 子なし
+        text_layer(1, "pwsh --enc CCCC"),  // 2 行: 子 3 が解けない → 包みでない
+        not_text_layer(2),                 // 3 行
+        in_file(text_layer(1, "pwsh --enc DDDD"), "a.py"), // 4 A: 子 5（孫 6 は数えない）
+        in_file(text_layer(2, "pwsh --enc EEEE"), "a.py"), // 5 A: 子 6
+        in_file(text_layer(3, "Write-Host hello"), "a.py"), // 6 A
+        in_file(text_layer(1, "Get-Date"), "b.py"), // 7 B: 次は B の1段目なので子なし
+        in_file(not_text_layer(1), "b.py"), // 8 B
+    ];
+    let wraps: Vec<bool> = (0..layers.len())
+        .map(|i| wraps_decoded_text(&layers, i))
+        .collect();
+    assert_eq!(
+        wraps,
+        [true, false, false, false, true, true, false, false, false]
+    );
+    // 現実の並びでは起きないが、境目を深さだけに頼らないことを固定する。
+    let crossing = vec![
+        text_layer(1, "pwsh --enc BBBB"),
+        in_file(text_layer(2, "Write-Host hello"), "a.py"),
+    ];
+    assert!(!wraps_decoded_text(&crossing, 0));
+
+    // 行の直下は 0 と 2（どちらも文字）。ファイルの段（8 の解けない段を含む）は数えない。
+    assert!(line_wraps_decoded_text(&layers, &[]));
+    assert!(
+        !line_wraps_decoded_text(&layers[4..], &[]),
+        "ファイルの段だけ"
+    );
+    assert!(!line_wraps_decoded_text(&[], &[]), "塊が無い");
+    assert!(!line_wraps_decoded_text(&layers, &[not_text_layer(1)]));
+    assert!(line_wraps_decoded_text(
+        &[],
+        &[text_layer(1, "Get-Date"), not_text_layer(2)]
+    ));
+}
