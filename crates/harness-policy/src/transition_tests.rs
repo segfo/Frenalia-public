@@ -631,6 +631,25 @@ fn an_exe_pattern_into_a_wider_strict_domain_is_still_refused() {
 /// Daemon は標準入力も断たない。P5.3 までは「固定していない、かつ広げない」でしか呼び出し元の標準入出力を渡さず、
 /// 広げる辺の子には渡していなかった。
 #[test]
+fn with_output_changes_only_the_output_of_an_editor_edge() {
+    let base = editor_edge(r"C:\tools\gen.exe", any_argv(), "logs");
+    let discarding = base.clone().with_output(ChildOutput::Discard);
+    assert_eq!(discarding.output, ChildOutput::Discard);
+    assert_eq!(
+        TransitionEdge {
+            output: ChildOutput::Return,
+            ..discarding.clone()
+        },
+        base,
+        "the output setting must be the only difference (the shape stays editor_edge's)"
+    );
+    assert_eq!(
+        discarding.with_output(ChildOutput::Return).output,
+        ChildOutput::Return
+    );
+}
+
+#[test]
 fn a_widening_edge_returns_the_childs_output_and_is_not_strict() {
     let declared = Declared::new()
         .domain(

@@ -137,3 +137,43 @@ fn a_policy_that_cannot_be_counted_says_so_instead_of_showing_nothing() {
     let text = lines(&widening).join("\n");
     assert!(text.contains("数えられません"), "{text}");
 }
+
+/// [P5.5] **出力を捨てる辺か Strict の印を初めて書く確定は、`policy.json`のスキーマ版が3へ上がることを言う**——
+/// 版2までしか読めない古い`harness.exe`は読込で断る（黙って印を無視して読むことはない）ので、書く前に知らせる。
+///
+/// 対（`B-35`）: 既に版3のファイルへ足すとき・版が上がらない変更（普通の辺を足すだけ）では言わない。
+#[test]
+fn writing_the_first_discarding_edge_or_strict_mark_says_the_schema_version_rises_to_3() {
+    let plain = file(vec![with_edge(PolicyDomain::new(ENTRY_DOMAIN), PEEK, "secret")]);
+    let mut discarding = plain.clone();
+    discarding.domains[0].process.transitions[0].output = ChildOutput::Discard;
+    let raised = widening(&plain, &discarding, &ws());
+    assert_eq!(raised.schema_raised, Some((2, 3)));
+    assert!(!raised.is_empty());
+    let text = lines(&raised).join("\n");
+    assert!(
+        text.contains("スキーマ版") && text.contains("2→3") && text.contains("harness.exe"),
+        "{text}"
+    );
+
+    let mut strict = plain.clone();
+    strict.domains.push(PolicyDomain::new("secret"));
+    strict.domains[1].strict = true;
+    assert_eq!(widening(&plain, &strict, &ws()).schema_raised, Some((2, 3)));
+
+    // 対: 既に版3（捨てる辺がある）のファイルへ印を足しても言わない。普通の辺を足すだけでも言わない。
+    let mut both = discarding.clone();
+    both.domains.push(PolicyDomain::new("secret"));
+    both.domains[1].strict = true;
+    assert_eq!(widening(&discarding, &both, &ws()).schema_raised, None);
+    let first_edge = widening(&file(vec![PolicyDomain::new(ENTRY_DOMAIN)]), &plain, &ws());
+    assert_eq!(first_edge.schema_raised, None, "版1→2は言わない（P5 より前からの振る舞い）");
+    assert!(!lines(&first_edge).join("\n").contains("スキーマ版"));
+}
+
+/// [P5.5] 辺の綴りに添える出力の設定は、捨てる辺にだけ付く（既定の「返す」は何も添えない）。
+#[test]
+fn only_a_discarding_edge_gets_an_output_suffix() {
+    assert_eq!(output_suffix(ChildOutput::Return), "");
+    assert!(output_suffix(ChildOutput::Discard).contains("子の出力を捨てる"));
+}

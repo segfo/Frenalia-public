@@ -81,6 +81,8 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
             // 位置の木は位置ごとのドメインの記録にしか出ないので、`a`はいつも全タブの確定（P4.5）。
             keys.push(position_commit_hint(app));
             keys.push(press("u 引数の広さ", KeyCode::Char('u')));
+            // [P5.5] 子の出力を捨てる／返す（決定66(4)）。`u`と同じく書く辺の形を変える設定なので隣に置く。
+            keys.push(press("o 出力を捨てる/返す", KeyCode::Char('o')));
             keys.push(press("Tab 遷移先", KeyCode::Tab));
             if let Some(positions) = positions {
                 keys.push(press(
@@ -146,11 +148,21 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
         Screen::Declared if app.declared_transitions.tab.is_transitions() => {
             keys.push(press("Space 取り消しを予約", KeyCode::Char(' ')));
             let reserved = app.declared_transitions.remove.len();
-            if reserved == 0 {
+            let strict = app.declared_transitions.strict.len();
+            let parts: Vec<String> = [
+                (reserved > 0).then(|| format!("{reserved}本を取り消し")),
+                (strict > 0).then(|| format!("Strict {strict}件")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if parts.is_empty() {
                 keys.push(press("a 確定", KeyCode::Char('a')));
             } else {
-                keys.push(press(format!("a 確定（{reserved}本を取り消し）"), KeyCode::Char('a')));
+                keys.push(press(format!("a 確定（{}）", parts.join("・")), KeyCode::Char('a')));
             }
+            // [P5.5] Strict の印（決定66の追記）。予約を変えるキーなので`a`の直後に置く。
+            keys.push(press("s Strict の付け外し", KeyCode::Char('s')));
             keys.push(shown("↑↓ 選択"));
             keys.push(press("r 読み直し", KeyCode::Char('r')));
             keys.push(press("F3 タブ切替", KeyCode::F(3)));

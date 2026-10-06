@@ -98,6 +98,8 @@ pub struct PositionsState {
     pub approve: BTreeSet<PositionKey>,
     /// そのうち記録どおりのコマンドラインに絞るもの（`u`）。既定は任意の引数（決定65 Q2）。
     pub narrow: BTreeSet<PositionKey>,
+    /// そのうち子の出力を捨てる辺にするもの（`o`。P5.5）。既定は返す（決定66(4)）。`approve`の部分集合。
+    pub discard_output: BTreeSet<PositionKey>,
     /// 遷移先の名前の付け替え（割り当ての名前 → 新しい名前）。**名前ごと**当てるので、子の行の遷移元も変わる。
     pub renamed: BTreeMap<String, String>,
     /// 見えている行での選択位置。
@@ -115,6 +117,7 @@ impl PositionsState {
             verdicts: Vec::new(),
             approve: BTreeSet::new(),
             narrow: BTreeSet::new(),
+            discard_output: BTreeSet::new(),
             renamed: BTreeMap::new(),
             row: 0,
             filter: PositionFilter::default(),
@@ -172,6 +175,11 @@ impl PositionsState {
         can_narrow(position) && self.narrow.contains(&key_of(position))
     }
 
+    /// この位置の辺を、子の出力を捨てる設定で書くか（`o`）。
+    pub fn is_output_discarded(&self, position: &Position) -> bool {
+        self.discard_output.contains(&key_of(position))
+    }
+
     /// 判定を取り直し、**書けなくなった位置の予約を外す**（外した件数を返す）。
     ///
     /// `extra_fs`は FS/ネットのタブで選んだ位置ごとのドメインの候補（[`App::position_extra_fs`]。ドメインは
@@ -182,7 +190,12 @@ impl PositionsState {
         workspace_root: &Path,
         extra_fs: &[(String, String, FsAccess)],
     ) -> usize {
-        let edges = position_edges(&self.view.assignment, &self.renamed, &self.narrow);
+        let edges = position_edges(
+            &self.view.assignment,
+            &self.renamed,
+            &self.narrow,
+            &self.discard_output,
+        );
         let extra: Vec<(String, String, FsAccess)> = extra_fs
             .iter()
             .map(|(domain, value, access)| {
@@ -205,9 +218,9 @@ impl PositionsState {
             .collect();
         let before = self.approve.len();
         self.approve.retain(|key| writable.contains(key));
-        let narrow = &mut self.narrow;
         let approve = &self.approve;
-        narrow.retain(|key| approve.contains(key));
+        self.narrow.retain(|key| approve.contains(key));
+        self.discard_output.retain(|key| approve.contains(key));
         before - self.approve.len()
     }
 
@@ -230,6 +243,11 @@ impl PositionsState {
             .collect();
         self.narrow = previous
             .narrow
+            .into_iter()
+            .filter(|k| keys.contains(k))
+            .collect();
+        self.discard_output = previous
+            .discard_output
             .into_iter()
             .filter(|k| keys.contains(k))
             .collect();
@@ -351,6 +369,7 @@ impl App {
             KeyCode::PageDown => self.move_position_row(rows, 10),
             KeyCode::Char(' ') => self.toggle_selected_position(),
             KeyCode::Char('u') => self.toggle_selected_position_argv(),
+            KeyCode::Char('o') => self.toggle_selected_position_output(),
             // 前例の表の10: 却下印は観測した（exe, 引数）1種類ごとの印で、位置は記録ごとに作り直す。1対1にならない
             // 印を作らない。何も起きないので理由を言う（`B-32`）。
             KeyCode::Char('x') | KeyCode::Char('X') => {
@@ -480,6 +499,8 @@ impl App {
             return;
         };
         if positions.approve.remove(&key) {
+            // 書かない行に辺の形の設定を残さない（出力の設定は判定に効かないので取り直さない）。
+            positions.discard_output.remove(&key);
             if positions.narrow.remove(&key) {
                 positions.refresh_verdicts(&workspace_root, &extra_fs);
             }
@@ -577,6 +598,35 @@ impl App {
             "{name}: 記録どおりに絞ると検査に落ちるので絞れません（任意の引数のままにします。\
              このエディタは作業ディレクトリを宣言しない）。検査の理由: {detail}"
         );
+    }
+
+    /// [P5.5] 選んでいる位置の子の出力を捨てる／返すを切り替える（`o`。決定66(4)。既定は返す）。
+    ///
+    /// 出力の設定は書く辺の形なので、`u`と同じく**選んだ行だけ**に持てる。判定（書けるか・広げるか）には効かない
+    /// ——編集時検査は出力を見ない——ので取り直さない。捨てても子が書いたファイルは残るので「渡らない」とは言わない。
+    fn toggle_selected_position_output(&mut self) {
+        let Some(selected) = self.selected_position() else {
+            self.status = self.no_position_message();
+            return;
+        };
+        let name = file_name(&selected.position.exe).to_string();
+        let key = key_of(&selected.position);
+        let Some(positions) = self.pending.positions.as_mut() else {
+            return;
+        };
+        if !positions.approve.contains(&key) {
+            self.status =
+                "先にSpaceで選んでください（選んだ行の子の出力を捨てる／返すを切り替えます）".to_string();
+            return;
+        }
+        self.status = if positions.discard_output.remove(&key) {
+            format!("{name}: 子の出力を返します（子が読めるものは標準出力・標準エラーを通って呼び出し元へ渡ります）")
+        } else {
+            positions.discard_output.insert(key);
+            format!(
+                "{name}: 子の出力を捨てます（標準出力・標準エラーは呼び出し元へ返りません。子が書いたファイルは残ります）"
+            )
+        };
     }
 
     /// `Tab`: 選んでいる位置の遷移先の欄へ入る。新しく提案した位置だけ（既にある辺の遷移先は`policy.json`が決める）。

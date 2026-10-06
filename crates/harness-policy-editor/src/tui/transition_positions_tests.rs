@@ -260,6 +260,7 @@ fn the_destination_field_renames_the_selected_position_and_its_children_follow()
         &positions.view.assignment,
         &positions.renamed,
         &positions.narrow,
+        &positions.discard_output,
     );
     let edge_of = |exe: &str| {
         edges
@@ -644,4 +645,119 @@ fn a_on_the_denied_tab_of_a_position_record_writes_positions_and_denials_togethe
     to.sort();
     assert_eq!(to, vec!["hn".to_string(), "pwsh".to_string()], "{}", app.status);
     assert!(app.pending.approve.is_empty(), "拒否からの予約が残っている");
+}
+
+/// [P5.5] **`o`で選んだ位置の子の出力を捨てる設定にし、確定でその辺だけが`"output":"discard"`で書かれる**（決定66(4)）。
+///
+/// - 選んでいない行の`o`は何もせず理由を言う（`u`と同じ。出力の設定は書く辺の形なので、書かない行には持てない）
+/// - 行に「出力:捨てる」が出て、確認の明細の辺にも出る。**捨てる辺を書くと`policy.json`の版が3へ上がり、古い
+///   `harness.exe`は読込で断る**——確認の明細でそれを言う
+/// - 対（`B-35`）: 同じ確定の`o`を押していない位置の辺は既定の「返す」で書かれる
+#[test]
+fn o_discards_the_output_of_the_selected_position_and_only_that_edge_is_written_so() {
+    use harness_policy::transition::ChildOutput;
+    let ws = workspace();
+    let mut app = app_with_record(ws.path(), &user_example());
+    select(&mut app, PWSH);
+    press(&mut app, KeyCode::Char('o'));
+    assert!(app.status.contains("先にSpace"), "{}", app.status);
+    assert!(app.pending.positions.as_ref().unwrap().discard_output.is_empty());
+
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Char('o'));
+    assert!(app.status.contains("出力を捨て"), "{}", app.status);
+    assert!(app
+        .pending
+        .positions
+        .as_ref()
+        .unwrap()
+        .discard_output
+        .contains(&key_of(&app, PWSH)));
+    let drawn = screen(&app);
+    let row = drawn
+        .iter()
+        .find(|line| line.contains("pwsh.exe") && squash(line).contains("新規"))
+        .expect("pwsh の行");
+    assert!(squash(row).contains("出力:捨てる"), "{row}");
+    let calc_row = drawn
+        .iter()
+        .find(|line| line.contains("calc.exe") && squash(line).contains("新規"))
+        .expect("calc の行");
+    assert!(!squash(calc_row).contains("出力:捨てる"), "{calc_row}");
+
+    select(&mut app, CALC);
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Char('a'));
+    let modal = app.modal.as_ref().expect("確認ダイアログ");
+    assert!(
+        modal
+            .lines
+            .iter()
+            .any(|l| l.contains("pwsh.exe") && l.contains("子の出力を捨てる")),
+        "{:?}",
+        modal.lines
+    );
+    assert!(
+        !modal
+            .lines
+            .iter()
+            .any(|l| l.contains("calc.exe") && l.contains("子の出力を捨てる")),
+        "{:?}",
+        modal.lines
+    );
+    assert!(
+        modal
+            .lines
+            .iter()
+            .any(|l| l.contains("スキーマ版") && l.contains("harness.exe")),
+        "版3へ上がることを言っていない: {:?}",
+        modal.lines
+    );
+    press(&mut app, KeyCode::Char('y'));
+    let file = policy_file::load(ws.path()).expect("書いたはず");
+    let output_to = |from: &str, to: &str| {
+        file.domain(from)
+            .and_then(|d| d.process.transitions.iter().find(|e| e.to == to))
+            .map(|e| e.output)
+            .expect("その辺がある")
+    };
+    assert_eq!(output_to(ENTRY_DOMAIN, "pwsh"), ChildOutput::Discard, "{}", app.status);
+    assert_eq!(output_to("pwsh", "calc"), ChildOutput::Return);
+    assert_eq!(file.schema_version, 3);
+    assert!(
+        app.pending.positions.as_ref().unwrap().discard_output.is_empty(),
+        "書いた設定が残っている"
+    );
+}
+
+/// [P5.5] **`o`をもう一度押すと返す設定へ戻り、選ぶのをやめると捨てる設定も落ちる**（書かない行に設定を残さない）。
+#[test]
+fn o_toggles_back_and_unreserving_a_position_drops_its_output_setting() {
+    let ws = workspace();
+    let mut app = app_with_record(ws.path(), &user_example());
+    select(&mut app, PWSH);
+    press(&mut app, KeyCode::Char(' '));
+    press(&mut app, KeyCode::Char('o'));
+    press(&mut app, KeyCode::Char('o'));
+    assert!(app.status.contains("出力を返し"), "{}", app.status);
+    assert!(app.pending.positions.as_ref().unwrap().discard_output.is_empty());
+
+    press(&mut app, KeyCode::Char('o'));
+    press(&mut app, KeyCode::Char(' '));
+    assert!(app.pending.positions.as_ref().unwrap().approve.is_empty());
+    assert!(
+        app.pending.positions.as_ref().unwrap().discard_output.is_empty(),
+        "選ぶのをやめた位置に出力の設定が残っている"
+    );
+}
+
+/// [P5.5] **拒否からのタブの`o`は何もせず理由を言う**（出力の切り替えは位置の木だけ。`B-32`）。
+#[test]
+fn o_on_the_denied_tab_says_it_works_only_in_the_position_tree() {
+    let ws = workspace();
+    let mut app = app_with_record(ws.path(), &user_example());
+    press(&mut app, KeyCode::F(2));
+    assert_eq!(app.pending.tab.0, PendingTab::TransitionsDenied);
+    press(&mut app, KeyCode::Char('o'));
+    assert!(app.status.contains("位置の木"), "{}", app.status);
 }

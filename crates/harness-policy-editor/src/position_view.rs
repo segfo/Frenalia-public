@@ -36,7 +36,7 @@ use harness_policy::position_domains::{
 use harness_policy::process_event::{parse_process_audit, ProcessAuditError};
 use harness_policy::process_tree::walk;
 use harness_policy::transition::{
-    self, editor_edge, AnyMarker, ArgvMatcher, ExeMatcher, Resolution, SpawnAttempt,
+    self, editor_edge, AnyMarker, ArgvMatcher, ChildOutput, ExeMatcher, Resolution, SpawnAttempt,
     TransitionGraph,
 };
 
@@ -246,11 +246,13 @@ pub fn can_narrow(position: &Position) -> bool {
 ///
 /// 遷移元・遷移先の名前は`renamed`で置き換える（**名前ごと**——遷移先の名前を変えると、その位置から起きる子の
 /// 遷移元も一緒に変わる）。`narrow`に入っていて[`can_narrow`]な位置は記録したコマンドラインに絞り、他は任意の引数。
-/// 形は[`editor_edge`]の1か所（`B-05`）。
+/// `discard`に入っている位置は子の出力を捨てる辺にする（P5.5のキー`o`。決定66(4)）。
+/// 形は[`editor_edge`]の1か所（`B-05`。出力は`with_output`が替えるだけ）。
 pub fn position_edges(
     assignment: &Assignment,
     renamed: &BTreeMap<String, String>,
     narrow: &BTreeSet<PositionKey>,
+    discard: &BTreeSet<PositionKey>,
 ) -> Vec<EdgeToAdd> {
     assignment
         .positions
@@ -268,7 +270,12 @@ pub fn position_edges(
                     &position.exe,
                     argv,
                     renamed_name(renamed, &position.to_domain),
-                ),
+                )
+                .with_output(if discard.contains(&key_of(position)) {
+                    ChildOutput::Discard
+                } else {
+                    ChildOutput::Return
+                }),
                 source: position.source,
             }
         })

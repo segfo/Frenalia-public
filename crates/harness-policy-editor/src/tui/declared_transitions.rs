@@ -39,7 +39,8 @@
 //! # キー（決定62: 同じ画面のタブで同じキーに逆の意味を持たせない）
 //!
 //! `Space`（辺の行＝その辺の取り消しを予約／やめる。ドメインの見出し＝そのドメインの辺をまとめて。決定51で一括の
-//! 取り消しは許す）・`a`（確認ダイアログ）・`r`（読み直し）・`Esc`（記録画面へ）・`F3`（タブを戻す。`tui::state`）。
+//! 取り消しは許す）・`s`（ドメインの見出し＝Strict の印の付け外しを予約。P5.5、決定66の追記）・`a`（確認ダイアログ）・
+//! `r`（読み直し）・`Esc`（記録画面へ）・`F3`（タブを戻す。`tui::state`）。
 //! **`A`・`y`・`c`・`R`はファイル・通信のタブのキーなので、ここでは何もせず理由を言う**——ここで別の意味を持たせると、
 //! 決定62が挙げた問題2（`a`が画面によって正反対）と同じ形を同じ画面の中に作る。
 //!
@@ -60,7 +61,7 @@ use harness_policy::transition::{
 };
 use harness_policy::transition_listing::{self, Row};
 
-use crate::transition_approve::{self, RemovalPlan};
+use crate::transition_approve::{self, RemovalPlan, StrictChange};
 use crate::transition_destination::Outlook;
 use crate::tui::checkbox_tree;
 use crate::tui::state::{Action, App, Confirm, Modal, Screen};
@@ -116,6 +117,8 @@ impl TransitionEdgeKey {
 #[derive(Debug, Clone)]
 pub struct DomainTransitions {
     pub name: String,
+    /// [P5.5] いまの Strict の印（`policy.json`のドメインの`strict`。決定66の追記）。
+    pub strict: bool,
     /// そのドメインから見た遷移の形（P3c の`shape`。検査に落ちる宣言でも答える）。
     pub shape: TransitionShape,
     /// 宣言の順。
@@ -151,6 +154,8 @@ pub struct DeclaredTransitionsState {
     pub row: usize,
     /// 取り消しの予約（遷移元と、書かれている辺の中身）。
     pub remove: BTreeSet<(String, TransitionEdgeKey)>,
+    /// [P5.5] Strict の印の付け外しの予約（ドメイン名 → 付けるなら真）。いまの印と違う値だけが入る。
+    pub strict: BTreeMap<String, bool>,
     /// 読めなかった・検査に落ちた事実。**黙らせない**（`B-10`）。
     pub notes: Vec<String>,
     /// 一覧の表示開始位置（フレームをまたいで保つ。`App::declared_list_offset`のdoc）。
@@ -179,6 +184,14 @@ impl DeclaredTransitionsState {
     pub fn is_reserved(&self, domain: &str, edge: &TransitionEdge) -> bool {
         self.remove
             .contains(&(domain.to_string(), TransitionEdgeKey::of(edge)))
+    }
+
+    /// [P5.5] 予約している Strict の印の付け外し（ドメインの名前の順）。確定はこれも`plan_removals`へ渡す。
+    pub(crate) fn reserved_strict(&self) -> Vec<StrictChange> {
+        self.strict
+            .iter()
+            .map(|(name, strict)| (name.clone(), *strict))
+            .collect()
     }
 
     /// 予約している辺（一覧の順。同じ中身は1回だけ）。確定はこれを`plan_removals`へ渡す。
@@ -237,6 +250,7 @@ pub(super) fn edge_text(edge: &TransitionEdge) -> String {
     if edge.env.as_ref().is_some_and(|env| !env.is_empty()) {
         text.push_str("（環境変数の差分あり）");
     }
+    text.push_str(crate::exposure_view::output_suffix(edge.output));
     text
 }
 
@@ -270,6 +284,7 @@ fn listing(
                 .collect();
             Ok(DomainTransitions {
                 name: view.name.to_string(),
+                strict: view.strict,
                 shape: transition::shape(input, view.name)?,
                 edges,
             })
@@ -354,6 +369,15 @@ impl App {
             })
             .collect();
         state.remove.retain(|key| alive.contains(key));
+        // 印の予約も、もう無いドメインと、いまの印と同じになったもの（別の経路で付け替わった）は落とす。
+        let marks: BTreeMap<&str, bool> = state
+            .domains
+            .iter()
+            .map(|d| (d.name.as_str(), d.strict))
+            .collect();
+        state
+            .strict
+            .retain(|name, strict| marks.get(name.as_str()).is_some_and(|now| now != strict));
         let rows = state.rows().len();
         checkbox_tree::clamp_row(&mut state.row, rows);
     }
@@ -373,6 +397,7 @@ impl App {
             KeyCode::PageUp => checkbox_tree::move_row(row, rows, -10),
             KeyCode::PageDown => checkbox_tree::move_row(row, rows, 10),
             KeyCode::Char(' ') => self.toggle_declared_transition_removal(),
+            KeyCode::Char('s') => self.toggle_declared_strict(),
             KeyCode::Char('a') => self.request_declared_transition_removals(),
             KeyCode::Char('r') => {
                 self.reload_declared_transitions();
@@ -437,16 +462,100 @@ impl App {
         }
     }
 
-    /// 取り消しの確認ダイアログを出す（**まだ書かない**）。
+    /// [P5.5] 選択中のドメインの見出しで、Strict の印の付け外しを予約する／やめる（`s`。決定66の追記）。
+    ///
+    /// **付けると入る辺が検査に落ちるなら予約しない**——判定器の理由を言う（`transition_approve::strict_rejections`。
+    /// このエディタは入力を固定した辺を書かないので、エディタが書いた辺が入るドメインには付けられない）。
+    fn toggle_declared_strict(&mut self) {
+        let state = &self.declared_transitions;
+        let Some(ListedRow::Domain(domain)) = state.rows().get(state.row).copied() else {
+            self.status = "s はドメインの見出しの行で押してください（Strict はドメインに付ける印で、そのドメインへ\
+                           入る辺に効きます）"
+                .to_string();
+            return;
+        };
+        let (name, current) = (state.domains[domain].name.clone(), state.domains[domain].strict);
+        if name == ENTRY_DOMAIN {
+            self.status = format!(
+                "{name} は入口のドメインで、遷移先になりません（harness.exe が遷移先として用意しない）。\
+                 Strict の印は意味を持たないので付けません"
+            );
+            return;
+        }
+        if self.declared_transitions.strict.remove(&name).is_some() {
+            self.status = format!("{name} の Strict の付け外しをやめました");
+            return;
+        }
+        let wanted = !current;
+        let mut changes = self.declared_transitions.reserved_strict();
+        changes.push((name.clone(), wanted));
+        let removals = self.declared_transitions.reserved_edges();
+        match transition_approve::strict_rejections(&self.workspace_root, &removals, &changes) {
+            Ok(new) if new.is_empty() => {
+                self.declared_transitions.strict.insert(name.clone(), wanted);
+                self.status = if wanted {
+                    format!(
+                        "{name} に Strict を付けます（aで確定）。入る辺は入力を固定しないと書けなくなり、\
+                         呼び出し元はその辺の子を操れなくなります"
+                    )
+                } else {
+                    format!(
+                        "{name} の Strict を外します（aで確定）。入る辺は普通のモードになり、呼び出し元は子を通して\
+                         {name} の権限を使えるようになります（確定の画面に出ます）"
+                    )
+                };
+            }
+            Ok(new) => {
+                let what = if wanted { "付けられません" } else { "外せません" };
+                self.status = format!(
+                    "{name} に Strict を{what}——変えると次の辺が遷移の検査に落ちます（Strict のドメインへ入る辺は、\
+                     引数をリテラルに・作業ディレクトリを宣言し、それと固定したファイルを呼び出し元が書けない場所に\
+                     置く必要があります。このエディタはそういう辺を書けないので、辺を取り消すか policy.json に手で\
+                     書いてください）。検査の理由: {}{}",
+                    new[0],
+                    match new.len() {
+                        1 => String::new(),
+                        n => format!("（ほか {}件）", n - 1),
+                    }
+                );
+            }
+            Err(e) => self.status = format!("Strict を確かめられませんでした: {e}"),
+        }
+    }
+
+    /// 取り消しと Strict の印の付け外しの確認ダイアログを出す（**まだ書かない**）。
     fn request_declared_transition_removals(&mut self) {
         let removals = self.declared_transitions.reserved_edges();
-        if removals.is_empty() {
-            self.status = "取り消す辺を Space で選んでから a を押してください（ドメインの見出しの行で Space を押すと、\
-                           そのドメインの辺をまとめて選べます）"
+        let strict = self.declared_transitions.reserved_strict();
+        if removals.is_empty() && strict.is_empty() {
+            self.status = "取り消す辺を Space で選ぶか、ドメインの見出しで s を押してから a を押してください\
+                           （ドメインの見出しの行で Space を押すと、そのドメインの辺をまとめて選べます）"
                 .to_string();
             return;
         }
-        match transition_approve::plan_removals(&self.workspace_root, &removals, now_unix_ms()) {
+        // 予約してから確定までの間に別の経路で`policy.json`が変わったかもしれないので、印の検査を取り直す。
+        if let Ok(new) =
+            transition_approve::strict_rejections(&self.workspace_root, &removals, &strict)
+        {
+            if !new.is_empty() {
+                self.modal = Some(Modal {
+                    title: "書けません（何も書いていません）".to_string(),
+                    lines: std::iter::once(
+                        "Strict の印を変えると、次の辺が遷移の検査に落ちます:".to_string(),
+                    )
+                    .chain(new)
+                    .collect(),
+                    confirm: Confirm::ReadOnly,
+                });
+                return;
+            }
+        }
+        match transition_approve::plan_removals(
+            &self.workspace_root,
+            &removals,
+            &strict,
+            now_unix_ms(),
+        ) {
             Ok(plan) => {
                 self.modal = Some(Modal {
                     title: "この内容で書きますか？".to_string(),
@@ -469,8 +578,9 @@ impl App {
     /// 承認待ちの確定）で変わっていた場合に、古い読み込み結果で上書きしないため（`commit_transition`と同じ作法）。
     pub(crate) fn commit_declared_transition_removals(&mut self) {
         let removals = self.declared_transitions.reserved_edges();
+        let strict = self.declared_transitions.reserved_strict();
         let result =
-            transition_approve::plan_removals(&self.workspace_root, &removals, now_unix_ms())
+            transition_approve::plan_removals(&self.workspace_root, &removals, &strict, now_unix_ms())
                 .and_then(|plan| {
                     transition_approve::commit_removals(&self.workspace_root, &plan)
                         .map(|written| (written, plan))
@@ -482,16 +592,23 @@ impl App {
                     n => format!("。宣言に無くて消えないもの {n}件（別の経路で消えていました）"),
                 };
                 self.status = if written {
-                    format!(
-                        "{}本の遷移の宣言を取り消しました（ACLは変わりません）{missing}",
-                        plan.removed.len()
-                    )
+                    let done: Vec<String> = [
+                        (!plan.removed.is_empty())
+                            .then(|| format!("{}本の遷移の宣言を取り消し", plan.removed.len())),
+                        (!plan.strict.is_empty())
+                            .then(|| format!("Strict の印を{}件付け替え", plan.strict.len())),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    format!("{}ました（ACLは変わりません）{missing}", done.join("、"))
                 } else {
                     format!(
                         "取り消せる辺がありませんでした（policy.json は変えていません）{missing}"
                     )
                 };
                 self.declared_transitions.remove.clear();
+                self.declared_transitions.strict.clear();
                 self.reload_declared_transitions();
                 // 承認待ちの遷移タブの「宣言済み」も古くなる。
                 self.reload_transitions();
@@ -507,11 +624,28 @@ impl App {
 
 /// 確認ダイアログの行。**遷移元ごとに**、消す辺を全パスで並べる（遷移元を取り違えて消さないことを読んでから`y`）。
 fn removal_lines(workspace_root: &std::path::Path, plan: &RemovalPlan) -> Vec<String> {
-    let mut lines = vec![
-        format!("{}:", policy_file::path(workspace_root).display()),
-        String::new(),
-        format!("取り消す遷移の辺 {}本:", plan.removed.len()),
-    ];
+    let mut lines = vec![format!("{}:", policy_file::path(workspace_root).display())];
+    // [P5.5] 印の付け外しは判断材料（呼び出し元が子を操れるかが変わる）なので、辺の明細より先に出す。
+    if !plan.strict.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("Strict の印 {}件:", plan.strict.len()));
+        for (name, strict) in &plan.strict {
+            lines.push(if *strict {
+                format!("  + Strict を付ける: {name}（入る辺は入力を固定しないと書けなくなります）")
+            } else {
+                format!("  - Strict を外す: {name}（入る辺は普通のモード——呼び出し元は子を通して {name} の権限を使えます）")
+            });
+        }
+    }
+    if !plan.strict_not_found.is_empty() {
+        lines.push(format!(
+            "policy.json に無いドメイン（別の経路で消えていました。何もしません）: {}",
+            plan.strict_not_found.join(", ")
+        ));
+    }
+    lines.extend(crate::exposure_view::lines(&plan.widening));
+    lines.push(String::new());
+    lines.push(format!("取り消す遷移の辺 {}本:", plan.removed.len()));
     let mut current: Option<&str> = None;
     for (from, edge) in &plan.removed {
         if current != Some(from.as_str()) {

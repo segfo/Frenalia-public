@@ -174,6 +174,12 @@ impl App {
                 self.status = "policy.jsonを読み直しました".to_string();
             }
             KeyCode::Char('a') => self.request_declared_changes(),
+            // [P5.5] Strict の印は遷移のタブのドメインの見出しで付け外す。何も起きないので理由を言う（`B-32`）。
+            KeyCode::Char('s') => {
+                self.status = "s は遷移のタブ（F3 をもう一度）のキーです。ドメインの見出しの行で Strict の印を\
+                               付け外しします"
+                    .to_string();
+            }
             _ => {}
         }
         None

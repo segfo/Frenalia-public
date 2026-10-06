@@ -235,7 +235,12 @@ fn a_widening_position_is_judged_by_the_checker() {
     let (dir, manifest) = seed_position_record(ws.path(), "s1", &user_example());
     let policy = PolicyFile::default();
     let view = loaded(&dir, &manifest, &policy);
-    let edges = position_edges(&view.assignment, &BTreeMap::new(), &BTreeSet::new());
+    let edges = position_edges(
+        &view.assignment,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+    );
     let index_of = |to: &str| {
         view.assignment
             .positions
@@ -275,4 +280,31 @@ fn a_widening_position_is_judged_by_the_checker() {
         ENTRY_DOMAIN,
         view.assignment.positions[index_of("pwsh")].from_domain
     );
+}
+
+/// [P5.5] **出力を捨てる位置の辺は`"output":"discard"`で書く**（決定66(4)。キー`o`の予約）。形の持ち主は`editor_edge`の
+/// まま（`with_output`が出力だけを替える）で、捨てない位置は既定の「返す」。
+#[test]
+fn a_position_whose_output_is_discarded_becomes_a_discarding_edge() {
+    use harness_policy::transition::ChildOutput;
+    let ws = workspace();
+    let (dir, manifest) = seed_position_record(ws.path(), "s1", &user_example());
+    let policy = PolicyFile::default();
+    let view = loaded(&dir, &manifest, &policy);
+    let calc = view
+        .assignment
+        .positions
+        .iter()
+        .find(|p| p.to_domain == "calc")
+        .expect("calc の位置");
+    let discard: BTreeSet<PositionKey> = [key_of(calc)].into_iter().collect();
+    let edges = position_edges(&view.assignment, &BTreeMap::new(), &BTreeSet::new(), &discard);
+    for add in &edges {
+        let expected = if add.edge.to == "calc" {
+            ChildOutput::Discard
+        } else {
+            ChildOutput::Return
+        };
+        assert_eq!(add.edge.output, expected, "{}", add.edge.to);
+    }
 }

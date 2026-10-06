@@ -194,6 +194,15 @@ pub fn editor_edge(exe: &str, argv: ArgvMatcher, to: &str) -> TransitionEdge {
     }
 }
 
+impl TransitionEdge {
+    /// 子の出力の設定だけを替えた辺（ポリシーエディタの「子の出力を捨てる」。P5.5）。形の持ち主は[`editor_edge`]のまま
+    /// ——出力以外の欄を作り直す口を増やさない（`B-05`）。
+    pub fn with_output(mut self, output: ChildOutput) -> Self {
+        self.output = output;
+        self
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 判定器への入力
 // ---------------------------------------------------------------------------

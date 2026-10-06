@@ -216,6 +216,13 @@ fn row_line<'a>(positions: &'a PositionsState, row: &PositionRow) -> Line<'a> {
         ),
         Span::styled(format!("  {source}"), Style::default().fg(Color::DarkGray)),
     ];
+    // [P5.5] 子の出力を捨てる辺にする予約（`o`）。既定の「返す」は出さない（行を既定の説明で埋めない）。
+    if positions.is_output_discarded(position) {
+        spans.push(Span::styled(
+            "  出力:捨てる".to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
     if row.startable.note().is_some() {
         spans.push(Span::styled(
             "  ［この綴りは起こせない］".to_string(),
@@ -246,8 +253,8 @@ fn notes_text(app: &App, positions: &PositionsState) -> String {
         text.push_str("遷移先の名前を入力中です（Enter で決める・空のまま Enter でやめる）。\n");
     } else if positions.approve.is_empty() {
         text.push_str(
-            "Spaceで選ぶ／Tabで遷移先／uで引数の広さ／fで表示の切替／rで読み直し／aで確定\
-             （承認待ちの全タブの予約をまとめて書きます）。\n",
+            "Spaceで選ぶ／Tabで遷移先／uで引数の広さ／oで子の出力を捨てる・返す／fで表示の切替／rで読み直し／\
+             aで確定（承認待ちの全タブの予約をまとめて書きます）。\n",
         );
     } else {
         text.push_str(&format!(
@@ -288,6 +295,14 @@ fn notes_text(app: &App, positions: &PositionsState) -> String {
             position.exe,
             positions.destination_name(position)
         ));
+        // [P5.5] 出力の行き先（決定66(4)）。返す辺は、子が読めるものが出力を通って呼び出し元へ渡る。
+        if positions.is_reserved(position) {
+            text.push_str(if positions.is_output_discarded(position) {
+                "  子の出力: 捨てる（標準出力・標準エラーは呼び出し元へ返りません。子が書いたファイルは残ります）\n"
+            } else {
+                "  子の出力: 返す（子が読めるものは呼び出し元へ渡ります。o で捨てる設定にできます）\n"
+            });
+        }
         let lines = &position.command_lines;
         text.push_str(&format!("  記録したコマンドライン {}通り", lines.len()));
         for line in lines.iter().take(3) {

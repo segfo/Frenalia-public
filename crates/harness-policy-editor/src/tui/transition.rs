@@ -496,6 +496,12 @@ impl App {
             KeyCode::Char('x') => self.toggle_selected_dismissal(),
             KeyCode::Char('X') => self.reserve_visible_dismissals(),
             KeyCode::Char('u') => self.toggle_selected_argv_width(),
+            // [P5.5] 出力の切り替えは位置の木にだけある。何も起きないので理由を言う（`B-32`）。
+            KeyCode::Char('o') => {
+                self.status = "子の出力を捨てる切り替え（o）は「遷移・観測から」の位置の木だけです。拒否からの\
+                               辺は出力を返す設定で書きます（変えるなら policy.json の辺に \"output\": \"discard\"）"
+                    .to_string();
+            }
             KeyCode::Char('f') => {
                 self.pending.filter = self.pending.filter.next();
                 let rows = self.pending.visible().len();

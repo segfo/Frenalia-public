@@ -436,6 +436,7 @@ fn removals_from_two_domains_are_written_with_one_save() {
     let plan = crate::transition_approve::plan_removals(
         ws.path(),
         &app.declared_transitions.reserved_edges(),
+        &[],
         1,
     )
     .expect("plan");
@@ -654,6 +655,7 @@ fn the_transition_tab_hints_are_shown_in_order_when_wide_enough() {
         vec![
             "Space 取り消しを予約",
             "a 確定",
+            "s Strict の付け外し",
             "↑↓ 選択",
             "r 読み直し",
             "F3 タブ切替",
@@ -670,4 +672,185 @@ fn the_transition_tab_hints_are_shown_in_order_when_wide_enough() {
     move_to_edge(&mut app, ENTRY_DOMAIN, &literal(PWSH));
     key(&mut app, KeyCode::Char(' '));
     assert_eq!(labels(&app)[1], "a 確定（1本を取り消し）");
+
+    // [P5.5] 入る辺（固定していない）を取り消す予約があれば、その上で Strict を付けられる——印の検査は予約した
+    // 取り消しを当てた宣言で行う。`a`の案内に印の件数も出る。
+    move_to_domain(&mut app, "pwsh");
+    key(&mut app, KeyCode::Char('s'));
+    assert_eq!(labels(&app)[1], "a 確定（1本を取り消し・Strict 1件）", "{}", app.status);
+}
+
+// ---------------------------------------------------------------------------
+// [P5.5] Strict の印（決定66の追記）——ドメインの見出しの`s`で付け外しを予約し、`a`で書く
+// ---------------------------------------------------------------------------
+
+fn move_to_domain(app: &mut App, name: &str) {
+    let state = &app.declared_transitions;
+    let target = state
+        .rows()
+        .iter()
+        .position(|row| matches!(row, ListedRow::Domain(d) if state.domains[*d].name == name))
+        .unwrap_or_else(|| panic!("{name} の見出しが無い"));
+    app.declared_transitions.row = target;
+}
+
+/// 入力を固定した辺（引数はリテラル・作業ディレクトリを宣言。手で書いたもの——このエディタは書かない）。
+fn fixed_edge(exe: &str, to: &str, cwd: &str) -> TransitionEdge {
+    TransitionEdge {
+        exe: ExeMatcher::Literal(exe.to_string()),
+        argv: ArgvMatcher::Literal(format!("\"{exe}\" --report")),
+        cwd: Some(cwd.to_string()),
+        to: to.to_string(),
+        env: None,
+        output: ChildOutput::Return,
+    }
+}
+
+fn strict_of(ws: &Path, name: &str) -> bool {
+    policy_file::load(ws)
+        .expect("policy.json が読める")
+        .domain(name)
+        .map(|d| d.strict)
+        .expect("そのドメインがある")
+}
+
+/// **許可側**: 入る辺が入力を固定している（または入る辺が無い）ドメインの見出しで`s`を押すと Strict の印を付ける予約に
+/// なり、見出しに予約が出る。`a`の確認に「Strict を付ける」と**スキーマ版が3へ上がる**ことが出て、`y`で書く。
+/// 予約しただけ・`a`を押しただけでは1バイトも書かない。
+#[test]
+fn s_on_a_domain_header_reserves_the_strict_mark_and_a_then_y_writes_it() {
+    let ws = workspace();
+    save(
+        ws.path(),
+        vec![
+            domain(ENTRY_DOMAIN, vec![fixed_edge(CALC, "logs", "C:/work")], &[]),
+            domain("logs", vec![], &["C:/logs/**"]),
+        ],
+    );
+    let before = policy_bytes(ws.path());
+    let mut app = transition_tab(ws.path());
+    move_to_domain(&mut app, "logs");
+    key(&mut app, KeyCode::Char('s'));
+    assert!(app.status.contains("Strict を付けます"), "{}", app.status);
+    assert_eq!(
+        app.declared_transitions.strict.get("logs"),
+        Some(&true),
+        "予約されていない"
+    );
+    let rows = screen_rows(&mut app, 200, 30);
+    assert!(row_with(&rows, "[logs]").contains(&squash("← Strict を付けます")));
+    assert_eq!(policy_bytes(ws.path()), before, "予約しただけで書いた");
+
+    key(&mut app, KeyCode::Char('a'));
+    let modal = app.modal.as_ref().expect("確認ダイアログ");
+    assert_eq!(modal.confirm, Confirm::DeclaredTransitions);
+    let text = modal.lines.join("\n");
+    assert!(text.contains("Strict を付ける") && text.contains("logs"), "{text}");
+    assert!(text.contains("スキーマ版") && text.contains("2→3"), "{text}");
+    assert_eq!(policy_bytes(ws.path()), before, "ダイアログを出しただけで書いた");
+
+    key(&mut app, KeyCode::Char('y'));
+    assert!(strict_of(ws.path(), "logs"), "{}", app.status);
+    assert!(!strict_of(ws.path(), ENTRY_DOMAIN));
+    assert!(app.declared_transitions.strict.is_empty(), "書いた予約が残っている");
+    let rows = screen_rows(&mut app, 200, 30);
+    assert!(row_with(&rows, "[logs]").contains("Strict"), "{rows:?}");
+}
+
+/// **禁止側**: 入る辺が入力を固定していない（このエディタが書いた形）ドメインには Strict を付けられず、理由を言う
+/// ——付けると、その辺が編集時検査（Strict のドメインへ入る辺は固定が要る）に落ちて`policy.json`を誰も読めなくなる
+/// （BUG-188 と同じ「宣言の変更で既存の辺が検査に落ちるなら書かない」）。予約しないので`a`でも書かない。
+#[test]
+fn s_is_refused_with_the_reason_when_an_edge_into_the_domain_does_not_fix_its_inputs() {
+    let ws = workspace();
+    save(
+        ws.path(),
+        vec![
+            domain(ENTRY_DOMAIN, vec![edge(PWSH, "pwsh")], &[]),
+            domain("pwsh", vec![], &["C:/logs/**"]),
+        ],
+    );
+    let before = policy_bytes(ws.path());
+    let mut app = transition_tab(ws.path());
+    move_to_domain(&mut app, "pwsh");
+    key(&mut app, KeyCode::Char('s'));
+    assert!(app.declared_transitions.strict.is_empty(), "断るべき予約が立った");
+    assert!(
+        app.status.contains("Strict を付けられません") && app.status.contains("is strict"),
+        "理由を言っていない: {}",
+        app.status
+    );
+    key(&mut app, KeyCode::Char('a'));
+    assert!(app.modal.is_none(), "予約が無いのにダイアログが出た");
+    assert_eq!(policy_bytes(ws.path()), before);
+}
+
+/// **Strict を外すと、入る辺が呼び出し元へ渡す権限が増える**——確認に「Strict を外す」と、広がる遷移とその権限が出る
+/// （外すと閉包がその辺を辿るようになる。決定66の追記）。`y`で印が消える。
+#[test]
+fn removing_the_strict_mark_shows_what_the_entering_edge_starts_to_hand_over() {
+    let ws = workspace();
+    let mut logs = domain("logs", vec![], &["C:/logs/**"]);
+    logs.strict = true;
+    save(
+        ws.path(),
+        vec![
+            domain(ENTRY_DOMAIN, vec![fixed_edge(CALC, "logs", "C:/work")], &[]),
+            logs,
+        ],
+    );
+    let mut app = transition_tab(ws.path());
+    let rows = screen_rows(&mut app, 200, 30);
+    assert!(row_with(&rows, "[logs]").contains("Strict"), "{rows:?}");
+    move_to_domain(&mut app, "logs");
+    key(&mut app, KeyCode::Char('s'));
+    assert!(app.status.contains("Strict を外します"), "{}", app.status);
+
+    key(&mut app, KeyCode::Char('a'));
+    let text = app.modal.as_ref().expect("確認ダイアログ").lines.join("\n");
+    assert!(text.contains("Strict を外す") && text.contains("logs"), "{text}");
+    assert!(text.contains("広がる遷移") && text.contains("C:/logs/**"), "{text}");
+    assert!(!text.contains("スキーマ版"), "版は下がるだけ: {text}");
+    key(&mut app, KeyCode::Char('y'));
+    assert!(!strict_of(ws.path(), "logs"), "{}", app.status);
+}
+
+/// **辺の行と入口のドメインの`s`は何もせず理由を言う**（`B-32`）。印はドメインに付けるもので、入口のドメインは
+/// 遷移先にならない（`harness.exe`が用意しない）ので印が意味を持たない。
+#[test]
+fn s_on_an_edge_row_or_the_entry_domain_says_why_it_does_nothing() {
+    let ws = workspace();
+    save(
+        ws.path(),
+        vec![
+            domain(ENTRY_DOMAIN, vec![edge(PWSH, "pwsh")], &[]),
+            domain("pwsh", vec![], &[]),
+        ],
+    );
+    let before = policy_bytes(ws.path());
+    let mut app = transition_tab(ws.path());
+    move_to_edge(&mut app, ENTRY_DOMAIN, &literal(PWSH));
+    key(&mut app, KeyCode::Char('s'));
+    assert!(app.status.contains("ドメインの見出し"), "{}", app.status);
+    move_to_domain(&mut app, ENTRY_DOMAIN);
+    key(&mut app, KeyCode::Char('s'));
+    assert!(app.status.contains("入口のドメイン"), "{}", app.status);
+    assert!(app.declared_transitions.strict.is_empty());
+    assert_eq!(policy_bytes(ws.path()), before);
+}
+
+/// **ファイル・通信のタブの`s`は何もせず、遷移のタブのキーだと言う**（決定62の裏返し。`B-32`）。
+#[test]
+fn s_on_the_files_tab_says_it_is_a_key_of_the_transition_tab() {
+    let ws = workspace();
+    save(
+        ws.path(),
+        vec![domain(ENTRY_DOMAIN, vec![], &["C:/logs/a.txt"])],
+    );
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    key(&mut app, KeyCode::F(3));
+    assert_eq!(app.declared_transitions.tab, DeclaredTab::Declarations);
+    key(&mut app, KeyCode::Char('s'));
+    assert!(app.status.contains("遷移のタブ"), "{}", app.status);
+    assert!(app.unapproved.is_empty());
 }

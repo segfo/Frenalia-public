@@ -304,6 +304,7 @@ impl App {
             if let Some(positions) = self.pending.positions.as_mut() {
                 positions.approve.clear();
                 positions.narrow.clear();
+                positions.discard_output.clear();
                 positions.renamed.clear();
             }
         }
@@ -416,10 +417,15 @@ fn changed_count(plan: &PositionPlan) -> usize {
         + plan.unapproved.len()
 }
 
-/// 位置の行で選んだ位置の辺（付け替え・絞り方を当てたもの。形は[`position_edges`]の1か所）。
+/// 位置の行で選んだ位置の辺（付け替え・絞り方・出力の設定を当てたもの。形は[`position_edges`]の1か所）。
 fn selected_position_edges(positions: &PositionsState) -> Vec<EdgeWrite> {
     let assignment = &positions.view.assignment;
-    position_edges(assignment, &positions.renamed, &positions.narrow)
+    position_edges(
+        assignment,
+        &positions.renamed,
+        &positions.narrow,
+        &positions.discard_output,
+    )
         .into_iter()
         .zip(&assignment.positions)
         .filter(|(_, position)| positions.approve.contains(&key_of(position)))

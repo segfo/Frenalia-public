@@ -750,7 +750,12 @@ fn edge_label(edge: &TransitionEdge) -> String {
         ArgvMatcher::Any(_) => harness_policy::transition_listing::ANY_ARGV,
         ArgvMatcher::Literal(value) | ArgvMatcher::Pattern(value) => value.as_str(),
     };
-    format!("{} {argv} → {}", matcher_text(&edge.exe), edge.to)
+    format!(
+        "{} {argv} → {}{}",
+        matcher_text(&edge.exe),
+        edge.to,
+        crate::exposure_view::output_suffix(edge.output)
+    )
 }
 
 fn matcher_text(exe: &ExeMatcher) -> &str {

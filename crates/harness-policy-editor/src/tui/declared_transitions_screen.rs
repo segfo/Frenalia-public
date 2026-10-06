@@ -124,22 +124,35 @@ fn header_line(state: &DeclaredTransitionsState, domain: usize) -> Line<'static>
     } else {
         shape.reachable.join(", ")
     };
-    Line::from(vec![
+    let mut spans = vec![
         Mark::of(entry.edges.len(), kept).span(),
         Span::styled(
             format!(" [{}]", entry.name),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!(
-                "  届く範囲: ファイル {}件・通信 {}件 ／ 起動で届く: {reachable} ／ 最長の連鎖: {}",
-                shape.rights.fs.len(),
-                shape.rights.net.len(),
-                chain_text(&shape.longest_chain)
-            ),
-            Style::default().fg(Color::Gray),
+    ];
+    // [P5.5] Strict の印（決定66の追記）。入る辺の入力を固定するモードなので、名前の直後に出す。
+    if entry.strict {
+        spans.push(Span::styled(
+            " ［Strict］",
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(
+        format!(
+            "  届く範囲: ファイル {}件・通信 {}件 ／ 起動で届く: {reachable} ／ 最長の連鎖: {}",
+            shape.rights.fs.len(),
+            shape.rights.net.len(),
+            chain_text(&shape.longest_chain)
         ),
-    ])
+        Style::default().fg(Color::Gray),
+    ));
+    match state.strict.get(&entry.name) {
+        Some(true) => spans.push(Span::styled("  ← Strict を付けます", Style::default().fg(Color::Red))),
+        Some(false) => spans.push(Span::styled("  ← Strict を外します", Style::default().fg(Color::Green))),
+        None => {}
+    }
+    Line::from(spans)
 }
 
 /// 辺の行: `  [x] <exe のファイル名> <引数> → <遷移先>  <起こせる／起こせません（理由）>`（記号は2つ目のspan）。
@@ -210,15 +223,16 @@ fn chain_text(chain: &LongestChain) -> String {
 fn notes_text(app: &App) -> String {
     let state = &app.declared_transitions;
     let mut text = String::new();
-    if state.remove.is_empty() {
+    if state.remove.is_empty() && state.strict.is_empty() {
         text.push_str(
-            "Spaceで取り消しを予約（ドメインの見出しの行なら、そのドメインの辺をまとめて）／aで確定／rで読み直し／\
-             F3でファイル・通信のタブへ。辺を足すのは承認待ち（F2）の遷移タブです。\n",
+            "Spaceで取り消しを予約（ドメインの見出しの行なら、そのドメインの辺をまとめて）／sでドメインの Strict の\
+             付け外し／aで確定／rで読み直し／F3でファイル・通信のタブへ。辺を足すのは承認待ち（F2）の遷移タブです。\n",
         );
     } else {
         text.push_str(&format!(
-            "{}本の取り消しを予約中（aを押すまで何も書きません）。\n",
-            state.remove.len()
+            "{}本の取り消しと Strict の付け外し {}件を予約中（aを押すまで何も書きません）。\n",
+            state.remove.len(),
+            state.strict.len()
         ));
     }
     for note in &state.notes {
@@ -234,6 +248,12 @@ fn notes_text(app: &App) -> String {
                 entry.name,
                 entry.edges.len()
             ));
+            // [P5.5] 2つのモードのどちらか（決定66の追記）。正本の使い分けはヘルプ（F4）と決定66の追記。
+            text.push_str(if entry.strict {
+                "  Strict: 入る辺は入力を固定した辺だけ（決めた操作だけが走り、呼び出し元は中身を選べません）。s で外せます\n"
+            } else {
+                "  普通のモード: 入る辺の子を、呼び出し元はこのドメインの権限の範囲で自由に動かせます。s で Strict にできます\n"
+            });
             if rights.is_empty() {
                 text.push_str("  なし（共通の土台だけ）\n");
             }

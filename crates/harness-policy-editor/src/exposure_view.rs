@@ -9,25 +9,28 @@
 //! **断らずに人が判断する**。数えるのは`harness_policy::transition::exposure_delta`（到達閉包・Strict の辺の除外・
 //! 前から渡していた分との差）で、ここは結果を並べるだけ（判定を2つ持たない、`B-13`）。
 //!
-//! # どの経路に出すか（`policy.json`を書く経路6つのうち4つ）
+//! # どの経路に出すか（`policy.json`を書く経路6つのうち5つ）
 //!
-//! `policy.json`を保存する関数は6つある。**広がり得る4つ**——位置ごとのドメインの確定（`position_approve`）・
-//! ファイル宣言の承認（`approve`）・付け替え（`reassign`）・取り消し（`unapprove`）——は、`plan`が
-//! [`Widening`]を作り、その確認を出す画面と CLI がすべて[`lines`]を並べる（TUI の承認待ち・宣言画面と、CLI の
-//! `approve`・`unapprove`）。宣言の承認・付け替えは遷移先の権限を増やし、取り消しは遷移元の宣言を減らすので、
-//! 辺に触らなくても辺が渡す権限は増え得る。**対象外の2つ**:
+//! `policy.json`を保存する関数は6つある。**広がり得る5つ**——位置ごとのドメインの確定（`position_approve`）・
+//! ファイル宣言の承認（`approve`）・付け替え（`reassign`）・取り消し（`unapprove`）・宣言画面の遷移タブの確定
+//! （`transition_approve::commit_removals`。P5.5 で Strict の印の付け外しが乗った）——は、`plan`が[`Widening`]を作り、
+//! その確認を出す画面と CLI がすべて[`lines`]を並べる（TUI の承認待ち・宣言画面の両タブと、CLI の`approve`・
+//! `unapprove`）。宣言の承認・付け替えは遷移先の権限を増やし、取り消しは遷移元の宣言を減らし、**Strict の印を外すと
+//! 入る辺が閉包に入る**ので、辺に触らなくても辺が渡す権限は増え得る。**対象外の1つ**:
 //!
-//! - `transition_approve::commit_removals`（宣言画面の遷移タブの取り消し）——辺を消すだけで、到達閉包は縮む
-//!   だけなので広がらない
 //! - `transition_approve::commit`（辺を足すが、画面と CLI からは呼ばれない。試験の入口として残る。
 //!   承認待ちの遷移タブの確定は`position_approve`を通る）
+//!
+//! [P5.5] [`Widening`]は**スキーマ版の上がり**（出力を捨てる辺か Strict の印を初めて書くと3へ。古い`harness.exe`は
+//! 読込で断る）も運ぶ——確定の明細を出す経路がすべてこの構造体を並べるので、案内の配線を1つにした。
 //!
 //! # 限界
 //!
 //! - **組み合わせの対**（Limit 1。あるドメインが書ける場所を、外部と通信できる別のドメインが読む／実行する）は
 //!   まだ出さない（P5.6）
 //! - **子の出力の行は、広がる辺にだけ出す**（P5.4b。Daemon が出力を返すようになった段で足した——P5.3 は返して
-//!   いなかったので、入る前に言うと嘘になった、`B-32`）。広がらない辺の出力の設定（「出力:捨てる」の表示）は P5.5
+//!   いなかったので、入る前に言うと嘘になった、`B-32`）。広がらない辺の出力の設定は、辺の綴りに添える
+//!   [`output_suffix`]が出す（P5.5。確認の明細・宣言画面の遷移タブ）
 //! - 1つの確認に2つの`plan`が並ぶ画面（承認待ちの「承認＋チェックを外した取り消し」、宣言画面の
 //!   「付け替え＋取り消し」）は、`plan`ごとに「いまの`policy.json`からの差」を出す。**2つを重ねて初めて広がる辺**
 //!   （片方が足した値を、もう片方が遷移元から外す）は数えない
@@ -35,7 +38,7 @@
 
 use std::path::Path;
 
-use harness_policy::policy_file::PolicyFile;
+use harness_policy::policy_file::{PolicyFile, POLICY_SCHEMA_VERSION};
 use harness_policy::transition::{self, ChildOutput, ExeMatcher};
 use harness_policy::transition_listing::Rights;
 
@@ -46,12 +49,16 @@ pub struct Widening {
     pub edges: Vec<WidenedEdge>,
     /// 数えられなかった理由（同じ名前のドメインが2つある等）。**黙って「広がらない」と言わない**（`B-10`）。
     pub uncounted: Option<String>,
+    /// [P5.5] この変更で`policy.json`のスキーマ版が上がるとき（変更前, 変更後）。出力を捨てる辺か Strict の印を初めて
+    /// 書くと3へ上がり、版2までしか読めない古い`harness.exe`は読込で断る——書く前に知らせる。広がりではないが、
+    /// 確定の明細を出す全経路がこの構造体を並べるので、ここに持たせて配線を1つにした（`B-06`）。
+    pub schema_raised: Option<(u32, u32)>,
 }
 
 impl Widening {
-    /// 確認に出すものが無い（広がる辺が無く、数えられなかったことも無い）。
+    /// 確認に出すものが無い（広がる辺が無く、数えられなかったことも、版が上がることも無い）。
     pub fn is_empty(&self) -> bool {
-        self.edges.is_empty() && self.uncounted.is_none()
+        self.edges.is_empty() && self.uncounted.is_none() && self.schema_raised.is_none()
     }
 }
 
@@ -71,6 +78,12 @@ pub struct WidenedEdge {
 
 /// `before` → `after`の変更で広がる遷移。`after`は書く予定の内容、`before`は読み込んだ`policy.json`。
 pub fn widening(before: &PolicyFile, after: &PolicyFile, workspace_root: &Path) -> Widening {
+    // 版は内容から決まる（`PolicyFile::required_schema_version`）。版1→2（初めての遷移）は P5 より前から言っていない。
+    let (was, will_be) = (
+        before.required_schema_version(),
+        after.required_schema_version(),
+    );
+    let schema_raised = (will_be == POLICY_SCHEMA_VERSION && was < will_be).then_some((was, will_be));
     let workspace = workspace_root.to_string_lossy();
     let delta = transition::exposure_delta(
         &before.transition_graph_input(Some(workspace.as_ref()), &[]),
@@ -102,10 +115,12 @@ pub fn widening(before: &PolicyFile, after: &PolicyFile, workspace_root: &Path) 
                 })
                 .collect(),
             uncounted: None,
+            schema_raised,
         },
         Err(e) => Widening {
             edges: Vec::new(),
             uncounted: Some(e.to_string()),
+            schema_raised,
         },
     }
 }
@@ -113,6 +128,14 @@ pub fn widening(before: &PolicyFile, after: &PolicyFile, workspace_root: &Path) 
 /// 確認の画面・CLI に並べる行（出すものが無ければ空）。先頭に空行を1つ置く（前の節と分ける）。
 pub fn lines(widening: &Widening) -> Vec<String> {
     let mut lines = Vec::new();
+    if let Some((was, will_be)) = widening.schema_raised {
+        lines.push(String::new());
+        lines.push(format!(
+            "policy.json のスキーマ版が {was}→{will_be} に上がります（子の出力を捨てる辺か Strict の印を書くため）。\
+             版{will_be}を知らない古い harness.exe・ポリシーエディタは、この policy.json を読込で断ります\
+             （印を黙って無視して読むことはありません）。このワークスペースを古い harness.exe で使うなら先に更新してください"
+        ));
+    }
     if let Some(reason) = &widening.uncounted {
         lines.push(String::new());
         lines.push(format!(
@@ -142,6 +165,15 @@ pub fn lines(widening: &Widening) -> Vec<String> {
         });
     }
     lines
+}
+
+/// [P5.5] 辺の綴りに添える出力の設定（捨てる辺だけ。既定の「返す」は何も添えない）。確認の明細・宣言画面の遷移タブ・
+/// 位置の木の行が同じこれを通す（文言を写さない、`B-05`）。
+pub fn output_suffix(output: ChildOutput) -> &'static str {
+    match output {
+        ChildOutput::Return => "",
+        ChildOutput::Discard => "（子の出力を捨てる）",
+    }
 }
 
 /// 権限を1件1行で（`fs.<種別> <値>`・`net.allow_domains <宛先>`）。位置の木の説明欄も同じ綴りで出す。

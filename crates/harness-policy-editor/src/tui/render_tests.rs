@@ -3029,15 +3029,22 @@ fn every_key_hint_appears_in_the_help_section_of_its_screen() {
 /// - 足す: 候補の選択（`accepted`）・`R`の再帰・遷移の承認の予約・位置の予約・このマシンでの承認の予約
 /// - 減らす: 宣言の取り消し（`unapproved`）・遷移の辺の取り消し（承認待ちと宣言画面の遷移タブ）
 /// - 数えない: 却下（表示だけの印）・引数の絞り・遷移先の付け替え・種類や`**`の付け替え（宣言を足しも消しもしない。
-///   付け替えが広げる向きかは、付け替えの確認ダイアログが言う）
+///   付け替えが広げる向きかは、付け替えの確認ダイアログが言う）・子の出力の設定（`o`。渡すものを減らすだけで、
+///   選んだ位置の予約の上に乗る）
+/// - [P5.5] Strict の印: **付ける予約は減らす側**（入る辺の子を呼び出し元が操れなくなる）、**外す予約は足す側**
 fn reservation_sizes(app: &App) -> (usize, usize) {
+    let strict = &app.declared_transitions.strict;
+    let unmark = strict.values().filter(|mark| !**mark).count();
     let adds = app.accepted.len()
         + app.recursive.len()
         + app.pending.approve.len()
         + app.pending.positions.as_ref().map_or(0, |p| p.approve.len())
-        + app.declared_approval.reserved.len();
-    let removes =
-        app.unapproved.len() + app.pending.remove.len() + app.declared_transitions.remove.len();
+        + app.declared_approval.reserved.len()
+        + unmark;
+    let removes = app.unapproved.len()
+        + app.pending.remove.len()
+        + app.declared_transitions.remove.len()
+        + (strict.len() - unmark);
     (adds, removes)
 }
 
@@ -3179,6 +3186,9 @@ fn no_key_has_opposite_directions_in_two_tabs_of_one_screen() {
         ("宣言", "ファイル・通信", 'A', REMOVES),
         ("宣言", "ファイル・通信", 'y', ADDS),
         ("宣言", "遷移", ' ', REMOVES),
+        // [P5.5] Strict の印を付ける（入る辺の子を呼び出し元が操れなくなる）。外す予約は印の付いたドメインでだけ
+        // 起き、この画面の試験の宣言には無いので「減らす」だけが出る。ファイル・通信のタブの`s`は理由を言うだけ。
+        ("宣言", "遷移", 's', REMOVES),
     ];
 
     let pending = pending_fixture();

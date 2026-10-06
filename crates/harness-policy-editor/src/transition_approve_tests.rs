@@ -226,6 +226,11 @@ fn a_strict_destination_is_refused_because_this_editor_does_not_fix_inputs() {
     match plan(&request_to(tmp.path(), "wide", &[any("C:/curl.exe")], &[])) {
         Err(TransitionApproveError::Rejected(detail)) => {
             assert!(detail.contains("is strict"), "検査の理由が落ちている: {detail}");
+            // [P5.5] このエディタで取れる直し方で先に言い直す（検査の英文は「cwd を宣言せよ」で、この画面では取れない）。
+            assert!(
+                detail.contains("遷移先「wide」は Strict です") && detail.contains("Strict を外す"),
+                "直し方を言っていない: {detail}"
+            );
         }
         other => panic!("Strict のドメインへの辺が別の形で返った: {other:?}"),
     }
