@@ -31,8 +31,7 @@ impl AppState {
                 // （BUG-232）。流入中に thinking や知らせの行（`[stderr]`・スラッシュコマンドの控え等）が入ると最後の
                 // 項目は別物になる。そのときは足し先が無いので、ターンの最初の文章と同じく新しい項目を始める
                 // ——以前はここで黙って捨てていた（画面からだけ返答の残りが消え、履歴には残っていた）。
-                let continues = self.turn_open
-                    && matches!(self.transcript.last(), Some(TranscriptItem::Assistant(_)));
+                let continues = self.streaming_item().is_some();
                 if !continues {
                     // モデル（特にLMStudio経由のローカルモデル）がチャットテンプレートの都合で
                     // 応答冒頭に意味の無い改行/空白だけのデルタを送ってくることがある。
@@ -48,7 +47,7 @@ impl AppState {
                     }
                     self.end_thinking_progress(true);
                     self.transcript
-                        .push(TranscriptItem::Assistant(visible.to_string()));
+                        .push(TranscriptItem::Assistant(AssistantText::new(visible)));
                     self.turn_open = true;
                     return;
                 }

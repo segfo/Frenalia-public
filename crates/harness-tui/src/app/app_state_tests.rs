@@ -599,7 +599,7 @@ fn text_deltas_within_a_turn_accumulate_into_one_item() {
 
     assert_eq!(app.transcript.len(), 1);
     match &app.transcript[0] {
-        TranscriptItem::Assistant(s) => assert_eq!(s, "hello"),
+        TranscriptItem::Assistant(s) => assert_eq!(s.as_str(), "hello"),
         other => panic!("expected Assistant item, got {other:?}"),
     }
 
@@ -1114,7 +1114,7 @@ fn leading_whitespace_only_deltas_are_dropped_and_indicator_stays() {
         "indicator clears once real content arrives"
     );
     assert_eq!(app.transcript.len(), 1);
-    assert!(matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s == "Hello"));
+    assert!(matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s.as_str() == "Hello"));
 }
 
 /// 非空白の内容が複数のデルタに分かれて届く通常ケースは引き続き1つのAssistant項目へ
@@ -1129,7 +1129,7 @@ fn subsequent_text_deltas_still_append_to_the_same_assistant_item() {
     app.apply(AgentEvent::TextDelta { text: "lo".into() });
 
     assert_eq!(app.transcript.len(), 1);
-    assert!(matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s == "Hello"));
+    assert!(matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s.as_str() == "Hello"));
 }
 
 // --- BUG-232: 流入中に別の項目が入っても、返答の残りを画面から落とさない ---
@@ -1140,7 +1140,7 @@ fn transcript_shape(app: &AppState) -> Vec<String> {
         .iter()
         .map(|item| match item {
             TranscriptItem::User(s) => format!("User:{s}"),
-            TranscriptItem::Assistant(s) => format!("Assistant:{s}"),
+            TranscriptItem::Assistant(s) => format!("Assistant:{}", s.as_str()),
             TranscriptItem::Thinking(s) => format!("Thinking:{s}"),
             TranscriptItem::ToolCard { name, .. } => format!("ToolCard:{name}"),
             TranscriptItem::Error(s) => format!("Error:{s}"),
@@ -1582,7 +1582,9 @@ fn a_discarded_turn_rewinds_the_transcript_to_the_start_of_the_attempt() {
 
     // 前のターンは残り、このターンの本文だけが消えて記録行に置き換わる。
     assert_eq!(app.transcript.len(), 2, "{:?}", app.transcript);
-    assert!(matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s == "前のターンの回答"));
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s.as_str() == "前のターンの回答")
+    );
     let TranscriptItem::Info(line) = &app.transcript[1] else {
         panic!("expected an Info line, got {:?}", app.transcript[1]);
     };
@@ -1595,7 +1597,9 @@ fn a_discarded_turn_rewinds_the_transcript_to_the_start_of_the_attempt() {
         text: "落ち着いた回答".into(),
     });
     assert_eq!(app.transcript.len(), 3);
-    assert!(matches!(&app.transcript[2], TranscriptItem::Assistant(s) if s == "落ち着いた回答"));
+    assert!(
+        matches!(&app.transcript[2], TranscriptItem::Assistant(s) if s.as_str() == "落ち着いた回答")
+    );
 }
 
 /// 同じターンで2回破棄されても、**1回目の記録行は消えない**。消えると
@@ -1680,7 +1684,7 @@ fn a_restored_session_renders_its_conversation_not_just_a_count() {
         "{items:?}"
     );
     assert!(
-        matches!(&items[1], TranscriptItem::Assistant(t) if t == "最初の回答"),
+        matches!(&items[1], TranscriptItem::Assistant(t) if t.as_str() == "最初の回答"),
         "{items:?}"
     );
     match &items[2] {

@@ -15,8 +15,8 @@ use ratatui::Terminal;
 
 use super::*;
 use crate::app::{
-    ApprovalStage, PermissionView, PreviousCopy, ReviewPanelState, ReviewRow, ReviewTarget,
-    TranscriptItem, MODAL_INPUT_GRACE,
+    ApprovalStage, AssistantText, PermissionView, PreviousCopy, ReviewPanelState, ReviewRow,
+    ReviewTarget, TranscriptItem, MODAL_INPUT_GRACE,
 };
 
 const WIDTH: u16 = 100;
@@ -181,7 +181,9 @@ fn app_with_transcript(lines: usize) -> AppState {
     let mut app = AppState::new("mock".into(), "mock-model".into());
     for i in 0..lines {
         app.transcript
-            .push(TranscriptItem::Assistant(format!("transcript line {i}")));
+            .push(TranscriptItem::Assistant(AssistantText::new(format!(
+                "transcript line {i}"
+            ))));
     }
     app
 }

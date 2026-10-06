@@ -7,11 +7,15 @@
 
 mod approval;
 mod review;
+#[cfg(test)]
+#[path = "transcript_tests.rs"]
+mod transcript_tests;
 
 pub(crate) use approval::render_permission_modal;
 
 use crossterm::event::KeyEvent;
 use harness_term::button::Press;
+use harness_term::select::LineJoin;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -390,9 +394,20 @@ fn set_input_cursor(f: &mut Frame, area: Rect, app: &AppState, rows: &[InputRow]
 
 /// `collapsed`が`true`のとき、ツールカードの入力/出力本文とthinkingブロックの全文を
 /// ヘッダ/要約1行だけに畳む（`Ctrl+O`トグル、Claude Code CLI相当の折り畳み表示）。
-fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
+///
+/// 戻り値は描く行と、行ごとの前の行とのつながり（`LineJoin`。行と同じ数。`harness_term::select::Selectable::joined`へ
+/// 渡す）。assistantの返答は`inner_width`（transcriptの枠の内側の幅）で`AssistantText::render`が描き、返った印を
+/// そのまま並べる。ほかの行は全部`Break`。**流入中でない返答は描く前に終える**（`AppState::streaming_item`。
+/// このあと文章が足されることは無い）。
+fn transcript_lines(
+    app: &AppState,
+    collapsed: bool,
+    inner_width: u16,
+) -> (Vec<Line<'static>>, Vec<LineJoin>) {
     let mut lines = Vec::new();
-    for item in &app.transcript {
+    let mut joins = Vec::new();
+    let streaming = app.streaming_item();
+    for (i, item) in app.transcript.iter().enumerate() {
         match item {
             TranscriptItem::User(text) => {
                 lines.push(Line::from(Span::styled(
@@ -403,12 +418,13 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
                 )));
             }
             TranscriptItem::Assistant(text) => {
-                for l in text.lines() {
-                    lines.push(Line::from(l.to_string()));
+                if streaming != Some(i) {
+                    text.finish();
                 }
-                if text.is_empty() {
-                    lines.push(Line::from(""));
-                }
+                let rendered = text.render(inner_width);
+                joins.resize(lines.len(), LineJoin::Break); // ここまでのほかの行
+                lines.extend(rendered.lines);
+                joins.extend(rendered.joins);
             }
             TranscriptItem::Thinking(text) => {
                 if collapsed {
@@ -550,7 +566,8 @@ fn transcript_lines(app: &AppState, collapsed: bool) -> Vec<Line<'static>> {
         )));
     }
 
-    lines
+    joins.resize(lines.len(), LineJoin::Break);
+    (lines, joins)
 }
 
 /// 戻り値は`scroll_offset`の上限（[`render`]がそのまま返す）。
@@ -561,15 +578,18 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &AppState, targets: &mut Ta
     // 末尾追従の描画と上限の算出は`harness_term::scrollback`が持つ
     // （ポリシーエディタの記録画面と共有。同局のdoc参照）。
     // 戻り値の上限を`AppState::apply_draw_feedback`へ渡すのは呼び出し側の責務（BUG-076）。
-    let lines = transcript_lines(app, app.collapsed);
+    // assistantの返答を描く幅は、描く枠と同じ枠の内側から測る（実装へ渡す幅は`crate::markdown`が狭める）。
+    let block = Block::default().borders(Borders::ALL);
+    let (lines, joins) = transcript_lines(app, app.collapsed, block.inner(area).width);
     let max = harness_term::scrollback::render_with_bar(
         f,
         area,
         lines,
-        Block::default().borders(Borders::ALL),
+        block,
         app.scroll,
         Style::default(),
-        harness_term::select::Selectable::new(targets, Wheel::Transcript, &app.selection),
+        harness_term::select::Selectable::new(targets, Wheel::Transcript, &app.selection)
+            .joined(&joins),
     );
     targets.wheel(area, Wheel::Transcript);
     let notice =
@@ -1190,7 +1210,7 @@ mod scope_label_tests {
 #[cfg(test)]
 mod border_tests {
     use super::*;
-    use crate::app::PermissionView;
+    use crate::app::{AssistantText, PermissionView};
     use harness_core::{PermissionSubject, ProgramSubject, RiskClass};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -1271,10 +1291,11 @@ mod border_tests {
         let mut app = AppState::new("mock".into(), "mock-model".into());
         for i in 0..40 {
             let pad = if i % 2 == 0 { "" } else { " " };
-            app.transcript.push(TranscriptItem::Assistant(format!(
-                "{pad}{}",
-                symbol.repeat(30)
-            )));
+            app.transcript
+                .push(TranscriptItem::Assistant(AssistantText::new(format!(
+                    "{pad}{}",
+                    symbol.repeat(30)
+                ))));
         }
         app
     }
@@ -1321,7 +1342,9 @@ mod border_tests {
         for width in [120u16, 119] {
             let mut app = AppState::new("mock".into(), "mock-model".into());
             app.transcript
-                .push(TranscriptItem::Assistant(spilling_line(width - 2)));
+                .push(TranscriptItem::Assistant(AssistantText::new(
+                    spilling_line(width - 2),
+                )));
             let grid = screen(&app, width, 20);
             let (_, right, top, bottom) = drawn_box(&grid, "t");
             let broken = broken_right_border(&grid, right, top, bottom);

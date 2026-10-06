@@ -44,7 +44,7 @@ fn app_with_items(items: &[&str]) -> AppState {
     let mut app = AppState::new("mock".into(), "mock-model".into());
     for item in items {
         app.transcript
-            .push(TranscriptItem::Assistant((*item).to_string()));
+            .push(TranscriptItem::Assistant(AssistantText::new(*item)));
     }
     app
 }
@@ -253,7 +253,9 @@ fn a_selection_whose_text_changed_is_dropped_instead_of_copying_something_else()
         },
     });
     app.transcript
-        .push(TranscriptItem::Assistant("after the tool".into()));
+        .push(TranscriptItem::Assistant(AssistantText::new(
+            "after the tool",
+        )));
     let screen = draw(&mut app);
     let (x, y) = screen.find("after the tool");
     drag(&mut app, (x, y), (x + 13, y));

@@ -49,7 +49,8 @@ pub enum ToolCardStatus {
 #[derive(Debug, Clone)]
 pub enum TranscriptItem {
     User(String),
-    Assistant(String),
+    /// assistantの返答。足すのは[`AssistantText::push_str`]だけ（原文と描く側を一緒に持つ。`app::assistant_text`）。
+    Assistant(AssistantText),
     Thinking(String),
     ToolCard {
         id: String,
@@ -68,6 +69,8 @@ pub enum TranscriptItem {
 /// キーバインドではなくスラッシュコマンドから操作するためのもの。Ctrl+GはVSCode統合ターミナルの
 /// 既定ショートカットと衝突するため、`/fsstage`へ置き換えて廃止した）。
 mod approval;
+/// transcriptの1項目としてのassistantの返答（原文と、それを描く`crate::markdown::MarkdownView`）。
+mod assistant_text;
 mod commands;
 mod events;
 mod input;
@@ -86,6 +89,7 @@ pub use approval::{
     ApprovalCommand, ApprovalLine, ApprovalStage, LineStyle, PermissionView, PreviousCopy,
     RiskView, SummaryState, SummaryWait, WaitClock,
 };
+pub(crate) use assistant_text::AssistantText;
 use commands::parse_slash_command;
 pub use commands::{Action, FsStageCommand, MemoryCommand, SlashCommand};
 pub use pointer::{Click, DrawFeedback, InputButton, KeyHint, ReviewDrawn, Step, Targets, Wheel};
@@ -210,6 +214,7 @@ pub struct AppState {
     /// スラッシュコマンドの控え等）が入っても、これは偽に戻らない。だから`TextDelta`が続きとして足すのは
     /// 「これが真で、**かつ`transcript`の最後が`Assistant`項目**」のときだけで、そうでなければ新しい
     /// `Assistant`項目を始める（[BUG-232](../../../../docs/bugs/BUG-232.md)。以前は足し先が無いまま黙って捨てていた）。
+    /// その判定は[`Self::streaming_item`]が持つ。
     turn_open: bool,
     /// 現在の試行が書き始めた`transcript`上の位置（`transcript.len()`）。
     ///
@@ -579,6 +584,17 @@ impl AppState {
         self.turn_open = false;
     }
 
+    /// いま流れ込んでいる本文の項目の位置——次の`TextDelta`が続きとして足される先（[`Self::turn_open`]の説明）。
+    /// 無ければ`None`（次の`TextDelta`は新しい項目を始める）。
+    ///
+    /// **続きとして足すかの判定（`events.rs`の`TextDelta`）と、描くときに流入中でない項目を終える判定（`crate::ui`）が
+    /// 同じこれを通る**——別々に書くと、足す先と終えずに残す項目が食い違い、終えた項目へ足すか、流入中の項目を終える。
+    pub(crate) fn streaming_item(&self) -> Option<usize> {
+        let streaming =
+            self.turn_open && matches!(self.transcript.last(), Some(TranscriptItem::Assistant(_)));
+        streaming.then(|| self.transcript.len() - 1)
+    }
+
     /// 入力欄の内容を送信する（スラッシュコマンドならパースして`Action::Slash`、それ以外は
     /// `Action::Submit`）。Alt+Enterと、`enter_submits`時の素のEnterから共通で呼ばれる。
     pub fn note_resumed_session(&mut self, message_count: usize) {
@@ -628,7 +644,7 @@ pub fn restored_transcript_items(messages: &[harness_core::Message]) -> Vec<Tran
                 ContentBlock::Text(text) if text.trim().is_empty() => {}
                 ContentBlock::Text(text) => items.push(match msg.role {
                     Role::User => TranscriptItem::User(text.clone()),
-                    _ => TranscriptItem::Assistant(text.clone()),
+                    _ => TranscriptItem::Assistant(AssistantText::new(text.clone())),
                 }),
                 ContentBlock::ToolUse { id, name, input } => items.push(TranscriptItem::ToolCard {
                     id: id.clone(),

@@ -5,6 +5,7 @@ mod app;
 mod approvals;
 mod engine;
 mod gate;
+mod markdown;
 mod picker;
 #[cfg(windows)]
 mod sandbox_prep;
