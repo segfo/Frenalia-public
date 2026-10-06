@@ -35,8 +35,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
-use crate::app::{ApprovalStage, Click, LineStyle, PermissionView, Targets, WaitClock, Wheel};
-use harness_core::RiskLevel;
+use crate::app::{
+    ApprovalStage, Click, LineStyle, PermissionView, Targets, TitleTone, WaitClock, Wheel,
+};
 use harness_sandbox::textdiff::DiffKind;
 use harness_term::button::Press;
 use harness_term::select::{Selectable, Selection};
@@ -108,15 +109,21 @@ pub fn render_permission_modal(
         ..rect
     };
 
-    // 外の判定モデルが危険と見たコマンドは、見出しと枠線の色を変える（赤）。
-    // 判定が無い・低いときは今までと同じ見た目（`PermissionView::title`）。
-    let (title_text, elevated) = pending.title();
-    let (title_style, border_style) = match elevated {
-        Some(RiskLevel::Danger) => (
+    // 危険度が高なら見出しと枠線を赤、中（機械の判定と判定モデルが食い違った）なら黄にする。
+    // 要確認・判定しない材料は今までと同じ見た目（`PermissionView::title`）。
+    let (title_text, tone) = pending.title();
+    let (title_style, border_style) = match tone {
+        TitleTone::Danger => (
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             Style::default().fg(Color::Red),
         ),
-        _ => (Style::default(), Style::default()),
+        TitleTone::Caution => (
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Yellow),
+        ),
+        TitleTone::Plain => (Style::default(), Style::default()),
     };
     // 本文の枠の下辺は、選択肢の枠との仕切りになる（左右の角を`├`/`┤`にして、1つの枠に見せる）。
     let body_block = Block::default()
@@ -327,5 +334,61 @@ mod tests {
         let screen = rendered(&view(&["gp\u{202E}yp.exe"]));
         assert!(!screen.contains('\u{202E}'), "{screen}");
         assert!(screen.contains(r"gp\u{202E}yp.exe"), "{screen}");
+    }
+
+    /// 枠線の色は危険度に従う——高は赤、中は黄、要確認・判定しない材料は今までどおり（色を付けない）。
+    #[test]
+    fn the_border_color_follows_the_risk_level() {
+        use harness_core::{CommandSubject, RiskVerdict};
+        use harness_engine::approval_risk::{self, RiskBasis};
+        use ratatui::style::Color;
+
+        // 機械の判定で高になる行（既存のフィクスチャ。`approvals_risk_tests`の`DANGEROUS_LINE`）。
+        let subject = PermissionSubject::Command(CommandSubject::line_only(
+            "rm C:\\Windows\\System32\\calc.exe",
+        ));
+        let border = |outcome: Option<approval_risk::RiskOutcome>| {
+            let mut pending = PermissionView::new(
+                "perm-0".to_string(),
+                "run_shell".to_string(),
+                RiskClass::Exec,
+                subject.clone(),
+                "{}".to_string(),
+                None,
+                "C:/ws".to_string(),
+            );
+            pending.assessment = outcome.map(|o| crate::app::RiskView::done(o, None));
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            term.draw(|f| {
+                super::render_permission_modal(
+                    f,
+                    f.area(),
+                    &pending,
+                    &Default::default(),
+                    &mut Default::default(),
+                    &Default::default(),
+                    clock(),
+                );
+            })
+            .unwrap();
+            let buffer = term.backend().buffer().clone();
+            let corner = buffer
+                .content()
+                .iter()
+                .find(|cell| cell.symbol() == "┌")
+                .expect("枠の左上の角が無い");
+            corner.fg
+        };
+        let high = approval_risk::machine(&subject).unwrap();
+        let mut medium = high.clone();
+        medium.basis = RiskBasis::WithModel;
+        medium.unjudged_damage = false;
+        medium.model_peak = Some(RiskVerdict::from_score(0.3).unwrap());
+        assert_eq!(medium.severity(), approval_risk::Severity::Medium);
+
+        assert_eq!(border(Some(high)), Color::Red);
+        assert_eq!(border(Some(medium)), Color::Yellow);
+        let plain = border(None);
+        assert!(plain != Color::Red && plain != Color::Yellow, "{plain:?}");
     }
 }

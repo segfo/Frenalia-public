@@ -1,7 +1,7 @@
-//! 承認画面の「危険度: 要確認／高」の行（D-100 の追記。組み立ては`harness_engine::approval_risk`）。
+//! 承認画面の「危険度: 要確認／中／高」の行と枠の見出し（D-100 の追記。組み立ては`harness_engine::approval_risk`）。
 //!
 //! `approval.rs`の子モジュール（同じ行の部品`ApprovalLine`・`LineStyle`をそのまま使う）。
-//! 色はここで決めない——行の意味（`LineStyle`）だけを付け、色は`ui::approval`が決める。
+//! 色はここで決めない——行の意味（`LineStyle`）と見出しの調子（[`TitleTone`]）だけを付け、色は`ui::approval`が決める。
 
 use std::time::Instant;
 
@@ -64,10 +64,32 @@ impl RiskView {
     }
 }
 
+/// 枠の見出しの調子。色は`ui::approval`が決める。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleTone {
+    /// 今までと同じ見た目（要確認・判定しない材料）。
+    Plain,
+    /// 危険度が中（機械の判定と判定モデルが食い違った）。
+    Caution,
+    /// 危険度が高。
+    Danger,
+}
+
 impl PermissionView {
-    /// `危険度: 要確認`／`危険度: 高`の行と、高の理由・注記・判定中の行。判定しない材料（書込先・その他）は何も出さない。
+    /// 枠の見出しと、その調子（枠の色に使う）。**要確認・判定しない材料は今までと同じ「承認が必要です」**で、
+    /// 安全だとも書かない。段階を足したら、ここで見出しを決めるまでコンパイルが通らない（`_`の腕を置かない）。
+    pub fn title(&self) -> (&'static str, TitleTone) {
+        match self.assessment.as_ref().map(RiskView::severity) {
+            Some(Severity::High) => ("危険なコマンド — 承認が必要です", TitleTone::Danger),
+            Some(Severity::Medium) => ("注意が必要なコマンド — 承認が必要です", TitleTone::Caution),
+            Some(Severity::NeedsReview) | None => ("承認が必要です", TitleTone::Plain),
+        }
+    }
+
+    /// `危険度: 要確認`／`中`／`高`の行と、中・高の理由・注記・判定中の行。判定しない材料（書込先・その他）は何も出さない。
     ///
     /// **「要確認」は安全という意味ではない**——見つけた危険が無かっただけで、人が中身を確かめる（「低」「安全」と書かない）。
+    /// **「中」も安全ではない**——機械が見つけた被害を、判定モデルが低いと見ただけである。
     pub(super) fn risk_lines(&self, clock: WaitClock) -> Vec<ApprovalLine> {
         let Some(view) = &self.assessment else {
             return Vec::new();
@@ -103,6 +125,10 @@ impl PermissionView {
                 LineStyle::Normal,
                 format!("  ・{}", reason.describe_ja()),
             ));
+        }
+        // 中のときは、なぜ中か（判定モデルの点数の最大）を理由と同じ形で添える。理由の一つなので注記（Dim）にしない。
+        if let Some(low) = view.outcome.model_low_ja() {
+            out.push(ApprovalLine::new(LineStyle::Normal, format!("  ・{low}")));
         }
         for note in &view.outcome.notes {
             let style = match note {

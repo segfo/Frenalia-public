@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use harness_core::{
     BoundFile, CommandSubject, FilePreview, PermissionSubject, ProgramSubject, RiskClass,
+    RiskVerdict,
 };
 use harness_engine::approval_risk::{self, RiskBasis};
 use harness_tui::{
@@ -243,6 +244,22 @@ fn scenes() -> Vec<(&'static str, PermissionView)> {
     ));
     fallback.assessment = Some(RiskView::done(outcome, Some("ollaya / winnow:e4b".to_string())));
     out.push(("13. 判定モデルを使えなかった（機械判定のみ）", fallback));
+
+    // D-100 の 2026-10-06 追記: 機械は高、判定モデルは機械が引っ掛けた材料を読んだうえで低い → 中（黄）。
+    let subject = shell(r"Remove-Item $Env:windir\System32\drivers -Recurse -Force");
+    let mut medium = view("run_shell", subject.clone());
+    let mut outcome = machine(&subject);
+    outcome.basis = RiskBasis::WithModel;
+    outcome.unjudged_damage = false;
+    outcome.model_peak = Some(RiskVerdict::from_score(0.30).expect("範囲内の点数"));
+    medium.assessment = Some(RiskView::done(
+        outcome,
+        Some("ollaya / winnow:e4b".to_string()),
+    ));
+    out.push((
+        "14. 危険度: 中（機械判定は高・判定モデルは読んだうえで低い）",
+        medium,
+    ));
 
     out
 }

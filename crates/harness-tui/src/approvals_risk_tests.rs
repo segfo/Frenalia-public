@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::approvals_tests::{app_with, apply_until_ready, open_scope, Capturing};
 use super::*;
-use crate::app::{LineStyle, TranscriptItem, WaitClock};
+use crate::app::{LineStyle, TitleTone, TranscriptItem, WaitClock};
 
 /// 機械の判定でも「高」になる行（システムの場所を消す）。
 const DANGEROUS_LINE: &str = "rm C:\\Windows\\System32\\calc.exe";
@@ -186,7 +186,7 @@ fn without_a_model_the_machine_judgement_is_shown_at_once() {
     let mut dangerous = shell_app(DANGEROUS_LINE);
     let gate = start_risk(None, &tx, &mut dangerous, &CancellationToken::new());
     assert!(matches!(gate, Some(RiskGate::Ready(ref o)) if o.severity() == Severity::High));
-    assert_eq!(view(&dangerous).title().1, Some(RiskLevel::Danger));
+    assert_eq!(view(&dangerous).title().1, TitleTone::Danger);
     let line = risk_line(&dangerous);
     assert_eq!(line.style, LineStyle::Danger);
     assert_eq!(
@@ -208,7 +208,7 @@ fn without_a_model_the_machine_judgement_is_shown_at_once() {
         "危険度: 要確認（機械判定のみ。判定モデルを使わない設定）"
     );
     assert_eq!(risk_line(&plain).style, LineStyle::Normal);
-    assert_eq!(view(&plain).title(), ("承認が必要です", None));
+    assert_eq!(view(&plain).title(), ("承認が必要です", TitleTone::Plain));
 }
 
 /// ユーザーが示した並び: 見出し→実行対象のコマンド→危険度。
@@ -234,7 +234,7 @@ async fn a_dangerous_verdict_reaches_the_title_the_line_and_the_summary() {
     let req = run_dialog(&mut app, Some(&risk_of(&fake)), &mut cache).await;
 
     assert_eq!(severity(&app), Some(Severity::High));
-    assert_eq!(view(&app).title().1, Some(RiskLevel::Danger));
+    assert_eq!(view(&app).title().1, TitleTone::Danger);
     assert!(view(&app).title().0.contains("危険なコマンド"));
     assert_eq!(
         risk_line(&app).text,
@@ -254,6 +254,64 @@ async fn a_dangerous_verdict_reaches_the_title_the_line_and_the_summary() {
     );
     assert!(!system.contains("example.com"), "{system}");
     assert_eq!(fake.lines.lock().unwrap().as_slice(), [MODEL_ONLY_LINE]);
+}
+
+/// **機械が高・判定モデルが読んだうえで低い → 中**（D-100 の 2026-10-06 追記）。危険度の行は黄（`Warn`）、見出しは
+/// 「注意が必要なコマンド」で枠は黄、判定モデルの点数の最大を固定の1行で添える。**要約へは何も足さない**。
+/// 対照: 同じ行を判定モデルも高と見たら、高・赤・要約に固定の一言。
+#[tokio::test]
+async fn a_medium_verdict_is_yellow_and_adds_nothing_to_the_summary() {
+    let fake = FakeRisk::scoring(0.3);
+    let mut app = shell_app(DANGEROUS_LINE);
+    let mut cache = SummaryCache::new();
+    let req = run_dialog(&mut app, Some(&risk_of(&fake)), &mut cache).await;
+
+    assert_eq!(severity(&app), Some(Severity::Medium));
+    let line = risk_line(&app);
+    assert_eq!(
+        line.text,
+        "危険度: 中（機械判定と判定モデル ollaya / test）"
+    );
+    assert_eq!(line.style, LineStyle::Warn);
+    assert_eq!(
+        view(&app).title(),
+        ("注意が必要なコマンド — 承認が必要です", TitleTone::Caution)
+    );
+    let texts = body_texts(&app);
+    assert!(
+        texts.iter().any(|t| t.contains("機械判定: システムの場所")),
+        "機械の理由も残す: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("最大 0.30 / 2")),
+        "{texts:?}"
+    );
+    let system = &req.system[0].text;
+    assert!(
+        !system.contains("DANGEROUS"),
+        "中なのに要約へ危険度を渡した: {system}"
+    );
+
+    let fake = FakeRisk::scoring(1.73);
+    let mut app = shell_app(DANGEROUS_LINE);
+    let mut cache = SummaryCache::new();
+    let req = run_dialog(&mut app, Some(&risk_of(&fake)), &mut cache).await;
+    assert_eq!(severity(&app), Some(Severity::High));
+    let line = risk_line(&app);
+    assert_eq!(
+        line.text,
+        "危険度: 高（機械判定と判定モデル ollaya / test）"
+    );
+    assert_eq!(line.style, LineStyle::Danger);
+    assert_eq!(
+        view(&app).title(),
+        ("危険なコマンド — 承認が必要です", TitleTone::Danger)
+    );
+    assert!(
+        !body_texts(&app).iter().any(|t| t.contains("最大")),
+        "高に中の1行を添えた"
+    );
+    assert!(req.system[0].text.contains("DANGEROUS"));
 }
 
 /// **危険の線（1.5）に届かない数値は「要確認」のまま**で、要約への要求も判定モデルを使わない構成と同じ。

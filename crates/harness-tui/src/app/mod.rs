@@ -84,7 +84,7 @@ mod stderr;
 pub use approval::MODAL_INPUT_GRACE;
 pub use approval::{
     ApprovalCommand, ApprovalLine, ApprovalStage, LineStyle, PermissionView, PreviousCopy,
-    RiskView, SummaryState, SummaryWait, WaitClock,
+    RiskView, SummaryState, SummaryWait, TitleTone, WaitClock,
 };
 use commands::parse_slash_command;
 pub use commands::{Action, FsStageCommand, MemoryCommand, SlashCommand};
