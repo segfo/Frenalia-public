@@ -117,6 +117,17 @@ impl AppState {
                 };
                 self.transcript.push(TranscriptItem::Info(line));
             }
+            // 連続拒否が閾値に達して素通りさせた（`TranscriptionCheckBypassed`、`turn/mod.rs`）。
+            // モデルがファイル編集の`old_string`等で詰まったときの無限ループを止めるための救命具。
+            AgentEvent::TranscriptionCheckBypassed {
+                value_chars,
+                differences,
+            } => {
+                let line = format!(
+                    "[参照] モデルの書き写しが{value_chars}文字で{differences}文字分違う判定を連続で受けたので、今回は素通りで実行する（コマンドが本当に化けていれば構文失敗か承認画面で止まる）"
+                );
+                self.transcript.push(TranscriptItem::Info(line));
+            }
             AgentEvent::ToolStarted { name, subject, .. } => {
                 if let Some(subject) = subject {
                     self.command_history.record(&name, &subject);

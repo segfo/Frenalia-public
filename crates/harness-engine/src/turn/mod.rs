@@ -238,6 +238,17 @@ pub trait Executor: Send + Sync {
 /// 縮退ガードの移動統計はセッション全体を寿命とするため、`degeneracy`だけは
 /// 呼び出し側が所有する[`DegeneracyDetector`]を借りる形にしてある（中身は`Arc`）。
 /// `None`ならガードは完全に無効で、M21以前と同じ経路になる。
+/// 損じた写しの拒否をこの回数まで続けたら、次の呼び出しはカウンタを0に戻して素通りさせる。
+///
+/// **用途**: モデルが番号参照（`{{val:N}}`）で書き直せない形で写し間違いを繰り返す経路の無限ループ対策。
+/// 典型例はファイル編集ツールの`old_string`——ファイルの中身から切り出した語がユーザー文の長い値と
+/// 似ているとき、番号参照を使っても別の文字列になるのでモデルは少し変えた写しで撃ち直し続ける。
+///
+/// **下流の防御がある前提で選んだ値**: 3回で素通りに倒す。本当に別物が走る写しなら、コマンドの構文失敗・
+/// 承認画面・ファイル照合失敗のいずれかが受ける。レビューで値を上げたくなった場合は`turn/mod.rs`の
+/// 試験の`refused_streak_bypasses_after_threshold`も合わせて更新する。
+pub const TRANSCRIPTION_REFUSAL_BYPASS_THRESHOLD: u32 = 3;
+
 pub struct TurnExecutor<'a> {
     provider: &'a dyn LlmProvider,
     tools: &'a ToolRegistry,
@@ -246,6 +257,14 @@ pub struct TurnExecutor<'a> {
     events: Option<&'a EventSink>,
     cancel: Option<&'a CancellationToken>,
     degeneracy: Option<&'a DegeneracyDetector>,
+    /// 損じた写しを拒否した連続回数。`TRANSCRIPTION_REFUSAL_BYPASS_THRESHOLD`に達したら
+    /// 次を素通りさせてカウンタを0に戻す。`Executed`な決定が1つでも通ったら0に戻す。
+    ///
+    /// **ターンまたぎでは引き継がない**（`TurnExecutor`はターンごとに作り直されるため、新しいターンは
+    /// 0から始まる）。無限ループは1ターン内で起きる現象なので、これで足りる。
+    ///
+    /// `Executor` trait が`Sync`を要求するので`AtomicU32`で持つ（`Cell`は`Sync`でない）。
+    transcription_refusal_streak: std::sync::atomic::AtomicU32,
 }
 
 impl<'a> TurnExecutor<'a> {
@@ -267,6 +286,7 @@ impl<'a> TurnExecutor<'a> {
             events,
             cancel,
             degeneracy,
+            transcription_refusal_streak: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -591,33 +611,58 @@ impl<'a> TurnExecutor<'a> {
             let references = values.texts();
             let transcriptions = harness_core::review_user_references(input, &references);
             let damaged = transcriptions.iter().find(|t| !t.is_exact());
+            let bypass_damaged = damaged.is_some()
+                && self
+                    .transcription_refusal_streak
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    + 1
+                    >= TRANSCRIPTION_REFUSAL_BYPASS_THRESHOLD;
             for t in &transcriptions {
                 emit(
                     self.events,
                     AgentEvent::UserValueTranscribed {
                         value_chars: t.value_chars,
                         differences: t.differences,
-                        refused: damaged.is_some(),
+                        refused: damaged.is_some() && !bypass_damaged,
                     },
                 );
             }
             if let Some(damaged) = damaged {
-                // **走らせない。** 壊れた写しは別のものを実行する命令なので、人に承認を聞く意味も無い。
-                // 断った理由はツールの結果としてモデルへ返し、番号で書き直させる。
-                tool_calls.push(CompletedToolCall {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                    output: ToolOutput {
-                        // **一覧をそのまま渡して、どれを指すかはモデルに選ばせる**
-                        // （ハーネスは「どれに近いか」までしか言えない。`Transcription::refusal_ja`）。
-                        content: damaged.refusal_ja(&values.render().unwrap_or_default()),
-                        is_error: true,
-                    },
-                    decision: ToolCallDecision::TranscribedValue,
-                    subject: None,
-                });
-                continue;
+                if bypass_damaged {
+                    // 連続拒否の閾値に達した。**カウンタを0に戻して、この呼び出しは素通りさせる**
+                    // ——モデルは番号参照で書き直せない形で詰まっていて（`edit_file`の`old_string`等）、
+                    // 拒否を続けると無限ループになる。下流（コマンドの構文失敗・承認画面・ファイル照合）が
+                    // 本当に別物の実行を受けるので、ここで止め続ける意味は薄い。
+                    self.transcription_refusal_streak
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    emit(
+                        self.events,
+                        AgentEvent::TranscriptionCheckBypassed {
+                            value_chars: damaged.value_chars,
+                            differences: damaged.differences,
+                        },
+                    );
+                    // 素通りなので、下の正常な実行経路（差し込み→承認→実行）へ流す。
+                } else {
+                    // **走らせない。** 壊れた写しは別のものを実行する命令なので、人に承認を聞く意味も無い。
+                    // 断った理由はツールの結果としてモデルへ返し、番号で書き直させる。
+                    self.transcription_refusal_streak
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tool_calls.push(CompletedToolCall {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: input.clone(),
+                        output: ToolOutput {
+                            // **一覧をそのまま渡して、どれを指すかはモデルに選ばせる**
+                            // （ハーネスは「どれに近いか」までしか言えない。`Transcription::refusal_ja`）。
+                            content: damaged.refusal_ja(&values.render().unwrap_or_default()),
+                            is_error: true,
+                        },
+                        decision: ToolCallDecision::TranscribedValue,
+                        subject: None,
+                    });
+                    continue;
+                }
             }
 
             // **ユーザーの文の値を差し込むのはここ1か所だけ**（`harness_core::user_reference`）。危険度の判定・
@@ -635,6 +680,13 @@ impl<'a> TurnExecutor<'a> {
             );
 
             let (output, decision, subject) = self.dispatch_one(id, name, input, malformed).await;
+
+            // ツールが実際に走ったら、拒否連続カウンタを0に戻す（別のユーザー値の写しが来たときに
+            // 直前の無関係な拒否が引き継がれないようにする）。
+            if decision == ToolCallDecision::Executed {
+                self.transcription_refusal_streak
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+            }
 
             let mut output = output;
             if self.is_tier3() {

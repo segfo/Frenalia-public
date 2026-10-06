@@ -229,6 +229,84 @@ async fn an_exact_transcription_runs_but_is_recorded() {
     assert_eq!(transcription_notices(&events), vec![(0, false)]);
 }
 
+/// **損じた写しの拒否が3回続いたら、次を素通りさせる**（連続拒否カウンタ、`turn/mod.rs`）。
+///
+/// 無限ループ対策——ファイル編集ツールの`old_string`等でモデルが番号参照に書き直せない形で
+/// 詰まったときに、拒否と再試行が永遠に続くのを止める。本当に別物が走る写しなら、下流
+/// （コマンドの構文失敗・承認画面・ファイル照合）がそれぞれ受ける。
+#[tokio::test]
+async fn after_three_damaged_transcriptions_the_fourth_runs_through() {
+    let value = long_value();
+    let mut damaged: Vec<char> = value.chars().collect();
+    damaged[7] = 'Z';
+    let damaged: String = damaged.into_iter().collect();
+    assert_ne!(damaged, value);
+
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    // 損じた写しを3回続けて撃つ。4ターン目は端のない end_turn。
+    let provider = MockProvider::new(vec![
+        tool_use_turn(serde_json::json!({ "path": "out.txt", "content": damaged.clone() })),
+        tool_use_turn(serde_json::json!({ "path": "out.txt", "content": damaged.clone() })),
+        tool_use_turn(serde_json::json!({ "path": "out.txt", "content": damaged.clone() })),
+        end_turn(),
+    ]);
+    let mut state = ConversationState::new(Vec::new());
+    state.push_user_text(format!("これを書いて {value}"));
+
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], dir.path());
+
+    run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 10,
+            compaction: Default::default(),
+            degeneracy: None,
+        },
+        Some(&tx),
+        None,
+        |_| {},
+    )
+    .await
+    .expect("the loop itself must not fail");
+
+    // 3回目で素通りして、ファイルが書かれる。
+    let file = std::fs::read_to_string(dir.path().join("out.txt")).ok();
+    assert_eq!(
+        file.as_deref(),
+        Some(damaged.as_str()),
+        "3回目の素通りでファイルが書かれるはず"
+    );
+
+    drop(tx);
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+
+    // 1・2回目は拒否（`UserValueTranscribed { refused: true }`）、3回目は素通り
+    // （`UserValueTranscribed { refused: false }` と `TranscriptionCheckBypassed` の対）。
+    let notices = transcription_notices(&events);
+    assert_eq!(
+        notices,
+        vec![(1, true), (1, true), (1, false)],
+        "拒否→拒否→素通りの並びが崩れている: {notices:?}"
+    );
+    let bypass_count = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::TranscriptionCheckBypassed { .. }))
+        .count();
+    assert_eq!(bypass_count, 1, "素通りの通知が1回出ているはず");
+}
+
 /// 対照: **別物は止めない。** モデルが自分で作った長い値はそのまま走り、記録にも出ない。
 #[tokio::test]
 async fn a_different_long_value_runs_untouched() {
