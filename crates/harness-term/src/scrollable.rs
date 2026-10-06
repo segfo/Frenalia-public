@@ -179,6 +179,7 @@ fn draw_text<'a, C: Clone, W: Clone + PartialEq>(
             heights: &heights,
             top: window.top,
             wrapped,
+            joins: on.joins,
         },
         on.selection.mark(&on.surface),
     );

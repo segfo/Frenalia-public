@@ -15,6 +15,9 @@
 //! 行は呼び出し側が渡した`Text`の行で、折り返した後の表示行ではない——だから折り返して描いた1行を選ぶと、
 //! 取り出す文章は改行の入らない元の1行に戻る（折り返しの位置で落ちた空白も戻る）。
 //!
+//! 取り出すときは`Text`の行の間に`\n`を入れる。ただし描画部品が自分で分けた続きの行（[`LineJoin::Continues`]。
+//! [`Shape::joins`]で受け取る）の前には入れず、その行の頭の字下げも写さない——選択の色も同じ範囲に付ける。
+//!
 //! # 限界
 //!
 //! - 見えている行だけを数え直す（描くたびに、見えている行の数だけ小さく描き直す）。費用は測っていない。
@@ -27,7 +30,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 
-use super::SELECTED;
+use super::{LineJoin, SELECTED};
 
 /// 文章の中の位置——描いた`Text`の何行目の、何番目の文字（書記素）の**前**か。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -204,17 +207,26 @@ pub(crate) struct Shape<'h> {
     pub top: usize,
     /// 折り返すか（[`crate::wrap::Wrapped`]で描くか、折り返さない`Paragraph`で描くか）。
     pub wrapped: bool,
+    /// 行ごとの、前の行とのつながり（[`LineJoin`]。[`super::Selectable::joined`]で渡されたもの）。空なら全部`Break`。
+    pub joins: &'h [LineJoin],
 }
 
 /// 描く直前に呼ぶ。見えている行の文字の場所を[`TextMap`]にし、`mark`があれば選んだ範囲を決めて、
 /// **見えている行のうち範囲に入る文字に選択の色を付けた`text`**と、範囲の文章を返す。
 ///
 /// 色を付けても折り返しは変わらない（モジュールdoc）ので、返した`text`をそのまま同じ形で描けばよい。
+/// 続きの行（[`LineJoin::Continues`]）の頭の字下げは、写さず色も付けない（[`chosen_in_line`]）。
 pub(crate) fn prepare<'a>(
     mut text: Text<'a>,
     shape: Shape<'_>,
     mark: Option<Mark>,
 ) -> (Text<'a>, TextMap) {
+    debug_assert!(
+        shape.joins.is_empty() || shape.joins.len() == text.lines.len(),
+        "印の並び（{}個）が描く行の数（{}行）と違う",
+        shape.joins.len(),
+        text.lines.len()
+    );
     let width = if shape.wrapped {
         crate::wrap::text_width(shape.inner.width)
     } else {
@@ -282,18 +294,15 @@ pub(crate) fn prepare<'a>(
         return (text, map);
     };
     let range = span(mark.anchor, head);
-    let selected = range.map(|range| extract(&text, range)).unwrap_or_default();
-    if let Some((from, to)) = range {
+    let selected = range
+        .map(|range| extract(&text, range, shape.joins))
+        .unwrap_or_default();
+    if let Some(range @ (from, to)) = range {
         for index in shown_lines {
             if index < from.line || index > to.line {
                 continue;
             }
-            let first = if index == from.line { from.offset } else { 0 };
-            let last = if index == to.line {
-                to.offset
-            } else {
-                usize::MAX
-            };
+            let (first, last) = chosen_in_line(index, range, shape.joins);
             text.lines[index] = highlighted(&text.lines[index], first, last);
         }
     }
@@ -403,22 +412,42 @@ fn decode(color: Color) -> Option<usize> {
     }
 }
 
-/// `range`の文章を取り出す（行の間は`\n`）。描かれない文字（幅0）は入れない（モジュールdoc）。
-pub(crate) fn extract(text: &Text, (from, to): (Pos, Pos)) -> String {
+/// 行`index`の、前の行とのつながり。印の並びが足りなければ（空を含む）`Break`（[`LineJoin`]）。
+fn join_at(joins: &[LineJoin], index: usize) -> LineJoin {
+    joins.get(index).copied().unwrap_or_default()
+}
+
+/// 範囲`(from, to)`のうち、行`index`で選ばれる文字（`first..last`番目）。続きの行（[`LineJoin::Continues`]）は
+/// 頭の字下げを入れない（選び始めが字下げの中でも、字下げの後ろから）。
+///
+/// **写す文字（[`extract`]）と選択の色を付ける文字（[`prepare`]）の両方がここを通る**——別々に書くと、
+/// 色を付けた所と写るものが食い違う。
+fn chosen_in_line(index: usize, (from, to): (Pos, Pos), joins: &[LineJoin]) -> (usize, usize) {
+    let first = if index == from.line { from.offset } else { 0 };
+    let last = if index == to.line {
+        to.offset
+    } else {
+        usize::MAX
+    };
+    let indent = match join_at(joins, index) {
+        LineJoin::Break => 0,
+        LineJoin::Continues { indent } => indent,
+    };
+    (first.max(indent), last)
+}
+
+/// `range`の文章を取り出す（行の間は`\n`。ただし続きの行の前には入れず、その行の字下げも入れない——[`LineJoin`]）。
+/// 描かれない文字（幅0）は入れない（モジュールdoc）。
+pub(crate) fn extract(text: &Text, range @ (from, to): (Pos, Pos), joins: &[LineJoin]) -> String {
     let mut out = String::new();
     let Some(last_line) = text.lines.len().checked_sub(1) else {
         return out;
     };
     for index in from.line..=to.line.min(last_line) {
-        if index > from.line {
+        if index > from.line && join_at(joins, index) == LineJoin::Break {
             out.push('\n');
         }
-        let first = if index == from.line { from.offset } else { 0 };
-        let last = if index == to.line {
-            to.offset
-        } else {
-            usize::MAX
-        };
+        let (first, last) = chosen_in_line(index, range, joins);
         for (k, grapheme) in text.lines[index]
             .styled_graphemes(Style::default())
             .enumerate()
@@ -492,6 +521,7 @@ mod tests {
                     heights: &heights,
                     top: usize::from(top),
                     wrapped,
+                    joins: &[],
                 },
                 None,
             );
@@ -597,8 +627,220 @@ mod tests {
         let line = Line::raw("a\tb");
         assert_eq!(line.styled_graphemes(Style::default()).count(), 2);
         let text = Text::from(vec![line]);
-        let all = extract(&text, (Pos::default(), Pos { line: 0, offset: 2 }));
+        let all = extract(&text, (Pos::default(), Pos { line: 0, offset: 2 }), &[]);
         assert_eq!(all, "ab");
+    }
+
+    /// **印を渡さない取り出しは今までと同じ**——行の間は`\n`、行頭の空白もそのまま写る。
+    /// 期待値は、続きの行の印（`LineJoin`）を足す前の`extract`が返した文字列（その版で緑を確かめてから固定した）。
+    /// 印を渡さない呼び出し（ポリシーエディタの全部）が1バイトも変わらないことの網。
+    #[test]
+    fn without_joins_lines_are_copied_as_they_were() {
+        let text = Text::from(sample());
+        assert_eq!(extract(&text, (at(0, 2), at(1, 9)), &[]), "ort\nthe quick");
+        assert_eq!(
+            extract(&text, (at(1, 16), at(3, 3)), &[]),
+            "fox jumps over the lazy dog again and again\n\nあああ"
+        );
+        assert_eq!(
+            extract(&text, (at(4, 0), at(4, 18)), &[]),
+            "tabhere styled end"
+        );
+        let indented = Text::from(vec![Line::raw("- word "), Line::raw("  next")]);
+        assert_eq!(
+            extract(&indented, (at(0, 0), at(1, 6)), &[]),
+            "- word \n  next"
+        );
+        assert_eq!(extract(&indented, (at(1, 1), at(9, 0)), &[]), " next");
+        assert_eq!(extract(&Text::default(), (at(0, 0), at(1, 0)), &[]), "");
+    }
+
+    /// 字下げ2文字の続きの行の印。
+    const CONTINUES: LineJoin = LineJoin::Continues { indent: 2 };
+
+    fn at(line: usize, offset: usize) -> Pos {
+        Pos { line, offset }
+    }
+
+    /// 描画部品が「- word next」を幅で分け、続きの行に字下げを付けた形。英語の語の切れ目の空白は前の行の末尾に残る。
+    fn hanging() -> (Text<'static>, [LineJoin; 2]) {
+        (
+            Text::from(vec![Line::raw("- word "), Line::raw("  next")]),
+            [LineJoin::Break, CONTINUES],
+        )
+    }
+
+    /// **続きの行は改行なし・字下げなしで前の行に付く。** 前の行の末尾に残した空白は1つ残る（語の間が詰まらない）。
+    /// 同じ入力に印を渡さなければ、今までどおり改行と字下げが写る（対照）。
+    #[test]
+    fn a_continuation_line_joins_the_previous_line_keeping_its_trailing_space() {
+        let (text, joins) = hanging();
+        assert_eq!(extract(&text, (at(0, 0), at(1, 6)), &joins), "- word next");
+        assert_eq!(extract(&text, (at(0, 0), at(1, 6)), &[]), "- word \n  next");
+    }
+
+    /// 続きの行の字下げの中から選び始めても、写るのは字下げの後ろから。字下げより後ろから選べば、そこから写る。
+    #[test]
+    fn a_selection_starting_inside_the_indent_copies_from_the_text() {
+        let (text, joins) = hanging();
+        for start in 0..=2 {
+            assert_eq!(
+                extract(&text, (at(1, start), at(1, 6)), &joins),
+                "next",
+                "{start}文字目から"
+            );
+        }
+        assert_eq!(extract(&text, (at(1, 3), at(1, 6)), &joins), "ext");
+        assert_eq!(
+            extract(&text, (at(1, 0), at(1, 2)), &joins),
+            "",
+            "字下げだけを選んだ"
+        );
+        // 前の行の途中から字下げの中まで: 前の行の残りだけ（改行も字下げも付かない）。
+        assert_eq!(extract(&text, (at(0, 2), at(1, 1)), &joins), "word ");
+    }
+
+    /// 改行になるのは`Break`の行の前だけ——段落を3つ（2つは続きの行を持つ）またいで選ぶと、`\n`はちょうど2つ。
+    #[test]
+    fn only_break_boundaries_become_newlines() {
+        let text = Text::from(vec![
+            Line::raw("first "),
+            Line::raw("  para"),
+            Line::raw("second "),
+            Line::raw("  para "),
+            Line::raw("  ends"),
+            Line::raw("third"),
+        ]);
+        let joins = [
+            LineJoin::Break,
+            CONTINUES,
+            LineJoin::Break,
+            CONTINUES,
+            CONTINUES,
+            LineJoin::Break,
+        ];
+        let all = extract(&text, (at(0, 0), at(5, 5)), &joins);
+        assert_eq!(all, "first para\nsecond para ends\nthird");
+        assert_eq!(all.matches('\n').count(), 2);
+        assert_eq!(
+            extract(&text, (at(1, 4), at(4, 4)), &joins),
+            "ra\nsecond para en"
+        );
+    }
+
+    /// 続きの行の全角文字は割れずに1文字ずつ写る。日本語の文字の間で分けた行は、何も挟まずにつながる。
+    #[test]
+    fn wide_characters_on_a_continuation_line_stay_whole() {
+        let text = Text::from(vec![Line::raw("日本語の文章を"), Line::raw("  続けて書く")]);
+        let joins = [LineJoin::Break, CONTINUES];
+        assert_eq!(
+            extract(&text, (at(0, 0), at(1, 7)), &joins),
+            "日本語の文章を続けて書く"
+        );
+        assert_eq!(extract(&text, (at(0, 5), at(1, 4)), &joins), "章を続け");
+    }
+
+    /// 印の並びが空・足りないときは、足りない分を`Break`とみなす（全部`Break`を渡したのと同じ）。
+    /// 選べる範囲を全部試す。
+    #[test]
+    fn missing_joins_mean_break() {
+        let text = Text::from(sample());
+        let all_break = vec![LineJoin::Break; text.lines.len()];
+        let lens: Vec<usize> = text
+            .lines
+            .iter()
+            .map(|l| l.styled_graphemes(Style::default()).count())
+            .collect();
+        for (fl, &flen) in lens.iter().enumerate() {
+            for fo in 0..=flen {
+                for (tl, &tlen) in lens.iter().enumerate().skip(fl) {
+                    for to in 0..=tlen {
+                        let range = (at(fl, fo), at(tl, to));
+                        assert_eq!(
+                            extract(&text, range, &[]),
+                            extract(&text, range, &all_break),
+                            "{range:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // 2行の文章に1つだけ: 2行目の印が無い＝`Break`。
+        let (text, _) = hanging();
+        assert_eq!(
+            extract(&text, (at(0, 0), at(1, 6)), &[LineJoin::Break]),
+            "- word \n  next"
+        );
+    }
+
+    /// **続きの行の字下げには選択の色を付けない**——色を付けた所と写る文字が揃う（字下げの中から選び始めても同じ）。
+    #[test]
+    fn the_indent_of_a_continuation_line_is_not_painted_as_selected() {
+        let (text, joins) = hanging();
+        let block = Block::default().borders(Borders::ALL);
+        let inner = block.inner(Rect::new(0, 0, 20, 6));
+        let heights = heights_of(text.clone(), inner.width);
+        for anchor in [Hit::glyph(0, 2), Hit::glyph(1, 0), Hit::glyph(1, 1)] {
+            let mark = Mark {
+                anchor,
+                head: Head::Fixed(Hit::glyph(1, 5)),
+            };
+            let (marked_text, map) = prepare(
+                text.clone(),
+                Shape {
+                    inner,
+                    heights: &heights,
+                    top: 0,
+                    wrapped: true,
+                    joins: &joins,
+                },
+                Some(mark),
+            );
+            let copied = map.marked.as_ref().map(|m| m.text.clone());
+            let mut term = Terminal::new(TestBackend::new(20, 6)).expect("test terminal");
+            term.draw(|frame| {
+                Wrapped::new(marked_text)
+                    .block(block.clone())
+                    .render(frame, frame.area());
+            })
+            .expect("draw");
+            let buffer = term.backend().buffer();
+            let row = map.rows.iter().find(|r| r.line == 1).expect("2行目");
+            for glyph in &row.glyphs {
+                assert_eq!(
+                    buffer[(glyph.x, row.y)].bg == Color::Blue,
+                    glyph.index >= 2,
+                    "{anchor:?}から: 2行目の{}番目の文字",
+                    glyph.index
+                );
+            }
+            let expected = if anchor.before.line == 0 {
+                "word next"
+            } else {
+                "next"
+            };
+            assert_eq!(copied.as_deref(), Some(expected), "{anchor:?}から");
+        }
+    }
+
+    /// 印の並びの長さが行の数と違うのは呼び出し側の誤り（空の並びだけは「全部`Break`」として許す）。
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "印の並び")]
+    fn joins_of_a_different_length_than_the_lines_are_a_bug() {
+        let (text, _) = hanging();
+        let heights = [1, 1];
+        let _ = prepare(
+            text,
+            Shape {
+                inner: Rect::new(0, 0, 20, 4),
+                heights: &heights,
+                top: 0,
+                wrapped: true,
+                joins: &[LineJoin::Break],
+            },
+            None,
+        );
     }
 
     /// 押した文字から今の文字まで（両端を含む）。逆向きにずらしても同じ範囲。文字の無い1点同士は空。
@@ -630,6 +872,7 @@ mod tests {
             heights,
             top: 0,
             wrapped: true,
+            joins: &[],
         };
         let (_, plain) = prepare(text.clone(), shape(&heights), None);
         let mark = Mark {

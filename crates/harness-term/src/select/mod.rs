@@ -15,6 +15,8 @@
 //!    `W`）をそのまま使う——選べる枠はどれも送れる枠で、枠の外へドラッグしたときはホイールと同じ送り方で送るため。
 //! 2. 送れる枠（[`crate::scrollable`]・[`crate::scrollback`]）を描くときに[`Selectable`]を渡す。枠は選んでいる範囲に
 //!    選択の色（[`SELECTED`]）を付けて描き、**どの文字を画面のどこに描いたか**を押せる場所と一緒に登録する。
+//!    長い1行を自分で複数の`Line`へ分けて描く文章（字下げを保つ折り返し）は、[`Selectable::joined`]で
+//!    「どの行が前の行の続きか」（[`LineJoin`]）を渡す——写すと元の1行に戻る。
 //! 3. 描き終えたら[`Selection::after_draw`]（その描画で決まった範囲の端と文章を受け取る）。
 //! 4. マウス: 枠の上で左ボタンを押したら（[`crate::pointer::Pointer::Text`]）[`Selection::press`]、押したまま動いたら
 //!    [`Selection::drag`]、離したら[`Selection::release`]。時間が進んだら[`Selection::tick`]（枠の外で止めている間も送る）。
@@ -75,20 +77,61 @@ pub const SELECTED: Style = Style::new().fg(Color::White).bg(Color::Blue);
 /// （会話画面の描画の合図は33msごとだが、そこに合わせるとエディタだけ遅くなる）。
 pub const AUTO_SCROLL_EVERY: Duration = Duration::from_millis(100);
 
+/// 描いた`Text`の1行が、前の行とどうつながるか（写すときだけ使う。描く見た目は変えない）。
+///
+/// # 何のためにあるのか
+///
+/// 字下げを保ったまま折り返すために、**描画部品が自分で長い1行を幅に合わせて複数の`Line`へ分ける**ことがある
+/// （Markdownのリスト項目・引用の続きの行は、2行目以降も項目の字下げの位置から始まる）。範囲選択で写すときは
+/// `Line`の間に改行を入れるので、何もしなければ、画面で分けた位置ごとに改行と字下げの空白が入って写る。
+/// 分けた側がこの印で「この行は前の行の続き」と伝えると、写すときに元の1行へ戻す——前の行との間に改行を入れず、
+/// この行の頭の字下げ（`indent`文字）を写さない。選択の色も字下げには付けない（色を付けた所と写る文字を揃える）。
+///
+/// 描いた`Text`はフレームをまたいで残らず、写す文章は描くたびにその場で取り出す（[`map`]）ので、印は描くときに
+/// [`Selectable::joined`]で渡す。
+///
+/// # 限界
+///
+/// - 語の切れ目の空白は、分けた側が**前の行の末尾に残す**ものとして扱う（つなぐときに空白を足さない）。
+///   英語の語の間で分けて空白を落とすと、つないだ語が詰まって写る。
+/// - `indent`は文字（書記素）の数で数え、桁の数ではない（[`map::Pos`]と同じ数え方）。字下げの中身が空白かどうかは見ない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineJoin {
+    /// 前の行とは別の行（写すとき、前の行との間に改行を入れる）。
+    #[default]
+    Break,
+    /// 前の行の続き（描画部品が幅に合わせて分けた行）。写すとき、前の行との間に改行を入れず、
+    /// 行の頭の`indent`文字（続きの行に付けた字下げ）を写さない。
+    Continues {
+        /// 行の頭の字下げの文字の数（[`map::Pos`]の`offset`と同じく、描かれる書記素で数える）。
+        indent: usize,
+    },
+}
+
 /// 送れる枠を描くときに渡すもの（モジュールdocの2）。`surface`はその枠の名前、`selection`は画面が持つ選択。
 pub struct Selectable<'s, C, W> {
     pub targets: &'s mut Targets<C, W>,
     pub surface: W,
     pub selection: &'s Selection<W>,
+    /// 描く`Text`の行ごとの、前の行とのつながり（[`LineJoin`]）。空なら全部`Break`（[`Self::new`]の既定）。
+    pub(crate) joins: &'s [LineJoin],
 }
 
 impl<'s, C, W> Selectable<'s, C, W> {
+    /// 全部の行を`Break`として写す（行の間に改行を入れる）。続きの行を持つ文章は[`Self::joined`]で印を足す。
     pub fn new(targets: &'s mut Targets<C, W>, surface: W, selection: &'s Selection<W>) -> Self {
         Self {
             targets,
             surface,
             selection,
+            joins: &[],
         }
+    }
+
+    /// 描く`Text`の行ごとの、前の行とのつながりを渡す（[`LineJoin`]）。**`joins`は描く`Text`の行と同じ数**にする
+    /// （空なら全部`Break`。数が違うのは呼び出し側の誤りで、デバッグビルドでは描くときに止まる）。
+    pub fn joined(self, joins: &'s [LineJoin]) -> Self {
+        Self { joins, ..self }
     }
 }
 
@@ -525,6 +568,93 @@ mod tests {
         selection.drag(&targets, 4, 1, Instant::now());
         selection.after_draw(&Targets::<(), &str>::default());
         assert!(!selection.is_active(), "枠を描かなくなったのに残った");
+    }
+
+    /// 選べる文章を描く2つの部品（`prepare`を呼ぶ2か所）。
+    #[derive(Debug, Clone, Copy)]
+    enum Renderer {
+        /// 末尾追従の枠（会話TUIのtranscript。[`crate::scrollback::render_with_bar`]）。
+        Scrollback,
+        /// 先頭から読ませる枠（承認ダイアログ等。[`crate::scrollable::draw`]）。
+        Scrollable,
+    }
+
+    /// 項目の続きの行を持つ3行を`renderer`で描く。`joins`が`Some`なら`.joined`で渡す。
+    fn paint_log(
+        selection: &mut Selection<&'static str>,
+        joins: Option<&[LineJoin]>,
+        renderer: Renderer,
+    ) -> Targets<(), &'static str> {
+        let lines = vec![
+            Line::raw("- the first item "),
+            Line::raw("  continues here"),
+            Line::raw("- the second item"),
+        ];
+        let mut targets: Targets<(), &str> = Targets::default();
+        let mut term = Terminal::new(TestBackend::new(30, 8)).expect("test terminal");
+        term.draw(|frame| {
+            let on = Selectable::new(&mut targets, "log", selection);
+            let on = match joins {
+                Some(joins) => on.joined(joins),
+                None => on,
+            };
+            let block = Block::default().borders(Borders::ALL);
+            match renderer {
+                Renderer::Scrollback => {
+                    crate::scrollback::render_with_bar(
+                        frame,
+                        frame.area(),
+                        lines,
+                        block,
+                        crate::scrollback::Scrollback::default(),
+                        Style::new(),
+                        on,
+                    );
+                }
+                Renderer::Scrollable => {
+                    crate::scrollable::draw(frame, frame.area(), lines, block, 0, LOOK, on);
+                }
+            }
+        })
+        .expect("draw");
+        selection.after_draw(&targets);
+        targets
+    }
+
+    /// 1行目の頭から3行目の末尾の文字までをドラッグで選んで写す。
+    fn drag_all_and_copy(joins: Option<&[LineJoin]>, renderer: Renderer) -> Option<String> {
+        let mut selection = Selection::default();
+        let targets = paint_log(&mut selection, joins, renderer);
+        selection.press(&targets, "log", 1, 1);
+        assert!(selection.drag(&targets, 17, 3, Instant::now()).started);
+        let _ = paint_log(&mut selection, joins, renderer);
+        assert_eq!(selection.release(), None);
+        let _ = paint_log(&mut selection, joins, renderer);
+        selection.copy()
+    }
+
+    /// **印を渡した続きの行は、写すと前の行に付く**（改行は`Break`の行の前だけ、字下げは落ちる）。
+    /// 会話TUIのtranscriptの描き方（`scrollback::render_with_bar`）と、先頭から読ませる枠の描き方の両方で確かめる
+    /// （印が`prepare`へ届く経路はこの2つ）。同じ画面を印なしで描けば、今までどおり行ごとに改行が入る（対照）。
+    #[test]
+    fn a_continuation_line_is_copied_as_one_line_through_both_renderers() {
+        let joins = [
+            LineJoin::Break,
+            LineJoin::Continues { indent: 2 },
+            LineJoin::Break,
+        ];
+        for renderer in [Renderer::Scrollback, Renderer::Scrollable] {
+            assert_eq!(
+                drag_all_and_copy(Some(&joins), renderer).as_deref(),
+                Some("- the first item continues here\r\n- the second item"),
+                "{renderer:?}"
+            );
+            assert_eq!(
+                drag_all_and_copy(None, renderer).as_deref(),
+                Some("- the first item \r\n  continues here\r\n- the second item"),
+                "{renderer:?}"
+            );
+        }
     }
 
     /// 押せる場所が上にある所で押しても、文章の上ではない（`Targets`が押せる場所を返す）。

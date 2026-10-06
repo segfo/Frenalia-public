@@ -165,6 +165,7 @@ fn render_inner<C: Clone, W: Clone + PartialEq>(
             heights: &heights,
             top: usize::from(top),
             wrapped: true,
+            joins: on.joins,
         },
         on.selection.mark(&on.surface),
     );
