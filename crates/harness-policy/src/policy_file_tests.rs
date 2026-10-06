@@ -161,8 +161,9 @@ fn saving_raises_the_schema_version_only_when_a_transition_is_actually_declared(
     .unwrap();
     save(ws.path(), &file).expect("save with a transition");
     let text = std::fs::read_to_string(path(ws.path())).unwrap();
+    // 上がるのは遷移の版（2）まで。Strict の印が無いので3にはしない（古いバイナリから読めなくする理由が無い）。
     assert!(
-        text.contains(&format!("\"schema_version\": {POLICY_SCHEMA_VERSION}")),
+        text.contains(&format!("\"schema_version\": {SCHEMA_VERSION_WITH_TRANSITIONS}")),
         "declaring a transition must raise the version: {text}"
     );
 
@@ -639,4 +640,107 @@ fn load_for_repair_reads_a_policy_that_fails_the_checks_and_says_why() {
         load_for_repair(ws.path()),
         Err(PolicyFileError::FutureSchema { .. })
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Strict の印（決定66の追記。`plans/position-domains/P5.md` の P5.3 の最初のコミット）
+// ---------------------------------------------------------------------------
+
+/// strict の印を知る前のバイナリ（P5.3 より前）が読めた最新の版。
+const SUPPORTED_BEFORE_THE_STRICT_MARK: u32 = 2;
+
+/// **書式の固定**: 印の綴りは`"strict": true`ただ1つで、付いていないドメインには欄そのものを書かない
+/// （印を使わないワークスペースの`policy.json`は、この変更の前と1バイトも変わらない）。
+#[test]
+fn the_strict_mark_is_written_only_when_set_and_in_one_spelling() {
+    let mut domain = PolicyDomain::new("secret-logs");
+    let plain = serde_json::to_string(&domain).unwrap();
+    assert!(!plain.contains("strict"), "an unmarked domain must not carry the key: {plain}");
+
+    domain.strict = true;
+    let marked = serde_json::to_string(&domain).unwrap();
+    assert!(marked.contains(r#""strict":true"#), "{marked}");
+    let read_back: PolicyDomain = serde_json::from_str(&marked).unwrap();
+    assert!(read_back.strict, "the mark must survive a round trip");
+}
+
+/// strict のドメインが1つでもあれば版3。遷移だけなら今までどおり2、どちらも無ければ1（対）。
+/// 印は遷移を1本も持たないドメインにも付けられる（入る辺を後から書く）ので、遷移が無くても3になる。
+#[test]
+fn a_strict_domain_requires_schema_version_3_while_transitions_alone_stay_at_2() {
+    let mut file = PolicyFile::default();
+    file.domains.push(PolicyDomain::new("shell"));
+    assert_eq!(file.required_schema_version(), 1);
+
+    file.domains[0].process = serde_json::from_str(
+        r#"{"transitions":[{"exe":{"literal":"C:\\x\\git.exe"},"argv":{"any":true},"to":"shell"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(file.required_schema_version(), 2, "transitions alone keep version 2");
+
+    let mut strict = PolicyDomain::new("secret-logs");
+    strict.strict = true;
+    file.domains.push(strict);
+    assert_eq!(file.required_schema_version(), 3);
+    assert_eq!(POLICY_SCHEMA_VERSION, 3, "this binary must be able to read what it writes");
+
+    file.domains[0].process = Default::default();
+    assert_eq!(file.required_schema_version(), 3, "the mark alone needs version 3");
+}
+
+/// 印の欄が無い古い`policy.json`（版2・遷移あり）は、どのドメインも普通のモード（`strict == false`）として読める。
+#[test]
+fn a_policy_written_before_the_strict_mark_reads_every_domain_as_not_strict() {
+    let ws = workspace();
+    write_policy(ws.path(), &policy_with_transition(SUPPORTED_BEFORE_THE_STRICT_MARK));
+
+    let file = load(ws.path()).expect("an old file still loads");
+
+    assert_eq!(file.domains.len(), 1);
+    assert!(!file.domains[0].strict);
+}
+
+/// **版3を古い版の読み手が断る**（[`a_newer_schema_version_is_refused_instead_of_being_reinterpreted`]と同じ形）。
+///
+/// 印を知らない読み手は欄を黙って捨てるので、Strict のつもりのドメインが普通のモード（入力を固定しない）で
+/// 効いてしまう。版2までしか知らない読み手が持つ検査（[`check_schema_version`]を`supported = 2`で通す）に、
+/// 印の付いたドメインを書いたファイルを掛けると未来の版として断られる。
+#[test]
+fn a_file_saved_with_a_strict_domain_is_refused_by_a_reader_that_knows_only_version_2() {
+    let ws = workspace();
+    let mut file = PolicyFile::default();
+    let mut strict = PolicyDomain::new("secret-logs");
+    strict.strict = true;
+    file.domains.push(strict);
+    save(ws.path(), &file).expect("save");
+
+    let written: PolicyFile =
+        serde_json::from_str(&std::fs::read_to_string(path(ws.path())).unwrap()).unwrap();
+    assert_eq!(written.schema_version, 3);
+    assert!(matches!(
+        check_schema_version(&written, path(ws.path()), SUPPORTED_BEFORE_THE_STRICT_MARK),
+        Err(PolicyFileError::FutureSchema { found: 3, supported: 2, .. })
+    ));
+    // 対: このバイナリは読める。
+    assert!(load(ws.path()).expect("this binary reads it").domains[0].strict);
+}
+
+/// 読む側の対（`B-01`）: 手で印を書いて版を2のままにしたファイルは、このバイナリが断る
+/// （そのまま通すと、同じファイルを古いバイナリが印を捨てて読む）。版を3にすれば読める。
+#[test]
+fn a_strict_domain_under_schema_version_2_is_refused_by_this_reader() {
+    let ws = workspace();
+    let text = |version: u32| {
+        format!(r#"{{"schema_version":{version},"domains":[{{"name":"secret-logs","strict":true}}]}}"#)
+    };
+    write_policy(ws.path(), &text(SUPPORTED_BEFORE_THE_STRICT_MARK));
+    let err = load(ws.path()).expect_err("version 2 cannot carry the strict mark");
+    assert!(
+        matches!(err, PolicyFileError::UnversionedTransitions { found: 2, required: 3, .. }),
+        "unexpected error: {err}"
+    );
+    assert!(err.to_string().contains("strict"), "the message must name the mark: {err}");
+
+    write_policy(ws.path(), &text(3));
+    assert!(load(ws.path()).expect("version 3 loads").domains[0].strict);
 }

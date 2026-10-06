@@ -83,7 +83,14 @@ pub const ENTRY_DOMAIN: &str = "workspace-shell";
 /// `process`を知らないバイナリが新しい`policy.json`を読むと、**遷移の宣言を黙って無視して
 /// 「FSとnetだけのポリシー」として扱う**——[`PolicyFileError::FutureSchema`]はまさにこれを
 /// 止めるためにある（`plans/DESIGN-MAC.md` §5.1(7)）。
-pub const POLICY_SCHEMA_VERSION: u32 = 2;
+///
+/// **3へ上げたのは P5.3**（ドメインの Strict の印＝[`PolicyDomain::strict`]を足した回。決定66の追記）。
+/// 印を知らないバイナリは欄を黙って捨てるので、Strict のつもりのドメインが**入力を固定しない普通のモード**で
+/// 効いてしまう。印を持つファイルだけが3を名乗る（[`PolicyFile::required_schema_version`]）。
+pub const POLICY_SCHEMA_VERSION: u32 = 3;
+
+/// 遷移の宣言（`process`）を持ち、Strict の印を1つも持たないファイルが名乗る版。
+const SCHEMA_VERSION_WITH_TRANSITIONS: u32 = 2;
 
 /// `process`を1件も持たないファイルが名乗る版。
 ///
@@ -117,10 +124,12 @@ pub enum PolicyFileError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// 版が内容に追いついていない。**遷移の宣言（版2）と Strict の印（版3）の両方がここへ来る**——
+    /// どちらも「それを知らない古いバイナリが黙って無視して読む」という同じ穴なので、変種を分けない。
     #[error(
-        "policy.json のスキーマ版が {found} なのに遷移の宣言（process）が入っています（{path}）。\
-         この形のファイルは、遷移を知らない古い harness が**黙って無視して**読みます。\
-         schema_version を {required} にしてください"
+        "policy.json のスキーマ版が {found} なのに、版 {required} が要る内容（遷移の宣言 process、\
+         またはドメインの strict の印）が入っています（{path}）。この形のファイルは、それを知らない\
+         古い harness が**黙って無視して**読みます。schema_version を {required} にしてください"
     )]
     UnversionedTransitions {
         path: PathBuf,
@@ -203,6 +212,18 @@ pub struct Provenance {
 pub struct PolicyDomain {
     /// ドメイン名。ユーザーが`--domain`で指定する識別子。
     pub name: String,
+    /// **Strict の印**（決定66の追記。`plans/POLICY-EDITOR-TOMOYO-DIG.md`）。真なら「このドメインへ入る辺は
+    /// 全部 Strict」——入力を固定した辺でしか入れない（呼び出し元はこのドメインの権限を、決めた操作にしか使えない）。
+    /// 偽（既定）は普通のモード（決定66。守る線はこのドメインの権限そのもの）。
+    ///
+    /// **辺ではなくドメインに付ける**——同じドメインへ入る辺を後から1本足したときに付け忘れるためである。
+    /// 綴りは`"strict": true`だけで、偽のときは欄を書かない（印を使わないワークスペースの`policy.json`は
+    /// 変わらない）。印を持つファイルは版3を名乗る（[`PolicyFile::required_schema_version`]）。
+    ///
+    /// 印をどう効かせるか（入る辺に掛ける束・到達閉包で辿らない）の正本は[`crate::transition`]で、
+    /// **このファイルは持たない**。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
     /// このドメインで記録したコマンド（**由来の記録であって実行時マッチャではない**）。
     #[serde(default)]
     pub commands: Vec<String>,
@@ -229,6 +250,7 @@ impl PolicyDomain {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            strict: false,
             commands: Vec::new(),
             cwd: None,
             fs: FsRules::default(),
@@ -450,9 +472,13 @@ impl PolicyFile {
     ///
     /// **版の正本は内容そのもの**にしてある——[`save`]はこの値を書くので、
     /// ファイルの中の`schema_version`と中身が食い違う状態を作れない（`B-13`: 正本を2つ持たない）。
+    ///
+    /// Strict の印（[`PolicyDomain::strict`]）が1つでもあれば3、遷移だけなら2、どちらも無ければ1。
     pub fn required_schema_version(&self) -> u32 {
-        if self.domains.iter().any(|d| !d.process.is_empty()) {
+        if self.domains.iter().any(|d| d.strict) {
             POLICY_SCHEMA_VERSION
+        } else if self.domains.iter().any(|d| !d.process.is_empty()) {
+            SCHEMA_VERSION_WITH_TRANSITIONS
         } else {
             SCHEMA_VERSION_WITHOUT_TRANSITIONS
         }
@@ -621,16 +647,29 @@ fn read_versioned(workspace_root: &Path) -> Result<PolicyFile, PolicyFileError> 
         path: path.clone(),
         source: e,
     })?;
-    if file.schema_version > POLICY_SCHEMA_VERSION {
+    check_schema_version(&file, path, POLICY_SCHEMA_VERSION)?;
+    Ok(file)
+}
+
+/// 読んだファイルの版を、このバイナリが読める版（`supported`）と内容に照らす。
+///
+/// `supported`を引数で受けるのは、**古い版の読み手が何を断るか**を試験で再現するためである
+/// （本物の呼び出し元は[`read_versioned`]の1つで、[`POLICY_SCHEMA_VERSION`]を渡す）。
+fn check_schema_version(
+    file: &PolicyFile,
+    path: PathBuf,
+    supported: u32,
+) -> Result<(), PolicyFileError> {
+    if file.schema_version > supported {
         return Err(PolicyFileError::FutureSchema {
             path,
             found: file.schema_version,
-            supported: POLICY_SCHEMA_VERSION,
+            supported,
         });
     }
     // **版が内容に追いついていないファイルを拒否する**（`plans/DESIGN-MAC.md` §5.1(7)）。
     // [`save`]が版を内容から決めるので、この形は手で書いたときにしか生まれない——
-    // だが生まれてしまうと、遷移を知らない古いバイナリが**黙って無視して**読む。
+    // だが生まれてしまうと、遷移（または Strict の印）を知らない古いバイナリが**黙って無視して**読む。
     // 書く側と読む側を対にして初めて塞がる（`B-01`）。
     let required = file.required_schema_version();
     if file.schema_version < required {
@@ -640,7 +679,7 @@ fn read_versioned(workspace_root: &Path) -> Result<PolicyFile, PolicyFileError> 
             required,
         });
     }
-    Ok(file)
+    Ok(())
 }
 
 /// 遷移の編集時検査に落ちた理由（落ちなければ空）。**[`load_for_session`]・[`load_for_repair`]・[`save`]が同じものを通る。**
