@@ -27,7 +27,13 @@ impl AppState {
             AgentEvent::TextDelta { text } => {
                 self.current_turn_downstream_chars += text.chars().count() as u64;
 
-                if !self.turn_open {
+                // 続きとして足すのは「このターンで本文が始まっていて、**かつ最後の項目がその本文**」のときだけ
+                // （BUG-232）。流入中に thinking や知らせの行（`[stderr]`・スラッシュコマンドの控え等）が入ると最後の
+                // 項目は別物になる。そのときは足し先が無いので、ターンの最初の文章と同じく新しい項目を始める
+                // ——以前はここで黙って捨てていた（画面からだけ返答の残りが消え、履歴には残っていた）。
+                let continues = self.turn_open
+                    && matches!(self.transcript.last(), Some(TranscriptItem::Assistant(_)));
+                if !continues {
                     // モデル（特にLMStudio経由のローカルモデル）がチャットテンプレートの都合で
                     // 応答冒頭に意味の無い改行/空白だけのデルタを送ってくることがある。
                     // まだ非空白の内容が届いていないうちに「考え中」インジケータを消して

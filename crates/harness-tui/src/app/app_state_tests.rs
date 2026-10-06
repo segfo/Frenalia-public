@@ -1132,6 +1132,106 @@ fn subsequent_text_deltas_still_append_to_the_same_assistant_item() {
     assert!(matches!(&app.transcript[0], TranscriptItem::Assistant(s) if s == "Hello"));
 }
 
+// --- BUG-232: 流入中に別の項目が入っても、返答の残りを画面から落とさない ---
+
+/// transcript の並びを「種類:中身」の文字列にする（項目の順番と中身をまとめて比べるため）。
+fn transcript_shape(app: &AppState) -> Vec<String> {
+    app.transcript
+        .iter()
+        .map(|item| match item {
+            TranscriptItem::User(s) => format!("User:{s}"),
+            TranscriptItem::Assistant(s) => format!("Assistant:{s}"),
+            TranscriptItem::Thinking(s) => format!("Thinking:{s}"),
+            TranscriptItem::ToolCard { name, .. } => format!("ToolCard:{name}"),
+            TranscriptItem::Error(s) => format!("Error:{s}"),
+            TranscriptItem::Info(s) => format!("Info:{s}"),
+        })
+        .collect()
+}
+
+/// [BUG-232] 文章の後に thinking が届き、また文章が届く（OpenAI互換サーバで、文章の後に`reasoning_content`を
+/// 送るモデル）。後の文章は**新しい** Assistant 項目として thinking の下に並ぶ——起きた順のまま、1文字も落とさない。
+/// thinking の直後に来がちな改行だけのデルタは、ターンの最初の文章と同じく落とす。新しい項目を始めた後の文章は、
+/// その項目へ続けて足す（足す側が死んでいないことも同じ試験で見る）。
+#[test]
+fn text_after_a_thinking_block_starts_a_new_assistant_item_instead_of_being_dropped() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    app.apply(AgentEvent::TextDelta {
+        text: "前半".into(),
+    });
+    app.apply(AgentEvent::ThinkingDelta {
+        text: "考え".into(),
+    });
+    app.apply(AgentEvent::TextDelta {
+        text: "\n\n".into(),
+    });
+    app.apply(AgentEvent::TextDelta { text: "後".into() });
+    app.apply(AgentEvent::TextDelta { text: "半".into() });
+
+    assert_eq!(
+        transcript_shape(&app),
+        vec!["Assistant:前半", "Thinking:考え", "Assistant:後半"]
+    );
+}
+
+/// [BUG-232] 流入中に標準エラーの行（`[stderr]`。描画の tick ごとに`note_stderr_lines`で取り込む）が入っても、
+/// その後の文章を落とさない。後の文章は知らせの行の下に、新しい Assistant 項目として並ぶ。
+#[test]
+fn text_after_a_captured_stderr_line_starts_a_new_assistant_item() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    app.apply(AgentEvent::TextDelta {
+        text: "前半".into(),
+    });
+    app.note_stderr_lines(vec!["warning: x".to_string()]);
+    app.apply(AgentEvent::TextDelta {
+        text: "後半".into(),
+    });
+
+    assert_eq!(
+        transcript_shape(&app),
+        vec![
+            "Assistant:前半",
+            "Info:[stderr] warning: x",
+            "Assistant:後半"
+        ]
+    );
+}
+
+/// [BUG-232] 応答の流入中にユーザーが`/compact`を送る（今のターンの後ろに並んで待つ、BUG-071）。送ったコマンドの
+/// 控えの行（`> /compact`）が入っても、その後の文章を落とさない。製品と同じく、入力欄へ打って送信キーで送る。
+#[test]
+fn text_after_a_slash_command_echo_sent_mid_turn_starts_a_new_assistant_item() {
+    let mut app = AppState::new("mock".into(), "mock-model".into());
+    app.apply(AgentEvent::TurnStarted {
+        estimated_input_tokens: 0,
+    });
+    app.apply(AgentEvent::TextDelta {
+        text: "前半".into(),
+    });
+    for c in "/compact".chars() {
+        app.on_key(key(c));
+    }
+    let action = app.on_key(alt(KeyCode::Enter));
+    assert!(
+        matches!(action, Some(Action::Slash(SlashCommand::Compact))),
+        "{action:?}"
+    );
+    app.apply(AgentEvent::TextDelta {
+        text: "後半".into(),
+    });
+
+    assert_eq!(
+        transcript_shape(&app),
+        vec!["Assistant:前半", "Info:> /compact", "Assistant:後半"]
+    );
+}
+
 // --- レビューパネル（`app::review`） ---
 
 /// レビュー行を**素のテキスト対から**組む。`ChangeEntry`も`ManifestOp`も構築していないのが

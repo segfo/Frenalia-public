@@ -202,8 +202,14 @@ pub struct AppState {
     pub model: String,
     pub last_usage: Usage,
     pub last_stop_reason: Option<StopReason>,
-    /// 直前の`TextDelta`がAssistantテキストの続きかどうか。`TurnStarted`/ツールカード挿入で
-    /// リセットし、新しいターンのテキストが別の`Assistant`項目として積まれるようにする。
+    /// このターン（またはツール呼び出し・巻き戻しの後の続き）で、本文の`Assistant`項目を既に作ったか。
+    /// 最初の非空白の`TextDelta`で真になり、`TurnStarted`・ツールカードの挿入・ターンの終わり（完了・エラー・
+    /// 中断）・応答の巻き戻し・ユーザー入力の追加・transcriptを空にしたときに偽へ戻る。
+    ///
+    /// **真でも「最後の項目が本文である」とは限らない**——流入中に thinking や知らせの行（`[stderr]`・
+    /// スラッシュコマンドの控え等）が入っても、これは偽に戻らない。だから`TextDelta`が続きとして足すのは
+    /// 「これが真で、**かつ`transcript`の最後が`Assistant`項目**」のときだけで、そうでなければ新しい
+    /// `Assistant`項目を始める（[BUG-232](../../../../docs/bugs/BUG-232.md)。以前は足し先が無いまま黙って捨てていた）。
     turn_open: bool,
     /// 現在の試行が書き始めた`transcript`上の位置（`transcript.len()`）。
     ///
