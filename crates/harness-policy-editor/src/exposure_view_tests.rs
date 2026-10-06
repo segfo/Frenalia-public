@@ -177,3 +177,62 @@ fn only_a_discarding_edge_gets_an_output_suffix() {
     assert_eq!(output_suffix(ChildOutput::Return), "");
     assert!(output_suffix(ChildOutput::Discard).contains("子の出力を捨てる"));
 }
+
+/// [P5.6] **変更で生まれた組み合わせの対を、断らずに明細へ並べる**（決定66(9)・Limit 1）——あるドメインが書ける場所を、
+/// 外部と通信できる別のドメインが読む／実行する組。外部と通信できるかの見立ては暫定（P7 で差し替え）と添える。
+///
+/// 対（`B-35`）: 前からあった対は出さない（何度確定しても同じ対を言い続けない）。
+#[test]
+fn a_new_combination_pair_is_listed_without_refusing() {
+    let mut builder = PolicyDomain::new("builder");
+    builder.fs.read_write.push("C:/share/**".to_string());
+    let before = file(vec![PolicyDomain::new(ENTRY_DOMAIN), builder.clone()]);
+    let after = file(vec![reading(ENTRY_DOMAIN, "C:/share/out.txt"), builder]);
+
+    let found = widening(&before, &after, &ws());
+    assert_eq!(found.pairs.len(), 1, "{:?}", found.pairs);
+    assert!(!found.is_empty());
+    assert!(found.hands_over_rights(), "組み合わせだけでも --auto-approve は断る（決定66(8)）");
+    let text = lines(&found).join("\n");
+    assert!(text.contains("組み合わせ 1組"), "{text}");
+    assert!(
+        text.contains("builder が書ける C:/share/**") && text.contains(&format!("{ENTRY_DOMAIN} が読める")),
+        "{text}"
+    );
+    assert!(text.contains("暫定"), "通信できるかの見立てが暫定だと言っていない: {text}");
+
+    assert!(widening(&after, &after, &ws()).pairs.is_empty(), "前からあった対を言った");
+}
+
+/// [P5.6] **明細は辺のモードを示す**——広がる辺は「普通」、新しく Strict になった辺は「入力を固定するので呼び出し元は
+/// 子を操れない（広がる遷移に数えない）」と1行で言う（決定66の追記）。
+#[test]
+fn the_details_say_whether_each_edge_is_ordinary_or_strict() {
+    let widened = file(vec![
+        with_edge(PolicyDomain::new(ENTRY_DOMAIN), PEEK, "secret"),
+        reading("secret", "C:/Users/x/secret/**"),
+    ]);
+    let ordinary = lines(&widening(
+        &file(vec![PolicyDomain::new(ENTRY_DOMAIN), reading("secret", "C:/Users/x/secret/**")]),
+        &widened,
+        &ws(),
+    ))
+    .join("\n");
+    assert!(ordinary.contains("［普通］"), "{ordinary}");
+    assert!(!ordinary.contains("［Strict］"), "{ordinary}");
+
+    let mut fixed = widened.clone();
+    let edge = &mut fixed.domains[0].process.transitions[0];
+    edge.argv = ArgvMatcher::Literal(format!("\"{PEEK}\" --report"));
+    edge.cwd = Some("C:/work".to_string());
+    let mut marked = fixed.clone();
+    marked.domains[1].strict = true;
+    let strict = widening(&fixed, &marked, &ws());
+    assert_eq!(strict.strict_edges.len(), 1, "{strict:?}");
+    assert!(strict.edges.is_empty(), "Strict の辺は何も渡さない: {strict:?}");
+    let text = lines(&strict).join("\n");
+    assert!(
+        text.contains("［Strict］") && text.contains("入力を固定するので") && text.contains("secret"),
+        "{text}"
+    );
+}

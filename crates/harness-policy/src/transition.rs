@@ -947,7 +947,7 @@ pub use transition_shape::{self_loops, shape, LongestChain, SelfLoop, Transition
 mod transition_exposure;
 pub use transition_exposure::{
     exposure_delta, newly_usable, provisional_net_capable, CombinationPair, EdgeExposure,
-    ExposureDelta, PairUse,
+    ExposureDelta, PairUse, StrictEdge,
 };
 
 #[cfg(test)]

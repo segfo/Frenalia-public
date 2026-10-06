@@ -91,6 +91,15 @@ pub struct CombinationPair {
     pub use_: PairUse,
 }
 
+/// [P5.6] Strict のドメインへ入る辺1本（入力を固定するので、呼び出し元は子を操れない。決定66の追記）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictEdge {
+    pub from: String,
+    /// `from`の`transitions`配列の添字（**変更後**の宣言での位置。[`EdgeExposure::edge_index`]と同じ）。
+    pub edge_index: usize,
+    pub to: String,
+}
+
 /// 変更（`before` → `after`）で増えたもの（[`exposure_delta`]の答え）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExposureDelta {
@@ -98,6 +107,9 @@ pub struct ExposureDelta {
     pub edges: Vec<EdgeExposure>,
     /// 変更で生まれた組み合わせの対（欄の順）。前からあった対は入らない。
     pub pairs: Vec<CombinationPair>,
+    /// [P5.6] 変更で**新しく** Strict のドメインへ入るようになった辺（変更後の宣言の順）。何も渡さないので[`Self::edges`]
+    /// には入らないが、明細は辺のモード（普通か Strict か）を示すためにこれを出す。前から Strict だった辺は入らない。
+    pub strict_edges: Vec<StrictEdge>,
 }
 
 /// `from`から`to`へ遷移すると、呼び出し元が子を通して新しく使えるようになる権限
@@ -134,9 +146,21 @@ where
     let after_facts = GraphFacts::new(after)?;
 
     let mut edges = Vec::new();
+    let mut strict_edges = Vec::new();
     for view in &after.domains {
         let before_view = before_facts.by_name.get(view.name);
         for (edge_index, edge) in view.process.transitions.iter().enumerate() {
+            // Strict の辺の鍵は`enters_strict`の1か所（`usable_through`が数えないのと同じ判定。`B-13`）。
+            let was_strict = before_view
+                .is_some_and(|b| b.process.transitions.contains(edge))
+                && before_facts.enters_strict(view.name, &edge.to);
+            if after_facts.enters_strict(view.name, &edge.to) && !was_strict {
+                strict_edges.push(StrictEdge {
+                    from: view.name.to_string(),
+                    edge_index,
+                    to: edge.to.clone(),
+                });
+            }
             let now = after_facts.usable_through(view.name, &edge.to);
             let added = match before_view {
                 Some(before_view) if before_view.process.transitions.contains(edge) => {
@@ -160,7 +184,11 @@ where
         .into_iter()
         .filter(|pair| !existed.contains(pair))
         .collect();
-    Ok(ExposureDelta { edges, pairs })
+    Ok(ExposureDelta {
+        edges,
+        pairs,
+        strict_edges,
+    })
 }
 
 /// 外部と通信できるかの**暫定**の判定（決定66(9)）: 入口のドメイン（[`ENTRY_DOMAIN`]）は常に通信できる、

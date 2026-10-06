@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use super::{confirm_write, resolve_limit, resolve_require_sandbox, resolve_workspace};
+use super::{confirm_write, resolve_limit, resolve_require_sandbox, resolve_workspace, Consent};
 
 pub(super) fn run_show(
     session: Option<&str>,
@@ -162,7 +162,7 @@ pub(super) fn run_approve(
     domain: Option<&str>,
     accept: &[String],
     require_sandbox: Option<&str>,
-    yes: bool,
+    consent: Consent,
 ) -> ExitCode {
     use harness_policy_editor::approve::{self, ApproveRequest, PathClass};
     use harness_policy_editor::session_dir;
@@ -207,7 +207,7 @@ pub(super) fn run_approve(
                 domain,
                 &accept_ids,
                 require_sandbox,
-                yes,
+                consent,
             );
         }
         candidates.proposals
@@ -307,7 +307,7 @@ pub(super) fn run_approve(
         return ExitCode::SUCCESS;
     }
 
-    if !confirm_write(yes) {
+    if !confirm_write(consent, &plan.widening) {
         eprintln!("中止しました。何も書いていません。");
         return ExitCode::FAILURE;
     }
@@ -339,7 +339,7 @@ fn approve_by_position(
     domain_flag: Option<&str>,
     accept_ids: &[String],
     require_sandbox: harness_core::RequireSandbox,
-    yes: bool,
+    consent: Consent,
 ) -> ExitCode {
     use harness_policy_editor::position_approve;
 
@@ -368,7 +368,7 @@ fn approve_by_position(
         println!("（承認済みの内容に変化はありません。何も書きませんでした）");
         return ExitCode::SUCCESS;
     }
-    if !confirm_write(yes) {
+    if !confirm_write(consent, &plan.widening) {
         eprintln!("中止しました。何も書いていません。");
         return ExitCode::FAILURE;
     }

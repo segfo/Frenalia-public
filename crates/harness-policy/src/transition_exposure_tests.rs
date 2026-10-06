@@ -554,3 +554,43 @@ fn a_value_the_grant_layer_refuses_opens_no_place() {
         vec![]
     );
 }
+
+// ---------------------------------------------------------------------------
+// [P5.6] Strict の辺を明細に出す（辺のモードを示す）
+// ---------------------------------------------------------------------------
+
+/// [P5.6] **変更で新しく Strict になった辺**（入る先に印が付いた・印の付いたドメインへ新しく入った）を返す——明細はそれを
+/// 「入力を固定するので呼び出し元は子を操れない（広がる遷移に数えない）」と1行で言う（辺のモードを示す。P5.md の P5.6）。
+///
+/// 対（`B-35`）: 前から Strict だった辺・自己ループ・印の無いドメインへ入る辺は出さない。
+#[test]
+fn edges_that_newly_enter_a_strict_domain_are_reported_but_old_ones_are_not() {
+    let plain = file(vec![
+        Decl::new(ENTRY_DOMAIN).fixed_edge("C:/t/report.exe", "logs"),
+        Decl::new("logs").read("C:/logs/**"),
+    ]);
+    let marked = file(vec![
+        Decl::new(ENTRY_DOMAIN).fixed_edge("C:/t/report.exe", "logs"),
+        Decl::new("logs").read("C:/logs/**").strict(),
+    ]);
+    let d = delta(&plain, &marked, provisional_net_capable);
+    assert_eq!(
+        d.strict_edges,
+        vec![StrictEdge {
+            from: ENTRY_DOMAIN.to_string(),
+            edge_index: 0,
+            to: "logs".to_string(),
+        }]
+    );
+    assert!(d.edges.is_empty(), "Strict の辺は何も渡さない: {:?}", d.edges);
+
+    // 前から Strict だった辺は新しくない。
+    assert!(delta(&marked, &marked, provisional_net_capable).strict_edges.is_empty());
+    // 印の無いドメインへ入る辺・Strict のドメインの中の自己ループは Strict の辺ではない。
+    let self_loop = file(vec![
+        Decl::new(ENTRY_DOMAIN),
+        Decl::new("logs").fixed_edge("C:/t/report.exe", "logs").strict(),
+    ]);
+    assert!(delta(&plain, &plain, provisional_net_capable).strict_edges.is_empty());
+    assert!(delta(&file(vec![]), &self_loop, provisional_net_capable).strict_edges.is_empty());
+}

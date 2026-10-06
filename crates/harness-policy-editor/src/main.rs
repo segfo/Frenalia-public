@@ -44,6 +44,10 @@ use cli_candidates::{run_approve, run_show};
 mod cli_overview;
 use cli_overview::print_overview;
 
+/// 書込の同意（`--auto-approve`／`--force-approve`。決定66(8)、P5.6）と、書く前の確認。
+mod cli_consent;
+use cli_consent::{confirm_write, Consent, ConsentArgs};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "harness-policy-editor",
@@ -157,9 +161,8 @@ enum Command {
         /// 承認を`--require-sandbox`の宣言と突き合わせる（none/write-containment/confidential）。
         #[arg(long)]
         require_sandbox: Option<String>,
-        /// 差分を確認済みとして書き込む（非対話では必須）。
-        #[arg(long)]
-        yes: bool,
+        #[command(flatten)]
+        consent: ConsentArgs,
     },
     /// 記録セッションの一覧（新しい順）。
     Sessions {
@@ -200,9 +203,8 @@ enum Command {
         /// **同じ関数**を通る（`exclusion::ExclusionRules`）。
         #[arg(long)]
         excluded: bool,
-        /// 差分を確認済みとして書き込む（非対話では必須）。
-        #[arg(long)]
-        yes: bool,
+        #[command(flatten)]
+        consent: ConsentArgs,
     },
     /// [D-112] **既に`policy.json`にあるファイル宣言を、このマシンで承認する。**
     ///
@@ -226,9 +228,8 @@ enum Command {
         /// 承認を`--require-sandbox`の宣言と突き合わせる（none/write-containment/confidential）。
         #[arg(long)]
         require_sandbox: Option<String>,
-        /// 確認済みとして書き込む（非対話では必須）。
-        #[arg(long)]
-        yes: bool,
+        #[command(flatten)]
+        consent: ConsentArgs,
     },
 }
 
@@ -278,14 +279,14 @@ fn main() -> ExitCode {
             domain,
             accept,
             require_sandbox,
-            yes,
+            consent,
         }) => run_approve(
             session.as_deref(),
             workspace,
             domain.as_deref(),
             &accept,
             require_sandbox.as_deref(),
-            yes,
+            consent.consent(),
         ),
         Some(Command::Sessions { workspace }) => run_sessions(workspace),
         Some(Command::ApproveDeclared {
@@ -294,14 +295,14 @@ fn main() -> ExitCode {
             fs,
             access,
             require_sandbox,
-            yes,
+            consent,
         }) => run_approve_declared(
             &domain,
             workspace,
             &fs,
             &access,
             require_sandbox.as_deref(),
-            yes,
+            consent.consent(),
         ),
         Some(Command::Unapprove {
             domain,
@@ -311,7 +312,7 @@ fn main() -> ExitCode {
             net,
             all,
             excluded,
-            yes,
+            consent,
         }) => run_unapprove(
             UnapproveSelector {
                 domain: domain.as_deref(),
@@ -322,7 +323,7 @@ fn main() -> ExitCode {
                 excluded,
             },
             workspace,
-            yes,
+            consent.consent(),
         ),
         None => run_tui(cli.workspace, cli.require_sandbox.as_deref()),
     }
@@ -808,9 +809,6 @@ fn resolve_require_sandbox(raw: Option<&str>) -> Option<harness_core::RequireSan
     }
 }
 
-/// 書込前の確認。非対話（パイプ・リダイレクト）では`--yes`を必須にする——ヘッドレスは
-/// 対話プロンプトを一切出さない原則に従い、「答えが返ってこないまま既定で進む」形を作らない
-/// （`harness policy apply`と同じ作法）。
 /// `harness-policy-editor unapprove` — 承認済み宣言を取り消す。
 ///
 /// 表示の作法は`approve`と同じ2段（差分を見せる→確認→書く）。**消える件数と「元から無かった」
@@ -832,7 +830,7 @@ struct UnapproveSelector<'a> {
 fn run_unapprove(
     selector: UnapproveSelector<'_>,
     workspace: Option<PathBuf>,
-    yes: bool,
+    consent: Consent,
 ) -> ExitCode {
     use harness_policy_editor::unapprove;
 
@@ -912,7 +910,7 @@ fn run_unapprove(
             ExitCode::FAILURE
         };
     }
-    if !confirm_write(yes) {
+    if !confirm_write(consent, &plan.widening) {
         println!("何も書いていません");
         return ExitCode::FAILURE;
     }
@@ -942,7 +940,7 @@ fn run_approve_declared(
     values: &[String],
     access: &str,
     require_sandbox: Option<&str>,
-    yes: bool,
+    consent: Consent,
 ) -> ExitCode {
     use harness_policy::generalize::SettingsKey;
     use harness_policy_editor::approve_declared;
@@ -1027,7 +1025,8 @@ fn run_approve_declared(
     println!(
         "承認すると、次の record-net と harness.exe の起動でこの宣言に許可（ACE）が付きます。"
     );
-    if !confirm_write(yes) {
+    // policy.json を変えない（このマシンの承認台帳だけ）ので、広がりは空（`cli_consent`のモジュールdoc）。
+    if !confirm_write(consent, &Default::default()) {
         println!("何も書いていません");
         return ExitCode::FAILURE;
     }
@@ -1155,28 +1154,6 @@ fn collect_unapprove_targets(
         });
     }
     Ok(targets)
-}
-
-fn confirm_write(yes: bool) -> bool {
-    use std::io::IsTerminal;
-
-    if yes {
-        return true;
-    }
-    if !std::io::stdin().is_terminal() {
-        eprintln!(
-            "確認なしには書きません: 標準入力が端末ではないためプロンプトを出せません。\
-             上の差分を確認したうえで --yes を付けて実行してください。"
-        );
-        return false;
-    }
-    eprint!("この内容を .harness/policy.json へ書きますか？ [y/N] ");
-    let _ = std::io::Write::flush(&mut std::io::stderr());
-    let mut answer = String::new();
-    if std::io::stdin().read_line(&mut answer).is_err() {
-        return false;
-    }
-    matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
 }
 
 fn run_sessions(workspace: Option<PathBuf>) -> ExitCode {

@@ -305,8 +305,7 @@ fn reassign_lines_list_the_transitions_a_reassignment_widens() {
                 },
                 output: harness_policy::transition::ChildOutput::Return,
             }],
-            uncounted: None,
-            schema_raised: None,
+            ..Widening::default()
         },
         ..Default::default()
     };

@@ -27,7 +27,8 @@
 //! # 限界
 //!
 //! - **組み合わせの対**（Limit 1。あるドメインが書ける場所を、外部と通信できる別のドメインが読む／実行する）は
-//!   まだ出さない（P5.6）
+//!   **断らずに並べるだけ**（P5.6、決定66(9)）。「外部と通信できるか」は暫定の見立て（`provisional_net_capable`。P7 で
+//!   差し替え）で、変更の前から在った対は出さない。CLI の`--auto-approve`は対が1組でもあれば書かない（`cli_consent`）
 //! - **子の出力の行は、広がる辺にだけ出す**（P5.4b。Daemon が出力を返すようになった段で足した——P5.3 は返して
 //!   いなかったので、入る前に言うと嘘になった、`B-32`）。広がらない辺の出力の設定は、辺の綴りに添える
 //!   [`output_suffix`]が出す（P5.5。確認の明細・宣言画面の遷移タブ）
@@ -39,7 +40,7 @@
 use std::path::Path;
 
 use harness_policy::policy_file::{PolicyFile, POLICY_SCHEMA_VERSION};
-use harness_policy::transition::{self, ChildOutput, ExeMatcher};
+use harness_policy::transition::{self, ChildOutput, CombinationPair, ExeMatcher, PairUse, TransitionEdge};
 use harness_policy::transition_listing::Rights;
 
 /// 変更で広がる遷移（[`widening`]の答え）。
@@ -53,12 +54,29 @@ pub struct Widening {
     /// 書くと3へ上がり、版2までしか読めない古い`harness.exe`は読込で断る——書く前に知らせる。広がりではないが、
     /// 確定の明細を出す全経路がこの構造体を並べるので、ここに持たせて配線を1つにした（`B-06`）。
     pub schema_raised: Option<(u32, u32)>,
+    /// [P5.6] 変更で生まれた組み合わせの対（決定66(9)・Limit 1。あるドメインが書ける場所を、外部と通信できる別のドメインが
+    /// 読む／実行する）。**断らずに見せる**——ポリシーの書き方の責任で、人が判断する。
+    pub pairs: Vec<CombinationPair>,
+    /// [P5.6] 変更で新しく Strict のドメインへ入るようになった辺。何も渡さないので[`Self::edges`]には入らないが、明細は
+    /// 辺のモード（普通か Strict か）を示すためにこれを出す（`harness_policy::transition::ExposureDelta::strict_edges`）。
+    pub strict_edges: Vec<StrictEdgeView>,
 }
 
 impl Widening {
-    /// 確認に出すものが無い（広がる辺が無く、数えられなかったことも、版が上がることも無い）。
+    /// 確認に出すものが無い（広がる辺・組み合わせ・新しい Strict の辺が無く、数えられなかったことも、版が上がることも無い）。
     pub fn is_empty(&self) -> bool {
-        self.edges.is_empty() && self.uncounted.is_none() && self.schema_raised.is_none()
+        self.edges.is_empty()
+            && self.uncounted.is_none()
+            && self.schema_raised.is_none()
+            && self.pairs.is_empty()
+            && self.strict_edges.is_empty()
+    }
+
+    /// [P5.6] **呼び出し元へ新しく権限を渡し得る変更か**——広がる辺・新しい組み合わせが1件でもある、または数えられ
+    /// なかった（確かめていないものを「渡さない」と言わない、`B-10`）。CLI の`--auto-approve`はこれが真なら書かない
+    /// （決定66(8)）。版の上がりと新しい Strict の辺は渡すものを増やさないので数えない。
+    pub fn hands_over_rights(&self) -> bool {
+        !self.edges.is_empty() || !self.pairs.is_empty() || self.uncounted.is_some()
     }
 }
 
@@ -76,6 +94,15 @@ pub struct WidenedEdge {
     pub output: ChildOutput,
 }
 
+/// [P5.6] 新しく Strict になった辺1本（明細の表示用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictEdgeView {
+    pub from: String,
+    /// 辺の実行ファイル（書かれた綴り）。
+    pub exe: String,
+    pub to: String,
+}
+
 /// `before` → `after`の変更で広がる遷移。`after`は書く予定の内容、`before`は読み込んだ`policy.json`。
 pub fn widening(before: &PolicyFile, after: &PolicyFile, workspace_root: &Path) -> Widening {
     // 版は内容から決まる（`PolicyFile::required_schema_version`）。版1→2（初めての遷移）は P5 より前から言っていない。
@@ -90,24 +117,27 @@ pub fn widening(before: &PolicyFile, after: &PolicyFile, workspace_root: &Path) 
         &after.transition_graph_input(Some(workspace.as_ref()), &[]),
         transition::provisional_net_capable,
     );
+    // 辺は変更後の宣言での位置で指される。見つからないことは無い（見つからなければ空の綴り・既定の出力）。
+    let written = |from: &str, index: usize| -> Option<&TransitionEdge> {
+        after.domain(from).and_then(|d| d.process.transitions.get(index))
+    };
+    let exe_of = |edge: Option<&TransitionEdge>| {
+        edge.map(|e| match &e.exe {
+            ExeMatcher::Literal(exe) | ExeMatcher::Pattern(exe) => exe.clone(),
+        })
+        .unwrap_or_default()
+    };
     match delta {
         Ok(delta) => Widening {
             edges: delta
                 .edges
                 .into_iter()
                 .map(|edge| {
-                    let written = after
-                        .domain(&edge.from)
-                        .and_then(|d| d.process.transitions.get(edge.edge_index));
+                    let found = written(&edge.from, edge.edge_index);
                     WidenedEdge {
-                        exe: written
-                            .map(|e| match &e.exe {
-                                ExeMatcher::Literal(exe) | ExeMatcher::Pattern(exe) => exe.clone(),
-                            })
-                            .unwrap_or_default(),
-                        // 辺が見つからないことは無い（`edge_index`は変更後の宣言での位置）。見つからなければ
-                        // 既定の「返す」——渡る側へ倒して言う（言わないより言い過ぎる側）。
-                        output: written.map(|e| e.output).unwrap_or_default(),
+                        exe: exe_of(found),
+                        // 見つからなければ既定の「返す」——渡る側へ倒して言う（言わないより言い過ぎる側）。
+                        output: found.map(|e| e.output).unwrap_or_default(),
                         from: edge.from,
                         to: edge.to,
                         newly_usable: edge.newly_usable,
@@ -116,16 +146,26 @@ pub fn widening(before: &PolicyFile, after: &PolicyFile, workspace_root: &Path) 
                 .collect(),
             uncounted: None,
             schema_raised,
+            pairs: delta.pairs,
+            strict_edges: delta
+                .strict_edges
+                .into_iter()
+                .map(|edge| StrictEdgeView {
+                    exe: exe_of(written(&edge.from, edge.edge_index)),
+                    from: edge.from,
+                    to: edge.to,
+                })
+                .collect(),
         },
         Err(e) => Widening {
-            edges: Vec::new(),
             uncounted: Some(e.to_string()),
             schema_raised,
+            ..Widening::default()
         },
     }
 }
 
-/// 確認の画面・CLI に並べる行（出すものが無ければ空）。先頭に空行を1つ置く（前の節と分ける）。
+/// 確認の画面・CLI に並べる行（出すものが無ければ空）。節ごとに先頭へ空行を1つ置く（前の節と分ける）。
 pub fn lines(widening: &Widening) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some((was, will_be)) = widening.schema_raised {
@@ -143,26 +183,58 @@ pub fn lines(widening: &Widening) -> Vec<String> {
              この画面では確かめていません"
         ));
     }
-    if widening.edges.is_empty() {
-        return lines;
+    if !widening.edges.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "広がる遷移 {}本——書くと、呼び出し元は子を通して次の権限を使えるようになります\
+             （守るのは子のドメインの権限。決定66）:",
+            widening.edges.len()
+        ));
+        for edge in &widening.edges {
+            // [P5.6] 辺のモード。広がる辺は定義から普通のモード（Strict の辺は何も渡さないので広がらない）。
+            lines.push(format!("  {} → {}（{}）［普通］", edge.from, edge.to, edge.exe));
+            lines.extend(rights_lines(&edge.newly_usable, "      "));
+            // [P5.4b] 出力の行き先（決定66(4)）。返す辺は、子が読めるものが出力を通って呼び出し元へ渡る
+            // ——いちばん太い持ち出しの経路なので明細で言う。捨てても子が書いたファイルは残るので「渡らない」とは言わない。
+            lines.push(match edge.output {
+                ChildOutput::Return => {
+                    "      出力を返すので、子が読めるものは呼び出し元へ渡ります".to_string()
+                }
+                ChildOutput::Discard => "      子の出力は捨てる設定です".to_string(),
+            });
+        }
     }
-    lines.push(String::new());
-    lines.push(format!(
-        "広がる遷移 {}本——書くと、呼び出し元は子を通して次の権限を使えるようになります\
-         （守るのは子のドメインの権限。決定66）:",
-        widening.edges.len()
-    ));
-    for edge in &widening.edges {
-        lines.push(format!("  {} → {}（{}）", edge.from, edge.to, edge.exe));
-        lines.extend(rights_lines(&edge.newly_usable, "      "));
-        // [P5.4b] 出力の行き先（決定66(4)）。返す辺は、子が読めるものが出力を通って呼び出し元へ渡る
-        // ——いちばん太い持ち出しの経路なので明細で言う。捨てても子が書いたファイルは残るので「渡らない」とは言わない。
-        lines.push(match edge.output {
-            ChildOutput::Return => {
-                "      出力を返すので、子が読めるものは呼び出し元へ渡ります".to_string()
-            }
-            ChildOutput::Discard => "      子の出力は捨てる設定です".to_string(),
-        });
+    if !widening.strict_edges.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "新しく Strict になる辺 {}本——入力を固定するので、呼び出し元は子を操れません（広がる遷移に数えていません）:",
+            widening.strict_edges.len()
+        ));
+        for edge in &widening.strict_edges {
+            lines.push(format!("  {} → {}（{}）［Strict］", edge.from, edge.to, edge.exe));
+        }
+    }
+    if !widening.pairs.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "組み合わせ {}組——あるドメインが書ける場所を、外部と通信できる別のドメインが読む／実行します。\
+             断らずに見せます（決定66(9)。書いたものが外へ出る・通信できるドメインで走る経路になり得ます）:",
+            widening.pairs.len()
+        ));
+        for pair in &widening.pairs {
+            let use_ = match pair.use_ {
+                PairUse::Read => "読める",
+                PairUse::Execute => "実行できる",
+            };
+            lines.push(format!(
+                "  {} が書ける {} を、{} が{use_}（{}）",
+                pair.writer, pair.writer_place, pair.reader, pair.reader_place
+            ));
+        }
+        lines.push(
+            "  外部と通信できるかは暫定の見立てです（入口のドメインと、通信先を宣言したドメイン。P7 で差し替え）"
+                .to_string(),
+        );
     }
     lines
 }
