@@ -33,9 +33,11 @@ fn control_request_hello_keeps_its_wire_shape() {
         writable_outside_policy: vec!["C:/tools".to_string()],
     })
     .expect("serialize");
+    // `policy.schema_version`は`PolicyFile::default()`の版（`POLICY_SCHEMA_VERSION`）をそのまま運ぶ——2026-10-06
+    // （P5.3、Strict の印）に 2 → 3。Daemon はこの値を見ずにグラフを組むので、欄の形は変わっていない。
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":8,"policy":{"schema_version":2,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"]}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":8,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"]}"#
     );
 }
 
