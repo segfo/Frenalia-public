@@ -16,6 +16,7 @@ pub mod approval_summary;
 pub mod compaction;
 pub mod degeneracy;
 pub mod encoded_span;
+pub mod past_requests;
 pub mod permission;
 pub mod references;
 mod sanitize;
@@ -35,6 +36,7 @@ pub use permission::{
     parse_allowlist_rule, AllowRule, AllowlistRule, Classification, Decision, PermissionArbiter,
     PermissionGate, PermissionMode, Remembered,
 };
+pub use past_requests::PastRequestsTool;
 pub use references::{value_store_for, References};
 pub use session::{SessionStore, SessionSummary};
 pub use turn::{

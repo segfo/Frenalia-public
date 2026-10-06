@@ -57,6 +57,21 @@ fn human_text(message: &Message) -> Option<&str> {
     }
 }
 
+/// 前の人の文と、その返事で呼んだツールを読む道具の名前（D-127 の3。道具は`harness_engine::past_requests`）。
+///
+/// **道具と、モデルへの伝え方（`prompt::render_user_reference`・[`crate::value_store::BACK_REFERENCE_LINE`]）が
+/// 同じ綴りを見る。** 綴りがずれると、存在しない道具を指す案内になる（B-05）。
+macro_rules! past_requests_tool {
+    () => {
+        "past_requests"
+    };
+}
+/// `concat!`で定数の文面へ埋め込むための綴り（`concat!`は定数を受け取れず、リテラルを返すマクロしか受け取れない）。
+pub(crate) use past_requests_tool;
+
+/// 前の人の文を読む道具の名前（`past_requests_tool!`と同じ綴り）。
+pub const PAST_REQUESTS_TOOL: &str = past_requests_tool!();
+
 /// 人が書いた文1つと、会話の中での位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HumanTurn<'a> {

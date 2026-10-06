@@ -53,11 +53,17 @@ const MENU_HEADER: &str = "ハーネスが次の値を持っています。コ�
      番号で指してください（ハーネスが中身へ置き換えます）。中身は渡していません——\
      符号化された中身は承認画面で人が見ます。\n";
 
-/// 前の文にも値があることを伝える1行（[`ReferenceBook::render_menu`]）。**値も番号も並べない。**
-pub const BACK_REFERENCE_LINE: &str =
+/// 前の文にも値があることを伝える1行（[`ReferenceBook::render_menu`]）。**値も番号も並べない**——
+/// どの文の何番かは、モデルが道具（[`crate::human_turns::PAST_REQUESTS_TOOL`]）で見てから選ぶ（D-127 の3）。
+pub const BACK_REFERENCE_LINE: &str = concat!(
     "ユーザーのもっと前の文にも長い値があります（この一覧には載せていません）。\
      それらも書き写さず {{back:K:N}} と書いて指してください——K はユーザーの文を新しい方から数えて\
-     何個前か（1 が1つ前の文）、N はその文の中での番号です（数え方は {{val:N}} と同じ）。\n";
+     何個前か（1 が1つ前の文）、N はその文の中での番号です（数え方は {{val:N}} と同じ）。\
+     どの文の何番かは、道具 ",
+    crate::human_turns::past_requests_tool!(),
+    " で前の文とその返事で走らせたコマンドを見てから選んでください\
+     （読むだけで承認は要りません。値は番号だけで出ます）。\n"
+);
 
 /// 値の中身を文面へ載せるかの上限（文字）。**0である**——[モジュールdoc](self)のとおり、
 /// 中身は一切載せない。定数として置いてあるのは、将来ここを動かすときに1か所で済ませるため。
@@ -158,8 +164,11 @@ impl ValueStore {
     }
 
     /// 1つずつの行。`back`個前の文の置き場として番号を綴る（0 なら`{{val:N}}`、それ以外は`{{back:K:N}}`。
-    /// 解読した段の親も同じ綴りで書く）。
-    fn entry_lines(&self, back: usize) -> String {
+    /// 解読した段の親も同じ綴りで書く）。**中身は1文字も載せない**（番号・長さ・出どころだけ）。
+    ///
+    /// システムプロンプトの一覧（[`ValueStore::render`]）と、前の文を読む道具（`harness_engine::past_requests`）が
+    /// 同じ行を出す——見せ方を2つ持たない。
+    pub fn entry_lines(&self, back: usize) -> String {
         let spelling = |number| ValueRef { back, number }.spelling();
         let mut out = String::new();
         for (index, value) in self.values.iter().enumerate() {

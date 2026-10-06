@@ -34,7 +34,7 @@ pub const CANCELLED_BEFORE_START: &str = "cancelled by user";
 pub enum RecordedOutcome {
     /// 実行して、エラーでない結果が返った。
     Ran,
-    /// エラーの結果が返った（実行してエラーになった。知らないツール・読めない引数もここ。[モジュールdoc](self)）。
+    /// エラーの結果が返った（実行してエラーになった。知らないツール・読めない引数もここ。モジュールdoc「ここが守らないもの」）。
     RanWithError,
     /// 判定器が拒否した（実行していない）。
     Denied,
