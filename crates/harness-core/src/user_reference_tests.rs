@@ -4,7 +4,14 @@ use super::*;
 use crate::ContentBlock;
 
 /// 実測で写し損じが起きた値（308文字の base64。`plans/risk-judge-spike/RESULTS.md`）と同じ長さの塊。
+///
+/// **seedはhex文字に限る**（0-9・a-f）。形フィルタ（[`looks_like_payload`]）は、
+/// Base64形か hex形に合う語だけを候補にするので、試験の塊もその形で作る。
 fn blob(seed: char) -> String {
+    debug_assert!(
+        seed.is_ascii_hexdigit(),
+        "blob の seed は hex 文字（0-9・a-f）に限る。形フィルタに合わないとそもそも候補にならない。"
+    );
     std::iter::repeat_n(seed, 308).collect()
 }
 
@@ -29,16 +36,17 @@ fn only_long_values_get_a_number_and_they_keep_their_order() {
     let values = values_in(&[user(&format!("実行して pwsh --enc {a} と {b} -Force"))]);
     assert_eq!(values, vec![a, b]);
     assert!(values_in(&[user("ls -la して")]).is_empty());
-    // ちょうど境目の長さ。
-    let short: String = std::iter::repeat_n('x', MIN_REFERENCE_CHARS - 1).collect();
-    let just: String = std::iter::repeat_n('y', MIN_REFERENCE_CHARS).collect();
+    // ちょうど境目の長さ。形フィルタに合わせて hex 文字で作る。
+    let short: String = std::iter::repeat_n('a', MIN_REFERENCE_CHARS - 1).collect();
+    let just: String = std::iter::repeat_n('b', MIN_REFERENCE_CHARS).collect();
     assert_eq!(values_in(&[user(&format!("{short} {just}"))]), vec![just]);
 }
 
 /// **長い値を含む直近のユーザーの文1つだけ**を見る（モデルの文は見ない。前の文まで通して数えない）。
 #[test]
 fn the_newest_user_message_that_has_long_values_wins() {
-    let (old, new) = (blob('o'), blob('n'));
+    // hex 文字で作らないと形フィルタに弾かれて候補にならない。
+    let (old, new) = (blob('c'), blob('d'));
     let messages = vec![
         user(&format!("これを使って {old}")),
         // モデルの文にも長い値があるが、**参照元にしない**（モデルが書いた値を差し込むと、写し損じを拾う）。
@@ -53,6 +61,52 @@ fn the_newest_user_message_that_has_long_values_wins() {
         user(&format!("今度はこれ {new}")),
     ];
     assert_eq!(values_in(&messages), vec![new]);
+}
+
+/// **散文・識別子・URL は候補にしない**（2026-10-06の無限ループ事故の再発防止）。
+///
+/// 「空白なしで40字以上」だけだと日本語の普通の文がまるごと候補になり、`edit_file`の`old_string`等と
+/// Levenshtein 距離で近く見えて拒否が無限に続く。[`looks_like_payload`]で形を見て、
+/// Base64 形か hex形に合うものだけ候補にする。
+#[test]
+fn prose_and_identifiers_are_not_candidates() {
+    // ちょうど無限ループを起こした形。日本語の文、仮名漢字あり。
+    let prose = "Harnessを使ったモデルとの会話の中で「Markdownの修正を依頼」するとハーネス側のリトライが走り無限ループする。";
+    assert!(values_in(&[user(prose)]).is_empty());
+
+    // ハイフン付きの英識別子。長さは40字以上だが Base64 文字集合に`-`が無い。
+    let identifier = "premise-first-explanation-is-a-skill-that-tells-you-how";
+    assert!(identifier.chars().count() >= MIN_REFERENCE_CHARS);
+    assert!(values_in(&[user(identifier)]).is_empty());
+
+    // URL。`:` `/` `.` があるのでどちらの形にも合わない。
+    let url = "https://example.com/very/long/path/to/some/resource.html";
+    assert!(url.chars().count() >= MIN_REFERENCE_CHARS);
+    assert!(values_in(&[user(url)]).is_empty());
+
+    // 数字も記号も無い長い純英単語（camelCase 等）。Base64 文字集合には収まるが、数字／記号が無いので脱落。
+    let camel = "UltraSuperAwesomeProductNameEditionWithExtendedCapabilities";
+    assert!(camel.chars().count() >= MIN_REFERENCE_CHARS);
+    assert!(values_in(&[user(camel)]).is_empty());
+}
+
+/// **本来の守備範囲（Base64形・hex形）はちゃんと候補になる。**
+#[test]
+fn genuine_payloads_remain_candidates() {
+    // UTF-16 BOM 付き Base64（PowerShell `-enc` の実測形）。数字`3`・`0`・`8`が含まれる。
+    let utf16_b64 = "cAB3AHMAaAAgAC0ALQBlAG4AYwAgAGMAQQBCADMAQQBIAE0AQQBhAEEAQQBnAEEAQwAwADA=";
+    assert!(utf16_b64.chars().count() >= MIN_REFERENCE_CHARS);
+    assert_eq!(values_in(&[user(utf16_b64)]), vec![utf16_b64.to_string()]);
+
+    // SHA-1（40字 hex）。
+    let sha1 = "abcdef0123456789abcdef0123456789abcdef01";
+    assert!(sha1.chars().count() == 40);
+    assert_eq!(values_in(&[user(sha1)]), vec![sha1.to_string()]);
+
+    // SHA-256（64字 hex）。
+    let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    assert!(sha256.chars().count() == 64);
+    assert_eq!(values_in(&[user(sha256)]), vec![sha256.to_string()]);
 }
 
 /// **ハーネスが差し込む。** モデルが書くのは番号だけで、値そのものは書かない。

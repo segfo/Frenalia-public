@@ -37,6 +37,22 @@
 //! 「どこからが別物か」の線引きが残り、線の外側——実測では308文字のうち64文字（20.8%）が落ちた形——が
 //! 黙って走る。**断る側に倒すと、壊れた写しが走らないことが機構として成り立つ。**
 //!
+//! # 候補にする語の絞り方（形フィルタ）
+//!
+//! 「空白なしで40字以上」だけでは**散文を候補から外せない**。日本語は空白で区切られないので、
+//! 普通の一文（話題がかぶっている文）がまるごと1つの「語」として入り、ファイル編集ツールの`old_string`等と
+//! Levenshtein 距離（文字を足す・消す・書き換える回数の合計）で近く見えて拒否が連発する。
+//! 実測（2026-10-06）で、ユーザーが書いた日本語の文と、モデルが`edit_file`に渡した Markdown の切り貼りが
+//! 「46文字／16文字分違う」で引っ掛かり、拒否と再試行が無限に続いた。
+//!
+//! そこで**形フィルタ**（[`looks_like_payload`]）を候補抽出の段に足す——残すのは
+//!
+//! - **Base64形**: 文字が`[A-Za-z0-9+/=]`のみ、かつ数字か記号を1字以上含む
+//! - **hex形**: 文字が`[0-9a-fA-F]`のみ、かつ長さ[`MIN_HEX_SHAPE_CHARS`]以上
+//!
+//! のどちらかに合うものだけ。これで**仮名漢字の文・ハイフン付き英識別子・URL・パスは候補から外れ**、
+//! 本来 D-115 が守りたかった Base64・hex・鍵・ハッシュだけが残る。
+//!
 //! # ここが守らないもの
 //!
 //! - **差し込めなかったときは、書いた綴りがそのまま残る**（勝手に消さない）。承認画面にも`{{user:1}}`が見えるので、
@@ -45,6 +61,8 @@
 //!   参照できない（モデルはそれらを書き写すしかなく、この仕組みでは守れない）
 //! - **差し込む中身はユーザー自身が書いたもの**である。中身がコマンドの意味を変えること（`; rm -rf /`）は
 //!   止めない——止めるのは承認画面と判定器の仕事で、人は差し込んだ後の文字列を見て決める
+//! - **形フィルタに合わない Payload**（空白を含む生スクリプト・Base64 文字集合に収まる長い純英単語）は
+//!   候補にならない。前者はユーザーがコードフェンスで囲むしかなく、後者は実務ではほぼ無い
 
 use serde_json::Value;
 
@@ -73,6 +91,12 @@ const MAX_SCANNED_WORD_CHARS: usize = 65_536;
 /// 書き写しで事故が起きるのは、人が目で照合できない長さの値である。
 pub const MIN_REFERENCE_CHARS: usize = 40;
 
+/// 「hex形」とみなす最短の長さ（文字）。SHA-1=40、SHA-256=64、MD5=32を拾う下限。
+///
+/// **実装の下限は[`MIN_REFERENCE_CHARS`]に押さえられている**（長さ40未満の語はそもそも候補にならない）が、
+/// hex形は32文字から意味を持つことを宣言しておく。
+pub const MIN_HEX_SHAPE_CHARS: usize = 32;
+
 /// モデルへ伝える書き方（システムプロンプトと、ここの取り出しが同じ綴りを見る）。
 pub const SYNTAX_EXAMPLE: &str = "{{val:1}}";
 
@@ -95,11 +119,81 @@ pub fn values_in(messages: &[Message]) -> Vec<String> {
 }
 
 /// 1つの文に出てくる長い値（出てきた順）。
+///
+/// **長さだけでは散文を落とせない。** 日本語は空白で区切られないので「空白なしで40字以上の語」の網には
+/// 普通の一文（話題がかぶっている文）が丸ごと入り、ファイル編集ツールの`old_string`等と Levenshtein 距離
+/// （文字を足す・消す・書き換える回数の合計）で類似してしまう。実測（2026-10-06）で日本語の一文と
+/// Markdown 編集の切り貼りが「46文字／16文字分違う」で引っ掛かり、拒否と再試行が無限に続いた。
+///
+/// そこで**形フィルタ**を足す——候補にするのは、1文字変えると実行が狂う値の形（Base64形か hex形）に
+/// 合うものだけ。[`looks_like_payload`]で判定する。
 fn long_values(text: &str) -> Vec<String> {
     text.split_whitespace()
         .filter(|word| word.chars().count() >= MIN_REFERENCE_CHARS)
+        .filter(|word| looks_like_payload(word))
         .map(str::to_string)
         .collect()
+}
+
+/// その語が「写し間違いで意味が変わる値」の形をしているかを判定する。
+///
+/// **目的**: 日本語散文・英識別子・URL・パスのような、1文字違っても意味が壊れない語を候補から外す。
+/// Base64・hex・鍵・ハッシュのように、1文字違うと別のものを指す語だけを残す。
+///
+/// # 判定
+///
+/// 次のどちらかに合致したら合格:
+///
+/// - **Base64形**: 文字が`[A-Za-z0-9+/=]`のみで構成され、かつ**数字か`+`／`/`／`=`を1字以上含む**。
+///   数字や記号を要求するのは、純英単語（`UltraSuperAwesomeProductName`のような長い識別子）を外すため
+///   ——実際の Base64 payload はほぼ必ず数字と記号を含むが、英識別子は含まないことが多い。
+/// - **hex形**: 文字が`[0-9a-fA-F]`のみで構成され、長さが[`MIN_HEX_SHAPE_CHARS`]以上。
+///
+/// # 落ちるもの（意図した通り）
+///
+/// - 仮名漢字を含む日本語の文（どちらの文字集合にも入らない）
+/// - `premise-first-explanation`のようなハイフン付き英識別子（Base64 文字集合に無い`-`があるので脱落）
+/// - URL（`:`・`/`・`.`がある。`/`は Base64 だが、URL は数字も記号も使いながら英単語を長く並べる形で、
+///   実務上は Base64 払いで事故を起こさない）
+/// - 純英単語の長い識別子（Base64 の数字／記号要件で脱落）
+///
+/// # 残るもの（意図した通り）
+///
+/// - UTF-16 BOM付き Base64（PowerShell `-enc` の実測形。`cABwAHMAaAAg…`）
+/// - 標準 Base64（数字と`+/=`が混ざる）
+/// - Git ハッシュ・SHA ハッシュ・MD5
+/// - トークン・API キー（hex形または Base64形の長い塊として渡されるもの）
+pub fn looks_like_payload(word: &str) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    if chars.len() < MIN_REFERENCE_CHARS {
+        return false;
+    }
+    looks_like_base64(&chars) || looks_like_hex(&chars)
+}
+
+/// Base64形か（[`looks_like_payload`]の片翼）。
+fn looks_like_base64(chars: &[char]) -> bool {
+    let mut has_digit_or_symbol = false;
+    for &c in chars {
+        let is_base64_alpha = c.is_ascii_alphabetic();
+        let is_base64_digit = c.is_ascii_digit();
+        let is_base64_symbol = matches!(c, '+' | '/' | '=');
+        if !(is_base64_alpha || is_base64_digit || is_base64_symbol) {
+            return false;
+        }
+        if is_base64_digit || is_base64_symbol {
+            has_digit_or_symbol = true;
+        }
+    }
+    has_digit_or_symbol
+}
+
+/// hex形か（[`looks_like_payload`]の片翼）。
+fn looks_like_hex(chars: &[char]) -> bool {
+    if chars.len() < MIN_HEX_SHAPE_CHARS {
+        return false;
+    }
+    chars.iter().all(|c| c.is_ascii_hexdigit())
 }
 
 /// メッセージの文字の中身（文字でないブロックは無視する）。
