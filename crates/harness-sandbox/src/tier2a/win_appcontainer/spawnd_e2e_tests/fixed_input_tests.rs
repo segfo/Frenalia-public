@@ -11,6 +11,12 @@
 //! | 2 | ワークスペースの**外のジャンクション**越しに、ワークスペースの中 | 通る（綴りはワークスペースの外） | **断る** |
 //! | 3 | 2と同じ形のジャンクション越しに、呼び出し元が何の権利も持たない場所 | 通る | **起きる** |
 //! | 4 | ワークスペースの中のプログラムへ、外から張った**ハードリンク**の名前 | 通る（パスをどう解決しても外） | **断る** |
+//! | 5 | プログラムは書けない場所。**作業ディレクトリ**に、宣言を通さず呼び出し元へ直接書込ACEを付けた（P5.4d） | 通る | **断る**（理由が作業ディレクトリを名指す） |
+//! | 6 | 5と同じプログラムで、作業ディレクトリは呼び出し元が何の権利も持たない場所（P5.4d） | 通る | **起きる** |
+//!
+//! 1〜4の作業ディレクトリも6と同じ作り方の場所にしてある（[`ask_for_fixed_edge`]）——P5.4d から作業ディレクトリも
+//! 検査の候補なので、ワークスペースに置くと4本とも作業ディレクトリのせいで断られる（1・2・4は断る理由が混ざり、
+//! 3は起きなくなる）。
 //!
 //! **3が無いと「固定辺を全部断る」実装で緑になる**（`B-35`）。2と3は、ジャンクションの先が
 //! 書けるかどうか**だけ**が違う。3が起きることは、2の拒否が「判定できなかったので断った」
@@ -30,7 +36,9 @@
 //! 遷移先ドメインへ入る固定辺で頼む（[`policy_with_strict_edge`]）。検査が使うのは**呼び出し元のトークン**なので、
 //! 子が別のドメインで起きることは判定に関わらない。
 
-use super::transition_acceptance_tests::{ask_daemon_as_a_hook, policy_with_strict_edge};
+use super::transition_acceptance_tests::{
+    ask_daemon_as_a_hook_with_stdin, policy_with_strict_edge, strict_cwd,
+};
 use super::*;
 
 /// プローブの写しを`dir\gen.exe`として置き、そのパスを返す。
@@ -61,11 +69,27 @@ fn junction(link: &std::path::Path, target: &std::path::Path) {
 /// `exe`を固定したプログラムとする Strict の辺を宣言し、呼び出し元にその辺を頼ませる。
 /// 戻り値はプローブ（呼び出し元役）の報告。`prepare`は宣言の後・要求の前に呼ばれる
 /// ——ファイルやACEの用意には、セッションのpackage SIDとワークスペースが要るため。
+///
+/// [P5.4d] 作業ディレクトリは呼び出し元が何の権利も持たない場所（[`strict_cwd`]）に宣言する——作業ディレクトリも
+/// 起こす直前の検査の候補になったので、ワークスペースに置くと4本とも作業ディレクトリのせいで断られ、
+/// 測りたいプログラムの置き場が測れない。**[`ask_for_fixed_edge_in`]をその場所で呼ぶ薄い包みである。**
 fn ask_for_fixed_edge(
     label: &str,
     exe: &std::path::Path,
     prepare: impl FnOnce(&OwnedContainerSid, &std::path::Path),
 ) -> String {
+    let cwd = strict_cwd(label);
+    ask_for_fixed_edge_in(label, exe, cwd.path(), prepare).0
+}
+
+/// [`ask_for_fixed_edge`]の作業ディレクトリを選べる版。戻り値は`(プローブの報告, Daemonの標準エラー)`
+/// ——Daemonの標準エラーは`Case`を落とすと消えるので、落とす前に読む（断った理由はここにしか出ない）。
+fn ask_for_fixed_edge_in(
+    label: &str,
+    exe: &std::path::Path,
+    cwd: &std::path::Path,
+    prepare: impl FnOnce(&OwnedContainerSid, &std::path::Path),
+) -> (String, String) {
     let exe_str = exe.to_string_lossy().into_owned();
     let command_line = format!("\"{exe_str}\" --emit fixed-input");
     let declared_exe = exe_str.clone();
@@ -73,7 +97,7 @@ fn ask_for_fixed_edge(
     let (case, profile, caps) = setup_with_provisioned_domains(
         label,
         ChildProcessPolicy::Unrestricted,
-        |workspace| policy_with_strict_edge(&declared_exe, &declared_line, workspace),
+        |_workspace| policy_with_strict_edge(&declared_exe, &declared_line, cwd),
     );
     let workspace = case
         .dir
@@ -83,18 +107,21 @@ fn ask_for_fixed_edge(
         .to_path_buf();
     prepare(&profile, &workspace);
     let captured = workspace.join("fixed-input-stdout.txt");
-    let out = ask_daemon_as_a_hook(
+    let out = ask_daemon_as_a_hook_with_stdin(
         &case,
         &profile,
         &caps,
         &exe_str,
         &command_line,
         &captured,
+        None,
+        Some(cwd),
         "not_needed",
         false,
     );
+    let daemon_stderr = std::fs::read_to_string(&case.daemon_log).unwrap_or_default();
     drop(case);
-    out
+    (out, daemon_stderr)
 }
 
 fn assert_refused(out: &str, what: &str) {
@@ -212,4 +239,72 @@ fn a_fixed_program_hard_linked_from_inside_the_workspace_is_refused() {
             .expect("hard link the workspace program from outside the workspace");
     });
     assert_refused(&out, "a hard link to a program inside the workspace");
+}
+
+/// 綴りの揺れ（大小・区切り）を畳んで比べる（Daemonは宣言の作業ディレクトリを畳んだ綴りで報告する）。
+fn folded(s: &str) -> String {
+    s.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// **5（禁止側。P5.4d）**: プログラムは呼び出し元が書けない場所に置き、**作業ディレクトリだけ**を、宣言を通さず
+/// 呼び出し元のpackage SIDへ直接書込ACEを付けた場所にする（決定66の追記の束「作業ディレクトリ: 呼び出し元が
+/// 書ける場所なら断る」。残課題 サンドボックス周辺 #67）。
+///
+/// 読み込み時の検査はこの場所を知らない（1と同じ。宣言にもワークスペースにも無い）ので、起こす直前の検査が
+/// 作業ディレクトリも見ていることだけがこれを断る。**断った理由（Daemonの標準エラー）が作業ディレクトリを名指す**
+/// ことまで見る——プログラムの側で断られたのなら、同じプログラムで作業ディレクトリだけが違う6が起きない。
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
+fn a_strict_edge_whose_cwd_the_caller_can_write_outside_any_declaration_is_refused() {
+    let tools = TestDirGuard::create("fixedin-cwd-acl-prog");
+    let cwd = TestDirGuard::create("fixedin-cwd-acl");
+    let exe = place_probe(tools.path());
+    let cwd_path = cwd.path().to_path_buf();
+    let (out, daemon_stderr) =
+        ask_for_fixed_edge_in("fixedin-cwd-acl-case", &exe, cwd.path(), |profile, _workspace| {
+            super::super::grant_ace_inheritable_access(
+                &cwd_path,
+                profile.as_psid(),
+                crate::FsAccess::ReadWriteExec,
+            )
+            .expect("grant the caller write access to the cwd");
+            // 台帳へ載せておけば、テストがパニックしても次回起動のGCが剥がす。
+            crate::tier2a::session_profile::record_granted_path(&cwd_path);
+        });
+    // **剥がしてから記録を落とす**（1と同じ順序。BUG-101）。
+    let sid = crate::tier2a::win_appcontainer::session_sid();
+    if super::super::revoke_ace(cwd.path(), sid.as_psid()).is_ok() {
+        crate::tier2a::session_profile::forget_granted_paths(&[cwd.path().to_path_buf()]);
+    }
+    assert_refused(&out, "a working directory the caller can write");
+    let cwd_folded = folded(&cwd.path().to_string_lossy());
+    assert!(
+        folded(&daemon_stderr).contains(&format!("{cwd_folded} is fixed by the transition")),
+        "the daemon's reason should name the working directory {cwd_folded}, not the program: \
+         {daemon_stderr}"
+    );
+}
+
+/// **6（許可側。5の対）**: 同じ置き場のプログラムを、呼び出し元が何の権利も持たない作業ディレクトリで頼むと起きる。
+///
+/// 5との違いは作業ディレクトリのACEだけである。これが起きなければ、5は「Strict の辺を全部断る」実装でも緑になる。
+#[test]
+#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
+fn a_strict_edge_whose_program_and_cwd_the_caller_cannot_write_runs() {
+    let tools = TestDirGuard::create("fixedin-cwd-ro-prog");
+    let cwd = TestDirGuard::create("fixedin-cwd-ro");
+    let exe = place_probe(tools.path());
+    let (out, daemon_stderr) =
+        ask_for_fixed_edge_in("fixedin-cwd-ro-case", &exe, cwd.path(), |_profile, _workspace| {});
+    assert_eq!(
+        reply_kind(&out).as_deref(),
+        Some("spawned"),
+        "neither the program nor the cwd is writable by the caller, so the strict edge must run: \
+         {out}\n{daemon_stderr}"
+    );
+    assert_eq!(
+        report_field(&out, "child_exit_code").and_then(|v| v.as_u64()),
+        Some(0),
+        "the fixed program must actually have run in that cwd: {out}"
+    );
 }

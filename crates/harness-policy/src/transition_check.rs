@@ -147,18 +147,29 @@ impl GraphFacts<'_> {
         // **どの書ける場所に当たったかを文面に出す。** 書ける場所は宣言の外からも来る
         // （`settings.json`・`--fs-allow`。残課題 サンドボックス周辺 #65）ので、
         // 根を出さないと、宣言のどこにも書込が無いのに拒否された理由が辿れない（`B-10`）。
+        // 作業ディレクトリ（P5.4d。決定66の追記の束「呼び出し元が書ける場所なら断る」）は文面を分ける——
+        // 固定したのは「指す先」ではなく「子がファイルを拾う場所」なので、直し方が違う。
+        let declared_cwd = edge.cwd.as_deref().map(fold_for_pattern_comparison);
         for (path, root) in self.caller_writable_fixed_paths(view, edge) {
-            reasons.push(format!(
-                "the fixed value points at {path:?}, which this domain can write (it lies under \
-                 {root:?}): fixing the arguments is pointless if the caller can rewrite what \
-                 they point at"
-            ));
+            reasons.push(if declared_cwd.as_deref() == Some(path.as_str()) {
+                format!(
+                    "the declared cwd {path:?} lies under {root:?}, which this domain can write: \
+                     the caller could plant files there that the child picks up from its working \
+                     directory (modules, DLLs, relative arguments). Declare a cwd the caller cannot write."
+                )
+            } else {
+                format!(
+                    "the fixed value points at {path:?}, which this domain can write (it lies under \
+                     {root:?}): fixing the arguments is pointless if the caller can rewrite what \
+                     they point at"
+                )
+            });
         }
 
         reasons
     }
 
-    /// 固定値（exeのリテラルと、literal argvの中のパスらしいトークン）のうち、
+    /// 固定値（exeのリテラルと、literal argvの中のパスらしいトークンと、宣言した作業ディレクトリ）のうち、
     /// **呼び出し元が書ける場所にあるもの**と、それを覆っている書ける場所の組。
     ///
     /// **Strict の辺（[`GraphFacts::is_strict_edge`]）だけを見る**——印の無いドメインへ入る辺と自己ループ辺は、
@@ -175,7 +186,7 @@ impl GraphFacts<'_> {
     ///   シンボリックリンクとジャンクション・ハードリンクは解決しない。**別名はSpawn Daemonが
     ///   起こす直前に、呼び出し元のトークンで実体のアクセス制御リストを見て補う**
     ///   （`harness_sandbox`の`spawnd::fixed_inputs`、[`Allowed::strict`]）
-    /// - 作業ディレクトリそのものと相対パスの引数は候補にしていない（[`fixed_file_paths`]のdoc）
+    /// - 相対パスの引数そのものは候補にしていない（[`fixed_file_paths`]のdoc。作業ディレクトリはP5.4dから候補）
     /// - 保証するのは「呼び出し元から書けない場所にある」ことだけで、
     ///   **そのファイルを別の経路で書ける主体が居ないこと**は検査していない
     fn caller_writable_fixed_paths(
@@ -193,15 +204,16 @@ impl GraphFacts<'_> {
             ArgvMatcher::Pattern(_) | ArgvMatcher::Any(_) => "",
         };
         // 候補の集め方は起こす直前の検査と共有する（[`fixed_file_paths`]）。ここは綴りで比べるので畳む。
-        let candidates: Vec<String> = match &edge.exe {
-            ExeMatcher::Literal(exe) => fixed_file_paths(exe, argv),
-            // パターンのexeは、実際にどの綴りで起きるかが宣言からは分からないので引数だけを見る
+        let image = match &edge.exe {
+            ExeMatcher::Literal(exe) => Some(exe.as_str()),
+            // パターンのexeは、実際にどの綴りで起きるかが宣言からは分からないので引数と作業ディレクトリだけを見る
             // （起こす直前の検査は、要求された実際の実行ファイルを見る）。
-            ExeMatcher::Pattern(_) => absolute_path_tokens(argv),
-        }
-        .iter()
-        .map(|path| fold_for_pattern_comparison(path))
-        .collect();
+            ExeMatcher::Pattern(_) => None,
+        };
+        let candidates: Vec<String> = fixed_input_places(image, argv, edge.cwd.as_deref())
+            .iter()
+            .map(|path| fold_for_pattern_comparison(path))
+            .collect();
 
         let writable = self.caller_writable_roots(view.name);
         candidates
@@ -420,19 +432,34 @@ fn absolute_path_tokens(command_line: &str) -> Vec<String> {
 }
 
 /// 固定辺で**固定したファイル**——起こす実行ファイルと、argv[0]以降の絶対パスらしいトークン
-/// ——を、書かれた綴りのまま返す。
+/// ——と、**宣言した作業ディレクトリ**（P5.4d）を、書かれた綴りのまま返す。
 ///
 /// 読み込み時の検査（[`GraphFacts::caller_writable_fixed_paths`]）と、Daemonが起こす直前に
 /// 呼び出し元のトークンでOSに聞く検査（`harness_sandbox`の`spawnd::fixed_inputs`）が
 /// **同じ候補**を見るための、唯一の集め方である（片方だけ候補が増えると、2層の検査が
 /// 別のファイルを見ることになる）。
 ///
+/// 作業ディレクトリを候補に入れるのは、決定66の追記の束が「作業ディレクトリ: 呼び出し元が書ける場所なら断る」
+/// と定めているためである——子は作業ディレクトリからモジュール・DLL・相対パスの引数を拾うので、プログラムと
+/// 引数を固定しても、呼び出し元がそこへ置いたものが子の権限で読まれる。
+///
 /// # 見ていないもの（P-11）
 ///
-/// **相対パスの引数と、作業ディレクトリそのもの**は候補にしない。相対トークンの見分けは
-/// 当て推量で（`/c`のようなスイッチもパスに見える）、候補にすると正当な辺まで断る。
-pub(super) fn fixed_file_paths(image: &str, command_line: &str) -> Vec<String> {
-    std::iter::once(image.to_string())
+/// **相対パスの引数そのもの**は候補にしない。相対トークンの見分けは当て推量で（`/c`のようなスイッチもパスに
+/// 見える）、候補にすると正当な辺まで断る。相対パスは作業ディレクトリの下で解決されるので、作業ディレクトリが
+/// 書けないことを確かめれば、相対パスが指す先を呼び出し元が**新しく置く**ことは防げる——ただし作業ディレクトリの
+/// 配下の個々のファイル・サブディレクトリに別のACEで書込が許されている形は見ない。
+pub(super) fn fixed_file_paths(image: &str, command_line: &str, cwd: Option<&str>) -> Vec<String> {
+    fixed_input_places(Some(image), command_line, cwd)
+}
+
+/// [`fixed_file_paths`]の本体。実行ファイルがパターンの辺（読み込み時の検査で、実際の綴りが宣言からは分からない）
+/// は`image`を`None`で呼ぶ。**候補の並べ方はここだけが持つ**（実行ファイル→絶対パスの引数→作業ディレクトリ）。
+fn fixed_input_places(image: Option<&str>, command_line: &str, cwd: Option<&str>) -> Vec<String> {
+    image
+        .map(str::to_string)
+        .into_iter()
         .chain(absolute_path_tokens(command_line))
+        .chain(cwd.map(str::to_string))
         .collect()
 }

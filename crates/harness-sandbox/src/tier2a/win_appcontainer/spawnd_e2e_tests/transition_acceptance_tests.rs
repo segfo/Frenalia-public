@@ -142,6 +142,7 @@ pub(super) fn ask_daemon_as_a_hook(
         command_line,
         stdout_file,
         None,
+        None,
         console,
         suspended,
     )
@@ -152,6 +153,9 @@ pub(super) fn ask_daemon_as_a_hook(
 /// **`ask_daemon_as_a_hook`はこれを`None`で呼ぶ薄い包みである**（組み立てを2箇所に書かない、
 /// `docs/CODE-STRUCTURE-RULES.md`規則5）。標準入力が子へ届いたかは「子が何を読んだか」でしか分からないので、
 /// 呼び出し側は目印を書いたファイルを渡して、子にそれを標準出力へ写させて確かめる（`edge_stdio_tests`）。
+///
+/// [P5.4d] `cwd`は呼び出し元が申告する作業ディレクトリ（`--spawn-cwd`）。`None`ならワークスペース。Strict の辺は
+/// 作業ディレクトリを呼び出し元が書けない場所に宣言するので（[`policy_with_strict_edge`]）、同じ値をここへ渡す。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn ask_daemon_as_a_hook_with_stdin(
     case: &Case,
@@ -161,6 +165,7 @@ pub(super) fn ask_daemon_as_a_hook_with_stdin(
     command_line: &str,
     stdout_file: &std::path::Path,
     stdin_file: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
     console: &str,
     suspended: bool,
 ) -> String {
@@ -172,7 +177,7 @@ pub(super) fn ask_daemon_as_a_hook_with_stdin(
         .path()
         .to_path_buf();
     let spawn_cap = spawn_request_capability_sid().expect("spawn request capability");
-    let workspace_str = workspace.to_string_lossy().into_owned();
+    let cwd_str = cwd.unwrap_or(&workspace).to_string_lossy().into_owned();
     let stdout_str = stdout_file.to_string_lossy().into_owned();
     let stdin_str = stdin_file.map(|p| p.to_string_lossy().into_owned());
 
@@ -189,7 +194,7 @@ pub(super) fn ask_daemon_as_a_hook_with_stdin(
             "--spawn-command-line",
             command_line,
             "--spawn-cwd",
-            &workspace_str,
+            &cwd_str,
             "--spawn-stdout",
             &stdout_str,
             "--spawn-console",
@@ -1099,6 +1104,10 @@ pub(super) const STRICT_DOMAIN: &str = "spawnd-strict-target";
 /// （「固定値が指す先を呼び出し元が書き換えられるなら、引数を固定しても無意味」）。
 /// だからこの辺の引数には**ワークスペースの中のパスを1つも書かない**——
 /// 走ったことは`exit`の終了コードで確かめる。
+///
+/// **作業ディレクトリ（`cwd`）も同じ**（P5.4d。決定66の追記の束「呼び出し元が書ける場所なら断る」）。ワークスペースを
+/// 渡すと`Hello`のグラフ組み立てが辺ごと拒否するので、呼び出し元が書けない場所（[`strict_cwd`]）を渡し、
+/// 頼むときも同じ値を`--spawn-cwd`に渡す（宣言と違う作業ディレクトリは`cwd_mismatch`で断られる）。
 pub(super) fn policy_with_strict_edge(
     exe: &str,
     command_line: &str,
@@ -1120,6 +1129,15 @@ pub(super) fn policy_with_strict_edge(
     target.strict = true;
     file.domains.push(target);
     file
+}
+
+/// [P5.4d] Strict の辺の作業ディレクトリにする、**呼び出し元が何の権利も持たない**ディレクトリ。
+///
+/// `C:\`直下に作るだけで、呼び出し元（セッションのpackage SID）へのACEも workspace capability も付けない
+/// （`fixed_input_tests`の3で、同じ作り方の場所を起こす直前の検査が「書けない」と判定することを確かめている）。
+/// 戻り値を生かしている間だけ在る。
+pub(super) fn strict_cwd(label: &str) -> TestDirGuard {
+    TestDirGuard::create(&format!("{label}-cwd"))
 }
 
 // **T8（BUG-161の本体）はP5.4bで`edge_stdio_tests.rs`へ移した。** かつてここに在った

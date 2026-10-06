@@ -108,9 +108,9 @@ pub(super) fn note(records: &[PendingRecord]) -> Option<String> {
         // 宣言は通っている。**宣言を直せとも、ツールを引けとも言わない**——どちらも効かない。
         // 直せるのはユーザーだけなので、モデルにはそう伝える。
         lines.push(format!(
-            "[transition: denied starting {}; the declared transition fixes a program or argument \
-             file that this sandbox can modify, so it is refused — ask the user to move that file \
-             somewhere this sandbox cannot write, or to remove the write permission]",
+            "[transition: denied starting {}; the declared transition fixes a program, an argument \
+             file or the working directory that this sandbox can modify, so it is refused — ask the \
+             user to move it somewhere this sandbox cannot write, or to remove the write permission]",
             named(&environment)
         ));
     }
@@ -272,6 +272,8 @@ mod tests {
             note(&[denial("C:/tools/gen.exe", DenyReason::FixedInputWritable)]).expect("a note");
         assert!(text.contains("gen.exe"), "{text}");
         assert!(text.contains("ask the user"), "{text}");
+        // [P5.4d] 断る理由は作業ディレクトリのこともある（同じ`FixedInputWritable`で返る）。
+        assert!(text.contains("working directory"), "{text}");
         assert!(
             !text.contains("declare the transition") && !text.contains(CAN_RUN_PROGRAM_TOOL),
             "宣言では直らないのに宣言やツールを促している: {text}"

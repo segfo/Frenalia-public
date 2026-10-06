@@ -210,9 +210,18 @@ fn a_hand_written_edge_that_fails_the_checks_is_refused_at_load_time() {
 
 /// `shell`から`sealed`へ、`exe`を引数と作業ディレクトリごと固定した辺を1本書く。`strict`なら`sealed`に
 /// Strict の印を付ける（決定66の追記。固定した値の書込可否＝規則(i)は印の付いたドメインへ入る辺にだけ掛かる——P5.4a）。
+///
+/// 作業ディレクトリは書けない場所（`C:\work`）に置く——P5.4d から作業ディレクトリも規則(i)の候補なので、
+/// ワークスペースに置くとプログラムの置き場を測る対が作業ディレクトリのせいで落ちる。**`write_fixed_edge_in`を
+/// `C:\work`で呼ぶ薄い包みである**（組み立てを2箇所に書かない、`docs/CODE-STRUCTURE-RULES.md`規則5）。
 fn write_fixed_edge(ws: &Path, exe: &str, strict: bool) {
+    write_fixed_edge_in(ws, exe, r"C:\work", strict)
+}
+
+/// [`write_fixed_edge`]の作業ディレクトリを選べる版。
+fn write_fixed_edge_in(ws: &Path, exe: &str, cwd: &str, strict: bool) {
     let exe = exe.replace('\\', "\\\\");
-    let cwd = ws.to_string_lossy().replace('\\', "\\\\");
+    let cwd = cwd.replace('\\', "\\\\");
     let mark = if strict { r#", "strict": true"# } else { "" };
     write_policy(
         ws,
@@ -310,6 +319,30 @@ fn a_fixed_edge_into_a_domain_without_the_strict_mark_loads_under_a_writable_pla
     let program = ws.path().join("gen.exe").to_string_lossy().into_owned();
     write_fixed_edge(ws.path(), &program, false);
     load(ws.path()).expect("an ordinary-mode edge may run a program inside the workspace");
+}
+
+/// [P5.4d] **Strict のドメインへ入る辺の作業ディレクトリがワークスペースなら読まない**（決定66の追記の束
+/// 「作業ディレクトリ: 呼び出し元が書ける場所なら断る」）。ワークスペースは`policy.json`に宣言として現れないので、
+/// `load`が判定器へ渡している根で捕まる。
+///
+/// 対: 同じ辺で遷移先の印を外すと読める（普通のモード）。作業ディレクトリが書けない場所なら印があっても読める
+/// （[`the_same_fixed_edge_loads_when_no_writable_place_covers_it`]）。
+#[test]
+fn a_strict_edge_whose_cwd_is_the_workspace_does_not_load() {
+    let ws = workspace();
+    let cwd = ws.path().to_string_lossy().into_owned();
+    write_fixed_edge_in(ws.path(), r"C:\tools\gen.exe", &cwd, true);
+    let err = load(ws.path()).expect_err("a strict edge must not run in a directory the caller can write");
+    match err {
+        PolicyFileError::RejectedTransitions { reason, .. } => assert!(
+            reason.contains("the declared cwd") && reason.contains("which this domain can write"),
+            "the reason should say the caller can write the cwd: {reason}"
+        ),
+        other => panic!("unexpected error: {other}"),
+    }
+
+    write_fixed_edge_in(ws.path(), r"C:\tools\gen.exe", &cwd, false);
+    load(ws.path()).expect("an ordinary-mode edge may run in the workspace");
 }
 
 /// 未来のスキーマ版は**解釈しようとしない**（知らないフィールドを落として書き戻すと、

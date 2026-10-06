@@ -1,5 +1,5 @@
-//! Strict の辺（決定66の追記。P5.4a）の起動直前に、**固定したファイルを呼び出し元が書き換えられないか**を、
-//! 呼び出し元のトークンでOSに聞く（`plans/DESIGN-MAC.md` §19.1「固定値が指すファイルの書込可否」）。
+//! Strict の辺（決定66の追記。P5.4a）の起動直前に、**固定したファイルと作業ディレクトリ（P5.4d）を呼び出し元が
+//! 書き換えられないか**を、呼び出し元のトークンでOSに聞く（`plans/DESIGN-MAC.md` §19.1「固定値が指すファイルの書込可否」）。
 //!
 //! # なぜ文字列の検査だけでは足りないのか
 //!
@@ -404,9 +404,12 @@ pub(crate) fn rewritable(fixed_path: &Path, token: &CallerToken) -> Result<Optio
 
 /// Strict の辺を起こしてよいか。**断るべきなら、その理由**（Daemonの標準エラー用）を返す。
 ///
-/// 見るのは**実際に`CreateProcessW`へ渡す値**——要求された実行ファイルと、呼び出し元の
-/// コマンドライン——から`harness_policy::transition::fixed_file_paths`が取り出したファイルである。
-/// 宣言の綴りで聞くと、判定したのと別のファイルが起き得る（B-21）。
+/// 見るのは**実際に`CreateProcessW`へ渡す値**——要求された実行ファイル・呼び出し元の
+/// コマンドライン・`lpCurrentDirectory`へ渡す作業ディレクトリ——から
+/// `harness_policy::transition::fixed_file_paths`が取り出したファイルと作業ディレクトリである（P5.4d で作業
+/// ディレクトリを足した。決定66の追記の束「呼び出し元が書ける場所なら断る」）。
+/// 宣言の綴りで聞くと、判定したのと別のファイルが起き得る（B-21）。作業ディレクトリは固定した引数の
+/// ディレクトリと同じ鎖の規則で見る（中へ置ける・差し替えられる・隣の親へ置ける、のどれでも断る）。
 ///
 /// **判定できないときも断る**（トークンを開けない・記述子を読めない等）。
 /// この検査が効かない状態で起こすと、固定の前提を確かめないまま広い権限で走らせることになる。
@@ -415,12 +418,13 @@ pub(crate) fn refusal(
     caller_pid: u32,
     image: &str,
     command_line: &str,
+    cwd: &str,
 ) -> Option<String> {
     let token = match CallerToken::from_process(caller_process, caller_pid) {
         Ok(token) => token,
         Err(e) => return Some(format!("could not open the caller's token: {e}")),
     };
-    for path in harness_policy::transition::fixed_file_paths(image, command_line) {
+    for path in harness_policy::transition::fixed_file_paths(image, command_line, Some(cwd)) {
         match rewritable(Path::new(&path), &token) {
             Ok(None) => continue,
             Ok(Some(reason)) => return Some(reason),

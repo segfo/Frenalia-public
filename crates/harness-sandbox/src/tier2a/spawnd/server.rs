@@ -835,22 +835,21 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
     // **その代償だった「固定辺では子の出力が返らない」は、Strict の辺でも出力の設定に従う形で解けた。**
     let handles = caller_handles_for(output, strict, request.handles);
 
-    // **Strict の辺なら、固定したファイルを呼び出し元が書き換えられないかをOSに聞く**（P5.4a で鍵を印へ。
-    // 決定66の追記・`plans/DESIGN-MAC.md` §19.1）。読み込み時の検査は綴りで比べるので、8.3形式の短い名前・
-    // リンク・ハードリンクを挟むと見逃す。ここは実体のアクセス制御リストを**呼び出し元のトークン**で
+    // **Strict の辺なら、固定したファイルと作業ディレクトリを呼び出し元が書き換えられないかをOSに聞く**（P5.4a で
+    // 鍵を印へ、P5.4d で作業ディレクトリも。決定66の追記・§19.1）。読み込み時の検査は綴りで比べるので、8.3形式の
+    // 短い名前・リンク・ハードリンクを挟むと見逃す。ここは実体のアクセス制御リストを**呼び出し元のトークン**で
     // 評価するので、どの名前で書かれていても同じ答えになる（`fixed_inputs`のモジュールdoc）。
     //
-    // 見るのは**実際に`CreateProcessW`へ渡す値**（`request.image`と呼び出し元のコマンドライン）で、
-    // 宣言の綴りではない——判定したのと別のファイルが起きる形を作らない（B-21）。
-    //
-    // **理由はサンドボックスへ返さない**（パスと権利の名前を含むので、`SpawnFailed`と同じ扱い）。
-    // Daemonの標準エラーにだけ出す（B-10）。
+    // 見るのは**実際に`CreateProcessW`へ渡す値**（`request.image`・コマンドライン・`effective_cwd`）で、宣言の綴り
+    // ではない——判定したのと別のものが起きる形を作らない（B-21）。**理由はサンドボックスへ返さない**（パスと
+    // 権利の名前を含むので、`SpawnFailed`と同じ扱い）。Daemonの標準エラーにだけ出す（B-10）。
     if strict {
         if let Some(reason) = super::fixed_inputs::refusal(
             HANDLE(caller.process as *mut _),
             caller.pid,
             request.image,
             &command_line,
+            effective_cwd,
         ) {
             eprintln!(
                 "[spawnd] refused a strict transition for pid {}: {reason}",
@@ -2107,9 +2106,17 @@ mod hello_graph_tests {
     ///
     /// [P5.4a] 遷移先に Strict の印を付ける——固定値の書込可否は Strict のドメインへ入る辺にだけ掛かる
     /// （決定66の追記）。かつての同じドメインへの自己ループでは、今は何も検査されない。
+    ///
+    /// [P5.4d] 作業ディレクトリは書けない場所（`C:\work`）に置く——作業ディレクトリも検査の候補になったので、
+    /// ワークスペースに置くと許可側の対が作業ディレクトリのせいで落ちる。
     fn fixed_edge_policy() -> harness_policy::policy_file::PolicyFile {
+        fixed_edge_policy_in(r"C:\\work")
+    }
+
+    /// [`fixed_edge_policy`]の作業ディレクトリを選べる版（`cwd`は JSON の文字列の中身として書く）。
+    fn fixed_edge_policy_in(cwd: &str) -> harness_policy::policy_file::PolicyFile {
         serde_json::from_str(
-            r#"{
+            &r#"{
               "schema_version": 3,
               "domains": [
                 {
@@ -2119,7 +2126,7 @@ mod hello_graph_tests {
                       {
                         "exe":  { "literal": "C:\\tools\\gen.exe" },
                         "argv": { "literal": "\"C:\\tools\\gen.exe\" --check" },
-                        "cwd":  "C:\\ws",
+                        "cwd":  "CWD",
                         "to":   "sealed"
                       }
                     ]
@@ -2127,7 +2134,8 @@ mod hello_graph_tests {
                 },
                 { "name": "sealed", "strict": true }
               ]
-            }"#,
+            }"#
+            .replace("CWD", cwd),
         )
         .expect("the fixture is a valid policy.json")
     }
@@ -2152,5 +2160,19 @@ mod hello_graph_tests {
         graph_from_hello(&fixed_edge_policy(), r"C:\ws", &[]).expect(r"nothing covers C:\tools");
         graph_from_hello(&fixed_edge_policy(), r"C:\ws", &[r"C:\other".to_string()])
             .expect(r"a writable place elsewhere does not cover C:\tools\gen.exe");
+    }
+
+    /// [P5.4d] **禁止側**: Strict の辺の作業ディレクトリがワークスペースなら`Hello`ごと失敗させる
+    /// ——Daemonも harness と同じくワークスペースを書ける場所として判定器へ渡している。対は上の許可側
+    /// （作業ディレクトリが`C:\work`なら組める）。
+    #[test]
+    fn a_strict_edge_whose_cwd_is_the_workspace_fails_the_hello() {
+        let error = graph_from_hello(&fixed_edge_policy_in(r"C:\\ws"), r"C:\ws", &[])
+            .expect_err("the daemon must refuse a strict edge that runs in the workspace");
+        let text = error.to_string();
+        assert!(
+            text.contains("the declared cwd") && text.contains("c:/ws"),
+            "the rejection should name the working directory: {text}"
+        );
     }
 }

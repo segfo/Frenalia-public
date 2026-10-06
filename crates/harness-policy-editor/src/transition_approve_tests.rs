@@ -311,8 +311,10 @@ fn an_edge_this_editor_writes_survives_the_writable_places_harness_adds() {
         .expect("このエディタが書いた辺がharness.exeの起動時の検査で落ちた");
 
     // 対: 同じ実行ファイルを、作業ディレクトリまで固定した辺（手で書いたもの）で Strict のドメインへ足す。
+    // [P5.4d] 作業ディレクトリは書けない場所に置く——ワークスペースに置くと、作業ディレクトリのせいでエディタの
+    // 保存が先に落ちる（作業ディレクトリも規則(i)の候補になった）。測りたいのはプログラムの置き場である。
     let mut file = policy_file::load(tmp.path()).unwrap();
-    let ws = tmp.path().to_string_lossy().into_owned();
+    let cwd = "C:/work".to_string();
     let mut sealed = PolicyDomain::new("sealed");
     sealed.strict = true;
     file.domains.push(sealed);
@@ -324,7 +326,7 @@ fn an_edge_this_editor_writes_survives_the_writable_places_harness_adds() {
     entry.process.transitions.push(TransitionEdge {
         exe: ExeMatcher::Literal("C:/tools/gen.exe".to_string()),
         argv: ArgvMatcher::Literal("\"C:/tools/gen.exe\" --fixed".to_string()),
-        cwd: Some(ws),
+        cwd: Some(cwd),
         to: "sealed".to_string(),
         env: None,
         output: ChildOutput::Return,

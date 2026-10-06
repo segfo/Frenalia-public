@@ -183,6 +183,7 @@ fn a_widening_edge_hands_the_callers_stdin_and_stdout_to_the_child() {
         &echo_stdin_command_line(&cmd),
         &captured,
         Some(&stdin_file),
+        None,
         "not_needed",
         false,
     );
@@ -219,11 +220,13 @@ fn a_strict_edge_cuts_the_callers_stdin_but_still_returns_the_childs_output() {
     let cmd = cmd_exe();
     let command_line = echo_stdin_command_line(&cmd);
     let declared = command_line.clone();
+    // [P5.4d] Strict の辺の作業ディレクトリは呼び出し元が書けない場所に宣言する（ワークスペースだと辺ごと拒否される）。
+    let cwd = super::transition_acceptance_tests::strict_cwd("spawnd-p54b-strict");
     let (case, profile, caps) = setup_with_provisioned_domains(
         "spawnd-p54b-strict",
         ChildProcessPolicy::Unrestricted,
-        |workspace| {
-            super::transition_acceptance_tests::policy_with_strict_edge(&cmd, &declared, workspace)
+        |_workspace| {
+            super::transition_acceptance_tests::policy_with_strict_edge(&cmd, &declared, cwd.path())
         },
     );
     let workspace = case
@@ -243,6 +246,7 @@ fn a_strict_edge_cuts_the_callers_stdin_but_still_returns_the_childs_output() {
         &command_line,
         &captured,
         Some(&stdin_file),
+        Some(cwd.path()),
         "not_needed",
         false,
     );

@@ -148,7 +148,8 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// 「harness の基準の値＋辺の差分」になった。版9の古い Daemon は同じ宣言を読んで**呼び出し元の環境変数を
 /// Strict の子へ渡す**ので、固定した操作の中身を呼び出し元が環境変数で選べる（黙って緩くなる向き）。
 /// **`harness-spawnd.exe`はテストのビルドで作り直されない**ので、版9の個体は実在し得る。
-pub const PROTOCOL_VERSION: u32 = 10;
+/// **11へ上げたのは P5.4d である**（電文の形は不変）。Strict の辺の作業ディレクトリも起こす直前に検査するようになり、版10の Daemon は黙って通す。
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// 相手が名乗った制御プロトコルの版を判定する。合わなければ理由の文面を返す。
 ///
@@ -962,13 +963,13 @@ pub enum DenyReason {
     /// **待ち行列を読んでも理由は出てこない。** 2026-09-19の測定（`plans/mac-spike/RESULTS.md`
     /// §S67）はここを取り違えて、待ち行列に理由が在るつもりで1往復を失った。
     SpawnFailed,
-    /// **Strict の辺（P5.4a）は許可だったが、固定したファイルを呼び出し元が書き換えられる**
+    /// **Strict の辺（P5.4a）は許可だったが、固定したファイルか作業ディレクトリ（P5.4d）を呼び出し元が書き換えられる**
     /// （`plans/DESIGN-MAC.md` §19.1）。起こす直前に、呼び出し元のトークンで実体の
     /// アクセス制御リストを評価して分かった（[`fixed_inputs`]）。判定できなかったときもこれで断る。
     ///
     /// # 宣言を直しても通らない
     ///
-    /// 辺そのものは宣言どおりである。直し方は、固定したプログラムを呼び出し元が書けない場所へ
+    /// 辺そのものは宣言どおりである。直し方は、固定したプログラム・作業ディレクトリを呼び出し元が書けない場所へ
     /// 移すか、その場所への書込許可を外すことで、**`policy.json`の側ではない**
     /// （[`transitions::Remedy::FixTheEnvironment`]）。
     ///
@@ -991,7 +992,7 @@ impl DenyReason {
             DenyReason::MalformedRequest => "malformed request",
             DenyReason::SpawnFailed => "the transition was allowed but the process could not be started",
             DenyReason::FixedInputWritable => {
-                "the transition fixes a file that the caller can modify (or that could not be verified)"
+                "the transition fixes a file or working directory that the caller can modify (or that could not be verified)"
             }
         }
     }

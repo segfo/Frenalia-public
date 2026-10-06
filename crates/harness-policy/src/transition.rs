@@ -657,15 +657,15 @@ pub fn edge_direction(
     Ok(Some(facts.direction(from, &edge.to)))
 }
 
-/// 固定辺で**固定したファイル**（起こす実行ファイルと、`argv[0]`以降の絶対パスらしいトークン）を、
-/// 書かれた綴りのまま返す。
+/// 固定辺で**固定したファイル**（起こす実行ファイルと、`argv[0]`以降の絶対パスらしいトークン）と
+/// **作業ディレクトリ**（P5.4d）を、書かれた綴りのまま返す。
 ///
 /// Daemonは Strict の辺（[`Allowed::strict`]）の子を起こす直前に、これらを**実際に`CreateProcessW`へ渡す値**
-/// （要求された実行ファイルとコマンドライン）から取り、呼び出し元のトークンで
+/// （要求された実行ファイル・コマンドライン・作業ディレクトリ）から取り、呼び出し元のトークンで
 /// 書き換えられないかをOSに聞く（[`Allowed::strict`]）。読み込み時の検査も同じ関数で
 /// 候補を集めるので、2層の検査が別のファイルを見ることはない。
-pub fn fixed_file_paths(image: &str, command_line: &str) -> Vec<String> {
-    transition_check::fixed_file_paths(image, command_line)
+pub fn fixed_file_paths(image: &str, command_line: &str, cwd: Option<&str>) -> Vec<String> {
+    transition_check::fixed_file_paths(image, command_line, cwd)
 }
 
 /// [段階6e] `domain`から**到達できる範囲**の権限（§19.3.4の到達閉包）。

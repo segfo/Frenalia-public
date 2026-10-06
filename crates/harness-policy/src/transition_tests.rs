@@ -877,11 +877,15 @@ fn only_an_edge_into_a_strict_domain_asks_the_daemon_to_check_its_fixed_files() 
 
 /// 固定したファイルの候補は、**書かれた綴りのまま**（大小も区切りも変えずに）返る
 /// ——Daemonはこの値でファイルを実際に開く。相対トークンとスイッチは候補にしない（対）。
+///
+/// [P5.4d] **作業ディレクトリも最後に並ぶ**（決定66の追記の束「呼び出し元が書ける場所なら断る」）。2層の検査が
+/// 同じ候補を見るので、片方だけが作業ディレクトリを見る形にならない。
 #[test]
 fn fixed_file_paths_are_the_image_and_absolute_arguments_as_written() {
     let paths = fixed_file_paths(
         r"C:\Tools\Gen.exe",
         r#""C:\Tools\Gen.exe" --in C:\Data\In.txt /c rel.txt --out "D:\Out Dir\x.bin""#,
+        Some(r"C:\Work Dir"),
     );
     assert_eq!(
         paths,
@@ -889,8 +893,14 @@ fn fixed_file_paths_are_the_image_and_absolute_arguments_as_written() {
             r"C:\Tools\Gen.exe".to_string(),
             r"C:\Data\In.txt".to_string(),
             r"D:\Out Dir\x.bin".to_string(),
+            r"C:\Work Dir".to_string(),
         ],
-        "the image first, then only the absolute path-like arguments, spelled as written"
+        "the image first, then only the absolute path-like arguments, then the cwd, spelled as written"
+    );
+    assert_eq!(
+        fixed_file_paths(r"C:\Tools\Gen.exe", r#""C:\Tools\Gen.exe""#, None),
+        vec![r"C:\Tools\Gen.exe".to_string()],
+        "an edge without a declared cwd adds no cwd candidate"
     );
 }
 
@@ -1151,6 +1161,9 @@ fn a_declared_cwd_must_match_the_caller_and_a_matching_one_resolves() {
 // ---------------------------------------------------------------------------
 
 /// `cmd`（ワークスペースへ書ける）から`to`へ、`script`を引数に固定した辺を1本持つ宣言。
+///
+/// 作業ディレクトリは書けない場所（`C:\tools`）に置く——P5.4d から作業ディレクトリも規則(i)の候補なので、
+/// ワークスペースに置くと許可側の対が作業ディレクトリのせいで落ちる（測りたいのは引数のスクリプトの置き場）。
 fn with_fixed_script(script: &str, to: &str) -> Declared {
     Declared::new()
         .domain_with_fs(
@@ -1159,7 +1172,7 @@ fn with_fixed_script(script: &str, to: &str) -> Declared {
             rules(vec![TransitionEdge {
                 exe: literal_exe(r"C:\python\python.exe"),
                 argv: literal_argv(&format!(r#""C:\python\python.exe" {script}"#)),
-                cwd: Some(r"C:\ws".to_string()),
+                cwd: Some(r"C:\tools".to_string()),
                 to: to.to_string(),
                 env: None,
                 output: ChildOutput::Return,
@@ -1224,6 +1237,73 @@ fn caller_writable_roots_supplied_from_outside_the_declaration_are_honoured() {
 
     input.caller_writable_roots = vec![r"C:\ws"];
     assert_rejects(&input, "which this domain can write");
+}
+
+/// `cmd`（ワークスペースへ書ける）から`to`へ、書けない場所のプログラムを固定し、作業ディレクトリを`cwd`に宣言した辺。
+fn with_fixed_cwd(cwd: &str, to: &str) -> Declared {
+    Declared::new()
+        .domain_with_fs(
+            "cmd",
+            vec![("C:/ws/**", FsAccess::ReadWrite)],
+            rules(vec![TransitionEdge {
+                exe: literal_exe(r"C:\tools\gen.exe"),
+                argv: literal_argv(r#""C:\tools\gen.exe" --check"#),
+                cwd: Some(cwd.to_string()),
+                to: to.to_string(),
+                env: None,
+                output: ChildOutput::Return,
+            }]),
+        )
+        .domain("logs", rules(vec![]))
+}
+
+/// [P5.4d] **Strict のドメインへ入る辺は、作業ディレクトリが呼び出し元から書ける場所なら断る**（決定66の追記の束
+/// 「作業ディレクトリ: 辺に宣言必須。呼び出し元が書ける場所なら断る」。残課題 サンドボックス周辺 #67）。
+/// 子は作業ディレクトリからモジュール・DLL・相対パスの引数を拾うので、プログラムと引数を固定しても、
+/// 呼び出し元がそこへ置いたものが子の権限で読まれる。
+///
+/// 対: 同じ辺で作業ディレクトリだけを書けない場所へ移すと通る。印の無いドメインへ入る同じ辺も通る
+/// （普通のモードは入力を固定しないので問いが無い。守る線は子のドメインの権限）。
+#[test]
+fn a_strict_edge_whose_cwd_the_caller_can_write_is_rejected_and_names_the_cwd() {
+    assert_rejects(
+        &with_fixed_cwd(r"C:\ws", "logs").mark_strict("logs").input(),
+        r#"the declared cwd "c:/ws" lies under "c:/ws", which this domain can write"#,
+    );
+    // 配下も同じ（書ける根の下の作業ディレクトリ）。
+    assert_rejects(
+        &with_fixed_cwd(r"C:\ws\sub", "logs")
+            .mark_strict("logs")
+            .input(),
+        "the declared cwd",
+    );
+
+    assert_accepts(&with_fixed_cwd(r"C:\tools", "logs").mark_strict("logs").input());
+    assert_accepts(&with_fixed_cwd(r"C:\ws", "logs").input());
+}
+
+/// [P5.4d] 宣言の外から渡した書ける場所（ワークスペース・`--fs-allow`）も、作業ディレクトリの検査に掛かる。
+#[test]
+fn a_strict_edge_whose_cwd_lies_under_a_place_writable_outside_the_declaration_is_rejected() {
+    let declared = Declared::new()
+        .domain(
+            "cmd",
+            rules(vec![TransitionEdge {
+                exe: literal_exe(r"C:\tools\gen.exe"),
+                argv: literal_argv(r#""C:\tools\gen.exe" --check"#),
+                cwd: Some(r"C:\work".to_string()),
+                to: "logs".to_string(),
+                env: None,
+                output: ChildOutput::Return,
+            }]),
+        )
+        .domain("logs", rules(vec![]))
+        .mark_strict("logs");
+    let mut input = declared.input();
+    assert_accepts(&input);
+
+    input.caller_writable_roots = vec![r"C:\work"];
+    assert_rejects(&input, "the declared cwd");
 }
 
 // ---------------------------------------------------------------------------

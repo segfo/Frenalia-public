@@ -155,6 +155,58 @@ fn a_system_executable_is_not_rewritable_by_a_non_admin() {
     assert_eq!(reason, None, "cmd.exe must not be rewritable by a non-admin");
 }
 
+/// [P5.4d] **禁止側**: 実行ファイルが書けない場所にあっても、**作業ディレクトリ**を呼び出し元が書けるなら断る
+/// （決定66の追記の束「作業ディレクトリ: 呼び出し元が書ける場所なら断る」）。理由は作業ディレクトリを名指す。
+///
+/// 許可側（対）は[`a_strict_edge_whose_program_and_cwd_the_caller_cannot_write_is_not_refused`]で、違うのは
+/// 作業ディレクトリだけ。昇格して走らせると`Administrators`の権利でシステムの場所も書けるので測れない。
+#[test]
+fn a_strict_edge_is_refused_when_the_caller_can_write_its_cwd() {
+    if crate::tier2a::privhelper::is_elevated() {
+        eprintln!("skipped: elevated tokens can modify system directories");
+        return;
+    }
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let cmd = format!(r"{system_root}\System32\cmd.exe");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let cwd_str = cwd.path().to_string_lossy().into_owned();
+    let reason = refusal(
+        unsafe { GetCurrentProcess() },
+        std::process::id(),
+        &cmd,
+        &format!("\"{cmd}\" /c ver"),
+        &cwd_str,
+    )
+    .expect("a cwd this process created is writable by this process, so the edge must be refused");
+    assert!(
+        reason.contains(&cwd_str),
+        "the reason should name the working directory: {reason}"
+    );
+}
+
+/// [P5.4d] **許可側（上の対）**: 実行ファイルも作業ディレクトリも書けない場所なら断らない。
+#[test]
+fn a_strict_edge_whose_program_and_cwd_the_caller_cannot_write_is_not_refused() {
+    if crate::tier2a::privhelper::is_elevated() {
+        eprintln!("skipped: elevated tokens can modify system directories");
+        return;
+    }
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let cmd = format!(r"{system_root}\System32\cmd.exe");
+    let cwd = format!(r"{system_root}\System32");
+    assert_eq!(
+        refusal(
+            unsafe { GetCurrentProcess() },
+            std::process::id(),
+            &cmd,
+            &format!("\"{cmd}\" /c ver"),
+            &cwd,
+        ),
+        None,
+        "neither cmd.exe nor System32 is writable by a non-admin"
+    );
+}
+
 /// ジャンクション越しに書かれたパスでは、**リンクそのもの**（書いた綴りの鎖）と、
 /// **リンク先の本当の親**（実体の鎖）の両方が判定の対象に入る。後者は書いた綴りの鎖に現れない。
 #[test]
