@@ -12,6 +12,7 @@
 //! | [`StreamingMarkdown`] | Port。表示に要る能力だけ |
 //! | [`MarkdownView`] | Facade。**どの実装を使うかと、描く幅をどう決めるかを、ここ1か所で決める** |
 //! | [`plain::PlainText`] | 原文を1行ずつそのまま描く実装（整形しない。付け替える前のtranscriptと同じ見た目） |
+//! | `codewandler`（feature `markdown-codewandler`。既定で有効） | codewandlerで整形して描く実装の置き場。いまは写した描画部品と試験だけで、**製品はまだ使わない**（Adapterは計画書のT8、切り替えはT9） |
 //!
 //! # 限界
 //!
