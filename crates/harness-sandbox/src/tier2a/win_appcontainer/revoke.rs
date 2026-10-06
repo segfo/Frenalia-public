@@ -24,6 +24,19 @@ mod dacl_protection_probe_tests;
 #[path = "control_dir_propagation_probe_tests.rs"]
 mod control_dir_propagation_probe_tests;
 
+/// [BUG-231](../../../../docs/bugs/BUG-231.md) の実測プローブ。**カーネル経由の書込で
+/// `SE_DACL_AUTO_INHERITED`がどうなるか**を測る。上と同じ理由でここに置く——測定対象が
+/// 本モジュールのprivate関数（[`copy_dacl_excluding_sids`]）と同じ書き方そのものである。
+#[cfg(all(windows, test))]
+#[path = "dacl_auto_inherit_probe_tests.rs"]
+mod dacl_auto_inherit_probe_tests;
+
+/// [BUG-231] の回帰試験（本番の3経路が`SE_DACL_AUTO_INHERITED`を保つこと）。上のプローブの
+/// 部品を使い、撤収側のprivate関数を直接撃つのでここに置く。
+#[cfg(all(windows, test))]
+#[path = "dacl_auto_inherit_tests.rs"]
+mod dacl_auto_inherit_tests;
+
 /// `ACCESS_ALLOWED_ACE_TYPE`（WinNT.h）。`windows`クレートはこの値を定数として公開して
 /// いないため、既知の固定値としてここに置く。
 pub(crate) const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -389,6 +402,12 @@ unsafe fn set_dacl_aclapi_with_protection(
 /// **`SE_DACL_AUTO_INHERITED`も一緒に立てる形**を測る必要が出たので、真偽値から列挙へ広げた
 /// （`docs/CODE-STRUCTURE-RULES.md`規則5.2: 同じ書込を2つ書かず、引数で受ける）。
 /// **既存の2つの呼び出しは同じビットを渡すので挙動は変わらない。**
+///
+/// # `SE_DACL_AUTO_INHERITED`は保護と独立に「書く前のまま」保つ（[BUG-231](../../../../docs/bugs/BUG-231.md)）
+///
+/// [`DaclProtection`]が決めるのは保護ビットだけである。`AI`は
+/// [`crate::win_common::keep_auto_inherited`]が書く前の状態から決める——付与側の
+/// [`super::set_dacl_single_object`]と同じ部品を通すので、2つの書込で印の扱いがずれない。
 unsafe fn set_dacl_single_object_with_protection(
     path: &Path,
     new_dacl: *mut ACL,
@@ -415,12 +434,15 @@ unsafe fn set_dacl_single_object_with_protection(
             // 「外す／外れたままにする」も`revoke_sids_from_node`が依存する契約だからである
             // （`InitializeSecurityDescriptor`直後はたまたま0だが、それに寄りかからない）。
             //
-            // **マスクは常に両ビットぶん渡す。** 値の側だけで差を付けるので、
+            // **マスクは常に保護ビットぶん渡す。** 値の側だけで差を付けるので、
             // 「立てたい方だけマスクに入れる」書き方をして消し忘れる余地を作らない。
-            SetSecurityDescriptorControl(
+            SetSecurityDescriptorControl(sd_ptr, SE_DACL_PROTECTED, protection.control_value())?;
+            // [BUG-231] `SE_DACL_AUTO_INHERITED`は保護とは別に、**書く前の状態を保つ**。
+            // かつてはここで保護ビットと一緒に0を渡しており、撤収のたびに印を落としていた
+            // （`AR`無しのカーネル書込は`AI`を落とす。実測は`dacl_auto_inherit_probe_tests`）。
+            crate::win_common::keep_auto_inherited(
                 sd_ptr,
-                SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED,
-                protection.control_value(),
+                crate::win_common::dacl_control_of_handle(handle)?,
             )?;
             // 修飾子は無視されるが、意図の表明として残す（読み手に「保護を書いている」と伝わる）。
             let protection_flag = if protection.is_protected() {

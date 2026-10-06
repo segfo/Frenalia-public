@@ -913,11 +913,110 @@ pub fn can_write_dacl(path: &std::path::Path) -> bool {
             &mut needed,
         )
         .is_ok();
+        // [BUG-231] 読んだSDの制御ビットに`AI`が立っていても、`AR`無しでカーネルへ渡すと
+        // **`AI`は落ちる**。`AR`を足して、読んだ状態のまま書き戻す。
+        let read = read && keep_auto_inherited_in(descriptor).is_ok();
         // **読めた内容をそのまま書き戻す。** 成功しても対象は変わらない。
         let written =
             read && SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, descriptor).is_ok();
         let _ = CloseHandle(handle);
         written
+    }
+}
+
+/// [BUG-231] カーネル経由（`SetKernelObjectSecurity`＝`NtSetSecurityObject`）でDACLを書くとき、
+/// **書く前の`SE_DACL_AUTO_INHERITED`（`AI`）を保つ**ために、これから渡すSD`descriptor`の
+/// 制御ビットを整える。
+///
+/// # なぜ要るのか
+///
+/// `AI`は「受け継いだACEは自動継承の規則で配られたものだ」という印で、印の無いフォルダの下に
+/// 作った子にも印が付かない。印の無いノードでは`icacls /inheritance:r`などのaclapi系の道具が
+/// 受け継いだACEを明示ACEとして扱い、消さずに残す。
+///
+/// カーネル経由の書込は、**渡したSDに`SE_DACL_AUTO_INHERIT_REQ`（`AR`）が無ければ、書いた
+/// ノードの`AI`を落とす**——制御ビット0でも、`AI`だけを立てても落ちる。`AR|AI`を渡せば`AI`は
+/// 残り、ACEの並びは渡したとおりになる（受け継いだACEを1本抜いた写しを渡すと、それも本当に消える）。
+/// 実測は`win_appcontainer::revoke`の`dacl_auto_inherit_probe_tests`（2026-10-06）。aclapi
+/// （`SetNamedSecurityInfoW`）は同じことを暗黙にやっているので、この差はカーネル経由の口にだけある
+/// （[BUG-083](../../../docs/bugs/BUG-083.md)の保護ビットと同じ型）。
+///
+/// 印が元から無いノードには立てない（書込で印を作らない）。
+///
+/// # 引数
+///
+/// `before`は**書く前の**そのノードの制御ビット。`descriptor`は書き込むSD（絶対形式でも
+/// 自己相対形式でもよい）。`AR`と`AI`だけを書き換え、他のビット（保護など）は触らない。
+pub(crate) unsafe fn keep_auto_inherited(
+    descriptor: windows::Win32::Security::PSECURITY_DESCRIPTOR,
+    before: u16,
+) -> windows::core::Result<()> {
+    use windows::Win32::Security::{
+        SetSecurityDescriptorControl, SECURITY_DESCRIPTOR_CONTROL, SE_DACL_AUTO_INHERITED,
+        SE_DACL_AUTO_INHERIT_REQ,
+    };
+    let bits = SE_DACL_AUTO_INHERIT_REQ.0 | SE_DACL_AUTO_INHERITED.0;
+    let value = if before & SE_DACL_AUTO_INHERITED.0 != 0 {
+        bits
+    } else {
+        0
+    };
+    unsafe {
+        SetSecurityDescriptorControl(
+            descriptor,
+            SECURITY_DESCRIPTOR_CONTROL(bits),
+            SECURITY_DESCRIPTOR_CONTROL(value),
+        )
+    }
+}
+
+/// [`keep_auto_inherited`]の、**読んだSDをそのまま書き戻す**ときの形（`can_write_dacl`用）。
+/// `descriptor`自身の制御ビットを「書く前」として使う。
+unsafe fn keep_auto_inherited_in(
+    descriptor: windows::Win32::Security::PSECURITY_DESCRIPTOR,
+) -> windows::core::Result<()> {
+    unsafe { keep_auto_inherited(descriptor, sd_control(descriptor)?) }
+}
+
+/// SD`descriptor`の制御ビット。
+unsafe fn sd_control(
+    descriptor: windows::Win32::Security::PSECURITY_DESCRIPTOR,
+) -> windows::core::Result<u16> {
+    use windows::Win32::Security::GetSecurityDescriptorControl;
+    let mut control: u16 = 0;
+    let mut revision: u32 = 0;
+    unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision)? };
+    Ok(control)
+}
+
+/// [BUG-231] ハンドル`handle`（`READ_CONTROL`で開いたもの）が指すオブジェクトの、**いまの**
+/// DACL制御ビットを読む。[`keep_auto_inherited`]へ「書く前」として渡すために使う。
+pub(crate) unsafe fn dacl_control_of_handle(
+    handle: windows::Win32::Foundation::HANDLE,
+) -> windows::core::Result<u16> {
+    use windows::Win32::Security::{
+        GetKernelObjectSecurity, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+    unsafe {
+        let mut needed = 0u32;
+        // 1回目は必要な大きさを聞くだけ（必ず失敗する）。
+        let _ = GetKernelObjectSecurity(
+            handle,
+            DACL_SECURITY_INFORMATION.0,
+            PSECURITY_DESCRIPTOR::default(),
+            0,
+            &mut needed,
+        );
+        let mut buffer = vec![0u8; needed.max(4096) as usize];
+        let descriptor = PSECURITY_DESCRIPTOR(buffer.as_mut_ptr().cast());
+        GetKernelObjectSecurity(
+            handle,
+            DACL_SECURITY_INFORMATION.0,
+            descriptor,
+            buffer.len() as u32,
+            &mut needed,
+        )?;
+        sd_control(descriptor)
     }
 }
 

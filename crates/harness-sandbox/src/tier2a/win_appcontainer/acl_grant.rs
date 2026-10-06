@@ -257,6 +257,13 @@ pub(crate) unsafe fn set_dacl_single_object(
     let result = (|| -> windows::core::Result<()> {
         InitializeSecurityDescriptor(sd_ptr, SECURITY_DESCRIPTOR_REVISION)?;
         SetSecurityDescriptorDacl(sd_ptr, true, Some(new_dacl as *const _), false)?;
+        // [BUG-231] 空のSDのまま渡すと、書いたノードの`SE_DACL_AUTO_INHERITED`が落ちる。
+        // 祖先への通行許可はユーザーの実フォルダ（`C:\`・プロファイル・`%TEMP%`）へ書くので、
+        // 落とすとその下に作られるフォルダ全部が印を失う。書く前の状態を保つ。
+        crate::win_common::keep_auto_inherited(
+            sd_ptr,
+            crate::win_common::dacl_control_of_handle(handle)?,
+        )?;
         SetKernelObjectSecurity(handle, DACL_SECURITY_INFORMATION, sd_ptr)
     })();
 
