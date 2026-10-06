@@ -81,6 +81,13 @@ pub enum TurnVisibility {
 pub struct RawTurnRequest {
     pub req: CompletionRequest,
     pub visibility: TurnVisibility,
+    /// 値の置き場（`{{val:N}}`・`{{back:K:N}}`が指すもの。D-127）。**`None`なら`req.messages`から組む**
+    /// （素朴ループ。送る文がそのまま会話なので、それで正しい）。
+    ///
+    /// 送る文が会話そのものでない呼び出し側（認知レイヤーは1つの文に組み直して送る）は、会話から組んだ
+    /// 置き場を[`RawTurnRequest::with_references`]で渡す——送る文から組むと、ツールの出力に出てきた値まで
+    /// 番号を取ってしまう（BUG-235）。`Arc`なのは、同じ発話の中の何回ものコールで使い回すため。
+    pub references: Option<std::sync::Arc<crate::References>>,
 }
 
 impl RawTurnRequest {
@@ -89,6 +96,7 @@ impl RawTurnRequest {
         Self {
             req,
             visibility: TurnVisibility::UserFacing,
+            references: None,
         }
     }
 
@@ -97,7 +105,14 @@ impl RawTurnRequest {
         Self {
             req,
             visibility: TurnVisibility::Internal,
+            references: None,
         }
+    }
+
+    /// 値の置き場を、送る文からではなく呼び出し側が組んだもので渡す（[`RawTurnRequest::references`]）。
+    pub fn with_references(mut self, references: std::sync::Arc<crate::References>) -> Self {
+        self.references = Some(references);
+        self
     }
 }
 
@@ -319,6 +334,7 @@ impl<'a> TurnExecutor<'a> {
         let RawTurnRequest {
             req: mut base_req,
             visibility,
+            references,
         } = request;
         let visible = visibility == TurnVisibility::UserFacing;
         // 呼び出し側が伏字化済みのリクエストを渡してくる経路（`run_agent_loop`）もあるが、
@@ -329,9 +345,12 @@ impl<'a> TurnExecutor<'a> {
 
         // ハーネスが持っている値（モデルに書き写させず、番号で指させる。`harness_core::value_store`）。
         // **この回の会話の文から1回だけ組む**——ツール呼び出しごとに数え直すと、途中で番号の意味が変わる。
-        // 組み立ては`value_store_for`の1か所だけを通す。ここと`build_request`（モデルへ一覧を見せる段）が
-        // 同じ関数を同じ`messages`で呼ぶので、**モデルが見た番号と差し込まれる値が食い違わない**。
-        let values = crate::value_store_for(&base_req.messages);
+        // 組み立ては`References::from_messages`の1か所だけを通す。ここと`build_request`（モデルへ一覧を
+        // 見せる段）が同じ関数を同じ`messages`で呼ぶので、**モデルが見た番号と差し込まれる値が食い違わない**。
+        // 呼び出し側が組んだ置き場を渡したなら、そちらを使う（`RawTurnRequest::references`）。
+        let references = references.unwrap_or_else(|| {
+            std::sync::Arc::new(crate::References::from_messages(&base_req.messages))
+        });
 
         let mut ladder: Option<ladder::Ladder> = None;
         // 現在の段。`None`は「素の1回目」（梯子はまだ登っていない）。
@@ -400,7 +419,7 @@ impl<'a> TurnExecutor<'a> {
                         w.record_clean();
                     }
                     return self
-                        .complete(content, malformed, stop_reason, usage, &values)
+                        .complete(content, malformed, stop_reason, usage, &references)
                         .await
                         .map(RawTurnResult::Completed);
                 }
@@ -543,7 +562,7 @@ impl<'a> TurnExecutor<'a> {
         malformed: std::collections::HashMap<String, MalformedToolInput>,
         stop_reason: StopReason,
         usage: Usage,
-        values: &harness_core::ValueStore,
+        references: &crate::References,
     ) -> Result<RawTurn, EngineError> {
         if self.is_tier3() {
             sanitize::content_blocks(&mut content);
@@ -558,8 +577,9 @@ impl<'a> TurnExecutor<'a> {
             .collect::<Vec<_>>()
             .join("");
 
-        let (tool_calls, cancelled_mid_tool) =
-            self.execute_tool_calls(&content, &malformed, values).await;
+        let (tool_calls, cancelled_mid_tool) = self
+            .execute_tool_calls(&content, &malformed, references)
+            .await;
 
         Ok(RawTurn {
             content,
@@ -577,7 +597,7 @@ impl<'a> TurnExecutor<'a> {
         &self,
         content: &[ContentBlock],
         malformed: &std::collections::HashMap<String, MalformedToolInput>,
-        values: &harness_core::ValueStore,
+        references: &crate::References,
     ) -> (Vec<CompletedToolCall>, bool) {
         let mut tool_calls = Vec::new();
         let mut cancelled_mid_tool = false;
@@ -608,7 +628,7 @@ impl<'a> TurnExecutor<'a> {
             }
 
             // 書き写しの審査 → 断るか素通りか → 差し込み（D-113・D-115。`references`モジュール）。
-            let input = match self.screen_references(id, name, input, values) {
+            let input = match self.screen_references(id, name, input, references) {
                 references::Screened::Refused(call) => {
                     tool_calls.push(*call);
                     continue;

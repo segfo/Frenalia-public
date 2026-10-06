@@ -1885,6 +1885,7 @@ fn a_transcribed_user_value_leaves_a_line_in_the_transcript() {
     // 損じていたので断った。
     let mut app = AppState::new("p".into(), "m".into());
     app.apply(AgentEvent::UserValueTranscribed {
+        back: 0,
         value_chars: 308,
         differences: 64,
         refused: true,
@@ -1899,6 +1900,7 @@ fn a_transcribed_user_value_leaves_a_line_in_the_transcript() {
     // 一字一句同じだったので走らせた。**こちらも黙らせない。**
     let mut app = AppState::new("p".into(), "m".into());
     app.apply(AgentEvent::UserValueTranscribed {
+        back: 0,
         value_chars: 308,
         differences: 0,
         refused: false,
@@ -1906,6 +1908,39 @@ fn a_transcribed_user_value_leaves_a_line_in_the_transcript() {
     assert!(
         matches!(&app.transcript[0], TranscriptItem::Info(l)
             if l.contains("308") && l.contains("書き写した") && !l.contains("実行しなかった")),
+        "{:?}",
+        app.transcript[0]
+    );
+}
+
+/// **前の文の値を差し込んだら、会話の記録に1行残る**（D-127 の5）。記録済みの規則で自動で通る呼び出しには
+/// 承認画面が出ないので、これが唯一の知らせになる。何個前の文の何番目かと長さを出し、中身は出さない。
+#[test]
+fn a_back_reference_leaves_a_line_in_the_transcript() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.apply(AgentEvent::BackReferenceUsed {
+        back: 2,
+        number: 1,
+        value_chars: 308,
+    });
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Info(l)
+            if l == "[参照] モデルが2つ前のあなたの文の値（{{back:2:1}}、308文字）を差し込んだ"),
+        "{:?}",
+        app.transcript[0]
+    );
+
+    // 前の文の値を書き写したときは、何個前の文かも言う。対: 直近の文なら言わない（上の試験）。
+    let mut app = AppState::new("p".into(), "m".into());
+    app.apply(AgentEvent::UserValueTranscribed {
+        back: 1,
+        value_chars: 308,
+        differences: 1,
+        refused: true,
+    });
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Info(l)
+            if l.contains("1つ前のあなたの文の308文字の値") && l.contains("実行しなかった")),
         "{:?}",
         app.transcript[0]
     );

@@ -415,3 +415,38 @@ fn the_old_spelling_still_substitutes() {
         json!({ "command": format!("cmp {b} {a}") })
     );
 }
+
+/// **前の文の値の写しも審査する**（D-127 の4）。どの文の何番目か（`{{back:K:N}}`）で報告する。
+#[test]
+fn a_transcription_of_an_older_value_names_its_back_number() {
+    use crate::reference_syntax::ValueRef;
+    let (current, older) = (blob('a'), blob('b'));
+    let mut slipped: Vec<char> = older.chars().collect();
+    slipped[100] = 'Z';
+    let slipped: String = slipped.into_iter().collect();
+
+    let candidates = [
+        (ValueRef::current(1), current.as_str()),
+        (ValueRef { back: 1, number: 1 }, older.as_str()),
+    ];
+    let found = review_against(&json!({ "command": slipped }), &candidates);
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].back, found[0].number), (1, 1));
+    assert_eq!(found[0].differences, 1);
+    assert_eq!(found[0].reference(), "{{back:1:1}}");
+
+    // 対: 前の文の値を相手にしない審査（`review`は直近の文だけ）では見つからない。
+    assert!(review(
+        &json!({ "command": slipped }),
+        std::slice::from_ref(&current)
+    )
+    .is_empty());
+
+    // 同じ値が今の文にも前の文にもあれば、今の番号で報告する（並びの先が勝つ）。
+    let same = [
+        (ValueRef::current(1), older.as_str()),
+        (ValueRef { back: 1, number: 1 }, older.as_str()),
+    ];
+    let found = review_against(&json!({ "command": slipped }), &same);
+    assert_eq!(found[0].reference(), "{{val:1}}");
+}

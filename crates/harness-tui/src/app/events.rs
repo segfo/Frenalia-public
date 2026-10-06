@@ -102,19 +102,37 @@ impl AppState {
             // モデルが参照の書き方を使わず値を書き写した（D-115）。**黙らせない**——一字一句同じでも、
             // 決まりが守られていない事実は残す（損じたときに断ったことは、なおさら見えないと困る）。
             AgentEvent::UserValueTranscribed {
+                back,
                 value_chars,
                 differences,
                 refused,
             } => {
+                // 前の文の値を写したなら、何個前の文かも言う（D-127）。
+                let whose = match back {
+                    0 => "あなたの".to_string(),
+                    k => format!("{k}つ前のあなたの文の"),
+                };
                 let line = if refused {
                     format!(
-                        "[参照] モデルがあなたの{value_chars}文字の値を書き写し、{differences}文字分違っていたので実行しなかった（番号で書き直すよう伝えた）"
+                        "[参照] モデルが{whose}{value_chars}文字の値を書き写し、{differences}文字分違っていたので実行しなかった（番号で書き直すよう伝えた）"
                     )
                 } else {
                     format!(
-                        "[参照] モデルがあなたの{value_chars}文字の値を書き写した（一字一句同じだったのでそのまま実行する）"
+                        "[参照] モデルが{whose}{value_chars}文字の値を書き写した（一字一句同じだったのでそのまま実行する）"
                     )
                 };
+                self.transcript.push(TranscriptItem::Info(line));
+            }
+            // 前の文の値を`{{back:K:N}}`で差し込んだ（D-127 の5）。記録済みの規則で自動で通る呼び出しには
+            // 承認画面が出ないので、**ここが唯一の知らせ**になる。中身は出さない（長さだけ）。
+            AgentEvent::BackReferenceUsed {
+                back,
+                number,
+                value_chars,
+            } => {
+                let line = format!(
+                    "[参照] モデルが{back}つ前のあなたの文の値（{{{{back:{back}:{number}}}}}、{value_chars}文字）を差し込んだ"
+                );
                 self.transcript.push(TranscriptItem::Info(line));
             }
             // 連続拒否が閾値に達して素通りさせた（`TranscriptionCheckBypassed`、`turn/mod.rs`）。

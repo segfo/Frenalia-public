@@ -35,7 +35,7 @@ pub use permission::{
     parse_allowlist_rule, AllowRule, AllowlistRule, Classification, Decision, PermissionArbiter,
     PermissionGate, PermissionMode, Remembered,
 };
-pub use references::value_store_for;
+pub use references::{value_store_for, References};
 pub use session::{SessionStore, SessionSummary};
 pub use turn::{
     CompletedToolCall, EngineError, Executor, RawTurn, RawTurnRequest, RawTurnResult,
@@ -235,16 +235,12 @@ fn build_request(
     tool_specs: &[ToolSpec],
     config: &AgentLoopConfig,
 ) -> CompletionRequest {
-    // ハーネスが持っている値の一覧を**毎ターン作り直して**足す（D-115。`harness_core::value_store`）。
+    // ハーネスが持っている値の一覧を**毎ターン作り直して**足す（D-116・D-127。`harness_core::value_store`）。
+    // 並べるのは直近の人の文の値だけで、前の文に値があれば`{{back:K:N}}`で指せると1行足す。
     // 中身は1文字も載らない——載せればモデルが書き写せてしまうし、解読した中身は攻撃者が
-    // 書いたかもしれないデータで、ここはモデルが最も信用する位置だから。
-    //
-    // **`cache: false`。** 中身がターンごとに変わるので、送り直しを前提にする
-    // （1つめの塊＝環境の事実は変わらないので、そちらの使い回しは壊さない）。
+    // 書いたかもしれないデータで、ここはモデルが最も信用する位置だから。`cache: false`（`menu_block`）。
     let mut system = state.system.clone();
-    if let Some(text) = value_store_for(&state.messages).render() {
-        system.push(SystemBlock { text, cache: false });
-    }
+    system.extend(References::from_messages(&state.messages).menu_block());
     CompletionRequest {
         system,
         messages: state.messages.clone(),
@@ -442,10 +438,11 @@ where
                         },
                     );
                 }
-                let mut retry_req = CompletionRequest {
-                    messages: state.messages.clone(),
-                    ..req
-                };
+                // 畳んだ後の会話から**組み直す**（値の一覧も作り直す。D-127）。`messages`だけを
+                // 差し替えると、システムプロンプトの一覧は畳む前の会話のまま残り、差し込む段
+                // （畳んだ後の会話から組む）と食い違う。K は新しい方から数えるので、残った文の K は
+                // 変わらない。畳まれた文を指す`{{back:K:N}}`は置き換わらずに残る。
+                let mut retry_req = build_request(state, &tool_specs, &config);
                 if tier3 {
                     sanitize::completion_request(&mut retry_req);
                 }

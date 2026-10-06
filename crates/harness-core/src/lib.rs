@@ -15,6 +15,7 @@ pub mod permission_subject;
 pub mod program_rule;
 pub mod prompt;
 pub mod provider;
+pub mod reference_syntax;
 pub mod risk_check;
 pub mod schema;
 pub mod text;
@@ -59,6 +60,7 @@ pub use provider::{
     BlockKind, CompletionRequest, LlmProvider, OutputContract, ProviderCapabilities, ProviderError,
     Sampling, StopReason, StreamEvent, SystemBlock, ToolChoice, Usage,
 };
+pub use reference_syntax::ValueRef;
 pub use risk_check::{RiskCheckError, RiskLevel, RiskVerdict};
 pub use schema::{apply_schema_strategy, unwrap_forced_tool_stream, SchemaStrategy};
 pub use text::truncate_head_tail;
@@ -73,4 +75,4 @@ pub use user_reference::{
     review as review_user_references, substitute as substitute_user_references,
     values_in as user_reference_values, Transcription as UserValueTranscription,
 };
-pub use value_store::{from_messages as value_store_for, ValueStore};
+pub use value_store::{from_messages as value_store_for, ReferenceBook, ValueStore};
