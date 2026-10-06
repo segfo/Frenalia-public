@@ -61,6 +61,7 @@ use std::time::{Duration, Instant};
 use ratatui::style::{Color, Style};
 
 use crate::pointer::Targets;
+pub use map::Pos;
 pub(crate) use map::TextMap;
 use map::{Head, Hit, Mark};
 

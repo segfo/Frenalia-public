@@ -31,6 +31,15 @@
 //! [`Pointer::Text`]を返す。**押せる場所が上に登録されていれば、そちらが勝つ**（文章の中の押せる行・ボタンは
 //! 今までどおりクリック。選び始めない）。
 //!
+//! # 文字の上にポインタがあるか（2026-10-07）
+//!
+//! [`Targets::text_at`]は、あるセルに**見えている**文字が、枠`W`の文章の何行目の何文字目か（[`Pos`]）を答える。
+//! 会話TUIが、マウスの下の文字がリンクかを引いて吹き出しを出すのに使う（`plans/PLAN-TUI-IMPROVEMENTS.md`§3）。
+//! 文章を選ぶときの引き方（`crate::select`）と違って**枠の端へ寄せない**——文字の無いセル（行の右の空き）は`None`。
+//! 後から覆った範囲（[`Targets::cover`]）と、後から重ねた別の枠の文章の上も`None`（その文字は隠れている）。押せる場所は
+//! 文字を隠さない（押せる行も文字として描いてある）。逆向きの[`Targets::text_cell`]は、位置からその文字を描いたセルを返す
+//! （吹き出しをリンクの最後の文字の右に置くため）。
+//!
 //! # 限界
 //!
 //! - **左ボタンを押した瞬間**（`Down`）をクリックとする。離した瞬間（`Up`）・ドラッグ・右/中ボタン・横スクロールは
@@ -41,7 +50,7 @@
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
-use crate::select::TextMap;
+use crate::select::{Pos, TextMap};
 
 /// 登録した場所の1件。
 #[derive(Debug, Clone)]
@@ -184,6 +193,33 @@ impl<C, W: Clone + PartialEq> Targets<C, W> {
         })
     }
 
+    /// 枠`surface`の文章のうち、`(column, row)`のセルに**見えている**文字の位置（描いた`Text`の何行目の何文字目か。
+    /// モジュールdoc「文字の上にポインタがあるか」）。文字の描かれていないセル・覆った範囲・後から重ねた別の枠の文章の
+    /// 上は`None`。押せる場所は文字を隠さない。
+    pub fn text_at(&self, surface: &W, column: u16, row: u16) -> Option<Pos> {
+        let at = Position::new(column, row);
+        for entry in self.entries.iter().rev() {
+            match entry {
+                Entry::Cover(area) if area.contains(at) => return None,
+                Entry::Text(map, s) if map.area().contains(at) => {
+                    return if s == surface {
+                        map.glyph_at(column, row)
+                    } else {
+                        None
+                    };
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// 枠`surface`の文章の位置`at`の文字を描いたセルの矩形（高さ1、幅はその文字の桁数。[`Self::text_at`]の逆）。
+    /// 見えていない文字・描いていない枠は`None`。**覆われているかは見ない**（描いた場所を返すだけ）。
+    pub fn text_cell(&self, surface: &W, at: Pos) -> Option<Rect> {
+        self.text_map(surface)?.cell_of(at)
+    }
+
     /// 前に登録した枠`surface`の文章を、**いまの重なりの一番上へ登録し直す**（後ろを覆った後でも、外に見えている部分を
     /// 選べるようにする。会話画面は承認ダイアログ・レビューパネルの外に見えているtranscriptを選ばせる）。
     /// 登録し直した後に覆ったもの（重ねた枠）は、今までどおりその上にある。
@@ -220,8 +256,10 @@ pub fn acts(kind: MouseEventKind) -> bool {
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyModifiers;
+    use ratatui::text::{Line, Text};
 
     use super::*;
+    use crate::select::map::{prepare, Shape};
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
         MouseEvent {
@@ -367,6 +405,117 @@ mod tests {
             Some(Rect::new(1, 1, 18, 8))
         );
         assert_eq!(targets.text_map(&"other"), None);
+    }
+
+    /// `lines`を`area`へ折り返さずに上から描いたときの地図（`crate::select::map::prepare`。送れる枠が描くときと同じ部品）。
+    fn map_of(lines: &[&str], area: Rect) -> TextMap {
+        let lines: Vec<Line<'static>> = lines.iter().map(|l| Line::raw(l.to_string())).collect();
+        let heights = vec![1; lines.len()];
+        prepare(
+            Text::from(lines),
+            Shape {
+                inner: area,
+                heights: &heights,
+                top: 0,
+                wrapped: false,
+                joins: &[],
+            },
+            None,
+        )
+        .1
+    }
+
+    fn at(line: usize, offset: usize) -> Pos {
+        Pos { line, offset }
+    }
+
+    /// **[`Targets::text_at`]は、そのセルに見えている文字を答える**——文字の上なら何行目の何文字目か、文字の無いセル
+    /// （行の右の空き）と別の枠の上は`None`。押せる場所は文字を隠さない（押せる行も文字として描いてある）。
+    #[test]
+    fn text_at_answers_the_character_drawn_on_the_cell() {
+        let mut targets: Targets<&str, &str> = Targets::default();
+        targets.text(map_of(&["hello", "日本"], Rect::new(1, 1, 10, 3)), "body");
+        targets.text(map_of(&["other"], Rect::new(1, 6, 10, 1)), "side");
+        assert_eq!(targets.text_at(&"body", 1, 1), Some(at(0, 0)));
+        assert_eq!(targets.text_at(&"body", 5, 1), Some(at(0, 4)));
+        // 全角文字はどちらのセルでも同じ文字。
+        assert_eq!(targets.text_at(&"body", 1, 2), Some(at(1, 0)));
+        assert_eq!(targets.text_at(&"body", 2, 2), Some(at(1, 0)));
+        assert_eq!(targets.text_at(&"body", 3, 2), Some(at(1, 1)));
+        // 文字の無いセル・枠の外。
+        assert_eq!(targets.text_at(&"body", 6, 1), None, "行の右の空き");
+        assert_eq!(targets.text_at(&"body", 1, 3), None, "文章の無い行");
+        assert_eq!(targets.text_at(&"body", 0, 1), None, "枠の外");
+        // 別の枠の文字は、名前を合わせたときだけ答える。
+        assert_eq!(targets.text_at(&"body", 1, 6), None);
+        assert_eq!(targets.text_at(&"side", 1, 6), Some(at(0, 0)));
+        // 押せる場所が上にあっても、文字はそこに描かれている。
+        targets.click(Rect::new(1, 1, 10, 1), "row");
+        assert_eq!(targets.text_at(&"body", 2, 1), Some(at(0, 1)));
+    }
+
+    /// **覆った範囲の文字は答えない**（重ねた枠の下に隠れている）。覆った後に[`Targets::lift_text`]で登録し直すと、
+    /// 外に見えている部分は答え、後から覆った範囲は覆ったまま。後から別の枠の文章を重ねた所も答えない。
+    #[test]
+    fn text_at_does_not_answer_under_a_cover() {
+        let mut targets: Targets<&str, &str> = Targets::default();
+        targets.text(map_of(&["0123456789"], Rect::new(0, 0, 10, 1)), "body");
+        targets.cover(Rect::new(0, 0, 20, 5));
+        assert_eq!(targets.text_at(&"body", 2, 0), None, "覆った後ろ");
+        targets.lift_text(&"body");
+        targets.cover(Rect::new(0, 0, 4, 1));
+        assert_eq!(
+            targets.text_at(&"body", 2, 0),
+            None,
+            "登録し直した後に覆った"
+        );
+        assert_eq!(
+            targets.text_at(&"body", 6, 0),
+            Some(at(0, 6)),
+            "外に見えている"
+        );
+        targets.text(map_of(&["xx"], Rect::new(6, 0, 2, 1)), "modal");
+        assert_eq!(
+            targets.text_at(&"body", 6, 0),
+            None,
+            "上に重ねた別の枠の文章"
+        );
+        assert_eq!(targets.text_at(&"body", 8, 0), Some(at(0, 8)));
+    }
+
+    /// **[`Targets::text_cell`]は[`Targets::text_at`]の逆**——位置からその文字を描いたセルの矩形を返す
+    /// （全角文字は2桁）。見えていない文字・描いていない枠は`None`。
+    #[test]
+    fn text_cell_is_the_inverse_of_text_at() {
+        let mut targets: Targets<&str, &str> = Targets::default();
+        targets.text(map_of(&["ab", "日本"], Rect::new(3, 2, 10, 2)), "body");
+        assert_eq!(
+            targets.text_cell(&"body", at(0, 1)),
+            Some(Rect::new(4, 2, 1, 1))
+        );
+        assert_eq!(
+            targets.text_cell(&"body", at(1, 1)),
+            Some(Rect::new(5, 3, 2, 1))
+        );
+        assert_eq!(
+            targets.text_cell(&"body", at(0, 2)),
+            None,
+            "行の末尾より後ろ"
+        );
+        assert_eq!(targets.text_cell(&"body", at(5, 0)), None, "無い行");
+        assert_eq!(
+            targets.text_cell(&"other", at(0, 0)),
+            None,
+            "描いていない枠"
+        );
+        for (x, y) in [(3, 2), (4, 2), (5, 3), (6, 3)] {
+            let pos = targets.text_at(&"body", x, y).expect("文字の上");
+            let cell = targets.text_cell(&"body", pos).expect("描いたセル");
+            assert!(
+                cell.contains(Position::new(x, y)),
+                "({x}, {y}) → {pos:?} → {cell:?}"
+            );
+        }
     }
 
     /// 文章を描く矩形が空なら登録しない（押せない）。

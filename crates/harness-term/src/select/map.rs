@@ -25,7 +25,7 @@
 //! - 描かれない文字（幅0の書記素）は取り出さない（見えないものは写さない）。
 
 use ratatui::buffer::{Buffer, CellWidth};
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
@@ -33,8 +33,11 @@ use ratatui::widgets::{Paragraph, Widget, Wrap};
 use super::{LineJoin, SELECTED};
 
 /// 文章の中の位置——描いた`Text`の何行目の、何番目の文字（書記素）の**前**か。
+///
+/// 公開しているのは[`crate::pointer::Targets::text_at`]・[`crate::pointer::Targets::text_cell`]の答えと引数に使うため
+/// （会話TUIが、ポインタの下の文字がどのリンクかを引く。`offset`が`start..end`に入れば、その文字はリンクの中）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub(crate) struct Pos {
+pub struct Pos {
     /// `Text`の行（折り返す前の行）。
     pub line: usize,
     /// その行の何番目の文字の前か（描かれる書記素で数える。モジュールdoc）。
@@ -159,6 +162,38 @@ impl TextMap {
             area,
             ..Self::default()
         }
+    }
+
+    /// `(column, row)`のセルに描かれた文字の位置（その文字の前）。**文字の描かれていないセル（枠の外・行の右の空き）は
+    /// `None`**——[`Self::hit`]と違って端へ寄せない（ポインタが文字の上にあるかを知りたいとき。会話TUIのリンクの吹き出し）。
+    /// 全角文字は2つのセルのどちらでもその文字を答える。
+    pub(crate) fn glyph_at(&self, column: u16, row: u16) -> Option<Pos> {
+        if !self.area.contains(Position::new(column, row)) {
+            return None;
+        }
+        let shown = self.rows.iter().find(|r| r.y == row)?;
+        shown
+            .glyphs
+            .iter()
+            .find(|g| g.x <= column && column < g.x.saturating_add(g.width))
+            .map(|g| Pos {
+                line: shown.line,
+                offset: g.index,
+            })
+    }
+
+    /// 位置`at`の文字を描いたセルの矩形（高さ1、幅はその文字の桁数）。見えていない文字（送って枠の外へ出た行・
+    /// 行の文字数より後ろ）は`None`。
+    pub(crate) fn cell_of(&self, at: Pos) -> Option<Rect> {
+        self.rows
+            .iter()
+            .filter(|r| r.line == at.line)
+            .find_map(|r| {
+                r.glyphs
+                    .iter()
+                    .find(|g| g.index == at.offset)
+                    .map(|g| Rect::new(g.x, r.y, g.width, 1))
+            })
     }
 
     /// `(column, row)`が指す文章の位置。**枠の外も枠の端へ寄せて答える**——上なら見えている最初の表示行の頭、
@@ -944,5 +979,111 @@ mod tests {
             Some(Hit::caret(first.line, first.end))
         );
         assert_eq!(TextMap::default().hit(1, 1), None, "文字が無い地図");
+    }
+
+    /// **[`TextMap::glyph_at`]は、そのセルに描かれた文字だけを答える**（[`TextMap::hit`]と違って端へ寄せない）。
+    /// 答えた位置の文字は本物の画面のそのセル（全角文字は前半のセル）に描かれた文字で、[`TextMap::cell_of`]で引き直すと
+    /// 同じセルを含む矩形が返る。文字の描かれたセル（空白でない・全角文字の後半）はどれも答える。
+    /// 枠線・枠の外・行の右の空きは`None`。幅・送り位置・折り返すかを変える。
+    #[test]
+    fn glyph_at_answers_only_the_cells_a_character_was_drawn_on() {
+        let lines = sample();
+        for wrapped in [true, false] {
+            for (width, top) in [(12u16, 0u16), (17, 3), (23, 1), (40, 7)] {
+                let (buffer, map) = drawn(&lines, width, 8, top, wrapped);
+                let inner = map.area();
+                let mut answered = 0;
+                for y in 0..8u16 {
+                    for x in 0..width {
+                        let symbol = buffer[(x, y)].symbol();
+                        let inside = inner.contains(ratatui::layout::Position::new(x, y));
+                        match map.glyph_at(x, y) {
+                            Some(at) => {
+                                answered += 1;
+                                assert!(inside, "幅{width} 位置{top}: 枠の外({x}, {y})が{at:?}を答えた");
+                                let cell = map.cell_of(at).unwrap_or_else(|| {
+                                    panic!("幅{width} 位置{top}: {at:?}の描いたセルが引けない")
+                                });
+                                assert!(
+                                    cell.contains(ratatui::layout::Position::new(x, y)),
+                                    "幅{width} 位置{top}: ({x}, {y})が{at:?}の矩形{cell:?}の外"
+                                );
+                                let expected = lines[at.line]
+                                    .styled_graphemes(Style::default())
+                                    .nth(at.offset)
+                                    .map(|g| g.symbol);
+                                assert_eq!(
+                                    Some(buffer[(cell.x, cell.y)].symbol()),
+                                    expected,
+                                    "折り返し{wrapped} 幅{width} 位置{top}: ({x}, {y})"
+                                );
+                            }
+                            None => assert!(
+                                !inside || symbol == " ",
+                                "折り返し{wrapped} 幅{width} 位置{top}: ({x}, {y})の「{symbol}」に文字があるのに答えない"
+                            ),
+                        }
+                    }
+                }
+                assert!(answered > 0, "幅{width} 位置{top}: 1つも答えない");
+            }
+        }
+        // 短い行の右の空きは`None`（`hit`はその行の末尾へ寄せて答える——こちらは寄せない）。
+        let (_, map) = drawn(&lines, 40, 8, 0, true);
+        let first = &map.rows[0];
+        let right_of_short = map.area().x + 10;
+        assert!(map.hit(right_of_short, first.y).is_some());
+        assert_eq!(map.glyph_at(right_of_short, first.y), None);
+        assert_eq!(TextMap::default().glyph_at(1, 1), None, "文字が無い地図");
+    }
+
+    /// **[`TextMap::cell_of`]は見えている文字だけを答える**——送って枠の外へ出た行の文字・行の文字数より後ろ・
+    /// 無い行は`None`。全角文字は2桁の矩形。
+    #[test]
+    fn cell_of_answers_only_visible_characters() {
+        let lines = sample();
+        let (_, map) = drawn(&lines, 14, 5, 4, true);
+        let shown: Vec<usize> = map.rows.iter().map(|r| r.line).collect();
+        let hidden = (0..lines.len())
+            .find(|line| !shown.contains(line))
+            .expect("送って見えなくなった行（試験の前提）");
+        assert_eq!(
+            map.cell_of(Pos {
+                line: hidden,
+                offset: 0
+            }),
+            None
+        );
+        assert_eq!(
+            map.cell_of(Pos {
+                line: 99,
+                offset: 0
+            }),
+            None
+        );
+        let row = &map.rows[0];
+        let glyph = row.glyphs[0];
+        assert_eq!(
+            map.cell_of(Pos {
+                line: row.line,
+                offset: glyph.index
+            }),
+            Some(Rect::new(glyph.x, row.y, glyph.width, 1))
+        );
+        // 全角文字は2桁（3行目は「あ」が12個並ぶ行）。
+        let (_, wide) = drawn(&lines, 40, 8, 0, true);
+        let cell = wide
+            .cell_of(Pos { line: 3, offset: 0 })
+            .expect("全角の文字");
+        assert_eq!(cell.width, 2);
+        let len = lines[3].styled_graphemes(Style::default()).count();
+        assert_eq!(
+            wide.cell_of(Pos {
+                line: 3,
+                offset: len
+            }),
+            None,
+            "行の末尾より後ろ"
+        );
     }
 }
