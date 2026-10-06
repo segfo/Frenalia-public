@@ -151,7 +151,8 @@ impl GraphFacts<'_> {
             );
         }
 
-        // (i) 固定値が指すファイルは、呼び出し元から書けない場所にあること（§19.1）。
+        // (i) 固定値が指すファイルは、呼び出し元から書けない場所にあること（§19.1）。**Strict の辺だけに掛ける**
+        // （決定66の追記。P5.4a で鍵を書き方の形から印へ付け替えた——普通のモードは入力を固定しないので問いが無い）。
         //
         // **どの書ける場所に当たったかを文面に出す。** 書ける場所は宣言の外からも来る
         // （`settings.json`・`--fs-allow`。残課題 サンドボックス周辺 #65）ので、
@@ -169,6 +170,9 @@ impl GraphFacts<'_> {
 
     /// 固定値（exeのリテラルと、literal argvの中のパスらしいトークン）のうち、
     /// **呼び出し元が書ける場所にあるもの**と、それを覆っている書ける場所の組。
+    ///
+    /// **Strict の辺（[`GraphFacts::is_strict_edge`]）だけを見る**——印の無いドメインへ入る辺と自己ループ辺は、
+    /// 固定してあっても空を返す（決定66の追記。印の判定を2つ作らない、`B-13`）。
     ///
     /// # この検査が見ていない範囲（P-11）
     ///
@@ -189,11 +193,11 @@ impl GraphFacts<'_> {
         view: &DomainView<'_>,
         edge: &TransitionEdge,
     ) -> Vec<(String, String)> {
-        if !is_fully_fixed(edge) {
-            // 固定していない辺には、そもそも守るべき固定値が無い。
+        if !self.is_strict_edge(view.name, edge) {
+            // Strict の辺でなければ、守るべき固定値が無い（固定していない辺）か、固定を求めていない（普通のモード）。
             return Vec::new();
         }
-        // 固定辺ならargvはリテラルである（`is_fully_fixed`）。
+        // Strict の辺ならargvはリテラルである（`is_strict_edge`が`is_fully_fixed`を含む）。
         let argv = match &edge.argv {
             ArgvMatcher::Literal(argv) => argv.as_str(),
             ArgvMatcher::Pattern(_) | ArgvMatcher::Any(_) => "",

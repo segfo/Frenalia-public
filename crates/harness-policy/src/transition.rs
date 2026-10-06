@@ -180,7 +180,8 @@ pub struct DomainView<'a> {
     pub net: Vec<&'a str>,
     pub process: &'a TransitionRules,
     /// **Strict の印**（`policy.json`のドメインの`strict`。決定66の追記）。真なら、このドメインへ入る辺は
-    /// 入力を固定しなければ書けず（編集時検査）、固定した辺は到達閉包で辿らない（呼び出し元が子を操れないので、
+    /// 入力を固定しなければ書けず（編集時検査）、固定した値を呼び出し元が書き換えられないことを読み込み時（規則(i)）と
+    /// 起こす直前（[`Allowed::fixed`]）に確かめ、固定した辺は到達閉包で辿らない（呼び出し元が子を操れないので、
     /// 子の権限が呼び出し元へ渡らない）。印の効かせ方はここ（[`GraphFacts::enters_strict`]）が唯一の持ち主である。
     pub strict: bool,
 }
@@ -191,7 +192,9 @@ pub struct GraphInput<'a> {
     pub domains: Vec<DomainView<'a>>,
     /// **呼び出し元が書ける場所**として、宣言の外から分かっているもの。
     ///
-    /// §19.1の「固定値が指すファイルが呼び出し元から書けない場所にあること」を検査するのに使う。
+    /// 2つに使う——(1) §19.1の「固定値が指すファイルが呼び出し元から書けない場所にあること」の検査（規則(i)。
+    /// **Strict の辺だけ**、決定66の追記）、(2) 組み合わせの対（[`exposure_delta`]。**入口のドメインが書ける場所**
+    /// として数える。P5.4a）。
     /// 宣言だけを見ると**ワークスペース**と、**`policy.json`の外で書込を許した場所**
     /// （`settings.json`の`fs.read_write`・`--fs-allow <path>:rw`）が抜けるので、
     /// 呼び出し側が明示的に渡す。組み立ては`PolicyFile::transition_graph_input`が持つ。
@@ -331,11 +334,14 @@ pub struct Allowed<'a> {
     /// 完全分解（`..`を書かない）で、欄が増えるとあちらがコンパイルできなくなる。
     pub inherit_handles: bool,
     pub direction: Direction,
-    /// **固定辺か**（argvがリテラルで、cwdが宣言されている。`is_fully_fixed`）。
+    /// **Strict の辺か**（Strict の印が付いたドメインへ入り、argvがリテラルで、cwdが宣言されている。
+    /// [`GraphFacts::is_strict_edge`]）。**P5.4a で鍵を書き方の形から印へ付け替えた**（決定66の追記）——
+    /// 印の無いドメインへ入る辺は、固定した形で書いてあっても偽（普通のモードは入力を固定しない）。
+    /// 欄の名前は P5.4b で`strict`へ替える（`plans/position-domains/P5.md`）。
     ///
     /// 真なら、Daemonは起こす直前に「固定したファイルを呼び出し元が書き換えられないか」を
-    /// 呼び出し元のトークンでOSに聞く（`plans/DESIGN-MAC.md` §19.1）。読み込み時の検査は
-    /// 綴りで比べるので別名（8.3形式の短い名前・リンク・ハードリンク）に弱く、それを実体の側で補う。
+    /// 呼び出し元のトークンでOSに聞く（`plans/DESIGN-MAC.md` §19.1）。読み込み時の検査（規則(i)。同じく Strict の辺
+    /// だけ）は綴りで比べるので別名（8.3形式の短い名前・リンク・ハードリンク）に弱く、それを実体の側で補う。
     ///
     /// # なぜ`inherit_handles`から読み取らせないのか
     ///
@@ -486,7 +492,8 @@ impl TransitionGraph {
             let mut edges = Vec::with_capacity(view.process.transitions.len());
             for edge in &view.process.transitions {
                 let direction = facts.direction(view.name, &edge.to);
-                let fixed = is_fully_fixed(edge);
+                // [P5.4a] 起こす直前の検査は Strict の辺だけ（[`Allowed::fixed`]）。ハンドルの式は P5.4b まで形のまま。
+                let fixed = facts.is_strict_edge(view.name, edge);
                 edges.push(CompiledEdge {
                     // `compile_matcher`は検査が通った後にしか呼ばれないので、
                     // ここでの失敗は起こり得ない（起きたら検査とコンパイルがずれている）。
@@ -496,7 +503,7 @@ impl TransitionGraph {
                     to: edge.to.clone(),
                     env: env_policy(edge),
                     direction,
-                    inherit_handles: !fixed && direction != Direction::WiderOrUnknown,
+                    inherit_handles: !is_fully_fixed(edge) && direction != Direction::WiderOrUnknown,
                     fixed,
                 });
             }
@@ -610,7 +617,7 @@ pub fn edge_direction(
 /// 固定辺で**固定したファイル**（起こす実行ファイルと、`argv[0]`以降の絶対パスらしいトークン）を、
 /// 書かれた綴りのまま返す。
 ///
-/// Daemonは固定辺の子を起こす直前に、これらを**実際に`CreateProcessW`へ渡す値**
+/// Daemonは Strict の辺（[`Allowed::fixed`]）の子を起こす直前に、これらを**実際に`CreateProcessW`へ渡す値**
 /// （要求された実行ファイルとコマンドライン）から取り、呼び出し元のトークンで
 /// 書き換えられないかをOSに聞く（[`Allowed::fixed`]）。読み込み時の検査も同じ関数で
 /// 候補を集めるので、2層の検査が別のファイルを見ることはない。
@@ -699,7 +706,8 @@ impl<'a> GraphFacts<'a> {
     }
 
     /// `from`から`to`へ入る辺が**Strict の印が付いたドメインへ入る**か（決定66の追記。印の判定の唯一の持ち主——
-    /// 規則(e)・閉包・呼び出し元が使える権限の3つがこれを呼ぶ）。
+    /// 規則(e)・閉包・呼び出し元が使える権限の3つと、[`GraphFacts::is_strict_edge`]を通して規則(i)・
+    /// [`Allowed::fixed`]がこれを呼ぶ）。
     ///
     /// **自己ループ辺は入る辺に数えない**——呼び出し元は既にそのドメインに居て、印が守る権利を自分で持っている
     /// （[`Direction::Same`]・[`newly_usable`]の自己ループと同じ扱い）。
@@ -707,7 +715,8 @@ impl<'a> GraphFacts<'a> {
         from != to && self.by_name.get(to).is_some_and(|view| view.strict)
     }
 
-    /// **Strict の辺**＝Strict のドメインへ入り、入力（引数・作業ディレクトリ）を固定した辺。到達閉包はこれを辿らない。
+    /// **Strict の辺**＝Strict のドメインへ入り、入力（引数・作業ディレクトリ）を固定した辺。到達閉包はこれを辿らず、
+    /// 規則(i)（固定値の書込可否）と[`Allowed::fixed`]（起こす直前の検査）はこれにだけ掛かる（P5.4a）。
     ///
     /// 固定していない Strict のドメインへの辺は編集時検査が断る（規則(e)）が、検査に落ちる宣言でも答える関数
     /// （[`shape`]・[`rights_summary`]）のために、ここでも固定を確かめる——入力が本当に固定されていなければ
@@ -822,11 +831,11 @@ fn path_covered_by(root: &str, path: &str) -> bool {
 /// 使う。固定は構文だけで決める（向きを知るには閉包が要り、閉包はどの辺を辿るかを知る必要があるので、
 /// 形を構文で決めて循環を断つ）。
 ///
-/// **この段（P5.3）ではまだ形そのものを鍵にしている箇所が3つ残る**——規則(i)（固定値の書込可否）・
-/// [`Allowed::fixed`]（Daemon の起こす直前の検査）・[`Allowed::inherit_handles`]の式で、P5.4a・P5.4b で
-/// Strict の印へ付け替える（`plans/position-domains/P5.md`）。この条件を満たす辺は向きに関わらず
-/// stdinと継承ハンドルも断つ（Strict の辺で閉包の除外を健全にするため——呼び出し元がstdinでコードを
-/// 渡せるなら、その辺は権限を受け渡している）。
+/// 規則(i)（固定値の書込可否）と[`Allowed::fixed`]（Daemon の起こす直前の検査）は P5.4a で印へ付け替えた
+/// （[`GraphFacts::is_strict_edge`]を通る）。**形そのものを鍵にしている箇所は[`Allowed::inherit_handles`]の式だけ
+/// 残る**——この条件を満たす辺は向きに関わらずstdinと継承ハンドルも断つ（Strict の辺で閉包の除外を健全にするため
+/// ——呼び出し元がstdinでコードを渡せるなら、その辺は権限を受け渡している）。P5.4b で Strict の印と辺ごとの出力の
+/// 設定へ付け替える（`plans/position-domains/P5.md`）。
 fn is_fully_fixed(edge: &TransitionEdge) -> bool {
     matches!(edge.argv, ArgvMatcher::Literal(_)) && edge.cwd.is_some()
 }

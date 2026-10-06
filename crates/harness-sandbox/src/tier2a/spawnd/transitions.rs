@@ -288,7 +288,7 @@ pub fn remedy(reason: &DenyReason) -> Remedy {
         // 保守的に「いま何を書いても通らない」側へ倒してある——逆へ倒すと、
         // 直しようのない拒否に「宣言を直せ」と言うことになる。
         DenyReason::TargetDomainNotProvisioned { .. } => Remedy::BlockedUntilHarnessImplementsIt,
-        // 固定辺は許可だったが、固定したファイルを呼び出し元が書き換えられる（または判定できない）。
+        // Strict の辺は許可だったが、固定したファイルを呼び出し元が書き換えられる（または判定できない）。
         // 宣言は足りているので「宣言を直せ」ではない。
         DenyReason::FixedInputWritable => Remedy::FixTheEnvironment,
         // 判定器が断ったもの。**ここも`_ =>`を書かない**——判定器が理由を増やしたとき、

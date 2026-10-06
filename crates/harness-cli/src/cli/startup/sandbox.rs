@@ -441,7 +441,7 @@ pub(super) fn stage_prepare_sandbox(
                 eprintln!(
                     "note: places opened for writing by settings.json `fs.read_write` or \
                      `--fs-allow <path>:rw` count as writable by the caller, so a fixed \
-                     transition must not point into them: {}",
+                     transition into a strict domain must not point into them: {}",
                     writable_outside_policy.join(", ")
                 );
             }

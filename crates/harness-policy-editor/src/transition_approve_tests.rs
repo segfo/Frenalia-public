@@ -287,8 +287,11 @@ fn removing_alone_does_not_look_at_the_destination() {
 /// 「呼び出し元から書ける場所」を足しても（`settings.json`の`fs.read_write`・`--fs-allow :rw`）
 /// 起動時に落ちない——作業ディレクトリを宣言しないので固定した遷移にならず、その検査の対象外だからである。
 ///
-/// **歯の確認（対）**: 同じ場所の下を指す**固定した**辺（手で書いたもの）は、同じ入力で落ちる。
-/// これが落ちなければ、上の「落ちない」は何も測っていない。
+/// **歯の確認（対）**: 同じ場所の下を指す**固定した**辺（手で書いたもの）を **Strict のドメインへ**向けると、
+/// 同じ入力で落ちる。これが落ちなければ、上の「落ちない」は何も測っていない。
+///
+/// [P5.4a] 固定値の書込可否（規則(i)）は Strict の印が付いたドメインへ入る辺にだけ掛かる（決定66の追記）ので、
+/// 対の辺の遷移先には印を付ける（かつては同じドメインへの自己ループで作っていたが、自己ループは入る辺ではない）。
 #[test]
 fn an_edge_this_editor_writes_survives_the_writable_places_harness_adds() {
     let tmp = tempfile::tempdir().unwrap();
@@ -305,9 +308,12 @@ fn an_edge_this_editor_writes_survives_the_writable_places_harness_adds() {
     policy_file::load_for_session(tmp.path(), &writable_outside)
         .expect("このエディタが書いた辺がharness.exeの起動時の検査で落ちた");
 
-    // 対: 同じ実行ファイルを、作業ディレクトリまで固定した辺（手で書いたもの）で足す。
+    // 対: 同じ実行ファイルを、作業ディレクトリまで固定した辺（手で書いたもの）で Strict のドメインへ足す。
     let mut file = policy_file::load(tmp.path()).unwrap();
     let ws = tmp.path().to_string_lossy().into_owned();
+    let mut sealed = PolicyDomain::new("sealed");
+    sealed.strict = true;
+    file.domains.push(sealed);
     let entry = file
         .domains
         .iter_mut()
@@ -317,7 +323,7 @@ fn an_edge_this_editor_writes_survives_the_writable_places_harness_adds() {
         exe: ExeMatcher::Literal("C:/tools/gen.exe".to_string()),
         argv: ArgvMatcher::Literal("\"C:/tools/gen.exe\" --fixed".to_string()),
         cwd: Some(ws),
-        to: ENTRY_DOMAIN.to_string(),
+        to: "sealed".to_string(),
         env: None,
     });
     policy_file::save(tmp.path(), &file).expect("エディタの検査（書ける場所を知らない）は通る");

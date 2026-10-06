@@ -1044,7 +1044,18 @@ fn a_same_domain_child_is_still_fully_reachable_through_the_handle_the_caller_ge
     drop(case);
 }
 
-/// 固定辺（**リテラルargv＋cwd宣言**）を1本だけ持つ宣言。
+/// [P5.4a] Strict の印を付けた遷移先ドメイン（[`policy_with_strict_edge`]）。宣言を1件も持たない
+/// ——用意できるのは宣言が無いドメインだけだからである（[`policy_with_cross_domain_edge`]と同じ理由）。
+pub(super) const STRICT_DOMAIN: &str = "spawnd-strict-target";
+
+/// **Strict の辺**（Strict の印が付いたドメインへ入り、**リテラルargv＋cwd宣言**で入力を固定した辺）を1本だけ持つ宣言。
+/// 起こすには遷移先を用意する土台（[`setup_with_provisioned_domains`]）が要る。
+///
+/// # なぜ別ドメインへ入る辺なのか（P5.4a）
+///
+/// 固定値の書込可否（規則(i)・起こす直前の検査）と標準入力を断つ扱いは、決定66の追記で**Strict のドメインへ
+/// 入る辺にだけ**掛かるようになった。かつてここは同じドメインへの自己ループで固定辺を作っていたが、自己ループは
+/// 入る辺ではないので、今は何も掛からない（普通のモード）。
 ///
 /// # 固定値に呼び出し元が書ける場所を含めてはいけない
 ///
@@ -1052,7 +1063,7 @@ fn a_same_domain_child_is_still_fully_reachable_through_the_handle_the_caller_ge
 /// （「固定値が指す先を呼び出し元が書き換えられるなら、引数を固定しても無意味」）。
 /// だからこの辺の引数には**ワークスペースの中のパスを1つも書かない**——
 /// 走ったことは`exit`の終了コードで確かめる。
-pub(super) fn policy_with_fixed_edge(
+pub(super) fn policy_with_strict_edge(
     exe: &str,
     command_line: &str,
     cwd: &std::path::Path,
@@ -1064,11 +1075,14 @@ pub(super) fn policy_with_fixed_edge(
             "exe": { "literal": exe },
             "argv": { "literal": command_line },
             "cwd": cwd.to_string_lossy(),
-            "to": E2E_POLICY_DOMAIN,
+            "to": STRICT_DOMAIN,
         }]
     }))
-    .expect("the fixed transition declaration must parse");
+    .expect("the strict transition declaration must parse");
     file.domains.push(entry);
+    let mut target = PolicyDomain::new(STRICT_DOMAIN);
+    target.strict = true;
+    file.domains.push(target);
     file
 }
 
@@ -1105,10 +1119,10 @@ fn a_fixed_edge_does_not_hand_the_callers_stdout_to_the_child() {
     let command_line = format!("\"{cmd}\" /c echo {MARKER} & exit {EXIT_CODE}");
 
     let declared = command_line.clone();
-    let (case, profile, caps) = setup_with_policy_and_transitions(
+    let (case, profile, caps) = setup_with_provisioned_domains(
         "spawnd-bug161-fixed",
         ChildProcessPolicy::Unrestricted,
-        |workspace| policy_with_fixed_edge(&cmd, &declared, workspace),
+        |workspace| policy_with_strict_edge(&cmd, &declared, workspace),
     );
     let workspace = case
         .dir

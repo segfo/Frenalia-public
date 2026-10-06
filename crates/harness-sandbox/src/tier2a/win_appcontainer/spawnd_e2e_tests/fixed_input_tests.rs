@@ -22,8 +22,15 @@
 //! 1つだけあるので、実体に聞く検査はどの名前で開いても同じ答えを返す。
 //!
 //! 起こすのは`tier2a_proc_probe.exe`の写し（`gen.exe`）で、`--emit`は常に終了コード0を返す。
+//!
+//! # 辺は Strict のドメインへ入る（P5.4a）
+//!
+//! この検査は決定66の追記で**Strict の印が付いたドメインへ入る辺（Strict の辺）にだけ**掛かるようになった
+//! （普通のモードは入力を固定しないので、固定したファイルという問いが無い）。だから4本とも、印を付けた
+//! 遷移先ドメインへ入る固定辺で頼む（[`policy_with_strict_edge`]）。検査が使うのは**呼び出し元のトークン**なので、
+//! 子が別のドメインで起きることは判定に関わらない。
 
-use super::transition_acceptance_tests::{ask_daemon_as_a_hook, policy_with_fixed_edge};
+use super::transition_acceptance_tests::{ask_daemon_as_a_hook, policy_with_strict_edge};
 use super::*;
 
 /// プローブの写しを`dir\gen.exe`として置き、そのパスを返す。
@@ -51,7 +58,7 @@ fn junction(link: &std::path::Path, target: &std::path::Path) {
     );
 }
 
-/// `exe`を固定したプログラムとする固定辺を宣言し、呼び出し元にその辺を頼ませる。
+/// `exe`を固定したプログラムとする Strict の辺を宣言し、呼び出し元にその辺を頼ませる。
 /// 戻り値はプローブ（呼び出し元役）の報告。`prepare`は宣言の後・要求の前に呼ばれる
 /// ——ファイルやACEの用意には、セッションのpackage SIDとワークスペースが要るため。
 fn ask_for_fixed_edge(
@@ -63,10 +70,10 @@ fn ask_for_fixed_edge(
     let command_line = format!("\"{exe_str}\" --emit fixed-input");
     let declared_exe = exe_str.clone();
     let declared_line = command_line.clone();
-    let (case, profile, caps) = setup_with_policy_and_transitions(
+    let (case, profile, caps) = setup_with_provisioned_domains(
         label,
         ChildProcessPolicy::Unrestricted,
-        |workspace| policy_with_fixed_edge(&declared_exe, &declared_line, workspace),
+        |workspace| policy_with_strict_edge(&declared_exe, &declared_line, workspace),
     );
     let workspace = case
         .dir

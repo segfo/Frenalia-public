@@ -701,9 +701,64 @@ fn an_any_argv_edge_passes_the_environment_through_and_a_literal_one_fixes_it() 
         !fixed.inherit_handles,
         "a fully fixed edge must not inherit the caller's handles (stdin can carry code)"
     );
+    // 固定したファイルの検査を Daemon へ頼むかは、書き方の形ではなく Strict の印で決まる（P5.4a）。
+    // この辺は自己ループなので頼まない——[`only_an_edge_into_a_strict_domain_asks_the_daemon_to_check_its_fixed_files`]。
+}
+
+/// [P5.4a] **起こす直前の検査（固定したファイルを呼び出し元が書き換えられないか）を Daemon へ頼むのは、
+/// Strict のドメインへ入る辺だけ**（決定66の追記）。鍵は書き方の形（引数のリテラル＋作業ディレクトリ）ではなく
+/// 遷移先の印で、印の判定は[`GraphFacts::is_strict_edge`]の1か所。
+///
+/// 対で見る（`B-35`）——同じ形の辺でも、印の無いドメインへ入る辺と、Strict のドメインの中の自己ループは頼まない。
+/// 前者が頼むと、普通のモードの辺まで固定の検査で断られ得る（決定66が外した束が戻る）。
+#[test]
+fn only_an_edge_into_a_strict_domain_asks_the_daemon_to_check_its_fixed_files() {
+    let fixed_edge = |exe: &str, to: &str| TransitionEdge {
+        exe: literal_exe(exe),
+        argv: literal_argv(&format!(r#""{exe}" --run"#)),
+        cwd: Some(r"C:\ws".to_string()),
+        to: to.to_string(),
+        env: None,
+    };
+    let declared = Declared::new()
+        .domain(
+            "shell",
+            rules(vec![
+                fixed_edge(r"C:\tools\sign.exe", "signer"),
+                fixed_edge(r"C:\tools\fmt.exe", "plain"),
+            ]),
+        )
+        .domain(
+            "signer",
+            rules(vec![fixed_edge(r"C:\tools\again.exe", "signer")]),
+        )
+        .domain("plain", rules(vec![]))
+        .mark_strict("signer");
+    let input = declared.input();
+    let graph = TransitionGraph::build(&input).expect("valid declaration");
+    let fixed_of = |from: &str, exe: &str| {
+        let Resolution::Allowed(allowed) = graph.resolve(SpawnAttempt {
+            from_domain: from,
+            exe,
+            command_line: &format!(r#""{exe}" --run"#),
+            cwd: r"C:\ws",
+        }) else {
+            panic!("the fixed edge {exe} from {from} should resolve");
+        };
+        allowed.fixed
+    };
+
     assert!(
-        fixed.fixed,
-        "a fully fixed edge must tell the daemon to check its fixed files before spawning"
+        fixed_of("shell", r"C:\tools\sign.exe"),
+        "an edge entering a strict domain must ask the daemon to check its fixed files"
+    );
+    assert!(
+        !fixed_of("shell", r"C:\tools\fmt.exe"),
+        "an edge into a domain without the strict mark is the ordinary mode: nothing is fixed"
+    );
+    assert!(
+        !fixed_of("signer", r"C:\tools\again.exe"),
+        "a self-loop inside a strict domain does not enter it"
     );
 }
 
@@ -971,56 +1026,76 @@ fn a_declared_cwd_must_match_the_caller_and_a_matching_one_resolves() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. 固定値が指すファイルの置き場
+// 7. 固定値が指すファイルの置き場（規則(i)。Strict の辺だけに掛かる——P5.4a）
 // ---------------------------------------------------------------------------
 
+/// `cmd`（ワークスペースへ書ける）から`to`へ、`script`を引数に固定した辺を1本持つ宣言。
+fn with_fixed_script(script: &str, to: &str) -> Declared {
+    Declared::new()
+        .domain_with_fs(
+            "cmd",
+            vec![("C:/ws/**", FsAccess::ReadWrite)],
+            rules(vec![TransitionEdge {
+                exe: literal_exe(r"C:\python\python.exe"),
+                argv: literal_argv(&format!(r#""C:\python\python.exe" {script}"#)),
+                cwd: Some(r"C:\ws".to_string()),
+                to: to.to_string(),
+                env: None,
+            }]),
+        )
+        .domain("logs", rules(vec![]))
+}
+
+/// Strict のドメインへ入る辺で、固定した値を呼び出し元が書き換えられるなら断る（決定66の追記の束）。
 #[test]
-fn a_fixed_value_that_the_caller_can_rewrite_is_rejected() {
-    let writable_by_declaration = Declared::new().domain_with_fs(
-        "cmd",
-        vec![("C:/ws/**", FsAccess::ReadWrite)],
-        rules(vec![TransitionEdge {
-            exe: literal_exe(r"C:\python\python.exe"),
-            argv: literal_argv(r#""C:\python\python.exe" C:\ws\a.py"#),
-            cwd: Some(r"C:\ws".to_string()),
-            to: "cmd".to_string(),
-            env: None,
-        }]),
-    );
+fn a_fixed_value_that_the_caller_can_rewrite_is_rejected_on_an_edge_into_a_strict_domain() {
     assert_rejects(
-        &writable_by_declaration.input(),
+        &with_fixed_script(r"C:\ws\a.py", "logs")
+            .mark_strict("logs")
+            .input(),
         "which this domain can write",
     );
 
     // 呼び出し元から書けない場所にあれば通る（対）。
-    let elsewhere = Declared::new().domain_with_fs(
-        "cmd",
-        vec![("C:/ws/**", FsAccess::ReadWrite)],
-        rules(vec![TransitionEdge {
-            exe: literal_exe(r"C:\python\python.exe"),
-            argv: literal_argv(r#""C:\python\python.exe" C:\tools\a.py"#),
-            cwd: Some(r"C:\ws".to_string()),
-            to: "cmd".to_string(),
-            env: None,
-        }]),
+    assert_accepts(
+        &with_fixed_script(r"C:\tools\a.py", "logs")
+            .mark_strict("logs")
+            .input(),
     );
-    assert_accepts(&elsewhere.input());
+}
+
+/// [P5.4a] **印の無いドメインへ入る辺には規則(i)を掛けない**（普通のモード。決定66——守る線は子のドメインの権限で、
+/// 入力を固定しないので「固定した値が書き換えられる」という問いが無い）。Strict のドメインの中の自己ループも
+/// 入る辺ではないので掛けない（[`a_self_loop_inside_a_strict_domain_is_not_an_entering_edge`]と同じ扱い）。
+///
+/// 上の禁止側と**同じ形の辺**で、違うのは遷移先の印だけ——これが緑のまま上が赤なら、鍵は書き方の形ではなく印である。
+#[test]
+fn a_fixed_value_the_caller_can_rewrite_is_not_judged_on_an_edge_without_the_strict_mark() {
+    assert_accepts(&with_fixed_script(r"C:\ws\a.py", "logs").input());
+    assert_accepts(
+        &with_fixed_script(r"C:\ws\a.py", "cmd")
+            .mark_strict("cmd")
+            .input(),
+    );
 }
 
 /// 宣言の外から渡した「呼び出し元が書ける場所」も同じ検査に掛かる
 /// （ワークスペースは`policy.json`に宣言として現れないことがある）。
 #[test]
 fn caller_writable_roots_supplied_from_outside_the_declaration_are_honoured() {
-    let declared = Declared::new().domain(
-        "cmd",
-        rules(vec![TransitionEdge {
-            exe: literal_exe(r"C:\python\python.exe"),
-            argv: literal_argv(r#""C:\python\python.exe" C:\ws\a.py"#),
-            cwd: Some(r"C:\ws".to_string()),
-            to: "cmd".to_string(),
-            env: None,
-        }]),
-    );
+    let declared = Declared::new()
+        .domain(
+            "cmd",
+            rules(vec![TransitionEdge {
+                exe: literal_exe(r"C:\python\python.exe"),
+                argv: literal_argv(r#""C:\python\python.exe" C:\ws\a.py"#),
+                cwd: Some(r"C:\ws".to_string()),
+                to: "logs".to_string(),
+                env: None,
+            }]),
+        )
+        .domain("logs", rules(vec![]))
+        .mark_strict("logs");
     let mut input = declared.input();
     assert_accepts(&input);
 

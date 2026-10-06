@@ -421,6 +421,52 @@ fn the_entry_domain_counts_as_net_capable_until_p7() {
     );
 }
 
+/// [P5.4a] 宣言の外で書ける場所（[`GraphInput::caller_writable_roots`]＝ワークスペースと、`policy.json`の外で書込を
+/// 許した場所）は、**入口のドメインが書ける場所**として対に数える——ファイルの宣言に書込が1つも無くても、入口の
+/// コードがそこへ置いたものを通信できる別のドメインが読む／実行すれば持ち出しの経路になる。根は**配下全部**を書ける
+/// 場所として重なりを見る（規則(i)が根を同じく配下ごとに数えるのと揃える）。
+///
+/// 対照: 同じ宣言でも根を渡さなければ対は無い（宣言の`read_write`だけを数えていた P5.2 の形）。
+#[test]
+fn places_writable_outside_the_declarations_are_written_by_the_entry_domain() {
+    let after = file(vec![Decl::new("r")
+        .read("C:/ws/out/report.txt")
+        .read_exec("C:/tools/**")
+        .net("example.com")]);
+    let roots = ["C:/tools".to_string()];
+    let with_roots = exposure_delta(
+        &file(vec![]).transition_graph_input(Some("C:/ws"), &roots),
+        &after.transition_graph_input(Some("C:/ws"), &roots),
+        provisional_net_capable,
+    )
+    .expect("同じ名前のドメインは無い");
+
+    assert_eq!(
+        with_roots.pairs,
+        vec![
+            pair(
+                ENTRY_DOMAIN,
+                "C:/tools",
+                "r",
+                "C:/tools/**",
+                PairUse::Execute
+            ),
+            pair(
+                ENTRY_DOMAIN,
+                "C:/ws",
+                "r",
+                "C:/ws/out/report.txt",
+                PairUse::Read
+            ),
+        ],
+    );
+    assert_eq!(
+        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        vec![],
+        "根を渡さなければ、宣言に書込が無いので対は無い"
+    );
+}
+
 /// 通信できるかは**呼び出し側が渡す関数だけ**で決める（宣言の`net`を自分で見ない）。
 #[test]
 fn the_net_capable_judgement_is_the_callers() {

@@ -41,8 +41,11 @@
 //!
 //! - **宣言されていない遷移先には空を返す**（[`super::rights_summary`]と同じ）。向きの判定に使うときは、
 //!   未宣言を「証明できない」へ倒す判定（[`super::GraphFacts::direction`]の先頭）を先に通すこと
-//! - **組み合わせの書く側は、ドメインの宣言（`read_write`）だけを数える。** 宣言の外で書ける場所
-//!   （[`super::GraphInput::caller_writable_roots`]＝ワークスペース等）は、P5.4a で入口のドメインが書ける場所として足す
+//! - **組み合わせの書く側は、ドメインの宣言（`read_write`）と、宣言の外で書ける場所**
+//!   （[`super::GraphInput::caller_writable_roots`]＝ワークスペース・`policy.json`の外で書込を許した場所。P5.4a）。
+//!   後者は**入口のドメインが書く**として数える（`--fs-allow`の穴を持つのは入口だけ）。遷移先のドメインも土台として
+//!   ワークスペースを書ける（`domain_provision`の共通の土台）が、それは数えていない——読む側も宣言だけを見るので、
+//!   宣言せずに土台で読むワークスペースの組は出ない（少なめに出る側）
 //! - 組み合わせは**ドメインの宣言どうし**で見る。そのドメインへ実際に遷移で届くかは問わない（届かない組も出る
 //!   ＝多めに出す側）
 //! - 外部と通信できるかの判定は暫定（上）。P7 までは強制で効くのは入口のドメインの通信宣言だけである（決定66の限界）
@@ -231,37 +234,48 @@ fn subtract<'a>(minuend: Rights<'a>, subtrahend: &Rights<'_>) -> Rights<'a> {
     }
 }
 
-/// 宣言どうしの組み合わせの対を全部（モジュールdocの限界のとおり、ドメインの宣言だけを見る）。
+/// 組み合わせの対を全部。書く側は各ドメインの`read_write`宣言と、宣言の外で書ける場所
+/// （[`GraphInput::caller_writable_roots`]。**入口のドメイン**が書く。P5.4a）。読む側はドメインの宣言だけを見る
+/// （モジュールdocの限界）。
 fn combination_pairs<F>(input: &GraphInput<'_>, net_capable: &F) -> BTreeSet<CombinationPair>
 where
     F: Fn(&DomainView<'_>) -> bool,
 {
-    let mut pairs = BTreeSet::new();
+    // (書く側のドメイン, 見せる綴り, 重なりを見る綴り)。宣言はそのまま、根は配下全部を書ける場所として
+    // `**`を付けて見る（規則(i)の`caller_writable_roots`が根を配下ごとに数えるのと揃える）。
+    let mut writes: Vec<(&str, &str, String)> = Vec::new();
     for writer in &input.domains {
-        for (writer_place, _) in writer
-            .fs
-            .iter()
-            .filter(|(_, access)| *access == FsAccess::ReadWrite)
-        {
-            for reader in &input.domains {
-                if reader.name == writer.name || !net_capable(reader) {
+        for (place, access) in &writer.fs {
+            if *access == FsAccess::ReadWrite {
+                writes.push((writer.name, place, place.to_string()));
+            }
+        }
+    }
+    for root in &input.caller_writable_roots {
+        let span = format!("{}/**", root.trim_end_matches(['/', '\\']));
+        writes.push((ENTRY_DOMAIN, root, span));
+    }
+
+    let mut pairs = BTreeSet::new();
+    for (writer, writer_place, span) in &writes {
+        for reader in &input.domains {
+            if reader.name == *writer || !net_capable(reader) {
+                continue;
+            }
+            for (reader_place, access) in &reader.fs {
+                if !places_overlap(span, reader_place) {
                     continue;
                 }
-                for (reader_place, access) in &reader.fs {
-                    if !places_overlap(writer_place, reader_place) {
-                        continue;
-                    }
-                    pairs.insert(CombinationPair {
-                        writer: writer.name.to_string(),
-                        writer_place: writer_place.to_string(),
-                        reader: reader.name.to_string(),
-                        reader_place: reader_place.to_string(),
-                        use_: match access {
-                            FsAccess::ReadExec => PairUse::Execute,
-                            FsAccess::Read | FsAccess::ReadWrite => PairUse::Read,
-                        },
-                    });
-                }
+                pairs.insert(CombinationPair {
+                    writer: writer.to_string(),
+                    writer_place: writer_place.to_string(),
+                    reader: reader.name.to_string(),
+                    reader_place: reader_place.to_string(),
+                    use_: match access {
+                        FsAccess::ReadExec => PairUse::Execute,
+                        FsAccess::Read | FsAccess::ReadWrite => PairUse::Read,
+                    },
+                });
             }
         }
     }

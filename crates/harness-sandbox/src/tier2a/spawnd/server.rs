@@ -843,8 +843,8 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
         super::CallerHandles::default()
     };
 
-    // **固定辺なら、固定したファイルを呼び出し元が書き換えられないかをOSに聞く**
-    // （`plans/DESIGN-MAC.md` §19.1）。読み込み時の検査は綴りで比べるので、8.3形式の短い名前・
+    // **Strict の辺なら、固定したファイルを呼び出し元が書き換えられないかをOSに聞く**（P5.4a で鍵を印へ。
+    // 決定66の追記・`plans/DESIGN-MAC.md` §19.1）。読み込み時の検査は綴りで比べるので、8.3形式の短い名前・
     // リンク・ハードリンクを挟むと見逃す。ここは実体のアクセス制御リストを**呼び出し元のトークン**で
     // 評価するので、どの名前で書かれていても同じ答えになる（`fixed_inputs`のモジュールdoc）。
     //
@@ -861,7 +861,7 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
             &command_line,
         ) {
             eprintln!(
-                "[spawnd] refused a fixed transition for pid {}: {reason}",
+                "[spawnd] refused a strict transition for pid {}: {reason}",
                 caller.pid
             );
             return Served::denied(DenyReason::FixedInputWritable, from_domain, command_line);
@@ -2112,10 +2112,13 @@ mod hello_graph_tests {
     use super::*;
 
     /// ワークスペースの外にあるプログラムを、引数と作業ディレクトリごと固定した辺を1本持つ宣言。
+    ///
+    /// [P5.4a] 遷移先に Strict の印を付ける——固定値の書込可否は Strict のドメインへ入る辺にだけ掛かる
+    /// （決定66の追記）。かつての同じドメインへの自己ループでは、今は何も検査されない。
     fn fixed_edge_policy() -> harness_policy::policy_file::PolicyFile {
         serde_json::from_str(
             r#"{
-              "schema_version": 2,
+              "schema_version": 3,
               "domains": [
                 {
                   "name": "shell",
@@ -2125,11 +2128,12 @@ mod hello_graph_tests {
                         "exe":  { "literal": "C:\\tools\\gen.exe" },
                         "argv": { "literal": "\"C:\\tools\\gen.exe\" --check" },
                         "cwd":  "C:\\ws",
-                        "to":   "shell"
+                        "to":   "sealed"
                       }
                     ]
                   }
-                }
+                },
+                { "name": "sealed", "strict": true }
               ]
             }"#,
         )
