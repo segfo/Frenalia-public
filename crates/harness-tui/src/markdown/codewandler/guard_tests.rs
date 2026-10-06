@@ -5,7 +5,7 @@
 
 use super::super::render::{render_lines, Theme};
 use super::super::wrap_tests::plain;
-use super::Guard;
+use super::{defused, Guard, GUARD_MISSES};
 
 /// `text`を1行ずつ[`Guard`]に通した結果。
 fn through(text: &str) -> String {
@@ -81,4 +81,21 @@ fn a_line_that_would_not_crash_the_parser_is_left_alone() {
 fn lines_after_a_closed_fence_are_guarded_again() {
     let text = "```\n|:|\n```\n| a |\n|:|\n";
     assert_eq!(through(text), "```\n|:|\n```\n| a |\n|\\:|\n");
+}
+
+/// **見張り**: 書き換えの部品がフェンスの中と見て、解析器はフェンスと見ない行の後ろは、今も書き換えずに解析器が落ちる
+/// （[`GUARD_MISSES`]。`guard.rs`のモジュールdocの限界）。この試験が赤くなったら（どれかが落ちなくなったら）、
+/// 書き換えか解析器が変わったので、限界の記述と[`GUARD_MISSES`]を直す。
+///
+/// 落ちたときにその返答を原文のまま描くことは`super::super::fallback_tests`が確かめる。
+#[test]
+fn the_guard_still_misses_fences_that_the_parser_does_not_see() {
+    for text in GUARD_MISSES {
+        let out = defused(text);
+        assert_eq!(out, text, "書き換えた（試験の前提が崩れた）: {text:?}");
+        assert!(
+            std::panic::catch_unwind(|| markdown_stream::parse_gfm(&out)).is_err(),
+            "書き換えが届かない形で、解析器が落ちなくなった（この試験のdoc）: {text:?}"
+        );
+    }
 }

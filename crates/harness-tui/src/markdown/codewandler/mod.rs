@@ -135,6 +135,9 @@ mod equivalence_tests;
 #[path = "fallback_tests.rs"]
 mod fallback_tests;
 #[cfg(test)]
+#[path = "fuzz_tests.rs"]
+mod fuzz_tests;
+#[cfg(test)]
 #[path = "link_tests.rs"]
 mod link_tests;
 #[cfg(test)]

@@ -12,13 +12,14 @@
 //! （[`contained_at_the_last_bomb`]）。範囲の外で落ちると、製品ではpanicのフックが端末を戻してしまい、受け止めても
 //! TUIの画面は壊れる——Adapterが`catch_unwind`を直接使っていないことを、これで確かめる。
 
-use std::cell::Cell;
-use std::sync::{Arc, Mutex};
+use std::cell::{Cell, RefCell};
+use std::sync::Once;
 
 use ratatui::style::Modifier;
 
 use super::super::contract_tests::{port_contract_with, SAMPLE};
 use super::super::plain::PlainText;
+use super::guard::GUARD_MISSES;
 use super::*;
 
 /// 解析する文章にあると、解析の入口で落ちる文字列（モジュールdoc）。
@@ -130,13 +131,39 @@ fn the_port_contract_holds_for_text_that_makes_the_adapter_fall_back() {
     }
 }
 
-/// 書かれたログを集める書き先（`tracing_subscriber`の`MakeWriter`）。
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
+/// **爆弾ではなく本物の解析器が落ちても、その返答は原文のまま描かれる**（書き換えが届かない形`GUARD_MISSES`。
+/// 落ちるのは、流れ込む途中の描画か、終えたときの全文の解析——確定の境界で書き換えの部品の数え方が切り替わるので、
+/// 流入中には落ちない形もある）。どちらで落ちても、終えた後は原文のまま描く。
+#[test]
+fn a_real_parser_panic_falls_back_to_plain_text_too() {
+    for text in GUARD_MISSES {
+        let mut m = fed(text);
+        let streaming = m.render(80);
+        assert!(
+            !m.has_fallen_back() || streaming == plain(text, 80),
+            "流入中に落ちたのに原文のまま描いていない: {text:?}"
+        );
+        m.finish();
+        assert_eq!(m.render(80), plain(text, 80), "{text:?}");
+        assert!(
+            m.has_fallen_back(),
+            "落ちていない（試験の前提が崩れた）: {text:?}"
+        );
+    }
+}
 
-impl std::io::Write for Captured {
+thread_local! {
+    /// このスレッドで書かれたログ（[`ThreadLogs`]）。
+    static LOG: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// ログを、書いたスレッドの[`LOG`]へ集める書き先（`tracing_subscriber`の`MakeWriter`）。試験は並んで走るので、
+/// 自分のスレッドで書かれた分だけを読む。
+struct ThreadLogs;
+
+impl std::io::Write for ThreadLogs {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("lock").extend_from_slice(buf);
+        LOG.with(|log| log.borrow_mut().extend_from_slice(buf));
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -144,33 +171,50 @@ impl std::io::Write for Captured {
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-    type Writer = Captured;
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLogs {
+    type Writer = ThreadLogs;
     fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
+        ThreadLogs
     }
+}
+
+/// このスレッドで書かれるログを集め始める（集めたものは空にする）。
+///
+/// 聞き手はプロセス全体に1つ置く（試験のバイナリで1回だけ。警告より細かいものは捨てる）。スレッドだけの聞き手
+/// （`with_default`）だと、ログを書く場所が「聞き手はいない」と覚える瞬間が別のスレッドの初めての通過と重なり、
+/// ときどき1件も集まらなかった（並べて回して20回に1回ほど）。プロセス全体の聞き手なら、どのスレッドから見ても
+/// 聞き手がいる。
+fn collect_logs_on_this_thread() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(ThreadLogs)
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("この試験のバイナリでは、ほかに聞き手を置かない");
+    });
+    tracing::callsite::rebuild_interest_cache();
+    LOG.with(|log| log.borrow_mut().clear());
+}
+
+/// このスレッドで集めたログ。
+fn collected_logs() -> String {
+    LOG.with(|log| String::from_utf8_lossy(&log.borrow()).into_owned())
 }
 
 /// **落ちたことは黙らない**——ログ（会話TUIではログファイル）へ、落ちたときの文面と一緒に警告を1回書く。
 /// 落ちた後に描き直しても、もう書かない（描くたびに書かない）。
 #[test]
 fn falling_back_is_logged_once_as_a_warning_with_the_panic_message() {
-    let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(captured.clone())
-        .with_ansi(false)
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        // ログを書く場所（`fall_back`の`warn!`）が「誰も聞いていない」と覚えた後かもしれない——並んで走る別の試験が、
-        // 聞き手の無いスレッドで先に通ることがある。聞き手を置いた後に覚え直させる（置かないと、ときどき0件になる）。
-        tracing::callsite::rebuild_interest_cache();
-        let mut m = fed(&format!("{PARSER_BOMB}\n"));
-        m.render(80);
-        m.render(40);
-        m.finish();
-        m.render(80);
-    });
-    let log = String::from_utf8(captured.0.lock().expect("lock").clone()).expect("utf-8");
+    collect_logs_on_this_thread();
+    let mut m = fed(&format!("{PARSER_BOMB}\n"));
+    m.render(80);
+    m.render(40);
+    m.finish();
+    m.render(80);
+    let log = collected_logs();
     let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
     assert_eq!(warnings.len(), 1, "{log}");
     assert!(
