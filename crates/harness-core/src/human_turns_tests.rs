@@ -53,7 +53,10 @@ fn the_two_checks_differ_only_on_the_fold_summary() {
         (
             Message {
                 role: Role::User,
-                content: vec![ContentBlock::Text("a".into()), ContentBlock::Text("b".into())],
+                content: vec![
+                    ContentBlock::Text("a".into()),
+                    ContentBlock::Text("b".into()),
+                ],
             },
             false,
             false,
