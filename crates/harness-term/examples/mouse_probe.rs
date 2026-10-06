@@ -6,10 +6,15 @@
 //! - (a) ボタンを押さずにマウスを動かした事象（`MouseEventKind::Moved`）が届くか——リンクのホバーに要る
 //! - (b) マウスの事象に Ctrl が載るか（Ctrl を押しながらの左クリック）——リンクを開く操作に要る
 //!
-//! 使い方: `cargo run -p harness-term --example mouse_probe`。`q` か `Esc` で終わり、終わった後の画面に集計を出す
-//! （その数行を貼ってもらえば記録できる）。製品のコードからは使わない。
+//! 使い方: `cargo run -p harness-term --example mouse_probe -- <名前>`（名前は測った端末とシェル。例: `conhost-cmd`・
+//! `wt-pwsh`・`vscode-pwsh`。省略してよい）。`q` か `Esc` で終わり、終わった後の画面に集計を出し、同じ集計を
+//! ワークスペースの [`LOG`]（`target/_logs/mouse_probe.log`。gitの管理外）へ追記する——画面に出しただけでは
+//! 測った人が貼らない限り読めないため。製品のコードからは使わない。
 
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
@@ -32,7 +37,16 @@ struct Tally {
 /// 画面に残す直近の事象の数。
 const RECENT: usize = 15;
 
+/// 集計を追記するファイル（ワークスペースの`target/`の下。どのディレクトリから動かしても同じ場所）。
+const LOG: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/_logs/mouse_probe.log"
+);
+
 fn main() -> io::Result<()> {
+    let label = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "(名前なし)".to_string());
     let mut tally = Tally::default();
     let mut recent: Vec<String> = Vec::new();
     {
@@ -73,9 +87,33 @@ fn main() -> io::Result<()> {
             }
         }
     }
-    // 端末を返した後の普通の画面に出す（コピーして貼れるように）。
-    for line in summary(&tally) {
+    // 端末を返した後の普通の画面に出し、同じものをファイルへ追記する。
+    let lines = summary(&tally);
+    for line in &lines {
         println!("{line}");
+    }
+    match append_log(&label, &lines) {
+        Ok(()) => println!("集計を {} へ追記しました（名前: {label}）", LOG),
+        // 書けなかったことは黙らせない（画面の集計は上に出ている）。
+        Err(err) => println!("集計をファイルへ書けませんでした: {err}（{LOG}）"),
+    }
+    Ok(())
+}
+
+/// 集計を[`LOG`]の末尾へ足す。1回分は「区切りの行・測った時刻（UNIX秒）・名前・集計」。
+fn append_log(label: &str, lines: &[String]) -> io::Result<()> {
+    let path = Path::new(LOG);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    writeln!(file, "---- {unix} {label}")?;
+    for line in lines {
+        writeln!(file, "{line}")?;
     }
     Ok(())
 }
