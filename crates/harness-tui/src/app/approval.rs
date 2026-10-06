@@ -138,7 +138,7 @@ pub enum LineStyle {
     Dim,
     /// 注意（確かめられない・恒久承認できない・写しが壊れている）。
     Warn,
-    /// 外の判定モデルが危険と見たコマンド（`harness_core::RiskLevel::Danger`）。画面は赤の太字で描く。
+    /// 危険度「高」の行（`harness_engine::approval_risk::Severity::High`。機械の判定でも判定モデルでも）。赤の太字で描く。
     Danger,
     /// 差分の追加行・削除行。
     Added,
