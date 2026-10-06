@@ -37,7 +37,7 @@ fn control_request_hello_keeps_its_wire_shape() {
     // （P5.3、Strict の印）に 2 → 3。Daemon はこの値を見ずにグラフを組むので、欄の形は変わっていない。
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":9,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"]}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":10,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"]}"#
     );
 }
 
@@ -173,7 +173,7 @@ fn control_responses_keep_their_wire_shape() {
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":9}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":10}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {

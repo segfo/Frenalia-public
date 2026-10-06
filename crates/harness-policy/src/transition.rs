@@ -71,10 +71,12 @@ pub struct TransitionEdge {
     pub cwd: Option<String>,
     /// 遷移先ドメイン名。
     pub to: String,
-    /// 環境変数の**差分**（§19.1）。既定値はセッションのbase envで、ここには差分だけ書く。
+    /// 環境変数の**差分**（決定66(5)と追記）。**何に当てるかは辺ではなく Strict の印で決まる**
+    /// （[`EnvPolicy`]。普通の辺は呼び出し元の環境変数へ、Strict の辺は harness の基準の値へ）。
     ///
-    /// **呼び出し元のenvを通す指定は書けない。** 名前単位の素通し一覧を作ると、
-    /// §19.1が塞いだ穴が名前ごとに開き直る。
+    /// **呼び出し元のenvを名前単位で通す／止める指定は書けない。** 名前の一覧を宣言に持たせると、
+    /// 普通の辺では無意味（既に全部通る）で、Strict の辺では「この名前だけ呼び出し元から通す」という穴が
+    /// 名前ごとに開く。通したい値があるなら、辺の`set`で**ポリシーが決めた値**を書く。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<EnvOverride>,
     /// 子の出力（標準出力・標準エラー）を呼び出し元へ返すか（決定66(4)。**辺ごとに決める・既定は返す**）。
@@ -180,7 +182,7 @@ impl EnvOverride {
 /// 両方これを呼ぶ——写すと、片方だけ`cwd`を書き始めたときに「同じ位置の辺なのに経路で形が違う」が起きる。
 /// `cwd`を書かない理由は、観測に作業ディレクトリが無く、拒否側の作業ディレクトリは「ここでしか起こしては
 /// いけない」という意思ではないためである（意思でないものを宣言へ書くと、別の場所から走らせたときに
-/// 理由の分からない拒否になる）。環境変数の差分も書かない（既定はセッションのbase env、§19.1）。
+/// 理由の分からない拒否になる）。環境変数の差分も書かない（普通の辺では呼び出し元の環境変数がそのまま届く。決定66(5)）。
 pub fn editor_edge(exe: &str, argv: ArgvMatcher, to: &str) -> TransitionEdge {
     TransitionEdge {
         exe: ExeMatcher::Literal(exe.to_string()),
@@ -323,16 +325,24 @@ pub enum Direction {
     WiderOrUnknown,
 }
 
-/// Daemonが子へ渡すenvの決め方（§19.1の表）。
+/// Daemonが子へ渡すenvの決め方（決定66(5)と追記。P5.4c で鍵を**引数の種類から Strict の印へ**付け替えた）。
+///
+/// # どちらになるかは Strict の印だけで決まる
+///
+/// P5.4b までは`argv: any`の辺が「呼び出し元のenvをそのまま（辺の差分は効かない）」・それ以外が「差分を当てる」で、
+/// **同じ普通の辺が引数の書き方で2つに割れていた**（決定66(5)が直すと言った不整合。規則(f)はその不整合を
+/// 「無言で効かない」ようにしないための検査だったので、一緒に消えた）。
+///
+/// どちらのモードでも**harnessが所有する名前は系統の値で強制される**（`spawnd::nested_inputs::env_for_nested`）
+/// ——窓口のパイプ名・Redirectorの設定は、宣言からも呼び出し元からも差し替えられない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvPolicy {
-    /// 呼び出し元のenvをそのまま通す（`argv: any`かつ狭める／同値の辺だけ）。
-    PassThrough,
-    /// セッションのbase envへ、この辺の差分を当てたものを渡す。
-    ///
-    /// **呼び出し元のenvは1つも載らない。** 差分が空でも意味は変わらない
-    /// （「base envそのもの」である）。
-    Fixed(EnvOverride),
+    /// **普通の辺**: 呼び出し元の環境変数＋この辺の差分（決定66(5)）。差分が空なら呼び出し元のそのままである。
+    CallerPlusDiff(EnvOverride),
+    /// **Strict の辺**: harness の基準の値（系統のbase env）＋この辺の差分。**呼び出し元のenvは1つも載らない**
+    /// （決定66の追記）。引数を固定しても環境変数で振る舞いを変えられる実行ファイルは多いので、
+    /// Strict のドメインでは呼び出し元に操作の中身を選ばせない。差分が空でも意味は変わらない（基準そのもの）。
+    BaselinePlusDiff(EnvOverride),
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +532,9 @@ impl TransitionGraph {
             let mut edges = Vec::with_capacity(view.process.transitions.len());
             for edge in &view.process.transitions {
                 let direction = facts.direction(view.name, &edge.to);
+                // 印の判定は`is_strict_edge`の1か所（`B-13`）。環境変数・標準入力・起こす直前の検査が
+                // この1つの値から決まる（決定66の追記）。
+                let strict = facts.is_strict_edge(view.name, edge);
                 edges.push(CompiledEdge {
                     // `compile_matcher`は検査が通った後にしか呼ばれないので、
                     // ここでの失敗は起こり得ない（起きたら検査とコンパイルがずれている）。
@@ -529,12 +542,12 @@ impl TransitionGraph {
                     argv: compile_argv(&edge.argv).expect("checked above"),
                     cwd: edge.cwd.as_ref().map(|c| fold_for_pattern_comparison(c)),
                     to: edge.to.clone(),
-                    env: env_policy(edge),
+                    env: env_policy(strict, edge),
                     direction,
                     // 標準入出力の扱いは向きでは決めない（決定66(3)(4)）。出力は辺の設定、標準入力と
-                    // 起こす直前の検査は Strict の辺かどうか（印の判定は`is_strict_edge`の1か所、B-13）。
+                    // 起こす直前の検査は Strict の辺かどうか。
                     output: edge.output,
-                    strict: facts.is_strict_edge(view.name, edge),
+                    strict,
                 });
             }
             domains.insert(view.name.to_string(), CompiledDomain { edges });
@@ -870,14 +883,14 @@ fn is_fully_fixed(edge: &TransitionEdge) -> bool {
 }
 
 /// この辺でDaemonが子へ渡すenvの決め方（§19.1の表）。
-fn env_policy(edge: &TransitionEdge) -> EnvPolicy {
-    // argvを選択子に使う辺では、向きを問わずenvもポリシー側の値にする——argvだけ照合して
-    // envを通すと、同じargvのまま別のコードが走る（`PYTHONSTARTUP`等）。
-    match edge.argv {
-        ArgvMatcher::Any(_) => EnvPolicy::PassThrough,
-        ArgvMatcher::Literal(_) | ArgvMatcher::Pattern(_) => {
-            EnvPolicy::Fixed(edge.env.clone().unwrap_or_default())
-        }
+fn env_policy(strict: bool, edge: &TransitionEdge) -> EnvPolicy {
+    // 鍵は Strict の印だけ（決定66(5)と追記。P5.4c）。引数の種類では分けない——分けていたのが
+    // 「引数を絞らない辺では差分が効かない」不整合の正体だった。
+    let diff = edge.env.clone().unwrap_or_default();
+    if strict {
+        EnvPolicy::BaselinePlusDiff(diff)
+    } else {
+        EnvPolicy::CallerPlusDiff(diff)
     }
 }
 

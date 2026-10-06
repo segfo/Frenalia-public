@@ -59,10 +59,10 @@ pub(super) fn force_request_pipe(env: &mut Vec<(String, String)>, request_pipe: 
     env.push((super::REQUEST_PIPE_ENV.to_string(), request_pipe.to_string()));
 }
 
-/// 辺のenv方針を呼び出し元の申告へ当て、**harnessが所有する名前だけを系統の値で強制する**
-/// （§19.1の表と、2026-09-17の決定3）。
+/// 辺のenv方針（[`EnvPolicy`]）どおりに子へ渡す環境変数を組む
+/// （決定66(5)と追記の表、2026-09-17の決定3）。**どちらのモードでも harness 所有の名前は系統の値で強制する。**
 ///
-/// # 呼び出し元の申告を使うようになった理由（段階6f-1）
+/// # 呼び出し元の申告を使うようになった理由（段階6f-1。普通の辺がこれである）
 ///
 /// 段階6bは系統のbase env（harnessが組んだトップレベルの環境）に固定していた。
 /// §10.1.2が「envの欄を置いてもいけない」と書いていたためだが、**それが守りたかったのは
@@ -109,27 +109,28 @@ pub(super) fn env_for_nested(
     policy: &harness_policy::transition::EnvPolicy,
 ) -> Vec<(String, String)> {
     use harness_policy::transition::EnvPolicy;
-    // **申告が無いときは系統の基準env**（段階6bと同じ）。`Some(空)`とは別物である
-    // ——混ぜると`SystemRoot`の無い環境ブロックになり、`CreateProcessW`が
-    // `ERROR_ENVVAR_NOT_FOUND`で落ちる（[`SpawnRequest::Spawn::env`]のdoc）。
-    let caller_env = caller_env.unwrap_or(base_env);
-    let mut env: Vec<(String, String)> = match policy {
-        EnvPolicy::PassThrough => caller_env.to_vec(),
-        EnvPolicy::Fixed(over) => {
-            let mut env: Vec<(String, String)> = caller_env
-                .iter()
-                .filter(|(name, _)| {
-                    !over.unset.iter().any(|u| u.eq_ignore_ascii_case(name))
-                        && !over.set.keys().any(|s| s.eq_ignore_ascii_case(name))
-                })
-                .cloned()
-                .collect();
-            for (name, value) in &over.set {
-                env.push((name.clone(), value.clone()));
-            }
-            env
-        }
+    // [P5.4c] **出発点だけが2つに分かれる**（決定66(5)と追記）。差分の当て方は1つで、どちらも同じ行を通る。
+    //
+    // - 普通の辺（[`EnvPolicy::CallerPlusDiff`]）: 呼び出し元の申告。**申告が無いときは系統の基準env**
+    //   （段階6bと同じ）。`Some(空)`とは別物である——混ぜると`SystemRoot`の無い環境ブロックになり、
+    //   `CreateProcessW`が`ERROR_ENVVAR_NOT_FOUND`で落ちる（[`SpawnRequest::Spawn::env`]のdoc）
+    // - Strict の辺（[`EnvPolicy::BaselinePlusDiff`]）: **系統の基準envだけ**。申告は読まない
+    //   ——引数を固定しても環境変数で振る舞いを変えられるので、呼び出し元に操作の中身を選ばせない
+    let (start, over) = match policy {
+        EnvPolicy::CallerPlusDiff(over) => (caller_env.unwrap_or(base_env), over),
+        EnvPolicy::BaselinePlusDiff(over) => (base_env, over),
     };
+    let mut env: Vec<(String, String)> = start
+        .iter()
+        .filter(|(name, _)| {
+            !over.unset.iter().any(|u| u.eq_ignore_ascii_case(name))
+                && !over.set.keys().any(|s| s.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .collect();
+    for (name, value) in &over.set {
+        env.push((name.clone(), value.clone()));
+    }
 
     // harnessが所有する名前を、申告から**全部落とす**。辺の`set`で書かれていても落とす
     // ——`policy.json`は人が書くものだが、窓口の名前を宣言で差し替えられる形にはしない。

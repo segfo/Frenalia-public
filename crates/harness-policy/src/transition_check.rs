@@ -23,8 +23,8 @@ use harness_change_ledger::path_rules::fold_for_pattern_comparison;
 use harness_config::FsAccess;
 
 use super::{
-    build_anchored, env_policy, is_fully_fixed, path_covered_by, ArgvMatcher, Direction,
-    DomainView, EnvPolicy, ExeMatcher, GraphFacts, Rejection, TransitionEdge, MAX_DOMAIN_NAME_LEN,
+    build_anchored, is_fully_fixed, path_covered_by, ArgvMatcher, Direction, DomainView,
+    ExeMatcher, GraphFacts, Rejection, TransitionEdge, MAX_DOMAIN_NAME_LEN,
 };
 
 impl GraphFacts<'_> {
@@ -139,16 +139,6 @@ impl GraphFacts<'_> {
                     ));
                 }
             }
-        }
-
-        // (f) 呼び出し元のenvを通す辺にenv差分を書いても効かない。
-        if edge.env.is_some() && env_policy(edge) == EnvPolicy::PassThrough {
-            reasons.push(
-                "this edge passes the caller's environment through (argv is `any` and the \
-                 transition does not widen), so the declared env diff would never be applied. \
-                 Declare a literal argv if the environment must be fixed."
-                    .to_string(),
-            );
         }
 
         // (i) 固定値が指すファイルは、呼び出し元から書けない場所にあること（§19.1）。**Strict の辺だけに掛ける**

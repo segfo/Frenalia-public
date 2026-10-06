@@ -740,58 +740,79 @@ fn the_output_setting_is_written_only_when_discarding_and_in_one_spelling() {
 // 4. argvの粒度とenvの扱い
 // ---------------------------------------------------------------------------
 
+/// [P5.4c] **環境変数の決め方は、引数の種類ではなく Strict の印で分かれる**（決定66(5)と追記）。
+///
+/// 普通の辺は**引数の種類に関わらず**「呼び出し元の環境変数＋辺の差分」（[`EnvPolicy::CallerPlusDiff`]）で、
+/// Strict の辺だけが「harness の基準の値＋辺の差分」（[`EnvPolicy::BaselinePlusDiff`]）になる。
+/// P5.4b までは`argv: any`の辺が「呼び出し元のまま（差分は効かない）」・それ以外が「基準＋差分」で、
+/// **同じ普通の辺が引数の書き方で2つに割れていた**（決定66(5)が直すと言った不整合）。
+///
+/// 3つの辺を1本で見る（引数が任意の普通の辺・引数を固定した普通の辺・Strict の辺）——印だけが鍵であることは、
+/// **引数の書き方が同じで印だけ違う2本**（2つめと3つめ）が別の答えを返すことで示す。
 #[test]
-fn an_any_argv_edge_passes_the_environment_through_and_a_literal_one_fixes_it() {
+fn the_environment_is_keyed_by_the_strict_mark_not_by_the_kind_of_argv() {
+    let diff = || {
+        Some(EnvOverride {
+            set: BTreeMap::from([("GIT_PAGER".to_string(), "cat".to_string())]),
+            unset: Vec::new(),
+        })
+    };
+    let fixed_edge = |exe: &str, to: &str| TransitionEdge {
+        exe: literal_exe(exe),
+        argv: literal_argv(&format!(r#""{exe}" --run"#)),
+        cwd: Some(r"C:\ws".to_string()),
+        to: to.to_string(),
+        env: diff(),
+        output: ChildOutput::Return,
+    };
     let declared = Declared::new()
         .domain(
             "shell",
             rules(vec![
-                edge(literal_exe(r"C:\x\git.exe"), any_argv(), "shell"),
                 TransitionEdge {
-                    exe: literal_exe(r"C:\python\python.exe"),
-                    argv: literal_argv(r#""C:\python\python.exe" C:\ws\a.py"#),
-                    cwd: Some(r"C:\ws".to_string()),
-                    to: "shell".to_string(),
-                    env: None,
-                    output: ChildOutput::Return,
+                    env: diff(),
+                    ..edge(literal_exe(r"C:\x\git.exe"), any_argv(), "shell")
                 },
+                fixed_edge(r"C:\tools\fmt.exe", "plain"),
+                fixed_edge(r"C:\tools\sign.exe", "signer"),
             ]),
         )
-        .domain("py-a", rules(vec![]));
+        .domain("plain", rules(vec![]))
+        .domain("signer", rules(vec![]))
+        .mark_strict("signer");
     let input = declared.input();
     let graph = TransitionGraph::build(&input).expect("valid declaration");
-
-    let Resolution::Allowed(passed) = graph.resolve(SpawnAttempt {
-        from_domain: "shell",
-        exe: r"C:\x\git.exe",
-        command_line: "git status",
-        cwd: r"C:\ws",
-    }) else {
-        panic!("the any-argv edge should resolve");
+    let env_of = |exe: &str, command_line: &str| {
+        let Resolution::Allowed(allowed) = graph.resolve(SpawnAttempt {
+            from_domain: "shell",
+            exe,
+            command_line,
+            cwd: r"C:\ws",
+        }) else {
+            panic!("the edge {exe} should resolve");
+        };
+        allowed.env.clone()
     };
-    assert_eq!(passed.env, &EnvPolicy::PassThrough);
-    assert!(
-        !passed.strict,
-        "an any-argv edge fixes nothing, so the daemon has no fixed file to check"
-    );
-
-    let Resolution::Allowed(fixed) = graph.resolve(SpawnAttempt {
-        from_domain: "shell",
-        exe: r"C:\python\python.exe",
-        command_line: r#""C:\python\python.exe" C:\ws\a.py"#,
-        cwd: r"C:\ws",
-    }) else {
-        panic!("the literal edge should resolve");
+    let expected_diff = EnvOverride {
+        set: BTreeMap::from([("GIT_PAGER".to_string(), "cat".to_string())]),
+        unset: Vec::new(),
     };
-    assert!(
-        matches!(fixed.env, EnvPolicy::Fixed(_)),
-        "an argv-selector edge must not pass the caller's environment through"
+
+    assert_eq!(
+        env_of(r"C:\x\git.exe", "git status"),
+        EnvPolicy::CallerPlusDiff(expected_diff.clone()),
+        "an any-argv ordinary edge keeps the caller's environment and the declared diff applies \
+         (until P5.4c the diff was silently dropped here)"
     );
-    // 固定した形でも、自己ループは Strict の辺ではない（P5.4a/b）——Daemon は固定したファイルを検査せず、
-    // 標準入力も断たない（[`only_an_edge_into_a_strict_domain_asks_the_daemon_to_check_its_fixed_files`]）。
-    assert!(
-        !fixed.strict,
-        "a fixed self-loop is not a strict edge, so stdin is handed over like any ordinary edge"
+    assert_eq!(
+        env_of(r"C:\tools\fmt.exe", r#""C:\tools\fmt.exe" --run"#),
+        EnvPolicy::CallerPlusDiff(expected_diff.clone()),
+        "a fixed-argv edge into a domain without the strict mark is still the ordinary mode"
+    );
+    assert_eq!(
+        env_of(r"C:\tools\sign.exe", r#""C:\tools\sign.exe" --run"#),
+        EnvPolicy::BaselinePlusDiff(expected_diff),
+        "an edge entering a strict domain must not carry the caller's environment"
     );
 }
 
@@ -873,9 +894,13 @@ fn fixed_file_paths_are_the_image_and_absolute_arguments_as_written() {
     );
 }
 
-/// 呼び出し元のenvを通す辺にenv差分を書いても効かない。**無言で効かない**のが最悪なので落とす。
+/// [P5.4c] **どの辺でも env の差分が効くので、引数が任意の辺に差分を書いても落とさない**（規則(f)を削除。決定66(5)）。
+///
+/// かつてこの形は「無言で効かない」ことを避けるために拒否していた。P5.4c で**普通の辺は引数の種類に関わらず
+/// 呼び出し元の環境変数＋差分**になったので、差分は効く——落とす理由そのものが消えた
+/// （[`the_environment_is_keyed_by_the_strict_mark_not_by_the_kind_of_argv`]が効くことの側を固定する）。
 #[test]
-fn an_env_diff_on_a_pass_through_edge_is_rejected_instead_of_silently_ignored() {
+fn an_env_diff_on_an_any_argv_edge_is_accepted_because_it_now_applies() {
     let declared = Declared::new().domain(
         "shell",
         rules(vec![TransitionEdge {
@@ -890,7 +915,7 @@ fn an_env_diff_on_a_pass_through_edge_is_rejected_instead_of_silently_ignored() 
             output: ChildOutput::Return,
         }]),
     );
-    assert_rejects(&declared.input(), "would never be applied");
+    assert_accepts(&declared.input());
 }
 
 // ---------------------------------------------------------------------------

@@ -49,7 +49,7 @@ fn value_of<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
 /// 「孫が作れない」という判定とは無関係な形で出る。
 #[test]
 fn pass_through_hands_the_callers_own_environment_to_the_child() {
-    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, "FOO"),
@@ -79,7 +79,7 @@ fn pass_through_hands_the_callers_own_environment_to_the_child() {
 /// 「宣言は合っているのに起きない」で、**宣言の側をいくら直しても直らない**。
 #[test]
 fn an_unstated_environment_falls_back_to_the_lineage_but_an_empty_one_does_not() {
-    let unstated = env_for_nested(&base(), None, &EnvPolicy::PassThrough);
+    let unstated = env_for_nested(&base(), None, &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
     assert_eq!(
         value_of(&unstated, "PATH"),
         Some("C:/w/bin"),
@@ -87,7 +87,7 @@ fn an_unstated_environment_falls_back_to_the_lineage_but_an_empty_one_does_not()
          **`SystemRoot`の無い環境ブロックで子を起こすことになる**: {unstated:?}"
     );
 
-    let declared_empty = env_for_nested(&base(), Some(&[]), &EnvPolicy::PassThrough);
+    let declared_empty = env_for_nested(&base(), Some(&[]), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
     assert_eq!(
         value_of(&declared_empty, "PATH"),
         None,
@@ -119,7 +119,7 @@ fn a_caller_cannot_redeclare_a_harness_owned_variable() {
         r"C:\attacker\diff".to_string(),
     ));
 
-    let env = env_for_nested(&base(), Some(&claimed), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base(), Some(&claimed), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
@@ -144,7 +144,7 @@ fn the_one_shot_ready_handle_is_not_carried_over_from_the_lineage() {
     let mut base = base();
     base.push((redirector_env::READY_HANDLE.to_string(), "284".to_string()));
 
-    let env = env_for_nested(&base, Some(&caller()), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base, Some(&caller()), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, redirector_env::READY_HANDLE),
@@ -194,7 +194,7 @@ fn the_os_rewritten_names_come_from_the_lineage_not_from_the_caller() {
         r"C:\Users\u\AppData\Local\Packages\pkg\AC".to_string(),
     ));
 
-    let env = env_for_nested(&base, Some(&caller), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base, Some(&caller), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, "TEMP"),
@@ -238,7 +238,7 @@ fn an_os_rewritten_name_absent_from_the_lineage_does_not_survive_from_the_caller
     ));
 
     // 基準envには`TEMP`が無い。
-    let env = env_for_nested(&base(), Some(&caller), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base(), Some(&caller), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, "TEMP"),
@@ -247,18 +247,18 @@ fn an_os_rewritten_name_absent_from_the_lineage_does_not_survive_from_the_caller
     );
 }
 
-/// `Fixed`は**呼び出し元の申告へ**差分を当てる。**`set`は上書き、`unset`は取り除く。**
+/// [P5.4c] **普通の辺は呼び出し元の申告へ差分を当てる**（決定66(5)）。**`set`は上書き、`unset`は取り除く。**
 ///
 /// 対で見る（`B-35`）——`set`だけを測ると、`unset`を無視する実装でも緑になる。
 #[test]
-fn fixed_applies_the_edge_overrides_on_top_of_the_callers_environment() {
+fn an_ordinary_edge_applies_the_edge_overrides_on_top_of_the_callers_environment() {
     let over = EnvOverride {
         set: [("PATH".to_string(), "C:/fixed".to_string())]
             .into_iter()
             .collect(),
         unset: vec!["FOO".to_string()],
     };
-    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::Fixed(over));
+    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::CallerPlusDiff(over));
 
     assert_eq!(
         value_of(&env, "PATH"),
@@ -277,6 +277,82 @@ fn fixed_applies_the_edge_overrides_on_top_of_the_callers_environment() {
     );
 }
 
+/// [P5.4c] **Strict の辺は harness の基準の値＋辺の差分で、呼び出し元の値は1つも通さない**（決定66の追記）。
+///
+/// # 何が守られるのか
+///
+/// Strict のドメインは呼び出し元に自由に使わせたくない権利を持つ。引数を固定しても、環境変数で振る舞いを
+/// 変えられる実行ファイルは多い（`PYTHONSTARTUP`・`GIT_EXTERNAL_DIFF`等）ので、**固定した操作の中身を
+/// 呼び出し元が選べてしまう**。基準の値から組み直すとその経路が閉じる。
+///
+/// **対で見る**（`B-35`）: 同じ入力を普通の辺へ渡すと呼び出し元の値が届く（上の試験と同じ入力）。
+/// 片方だけだと、「常に基準から組む」実装でも「常に呼び出し元から組む」実装でも緑になる。
+#[test]
+fn a_strict_edge_starts_from_the_harness_baseline_not_from_the_caller() {
+    let over = || EnvOverride {
+        set: [("GIT_PAGER".to_string(), "cat".to_string())]
+            .into_iter()
+            .collect(),
+        unset: Vec::new(),
+    };
+    let strict = env_for_nested(
+        &base(),
+        Some(&caller()),
+        &EnvPolicy::BaselinePlusDiff(over()),
+    );
+
+    assert_eq!(
+        value_of(&strict, "FOO"),
+        None,
+        "**呼び出し元がシェルで設定した変数が、Strict の辺の子へ届いている。** 固定した操作の中身を\
+         呼び出し元が環境変数で選べる形である: {strict:?}"
+    );
+    assert_eq!(
+        value_of(&strict, "PATH"),
+        Some("C:/w/bin"),
+        "Strict の辺の`PATH`が系統の基準の値になっていない（呼び出し元の値が通っている）: {strict:?}"
+    );
+    assert_eq!(
+        value_of(&strict, "GIT_PAGER"),
+        Some("cat"),
+        "Strict の辺でも辺の差分は効く（決定66の追記の束の表）: {strict:?}"
+    );
+
+    // 対: 同じ入力の普通の辺では、呼び出し元の値が届く。
+    let ordinary = env_for_nested(&base(), Some(&caller()), &EnvPolicy::CallerPlusDiff(over()));
+    assert_eq!(value_of(&ordinary, "FOO"), Some("set-in-the-shell"));
+    assert_eq!(value_of(&ordinary, "PATH"), Some("C:/caller/bin"));
+    assert_eq!(value_of(&ordinary, "GIT_PAGER"), Some("cat"));
+}
+
+/// [P5.4c] **Strict の辺でも、辺の宣言は`unset`で基準の名前を落とせる**（差分の両側が効く。`B-35`）。
+/// あわせて、harness が所有する名前は**どちらのモードでも**系統の値で強制される
+/// （[`an_edge_declaration_cannot_redirect_the_request_pipe`]の Strict 版）。
+#[test]
+fn a_strict_edge_honours_both_sides_of_the_diff_but_not_the_harness_owned_names() {
+    let over = EnvOverride {
+        set: [(
+            crate::tier2a::spawnd::REQUEST_PIPE_ENV.to_string(),
+            r"\\.\pipe\declared".to_string(),
+        )]
+        .into_iter()
+        .collect(),
+        unset: vec!["PATH".to_string()],
+    };
+    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::BaselinePlusDiff(over));
+
+    assert_eq!(
+        value_of(&env, "PATH"),
+        None,
+        "Strict の辺で宣言した取り除きが効いていない（基準の値が残っている）: {env:?}"
+    );
+    assert_eq!(
+        value_of(&env, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
+        Some(PIPE),
+        "Strict の宣言から窓口の名前を差し替えられている: {env:?}"
+    );
+}
+
 /// **辺の宣言でも、harnessが所有する名前は差し替えられない。**
 ///
 /// `policy.json`は人が書くものだが、**そこから窓口の名前を差し替えられる形にはしない**
@@ -292,7 +368,7 @@ fn an_edge_declaration_cannot_redirect_the_request_pipe() {
         .collect(),
         unset: Vec::new(),
     };
-    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::Fixed(over));
+    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::CallerPlusDiff(over));
 
     assert_eq!(
         value_of(&env, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
@@ -346,7 +422,7 @@ fn overrides_match_environment_variable_names_case_insensitively() {
             .collect(),
         unset: vec!["foo".to_string()],
     };
-    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::Fixed(over));
+    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::CallerPlusDiff(over));
 
     assert_eq!(
         env.iter()
@@ -379,7 +455,7 @@ fn the_redirector_settings_are_not_restored_from_the_lineage() {
         r"C:\cow\s1".to_string(),
     ));
 
-    let env = env_for_nested(&base, Some(&caller()), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base, Some(&caller()), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, redirector_env::EXT_ROOTS),
@@ -433,7 +509,7 @@ fn a_cross_domain_child_gets_no_ext_roots_but_a_self_loop_child_gets_exactly_one
     let top = table.resolve(4200, |_| true).expect("resolve");
 
     let env_for = |plan: &ChildPlan<'_>| {
-        let mut env = env_for_nested(&top.base_env, Some(&caller()), &EnvPolicy::PassThrough);
+        let mut env = env_for_nested(&top.base_env, Some(&caller()), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
         if let Some(spec) = plan.redirector() {
             write_redirector_env(spec, &mut env, HANDLE(0x5678 as *mut _));
         }
