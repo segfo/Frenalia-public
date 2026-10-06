@@ -27,6 +27,7 @@ mod codewandler;
 mod plain;
 
 use harness_term::select::LineJoin;
+use ratatui::style::Style;
 use ratatui::text::Line;
 
 #[cfg(test)]
@@ -60,15 +61,36 @@ pub(crate) trait StreamingMarkdown {
     fn render(&mut self, width: u16) -> Rendered;
 }
 
-/// 描いた結果。行と、行ごとの「前の行の続きか」。
+/// 描いた結果。行と、行ごとの「前の行の続きか」と、リンクの文字が描かれた場所。
 ///
-/// **`lines`と`joins`は同じ長さ**（不変条件）。実装はそう作り、[`MarkdownView::render`]が確かめる。
+/// **`lines`と`joins`は同じ長さで、`links`の区間はどれも指す行の文字の中に収まる**（不変条件）。実装はそう作り、
+/// [`MarkdownView::render`]が確かめる。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Rendered {
     pub lines: Vec<Line<'static>>,
     /// `lines`と同じ長さ。実装が幅に合わせて自分で分けた続きの行は`Continues`（コピーでは元の1行に戻す。
     /// `harness_term::select::LineJoin`）。それ以外は`Break`。
     pub joins: Vec<LineJoin>,
+    /// リンクの文字が描かれた場所とURL（[`LinkSpan`]。行の順、同じ行では左から）。文中にURLを出さない代わりに、
+    /// マウスが指した文字がどのリンクかを引くのに使う（計画書§3。使う側はT11）。整形しない実装は返さない。
+    pub links: Vec<LinkSpan>,
+}
+
+/// リンクの文字が描かれた場所と、そのURL（計画書§1.5の6・§3）。
+///
+/// 場所は`lines[line]`の中の文字（書記素）の半開区間`start..end`。**数え方は範囲選択の位置
+/// （`harness_term::select`の`Pos.offset`）と同じ**——`Line::styled_graphemes`が返す書記素で数え、描かれない
+/// 制御文字は数えない。範囲選択の地図が返す「何行目の何文字目」をそのまま当てて、指した文字がリンクかを引けるように
+/// するため。折り返しをまたぐリンクは、行ごとに1つずつ分かれる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkSpan {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    /// リンク先。**製品で読むところはまだ無い**——吹き出しに出して開くのは計画書のT11で、それまでは試験だけが読む。
+    /// 試験でないビルドの「使われていない」の警告を止める（[`MarkdownView::reset`]と同じ扱い）。T11で読んだら外す。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub url: String,
 }
 
 /// どの実装で描くか。**ここ1か所で決める**（モジュールdoc）。
@@ -118,9 +140,13 @@ impl MarkdownView {
 /// （`harness_term::wrap`のモジュールdoc。行末の全角文字が右の枠線を覆わないよう、右端の1桁を空ける）。
 /// 実装が折り返さないときも同じ幅を渡す。
 ///
-/// 戻す前に`lines`と`joins`の長さを確かめる（[`Rendered`]の不変条件）。デバッグビルドでは食い違いで止まり、
-/// リリースでは足りない印を`Break`で埋め、余る印を捨てる——描画の経路は止めない（`harness_term::select`が
-/// 短い印の並びを`Break`とみなすのと同じ扱い）。
+/// 戻す前に[`Rendered`]の不変条件を確かめる。デバッグビルドでは食い違いで止まり、リリースでは直して渡す——描画の
+/// 経路は止めない。
+///
+/// - `lines`と`joins`の長さ: 足りない印を`Break`で埋め、余る印を捨てる（`harness_term::select`が短い印の並びを
+///   `Break`とみなすのと同じ扱い）
+/// - `links`の区間: 行の文字の中に収まらない区間（[`link_fits`]）を捨てる（使う側が位置から引いたときに、別の文字を
+///   リンクと取り違えないように）
 fn render_in(engine: &mut impl StreamingMarkdown, inner_width: u16) -> Rendered {
     let mut rendered = engine.render(harness_term::wrap::text_width(inner_width));
     debug_assert_eq!(
@@ -129,5 +155,20 @@ fn render_in(engine: &mut impl StreamingMarkdown, inner_width: u16) -> Rendered 
         "Markdownの実装が、行と印の数が違う結果を返した"
     );
     rendered.joins.resize(rendered.lines.len(), LineJoin::Break);
+    let returned = rendered.links.len();
+    let lines = &rendered.lines;
+    rendered.links.retain(|link| link_fits(lines, link));
+    debug_assert_eq!(
+        rendered.links.len(),
+        returned,
+        "Markdownの実装が返したリンクの区間が行の文字の外を指す"
+    );
     rendered
+}
+
+/// `link`の区間が、指す行の文字（`Line::styled_graphemes`で数えた書記素。[`LinkSpan`]）の中に収まり、空でないか。
+fn link_fits(lines: &[Line<'_>], link: &LinkSpan) -> bool {
+    lines.get(link.line).is_some_and(|line| {
+        link.start < link.end && link.end <= line.styled_graphemes(Style::default()).count()
+    })
 }

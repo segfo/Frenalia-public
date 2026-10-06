@@ -23,8 +23,8 @@
 //!   残した空白が幅を超えるため。その語が行の頭から置いても空白の1桁ぶん入らないときは、文字の間で切る
 //! - 字下げの後に1文字（と、その語の後ろに残す空白）も入らないほど狭いときだけ、**1行に1文字を置いて幅を超える**
 //!   （何も描けない形にはしない）
-//! - コードの行と表の行も、幅を超えたら文字の間で切る。続きの行には、最初の行と同じ字下げ（入れ子の字下げ。
-//!   コードはそれに2桁の字下げを足したもの）を付け、その文字数を`indent`にする——コピーすると元の1行に戻る
+//! - コードの行・表の行・HTMLブロックの行も、幅を超えたら文字の間で切る。続きの行には、最初の行と同じ字下げ
+//!   （入れ子の字下げ。入れ子でなければ0）を付け、その文字数を`indent`にする——コピーすると元の1行に戻る
 //!
 //! # 限界
 //!
@@ -56,7 +56,7 @@ const INNER_WIDTHS: [u16; 5] = [10, 21, 40, 80, 120];
 const ANY_INNER_WIDTHS: [u16; 9] = [0, 1, 2, 3, 10, 21, 40, 80, 120];
 
 /// 折り返しを試すための長い入力（特性化試験と同等性の試験の入力に足す）。
-const LONG_INPUTS: [&str; 16] = [
+const LONG_INPUTS: [&str; 23] = [
     // 長い日本語の段落と、英語の混ざった段落
     "日本語の長い段落です。画面の幅を超えても、全角文字の間で折り返されて、次の行へ続いていきます。さらに続きます。\n",
     "日本語とEnglishが混ざった文章です。The quick brown fox jumps over the lazy dog、そして日本語に戻ります。\n",
@@ -84,15 +84,27 @@ const LONG_INPUTS: [&str; 16] = [
     "first line with a hard break  \nsecond line is very long and keeps going beyond the narrow width of the screen\n",
     // 語の途中で書式が変わる（空白の無い所で書式が切り替わる）
     "foo**bar**baz qux**quux**corge grault garply waldo fred plugh xyzzy thud\n",
+    // 番号付きリストを入れ子にした箇条書き（T7b）。どの段も長い日本語
+    "- 箇条書きの親の項目です。長い説明が続いて、画面の幅を超えて折り返されます。\n  1. 番号付きの子の項目です。こちらも長い説明が続いて折り返されます。\n  2. 二つ目の子の項目です。\n- 次の親の項目です。\n",
+    // 詰めたリスト・ゆるいリストの項目の中の長いコードの行（T7b。タブで始まる行を含む）
+    "- 項目の本文です。長い説明が続いて、画面の幅を超えて折り返されます。\n  ```\n  let value = some_function_with_a_long_name(argument_one, argument_two);\n  ```\n- 次の項目\n",
+    "- ゆるいリストの項目です。\n\n  ```\n  \tlet 日本語 = \"タブで始まる長いコードの行が、画面の幅を超えて続きます\";\n  ```\n",
+    // 長いタスクリスト（T7b）
+    "- [ ] まだ終わっていない長いタスクです。説明が続いて、画面の幅を超えて折り返されます。\n- [x] done task with a long English sentence that wraps around the narrow width.\n",
+    // 長い行を含むHTMLブロック（T7b。タブで始まる行を含む）
+    "<div class=\"a-very-long-class-name-that-keeps-going\">\n\t日本語の長い文字列がHTMLブロックの中で続いて、画面の幅を超えます\n</div>\n\nafter\n",
+    // 折り返しをまたぐリンク（文字が長い日本語・英語・裸のURL。T7b）
+    "前置き [折り返しをまたぐ長いリンクの文字がここに続いて画面の幅を超えます](https://example.com/a) の後ろ。\n",
+    "See [a link whose text is long enough to wrap](https://example.com/very/long/path) and https://bare.example.com/also/a/long/path/to/cut here.\n",
 ];
 
 /// `src`をGFMで解析し、既定の書式のまま`width`桁で描く。
-fn draw(src: &str, width: usize) -> Rendered {
+pub(super) fn draw(src: &str, width: usize) -> Rendered {
     render::render_lines(&markdown_stream::parse_gfm(src), &Theme::default(), width)
 }
 
 /// 行の文字（書式を見ない）。
-fn plain(line: &Line<'_>) -> String {
+pub(super) fn plain(line: &Line<'_>) -> String {
     line.spans
         .iter()
         .map(|span| span.content.as_ref())
@@ -109,7 +121,7 @@ fn columns(line: &Line<'_>) -> usize {
 /// 行と印を、印に従ってつなぐ（`harness_term::select::map::extract`で全体を選んだときと同じつなぎ方）。
 /// `Break`の行で新しい論理行を始め、`Continues { indent }`の行は前の論理行へ、頭の`indent`文字を除いてつなぐ。
 /// 描かれない文字（幅0）は入れない（`extract`と同じ）。
-fn joined(rendered: &Rendered) -> Vec<String> {
+pub(super) fn joined(rendered: &Rendered) -> Vec<String> {
     assert_eq!(
         rendered.lines.len(),
         rendered.joins.len(),
@@ -137,7 +149,7 @@ fn joined(rendered: &Rendered) -> Vec<String> {
 }
 
 /// 行の文字と印。
-fn lines_and_joins(src: &str, width: usize) -> (Vec<String>, Vec<LineJoin>) {
+pub(super) fn lines_and_joins(src: &str, width: usize) -> (Vec<String>, Vec<LineJoin>) {
     let rendered = draw(src, width);
     (rendered.lines.iter().map(plain).collect(), rendered.joins)
 }
@@ -167,8 +179,8 @@ fn lines_ending_in_a_wide_character() -> Vec<String> {
     inputs
 }
 
-/// 不変条件を確かめる入力の全部。
-fn all_inputs() -> Vec<String> {
+/// 不変条件を確かめる入力の全部（`super::link_tests`も使う）。
+pub(super) fn all_inputs() -> Vec<String> {
     CASES
         .iter()
         .map(|(_, src)| *src)
@@ -463,44 +475,44 @@ fn a_hard_break_starts_a_new_logical_line() {
     assert_eq!(joins, [LineJoin::Break, LineJoin::Break]);
 }
 
-/// 幅を超えるコードの行は文字の間で切る。続きの行には最初の行と同じ字下げ（いまはコードの2桁）を付け、
-/// `indent`はその文字数——コピーすると元の1行（頭の2桁を含めて今までどおり）に戻る。
-/// 2桁の字下げを外すのは計画書のT7b（外せば、入れ子でないコードの`indent`は0になる）。
+/// 幅を超えるコードの行は文字の間で切る。入れ子でないコードは字下げを持たないので、続きの行も字下げ0（`indent`は0）
+/// ——コピーすると元の1行に、余分な空白なしで戻る（T7b。2桁の字下げを外す前は、どの行にも2桁が付き`indent`は2だった）。
 #[test]
 fn a_code_line_wider_than_the_width_is_cut_and_copies_back_whole() {
     let src = format!("```\n{}\n```\n", "x".repeat(25));
     assert_eq!(
         describe(&Text::from(draw(&src, 12).lines)),
         [
-            format!("  «code|{}»", "x".repeat(10)),
-            format!("  «code|{}»", "x".repeat(10)),
-            format!("  «code|{}»", "x".repeat(5)),
+            format!("«code|{}»", "x".repeat(12)),
+            format!("«code|{}»", "x".repeat(12)),
+            "«code|x»".to_string(),
         ]
     );
     assert_eq!(
         draw(&src, 12).joins,
-        [LineJoin::Break, CONTINUES_2, CONTINUES_2]
+        [LineJoin::Break, CONTINUES_0, CONTINUES_0]
     );
-    assert_eq!(joined(&draw(&src, 12)), [format!("  {}", "x".repeat(25))]);
+    assert_eq!(joined(&draw(&src, 12)), ["x".repeat(25)]);
 }
 
 /// 全角文字がコードの行の切れ目に掛かるときは、その文字を次の行へ送る（行は幅を超えない）。
 #[test]
 fn a_wide_character_at_the_cut_of_a_code_line_moves_to_the_next_line() {
-    let (lines, joins) = lines_and_joins("```\nabcdefghiあ\n```\n", 12);
-    assert_eq!(lines, ["  abcdefghi", "  あ"]);
-    assert_eq!(joins, [LineJoin::Break, CONTINUES_2]);
+    let (lines, joins) = lines_and_joins("```\nabcdefghijkあ\n```\n", 12);
+    assert_eq!(lines, ["abcdefghijk", "あ"]);
+    assert_eq!(joins, [LineJoin::Break, CONTINUES_0]);
 }
 
-/// 引用の中のコードの行は、続きの行にも縦線とコードの字下げを付ける（`indent`は4文字）。
+/// 引用の中のコードの行は、続きの行にも縦線を付ける（`indent`は縦線と空白の2文字。T7b。コードの2桁の字下げを
+/// 外す前は4文字だった）。
 #[test]
-fn a_code_line_in_a_quote_continues_with_the_bar_and_the_code_indent() {
+fn a_code_line_in_a_quote_continues_with_the_bar() {
     let src = format!("> ```\n> {}\n> ```\n", "y".repeat(10));
     assert_eq!(
         describe(&Text::from(draw(&src, 10).lines)),
-        ["«muted|│ »  «code|yyyyyy»", "«muted|│ »  «code|yyyy»"]
+        ["«muted|│ »«code|yyyyyyyy»", "«muted|│ »«code|yy»"]
     );
-    assert_eq!(draw(&src, 10).joins, [LineJoin::Break, CONTINUES_4]);
+    assert_eq!(draw(&src, 10).joins, [LineJoin::Break, CONTINUES_2]);
 }
 
 /// 幅を超える表の行（区切りの行を含む）は文字の間で切る。入れ子でない表の続きの行は字下げ0。

@@ -1,5 +1,5 @@
 //! 写した描画部品（[`super::render`]）が、写す前の描画部品（`codewandler-markdown-ratatui` 0.2.1の
-//! `markdown_ratatui`）と**同じ出力を返す**ことを確かめる試験（計画書`plans/PLAN-TUI-IMPROVEMENTS.md`§0のT6・T7a）。
+//! `markdown_ratatui`）と**同じ出力を返す**ことを確かめる試験（計画書`plans/PLAN-TUI-IMPROVEMENTS.md`§0のT6・T7a・T7b）。
 //!
 //! # 何のためにあるのか
 //!
@@ -17,6 +17,15 @@
 //! 描いた結果と同じで、どの行もその幅に収まっている（元が折り返した・はみ出した・下限20へ切り上げた組を除く）。
 //! 外れた組の見え方は`super::characterization_tests`と`super::wrap_tests`が固定する。
 //!
+//! # T7b（構造を直した）の後に比べるもの
+//!
+//! T7bで直したのは**特定の構造だけ**である——コードブロック（2桁の字下げを外し、タブを空白にした）・HTMLブロック・
+//! タスクリストの印・入れ子のリスト・詰めたリストの項目の中のブロック・リストの中に出た後ろのブロック・中身の無い
+//! 項目。だから、**これらを1つも含まない入力**では、写しは今も元と1つも違ってはいけない。含むかは
+//! [`changed_by_t7b`]が解析器の出来事を見て決める。残るのは見出し・段落・強調等の文中の書式・リンク（文字の描き方は
+//! 元のまま。位置を返すのは`Rendered::links`で、`Text`には出ない）・平らなリスト・ゆるいリスト・引用・表・区切り線で、
+//! 比べる意味は残る。外れた組の見え方は`super::characterization_tests`と`super::structure_tests`が固定する。
+//!
 //! 入力は3組。
 //!
 //! | 組 | 何のためか |
@@ -31,8 +40,8 @@
 //!   試したことにはならない。写した手順と、写した後に変えたものは`render.rs`の冒頭に書いてある。
 //! - 比べる組は[`original_ignores_width`]で選ぶので、選ばれる組が減っても試験は緑のまま残り得る。比べた組の数の
 //!   下限と、必ず比べる組（[`MUST_COMPARE`]）を確かめて、選び方が空回りしていないことを見る。
-//! - 計画書のT7bで構造の不具合（入れ子のリスト・タスクリスト・HTMLブロック・コードの字下げ・リンク）を直すと、
-//!   それらの入力は幅に関係なく元と違うのが正しくなる。T7bでさらに絞る。
+//! - [`changed_by_t7b`]も選び方なので、同じく必ず比べる組と、外した組が実際に元と違うこと
+//!   （[`the_comparison_skips_the_structures_t7b_changed_and_they_do_differ`]）を確かめる。
 
 use std::collections::BTreeSet;
 
@@ -113,27 +122,110 @@ fn original_ignores_width(src: &str, width: usize) -> bool {
         && at_width.lines.iter().all(|line| line.width() <= width)
 }
 
-/// 選び方が空回りしていないことを見るために、**必ず比べる**組（入力・幅）。T7aで変えてはいけない書式を並べる——
-/// 短い箇条書き・番号付きリスト・見出し・コード・文中の書式とリンク・収まる表・引用の入れ子。
-const MUST_COMPARE: [(&str, usize); 9] = [
+/// T7bで描き方を変えた構造を含むか（モジュールdoc）。解析器の出来事を見て、次のどれかがあれば真。
+///
+/// - コードブロック・HTMLブロック・タスクリストの印（解析器が出すHTMLの文字）
+/// - 入れ子のリスト（`ListItem`の中の`List`）
+/// - 詰めたリストの項目の中のブロック・中身の前にブロックで始まる項目（記号を出す行が変わった）
+/// - `List`の中に直接出たブロック（リスト直後の引用。解析器の出し方）
+/// - 中身の無い項目（記号だけの行を出すようにした）
+fn changed_by_t7b(src: &str) -> bool {
+    // 開いている入れ物（`List`・`ListItem`・`BlockQuote`）と、詰めたリスト（またはその項目）か。
+    let mut containers: Vec<(BlockKind, bool)> = Vec::new();
+    // 開いている項目ごとの、中身が来たか。
+    let mut item_has_content: Vec<bool> = Vec::new();
+    for event in markdown_stream::parse_gfm(src) {
+        match event {
+            Event::EnterBlock { block, data, .. } => {
+                if matches!(
+                    block,
+                    BlockKind::FencedCode | BlockKind::IndentedCode | BlockKind::HtmlBlock
+                ) {
+                    return true;
+                }
+                match containers.last() {
+                    Some((BlockKind::List, _)) if block != BlockKind::ListItem => return true,
+                    Some((BlockKind::ListItem, tight)) => {
+                        let first_is_not_text = !item_has_content.last().copied().unwrap_or(true)
+                            && block != BlockKind::Paragraph;
+                        if *tight || block == BlockKind::List || first_is_not_text {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(has) = item_has_content.last_mut() {
+                    *has = true;
+                }
+                match block {
+                    BlockKind::List => {
+                        containers.push((block, data.list.as_ref().is_some_and(|l| l.tight)));
+                    }
+                    BlockKind::ListItem => {
+                        let tight = containers.last().is_some_and(|(_, tight)| *tight);
+                        containers.push((block, tight));
+                        item_has_content.push(false);
+                    }
+                    BlockKind::BlockQuote => containers.push((block, false)),
+                    _ => {}
+                }
+            }
+            Event::ExitBlock { block, .. } => {
+                if matches!(
+                    block,
+                    BlockKind::List | BlockKind::ListItem | BlockKind::BlockQuote
+                ) {
+                    containers.pop();
+                }
+                if block == BlockKind::ListItem && !item_has_content.pop().unwrap_or(true) {
+                    return true;
+                }
+            }
+            Event::Text { text, style, .. } => {
+                if style.raw_html && text.contains("type=\"checkbox\"") {
+                    return true;
+                }
+                if !text.trim().is_empty() {
+                    if let Some(has) = item_has_content.last_mut() {
+                        *has = true;
+                    }
+                }
+            }
+            Event::SoftBreak | Event::LineBreak => {}
+            Event::EnterInline { .. } | Event::ExitInline { .. } => {}
+        }
+    }
+    false
+}
+
+/// 元と比べる組か——元の出力が幅に左右されず（T7a）、T7bで描き方を変えた構造を含まない（T7b）。
+fn comparable(src: &str, width: usize) -> bool {
+    original_ignores_width(src, width) && !changed_by_t7b(src)
+}
+
+/// 選び方が空回りしていないことを見るために、**必ず比べる**組（入力・幅）。T7a・T7bで変えてはいけない書式を並べる——
+/// 短い箇条書き・番号付きリスト・見出し・文中の書式とリンク・収まる表・引用の入れ子・ハードな改行・ゆるいリスト
+/// （段落を2つ持つ項目・表を持つ項目）・文中のHTMLと画像と裸のURL。
+const MUST_COMPARE: [(&str, usize); 10] = [
     (super::characterization_tests::HEADING, 40),
     (super::characterization_tests::BULLET_LIST, 40),
     (super::characterization_tests::ORDERED_LIST, 40),
-    (super::characterization_tests::RUST_CODE_BLOCK, 40),
     (super::characterization_tests::INLINE_STYLES_AND_LINK, 80),
-    (super::characterization_tests::TASK_LIST, 80),
     (BRANCH_INPUTS[9], 40),
     (BRANCH_INPUTS[5], 40),
+    (BRANCH_INPUTS[1], 40),
+    (BRANCH_INPUTS[6], 40),
+    (BRANCH_INPUTS[16], 40),
     (BRANCH_INPUTS[3], 120),
 ];
 
-/// 特性化試験の入力を幅40・80で描いた結果が、元の出力が幅に左右されない組では元と同じ。
+/// 特性化試験の入力を幅40・80で描いた結果が、比べる組（[`comparable`]）では元と同じ。
 #[test]
 fn the_copy_renders_every_characterization_case_the_original_draws_regardless_of_width() {
     let mut compared = 0;
     for (name, src) in CASES {
         for width in WIDTHS {
-            if !original_ignores_width(src, width) {
+            if !comparable(src, width) {
                 continue;
             }
             let (copied, original) = both(src, width, false);
@@ -141,17 +233,18 @@ fn the_copy_renders_every_characterization_case_the_original_draws_regardless_of
             compared += 1;
         }
     }
-    // 14入力×2幅のうち、折り返す・はみ出すのは普通の文章（両方の幅）・日本語の2つ（両方の幅）・タスクリスト（幅40）。
-    assert_eq!(compared, CASES.len() * WIDTHS.len() - 7);
+    // 14入力×2幅のうち、残るのは見出し・箇条書き・番号付きリスト・文中の書式とリンクの4入力×2幅。
+    // 外れるのは、折り返す・はみ出す組（T7a）と、T7bで直した構造の7入力（特性化試験のモジュールdoc）。
+    assert_eq!(compared, 8);
 }
 
-/// 分岐を通す入力を、どちらの書式で描いても、元の出力が幅に左右されない組では元と同じ。
+/// 分岐を通す入力を、どちらの書式で描いても、比べる組（[`comparable`]）では元と同じ。
 #[test]
 fn the_copy_renders_every_branch_input_the_original_draws_regardless_of_width() {
     let mut compared = 0;
     for src in BRANCH_INPUTS {
         for width in BRANCH_WIDTHS {
-            if !original_ignores_width(src, width) {
+            if !comparable(src, width) {
                 continue;
             }
             for no_color in [false, true] {
@@ -165,19 +258,17 @@ fn the_copy_renders_every_branch_input_the_original_draws_regardless_of_width() 
             }
         }
     }
-    // 23入力×8幅×2書式のうち、半分を下回るほど外れたら選び方を疑う。
-    assert!(
-        compared >= BRANCH_INPUTS.len() * BRANCH_WIDTHS.len(),
-        "比べたのが{compared}組しか無い"
-    );
+    // 23入力のうちT7bの構造を含む6入力（字下げのコード・入れ子・フェンスのコード・タスク・引用の中のコード・HTML）を
+    // 除いた17入力×8幅×2書式（272組）のうち、幅で外れる組を除いて2026-10-06の実測は134組。大きく減ったら選び方を疑う。
+    assert!(compared >= 120, "比べたのが{compared}組しか無い");
 }
 
-/// 既定の書式と幅（80桁）で描く入口（`render`）も、元の出力が幅に左右されない入力では元と同じ。
+/// 既定の書式と幅（80桁）で描く入口（`render`）も、比べる組では元と同じ。
 #[test]
 fn the_default_entry_point_renders_like_the_original_when_the_width_does_not_matter() {
     let mut compared = 0;
     for src in CASES.iter().map(|(_, src)| *src).chain(BRANCH_INPUTS) {
-        if !original_ignores_width(src, 80) {
+        if !comparable(src, 80) {
             continue;
         }
         let events = markdown_stream::parse_gfm(src);
@@ -188,7 +279,7 @@ fn the_default_entry_point_renders_like_the_original_when_the_width_does_not_mat
         );
         compared += 1;
     }
-    assert!(compared >= 20, "比べたのが{compared}入力しか無い");
+    assert!(compared >= 15, "比べたのが{compared}入力しか無い");
 }
 
 /// **選び方の対照**: 必ず比べる組（[`MUST_COMPARE`]）は選ばれ、元が折り返した組・はみ出した組は外れる。
@@ -197,7 +288,7 @@ fn the_default_entry_point_renders_like_the_original_when_the_width_does_not_mat
 fn the_comparison_keeps_the_formats_t7a_must_not_change_and_skips_the_wrapped_ones() {
     for (src, width) in MUST_COMPARE {
         assert!(
-            original_ignores_width(src, width),
+            comparable(src, width),
             "比べるはずの組が外れた: {src:?}・幅{width}"
         );
     }
@@ -217,6 +308,37 @@ fn the_comparison_keeps_the_formats_t7a_must_not_change_and_skips_the_wrapped_on
         assert!(
             copied != original,
             "元が折り返す組で、写しが元と同じに描いた: {src:?}・幅{width}"
+        );
+    }
+}
+
+/// **選び方の対照（T7b）**: T7bで直した構造の入力は、元の出力が幅に左右されない幅（80）でも比べる側から外れ、
+/// 写しは実際に元と違う（T7bの直しが効いていて、外すのが必要だった）。
+#[test]
+fn the_comparison_skips_the_structures_t7b_changed_and_they_do_differ() {
+    use super::characterization_tests as cases;
+    let changed = [
+        cases::NESTED_LIST,
+        cases::RUST_CODE_BLOCK,
+        cases::CODE_BLOCK_IN_TIGHT_LIST_ITEM,
+        cases::QUOTE_AFTER_LIST,
+        cases::TASK_LIST,
+        cases::HTML_BLOCK_AT_THE_END,
+        cases::HTML_BLOCK_BEFORE_A_PARAGRAPH,
+    ];
+    for src in changed {
+        assert!(
+            original_ignores_width(src, 80),
+            "前提: 元の出力が幅に左右されない: {src:?}"
+        );
+        assert!(
+            changed_by_t7b(src),
+            "T7bの構造なのに比べる側に入った: {src:?}"
+        );
+        let (copied, original) = both(src, 80, false);
+        assert!(
+            copied != original,
+            "T7bの構造で、写しが元と同じに描いた: {src:?}"
         );
     }
 }

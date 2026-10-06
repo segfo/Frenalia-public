@@ -1,5 +1,5 @@
 //! **写した**描画部品（[`super::render`]。出典は`codewandler-markdown-ratatui` 0.2.1）が、今どう描くかを固定する試験
-//! （特性化試験。計画書`plans/PLAN-TUI-IMPROVEMENTS.md`§0のT6で作り、T7a・T7bで期待値を書き換える）。
+//! （特性化試験。計画書`plans/PLAN-TUI-IMPROVEMENTS.md`§0のT6で作り、T7a・T7bで期待値を書き換えた）。
 //!
 //! # 何のためにあるのか
 //!
@@ -13,7 +13,7 @@
 //! | 組 | 入力 |
 //! |---|---|
 //! | ユーザーが指定した8つ（計画書§1.9） | 普通の文章／見出し／箇条書き／幅を超える日本語のリスト項目／幅を超える日本語の引用／番号付きリスト／3段の入れ子／Rustのコードブロック |
-//! | 計画書§1.3が挙げた既知の不具合が出る入力 | 詰めたリスト項目の中のコードブロック／リスト直後の引用／タスクリスト／HTMLブロック（末尾と、段落の前）／文中の書式とリンク |
+//! | 計画書§1.3が挙げた既知の不具合が出ていた入力（T7bで直した） | 詰めたリスト項目の中のコードブロック／リスト直後の引用／タスクリスト／HTMLブロック（末尾と、段落の前）／文中の書式とリンク |
 //!
 //! 幅は40と80。日本語の2つは**どちらの幅も超える**長さにしてある（記号を含めて、リスト項目は120桁・引用は104桁）。
 //!
@@ -35,24 +35,29 @@
 //!   字下げし、引用の続きの行にも縦線を付ける（[`a_long_japanese_list_item_wraps_under_the_text_after_the_bullet`]・
 //!   [`a_long_japanese_blockquote_repeats_the_bar_on_continuation_lines`]）
 //! - **英語の語の切れ目で分けた行は、末尾に空白を1つ残す**（コピーで1行に戻したとき、語の間に空白が残るように。
-//!   計画書§2）。分ける位置そのものは素の描画部品と同じ（[`a_plain_paragraph_wraps_at_ascii_spaces_and_a_soft_break_becomes_a_space`]・
-//!   [`a_task_list_shows_the_checkbox_as_an_html_string`]の幅40）
+//!   計画書§2）。分ける位置そのものは素の描画部品と同じ（[`a_plain_paragraph_wraps_at_ascii_spaces_and_a_soft_break_becomes_a_space`]）
 //!
 //! 折り返しの約束（画面で1行に収まる・印でつなぐと元に戻る）は`super::wrap_tests`が確かめる。
 //!
-//! # 今の見え方で、まだ直していないもの（計画書のT7b）
+//! # T7bで直したもの（構造）
 //!
-//! - **入れ子のリスト**は記号が1行目に重なって`• • • parent`になり、子と孫は記号を失って続きの行として出る
-//! - **詰めたリスト項目の中のコードブロック**は、項目の本文より前に出る（後ろに空白だけの行が残る）
-//! - **リスト直後の引用**は、リストとの間に空行が入らない（解析器が引用を`List`の中——最後の`ListItem`の後、
-//!   `ExitBlock(List)`の前——へ出し、描画部品はリストが閉じたときに付ける空行を付けない）
-//! - **タスクリスト**は`<input disabled="" type="checkbox">`の文字列のまま出る
-//! - **HTMLブロック**は、末尾にあると落ちる（1行も出ない）。後ろに段落があると、その段落に空行なしでつながる
-//!   （描画部品が`HtmlBlock`を扱わず、中の文字を次の段落の文字として溜めるため）
-//! - **リンク**はURLを捨て、文字だけを描く
-//! - コードブロックに2桁の字下げが付く
+//! T6で「既知の不具合」として固定した入力は、すべて直した後の形へ書き換えた（素の描画部品の見え方は、各試験のdocに
+//! 1行ずつ残す）。
 //!
-//! 直したら、この試験の期待値を直した後の形へ書き換える（計画書§0のT7b）。
+//! - **入れ子のリスト**は、各段の項目が自分の記号を自分の字下げで持つ（素の描画部品は`• • • parent`と記号を1行目に
+//!   重ね、子と孫は記号を失った）。詰めたリストの項目の本文を、中のブロック（入れ子のリスト・コード等）より先に出す
+//! - **詰めたリスト項目の中のコードブロック**は、項目の本文の後ろに、項目の字下げで出る（素の描画部品は本文より前に
+//!   出し、後ろに空白だけの行を残した）
+//! - **リスト直後の引用**は、リストの後ろの別のブロックとして、ほかのブロックと同じく空行を1つ挟んで出る
+//!   （解析器が引用を`List`の中——最後の`ListItem`の後、`ExitBlock(List)`の前——へ出すのを、描画部品の側で読み替える）
+//! - **タスクリスト**は`• [ ] `／`• [x] `の印になる（素の描画部品は`<input disabled="" type="checkbox">`の文字列を出した）
+//! - **HTMLブロック**は、中の文字を1行ずつそのまま薄い書式で出し、前後のブロックとは空行で分ける（素の描画部品は
+//!   末尾のものを落とし、後ろに段落があればその段落に空行なしでつないだ）
+//! - **コードブロック**の2桁の字下げを外した（コピーしたコードに余分な空白が入らないように）
+//! - **リンク**は今までどおり文字だけを青の下線で描き、URLは文中に出さない。位置とURLは`Rendered::links`で返す
+//!   （試験は`super::link_tests`）
+//!
+//! 構造ごとの細かい形（入れ子の深さ・ゆるいリスト・空の項目・タブ等）は`super::structure_tests`が固定する。
 //!
 //! # 限界
 //!
@@ -278,83 +283,77 @@ fn an_ordered_list_uses_numbers() {
     assert_same_at_both_widths(ORDERED_LIST, &["1. item 1", "2. item 2"]);
 }
 
-/// **既知の不具合**: 3段の入れ子は、記号が1行目に3つ重なり、子と孫は記号を失って続きの行（6桁の字下げ）になる。
+/// 3段の入れ子は、各段の項目が自分の記号を自分の字下げ（親の記号の幅ずつ深くなる）で持つ。段の間に空行は入らない
+/// （T7b。素の描画部品は`• • • parent`と記号を1行目に重ね、子と孫は記号を失って6桁の字下げの続きの行になった）。
 #[test]
-fn a_three_level_nested_list_stacks_the_markers_on_the_first_line() {
-    assert_same_at_both_widths(
-        NESTED_LIST,
-        &["• • • parent", "      child", "      grandchild"],
-    );
+fn a_three_level_nested_list_gives_each_item_its_own_marker_at_its_own_indent() {
+    assert_same_at_both_widths(NESTED_LIST, &["• parent", "  • child", "    • grandchild"]);
 }
 
-/// Rustのコードブロック。フェンスと言語名は出さず、各行に2桁の字下げとコードの書式を付ける（色分けは無い）。
+/// Rustのコードブロック。フェンスと言語名は出さず、字下げを付けずにコードの書式で描く（色分けは無い）
+/// （T7b。素の描画部品は各行に2桁の字下げを付けた——コピーしたコードに余分な空白が入る）。
 #[test]
-fn a_rust_code_block_is_indented_by_two_columns_in_the_code_style() {
+fn a_rust_code_block_is_drawn_without_an_indent_in_the_code_style() {
     assert_same_at_both_widths(
         RUST_CODE_BLOCK,
         &[
-            "  «code|fn main() {»",
-            "  «code|    println!(\"hello\");»",
-            "  «code|}»",
+            "«code|fn main() {»",
+            "«code|    println!(\"hello\");»",
+            "«code|}»",
         ],
     );
 }
 
-/// **既知の不具合**: 詰めたリスト項目の中のコードブロックが、項目の本文より前に出る。最後に空白だけの行が残る。
+/// 詰めたリスト項目の中のコードブロックは、項目の本文の後ろに、項目の字下げ（記号の幅）で出る。空白だけの行は残らない
+/// （T7b。素の描画部品は`["    code", "", "• item", "  "]`と本文より前に出した）。
 #[test]
-fn a_code_block_in_a_tight_list_item_comes_before_the_item_text() {
+fn a_code_block_in_a_tight_list_item_follows_the_item_text_at_the_item_indent() {
+    assert_same_at_both_widths(CODE_BLOCK_IN_TIGHT_LIST_ITEM, &["• item", "  «code|code»"]);
+}
+
+/// リスト直後の引用は、リストの後ろの別のブロックとして、空行を1つ挟んで字下げなしで出る（モジュールdoc。T7b。
+/// 素の描画部品は空行を挟まなかった）。
+#[test]
+fn a_blockquote_after_a_list_comes_after_a_blank_line_at_the_top_level() {
+    assert_same_at_both_widths(QUOTE_AFTER_LIST, &["• item", "", "«muted|│ »quote"]);
+}
+
+/// タスクリストの印は`[ ]`／`[x]`で、項目の記号の後ろに付く（T7b。素の描画部品はHTMLの文字列
+/// `<input disabled="" type="checkbox">`のまま出し、幅40ではそれを折り返した）。
+#[test]
+fn a_task_list_shows_the_checkbox_as_brackets() {
+    assert_same_at_both_widths(TASK_LIST, &["• [ ] todo", "• [x] done"]);
+}
+
+/// 末尾のHTMLブロックは、中の文字を1行ずつそのまま薄い書式で出す（T7b。素の描画部品は1行も出さなかった）。
+#[test]
+fn an_html_block_at_the_end_is_drawn_as_its_literal_lines() {
     assert_same_at_both_widths(
-        CODE_BLOCK_IN_TIGHT_LIST_ITEM,
-        &["    «code|code»", "", "• item", "  "],
+        HTML_BLOCK_AT_THE_END,
+        &["«muted|<div>»", "«muted|hello»", "«muted|</div>»"],
     );
 }
 
-/// **既知の不具合**: リスト直後の引用が、リストとの間に空行なしで続く（モジュールdoc）。
+/// 段落の前のHTMLブロックは、ほかのブロックと同じく空行を1つ挟んで段落と分かれる（T7b。素の描画部品は
+/// `["<div>", "hello", "</div>", "after"]`と段落に空行なしでつないだ——中の文字を段落の文字として溜めていた）。
 #[test]
-fn a_blockquote_after_a_list_has_no_blank_line_before_it() {
-    assert_same_at_both_widths(QUOTE_AFTER_LIST, &["• item", "«muted|│ »quote"]);
-}
-
-/// **既知の不具合**: タスクリストの印がHTMLの文字列のまま出る。その文字列もASCIIの空白で折り返す
-/// （分けた所の空白は前の行の末尾に残る。T7a）。
-#[test]
-fn a_task_list_shows_the_checkbox_as_an_html_string() {
-    assert_eq!(
-        describe(&drawn(TASK_LIST, 40)),
-        [
-            "• <input disabled=\"\" type=\"checkbox\"> ",
-            "  todo",
-            "• <input checked=\"\" disabled=\"\" ",
-            "  type=\"checkbox\"> done",
-        ]
-    );
-    assert_eq!(
-        describe(&drawn(TASK_LIST, 80)),
-        [
-            "• <input disabled=\"\" type=\"checkbox\"> todo",
-            "• <input checked=\"\" disabled=\"\" type=\"checkbox\"> done",
-        ]
-    );
-}
-
-/// **既知の不具合**: 末尾のHTMLブロックは1行も出ない。
-#[test]
-fn an_html_block_at_the_end_is_dropped() {
-    assert_same_at_both_widths(HTML_BLOCK_AT_THE_END, &[]);
-}
-
-/// **既知の不具合**: 段落の前のHTMLブロックは、その段落に空行なしでつながる。
-#[test]
-fn an_html_block_before_a_paragraph_is_glued_to_it() {
+fn an_html_block_before_a_paragraph_is_separated_from_it_by_a_blank_line() {
     assert_same_at_both_widths(
         HTML_BLOCK_BEFORE_A_PARAGRAPH,
-        &["<div>", "hello", "</div>", "after"],
+        &[
+            "«muted|<div>»",
+            "«muted|hello»",
+            "«muted|</div>»",
+            "",
+            "after",
+        ],
     );
 }
 
-/// 文中の書式は単語ごとに付き、間の空白には付かない。**リンクはURLを捨てて文字だけ**を描く（青の下線）。
+/// 文中の書式は単語ごとに付き、間の空白には付かない。**リンクは文字だけ**を青の下線で描き、URLは文中に出さない
+/// （URLと位置は`Rendered::links`で返す。`super::link_tests`）。
 #[test]
-fn inline_styles_are_applied_and_a_link_drops_its_url() {
+fn inline_styles_are_applied_and_a_link_shows_only_its_text() {
     assert_same_at_both_widths(
         INLINE_STYLES_AND_LINK,
         &["«bold|bold» «italic|italic» «code|code» «strike|strike» «link|link»"],

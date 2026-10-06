@@ -19,7 +19,8 @@
 //! # 限界
 //!
 //! - 文字列を数えるだけなので、別名（`use … as …`）を`markdown/mod.rs`で付けて外へ出す形は止められない。
-//!   使用側へ出す名前は[`super::MarkdownView`]と[`super::Rendered`]だけ、という形をレビューで保つ。
+//!   使用側へ出す名前は[`super::MarkdownView`]と[`super::Rendered`]（とその中の[`super::LinkSpan`]）だけ、という形を
+//!   レビューで保つ。
 
 use std::path::{Path, PathBuf};
 

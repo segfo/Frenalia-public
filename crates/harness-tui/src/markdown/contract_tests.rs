@@ -4,12 +4,14 @@
 //! その実装の試験から`port_contract`を呼ぶ——通ることが、差し替えの合格条件になる（計画書§1.4(5)・§1.9）。
 //! いまは[`PlainText`]に掛ける。
 
+use ratatui::style::Style;
+
 use super::plain::PlainText;
 use super::{Rendered, StreamingMarkdown};
 
-/// 契約を確かめる文章。Markdownの記号・入れ子・空行・フェンス・引用・全角文字・`\r\n`を含める
-/// （区切る場所の候補を増やすため）。
-const SAMPLE: &str = "# 見出し\n**太字**と`code`\r\n- 項目 1\n  - 入れ子の項目\n\n```rust\nlet x = 1;\n```\n> 引用\nこれは長い日本語の段落です。";
+/// 契約を確かめる文章。Markdownの記号・入れ子・空行・フェンス・引用・全角文字・`\r\n`・リンクを含める
+/// （区切る場所の候補を増やすため。リンクは[`links_stay_inside_their_lines`]が見る）。
+const SAMPLE: &str = "# 見出し\n**太字**と`code`\r\n- 項目 1\n  - 入れ子の項目\n\n```rust\nlet x = 1;\n```\n> 引用\nこれは長い日本語の段落です。[リンクの文字](https://example.com)も含みます。";
 
 /// 確かめる幅。広い幅・狭い幅に加えて、1桁と0桁（落ちないこと）。
 const WIDTHS: [u16; 5] = [120, 80, 20, 1, 0];
@@ -40,6 +42,7 @@ pub(super) fn port_contract<M: StreamingMarkdown>(make: impl Fn() -> M) {
     reset_renders_like_a_new_one(&make);
     finish_is_idempotent_and_push_after_finish_continues(&make);
     lines_and_joins_have_the_same_length(&make);
+    links_stay_inside_their_lines(&make);
 }
 
 /// **どの文字の境界で2つに分けて足しても、1回で足したのと同じに描く**（流入中も、終わった後も）。
@@ -153,6 +156,30 @@ fn lines_and_joins_have_the_same_length<M: StreamingMarkdown>(make: &impl Fn() -
                     rendered.lines.len(),
                     rendered.joins.len(),
                     "{w}桁で{text:?}を描くと行と印の数が違う（終わった後={finish}）"
+                );
+            }
+        }
+    }
+}
+
+/// **リンクの区間は、指す行の文字の中に収まる**（[`Rendered`]の`links`）。行の外や文字の外を指す区間は、使う側が
+/// 位置から引いたときに何にも当たらないか、別の文字を指してしまう。区間の文字は`Line::styled_graphemes`で数える
+/// （範囲選択の位置と同じ数え方）。
+fn links_stay_inside_their_lines<M: StreamingMarkdown>(make: &impl Fn() -> M) {
+    for finish in [false, true] {
+        let mut m = fed(make, &[SAMPLE]);
+        if finish {
+            m.finish();
+        }
+        for (w, rendered) in WIDTHS.iter().zip(every_width(&mut m)) {
+            for link in &rendered.links {
+                let line = rendered.lines.get(link.line).unwrap_or_else(|| {
+                    panic!("{w}桁で、行の外を指すリンクの区間{link:?}（終わった後={finish}）")
+                });
+                let count = line.styled_graphemes(Style::default()).count();
+                assert!(
+                    link.start < link.end && link.end <= count,
+                    "{w}桁で、行の文字（{count}文字）の外を指すリンクの区間{link:?}（終わった後={finish}）"
                 );
             }
         }

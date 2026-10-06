@@ -10,6 +10,7 @@
 //! # 限界
 //!
 //! - 折り返さない。長い行も1つの`Line`で返し、折り返しは`harness_term::wrap`が受け持つ（だから印は全部`Break`）。
+//! - リンクを見分けないので、リンクの区間（`Rendered::links`）を返さない（Markdownのリンクも原文の文字のまま描く）。
 //! - 行の割り方は`str::lines`のまま（`\r\n`も区切り、末尾の改行は空の行を足さない）。空の文章は空の1行にする
 //!   （0行にすると、流れ込み始めた返答の場所が画面に無くなる）。
 
@@ -51,6 +52,10 @@ impl StreamingMarkdown for PlainText {
             lines.push(Line::from(""));
         }
         let joins = vec![LineJoin::Break; lines.len()];
-        Rendered { lines, joins }
+        Rendered {
+            lines,
+            joins,
+            links: Vec::new(),
+        }
     }
 }

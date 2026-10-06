@@ -62,3 +62,16 @@ fn finishing_changes_nothing() {
     plain.finish();
     assert_eq!(plain.render(80), before);
 }
+
+/// 整形しないので、リンクの区間を1つも返さない（Markdownのリンクも原文の文字のまま描く）。
+#[test]
+fn no_link_spans_are_returned_even_for_a_markdown_link() {
+    let r = rendered("[リンク](https://example.com) と https://example.com", 80);
+    assert_eq!(
+        r.lines,
+        vec![Line::from(
+            "[リンク](https://example.com) と https://example.com"
+        )]
+    );
+    assert!(r.links.is_empty());
+}
