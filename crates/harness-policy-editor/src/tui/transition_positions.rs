@@ -27,11 +27,16 @@
 //! [`super::position_commit`]の`request_position_commit`。`crate::position_approve`が1つの`policy.json`に重ねて
 //! 1回だけ保存する）。
 //!
+//! # 引数を固定した位置・Strict・作業ディレクトリ（決定67。キーは別のファイル）
+//!
+//! `u`（コマンドラインごとに分ける／戻す）は[`super::position_split`]、`s`（Strict）と`w`（作業ディレクトリ）は
+//! [`super::position_strict`]。状態（分ける集合・Strict の行・宣言した作業ディレクトリ）はここ（[`PositionsState`]）が持つ。
+//!
 //! # 限界
 //!
 //! - 遷移先の名前を既にあるドメインの名前へ付け替えることはできない（別の位置と同じドメインになり深さを区別しなく
 //!   なる）。同じ記録の別の位置の名前とも重ねられない。
-//! - 記録を替えると予約・付け替えは捨てる（位置の鍵は記録ごとに作り直すので、別の記録の行を指しうる）。
+//! - 記録を替えると予約・付け替え・分ける集合は捨てる（位置の鍵は記録ごとに作り直すので、別の記録の行を指しうる）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -40,12 +45,12 @@ use crossterm::event::{KeyCode, KeyEvent};
 use harness_config::FsAccess;
 
 use harness_policy::policy_file::{PolicyFile, ENTRY_DOMAIN};
-use harness_policy::position_domains::{Position, PositionSource};
+use harness_policy::position_domains::{Position, PositionSource, SplitPositions};
 use harness_sandbox::tier2a::domain_profile_name_problem;
 
 use crate::position_view::{
-    self, can_narrow, key_of, position_edges, renamed_name, EdgeVerdict, PositionKey, PositionRow,
-    PositionView,
+    self, declared_cwds, key_of, position_edges, renamed_name, strict_destinations, EdgeVerdict,
+    PositionKey, PositionRow, PositionView,
 };
 use crate::transition_candidates::Startable;
 use crate::tui::checkbox_tree;
@@ -91,22 +96,29 @@ pub struct PositionsState {
     pub view: PositionView,
     /// 読み直したときの`policy.json`（判定を取り直すのに使う。読み直すたびに作り直す）。
     pub policy: PolicyFile,
-    /// 各位置の判定（[`crate::position_view::Assignment::positions`]と同じ並び）。予約・付け替え・絞り方を変えたら
+    /// 各位置の判定（[`crate::position_view::Assignment::positions`]と同じ並び）。予約・付け替え・分け方・Strict・作業ディレクトリを変えたら
     /// 取り直す（[`PositionsState::refresh_verdicts`]）。
     pub verdicts: Vec<EdgeVerdict>,
     /// 承認の予約（位置の鍵）。
     pub approve: BTreeSet<PositionKey>,
-    /// そのうち記録どおりのコマンドラインに絞るもの（`u`）。既定は任意の引数（決定65 Q2）。
-    pub narrow: BTreeSet<PositionKey>,
+    /// コマンドラインごとに分ける位置（`u`。決定67(1)）。鍵は分ける前の（遷移元, 畳んだ exe）で、割り当て
+    /// （[`crate::position_view::load`]）とファイルの候補（`crate::position_candidates`）へ**同じ集合**を渡す。
+    /// 書いた後も残す——書かなかった分けた行が1行へ戻ると、分けたドメインへ振り分けた候補と食い違うため。
+    pub split: SplitPositions,
     /// そのうち子の出力を捨てる辺にするもの（`o`。P5.5）。既定は返す（決定66(4)）。`approve`の部分集合。
     pub discard_output: BTreeSet<PositionKey>,
+    /// Strict にする行（`s`。決定67）: 引数のリテラル＋作業ディレクトリ＋遷移先に`strict`の印。分けた行だけ。
+    pub strict: BTreeSet<PositionKey>,
+    /// `w`で宣言した作業ディレクトリ（決定67(3)）。Strict の行で宣言が無ければ候補を使う（[`declared_cwds`]）。
+    pub cwd: BTreeMap<PositionKey, String>,
     /// 遷移先の名前の付け替え（割り当ての名前 → 新しい名前）。**名前ごと**当てるので、子の行の遷移元も変わる。
     pub renamed: BTreeMap<String, String>,
     /// 見えている行での選択位置。
     pub row: usize,
     pub filter: PositionFilter,
-    /// 遷移先の欄に居る間の入力（`Tab`で入り、`Enter`で決める）。
+    /// 遷移先の欄に居る間の入力（`Tab`で入り、`Enter`で決める）。`editing_cwd`なら作業ディレクトリの欄（`w`）。
     pub editing: Option<TextInput>,
+    pub editing_cwd: bool,
 }
 
 impl PositionsState {
@@ -116,12 +128,15 @@ impl PositionsState {
             policy,
             verdicts: Vec::new(),
             approve: BTreeSet::new(),
-            narrow: BTreeSet::new(),
+            split: SplitPositions::new(),
             discard_output: BTreeSet::new(),
+            strict: BTreeSet::new(),
+            cwd: BTreeMap::new(),
             renamed: BTreeMap::new(),
             row: 0,
             filter: PositionFilter::default(),
             editing: None,
+            editing_cwd: false,
         }
     }
 
@@ -171,8 +186,24 @@ impl PositionsState {
         self.approve.contains(&key_of(position))
     }
 
-    pub fn is_narrowed(&self, position: &Position) -> bool {
-        can_narrow(position) && self.narrow.contains(&key_of(position))
+    /// 引数を記録どおりに固定した（コマンドラインごとに分けた）行か（`u`。決定67）。
+    pub fn is_split(&self, position: &Position) -> bool {
+        position.fixed_command_line.is_some()
+    }
+
+    /// Strict にする行か（`s`）。
+    pub fn is_strict(&self, position: &Position) -> bool {
+        self.strict.contains(&key_of(position))
+    }
+
+    /// 辺に書く作業ディレクトリ（`w`で宣言した値、Strict の行なら無ければ候補。[`declared_cwds`]と同じ決め方）。
+    pub fn edge_cwd(&self, position: &Position) -> Option<String> {
+        let key = key_of(position);
+        self.cwd.get(&key).cloned().or_else(|| {
+            self.strict
+                .contains(&key)
+                .then(|| position_view::cwd_candidate(position).dir)
+        })
     }
 
     /// この位置の辺を、子の出力を捨てる設定で書くか（`o`）。
@@ -185,17 +216,19 @@ impl PositionsState {
     /// `extra_fs`は FS/ネットのタブで選んだ位置ごとのドメインの候補（[`App::position_extra_fs`]。ドメインは
     /// 割り当ての名前で、付け替えはここで当てる）。子が親の持たないファイルを選ぶと、その位置は広げる向きになる
     /// （決定65(6)、P4.4）。
-    fn refresh_verdicts(
+    pub(super) fn refresh_verdicts(
         &mut self,
         workspace_root: &Path,
         extra_fs: &[(String, String, FsAccess)],
     ) -> usize {
+        let assignment = &self.view.assignment;
         let edges = position_edges(
-            &self.view.assignment,
+            assignment,
             &self.renamed,
-            &self.narrow,
             &self.discard_output,
+            &declared_cwds(assignment, &self.cwd, &self.strict),
         );
+        let strict = strict_destinations(assignment, &self.renamed, &self.strict);
         let extra: Vec<(String, String, FsAccess)> = extra_fs
             .iter()
             .map(|(domain, value, access)| {
@@ -206,7 +239,8 @@ impl PositionsState {
                 )
             })
             .collect();
-        self.verdicts = position_view::verdicts(&self.policy, workspace_root, &edges, &extra);
+        self.verdicts =
+            position_view::verdicts(&self.policy, workspace_root, &edges, &extra, &strict);
         let writable: BTreeSet<PositionKey> = self
             .view
             .assignment
@@ -219,7 +253,6 @@ impl PositionsState {
         let before = self.approve.len();
         self.approve.retain(|key| writable.contains(key));
         let approve = &self.approve;
-        self.narrow.retain(|key| approve.contains(key));
         self.discard_output.retain(|key| approve.contains(key));
         before - self.approve.len()
     }
@@ -241,16 +274,23 @@ impl PositionsState {
             .into_iter()
             .filter(|k| keys.contains(k))
             .collect();
-        self.narrow = previous
-            .narrow
-            .into_iter()
-            .filter(|k| keys.contains(k))
-            .collect();
         self.discard_output = previous
             .discard_output
             .into_iter()
             .filter(|k| keys.contains(k))
             .collect();
+        self.strict = previous
+            .strict
+            .into_iter()
+            .filter(|k| keys.contains(k))
+            .collect();
+        self.cwd = previous
+            .cwd
+            .into_iter()
+            .filter(|(k, _)| keys.contains(k))
+            .collect();
+        // 分ける集合は割り当ての入力なので、読み直す前に`reload_positions`が渡している（ここでは引き継ぐだけ）。
+        self.split = previous.split;
         self.renamed = previous
             .renamed
             .into_iter()
@@ -300,12 +340,12 @@ impl PositionsState {
 }
 
 /// 選んでいる行の写し（借用を切るため）。
-struct Selected {
-    index: usize,
-    position: Position,
-    verdict: EdgeVerdict,
-    startable: Startable,
-    to: String,
+pub(super) struct Selected {
+    pub(super) index: usize,
+    pub(super) position: Position,
+    pub(super) verdict: EdgeVerdict,
+    pub(super) startable: Startable,
+    pub(super) to: String,
 }
 
 impl App {
@@ -313,9 +353,11 @@ impl App {
     /// 平らな一覧を読む。位置の情報が無い・作れない理由は`notes`に出す（`B-10`）。
     pub(super) fn reload_positions(&mut self, file: &PolicyFile, notes: &mut Vec<String>) -> bool {
         let previous = self.pending.positions.take();
+        // 分ける集合（決定67）は同じ記録のときだけ引き継ぐ。ファイルの候補も同じ集合で作る（`position_split`）。
+        let split = self.position_split_of(previous.as_ref());
         let Some(loaded) = self
             .selected_session()
-            .map(|entry| position_view::load(&entry.dir, &entry.manifest, file))
+            .map(|entry| position_view::load(&entry.dir, &entry.manifest, file, &split))
         else {
             return false;
         };
@@ -368,7 +410,11 @@ impl App {
             KeyCode::PageUp => self.move_position_row(rows, -10),
             KeyCode::PageDown => self.move_position_row(rows, 10),
             KeyCode::Char(' ') => self.toggle_selected_position(),
-            KeyCode::Char('u') => self.toggle_selected_position_argv(),
+            // [P5.10.2] 決定67: 引数を固定してコマンドラインごとに分ける（`position_split`）・Strict と作業ディレクトリ
+            // （`position_strict`）。
+            KeyCode::Char('u') => self.toggle_selected_position_split(),
+            KeyCode::Char('s') => self.toggle_selected_position_strict(),
+            KeyCode::Char('w') => self.focus_position_cwd(),
             KeyCode::Char('o') => self.toggle_selected_position_output(),
             // 前例の表の10: 却下印は観測した（exe, 引数）1種類ごとの印で、位置は記録ごとに作り直す。1対1にならない
             // 印を作らない。何も起きないので理由を言う（`B-32`）。
@@ -398,7 +444,7 @@ impl App {
 
     /// 位置の判定に足すファイルの宣言: FS/ネットのタブで選んだ、位置ごとのドメインの候補と`R`の合成提案（P4.4）。
     /// ドメインは割り当ての名前（付け替えは[`PositionsState::refresh_verdicts`]が当てる）。位置の情報が無い記録は空。
-    fn position_extra_fs(&self) -> Vec<(String, String, FsAccess)> {
+    pub(super) fn position_extra_fs(&self) -> Vec<(String, String, FsAccess)> {
         let Some(view) = self.view.as_ref().filter(|view| view.by_position()) else {
             return Vec::new();
         };
@@ -438,7 +484,7 @@ impl App {
         }
     }
 
-    fn selected_position(&self) -> Option<Selected> {
+    pub(super) fn selected_position(&self) -> Option<Selected> {
         let positions = self.pending.positions.as_ref()?;
         let index = positions.selected_index()?;
         let position = positions.view.assignment.positions[index].clone();
@@ -462,7 +508,7 @@ impl App {
     }
 
     /// 行が無いときに言うこと（フィルタで隠れているのか、本当に無いのかを区別する、`B-09`）。
-    fn no_position_message(&self) -> String {
+    pub(super) fn no_position_message(&self) -> String {
         match self.pending.positions.as_ref().map(|p| p.filter) {
             Some(PositionFilter::Writes) => {
                 "書く位置がありません（f で全部を出すと、宣言済みの位置も出ます）".to_string()
@@ -493,17 +539,13 @@ impl App {
             return;
         }
         let key = key_of(&selected.position);
-        let workspace_root = self.workspace_root.clone();
-        let extra_fs = self.position_extra_fs();
         let Some(positions) = self.pending.positions.as_mut() else {
             return;
         };
         if positions.approve.remove(&key) {
-            // 書かない行に辺の形の設定を残さない（出力の設定は判定に効かないので取り直さない）。
+            // 書かない行に辺の形の設定を残さない（出力の設定は判定に効かないので取り直さない）。Strict と作業
+            // ディレクトリは行の性質（書けるかが変わる）なので残す——選び直したときに同じ判定で選べる。
             positions.discard_output.remove(&key);
-            if positions.narrow.remove(&key) {
-                positions.refresh_verdicts(&workspace_root, &extra_fs);
-            }
             self.status = format!("{name} の承認をやめました");
         } else {
             positions.approve.insert(key);
@@ -515,89 +557,6 @@ impl App {
                 .unwrap_or_default();
             self.status = format!("{name} を許します（→ {}）{widens}", selected.to);
         }
-    }
-
-    /// 選んでいる位置の引数の広さを切り替える（任意の引数 ⇄ 記録どおりのコマンドライン）。
-    ///
-    /// 絞った辺が検査に落ちるなら（相対パスの引数を含む等）、**判定器の理由を言って絞らない**——相対かどうかを
-    /// ここで判定しない（`B-13`）。このエディタは作業ディレクトリを宣言しないので、その直し方は取れない。
-    fn toggle_selected_position_argv(&mut self) {
-        let Some(selected) = self.selected_position() else {
-            self.status = self.no_position_message();
-            return;
-        };
-        let name = file_name(&selected.position.exe).to_string();
-        if selected.position.source == PositionSource::ExistingEdge {
-            self.status = format!(
-                "{name} は宣言済みの辺の行です（引数の広さは policy.json の辺が決めています）"
-            );
-            return;
-        }
-        let key = key_of(&selected.position);
-        let workspace_root = self.workspace_root.clone();
-        let extra_fs = self.position_extra_fs();
-        let Some(positions) = self.pending.positions.as_mut() else {
-            return;
-        };
-        if !positions.approve.contains(&key) {
-            self.status =
-                "先にSpaceで選んでください（選んだ行の引数の広さを切り替えます）".to_string();
-            return;
-        }
-        if positions.narrow.remove(&key) {
-            positions.refresh_verdicts(&workspace_root, &extra_fs);
-            self.status = format!("{name}: 任意の引数を許します");
-            return;
-        }
-        let position = &selected.position;
-        if !can_narrow(position) {
-            self.status = if position.argv_truncated > 0 {
-                format!(
-                    "{name}: コマンドラインが切り詰められている疑いのある起動が{}回あるので、記録どおりには\
-                     絞れません（DESIGN-MAC §5.1(6)。任意の引数のまま）",
-                    position.argv_truncated
-                )
-            } else if position.argv_missing > 0 {
-                format!(
-                    "{name}: 引数が結び付かなかった起動が{}回あるので、記録どおりには絞れません（任意の引数のまま）",
-                    position.argv_missing
-                )
-            } else {
-                format!(
-                    "{name}: 記録したコマンドラインが{}通りあるので、1つに絞れません（任意の引数のまま）",
-                    position.command_lines.len()
-                )
-            };
-            return;
-        }
-        positions.narrow.insert(key.clone());
-        positions.refresh_verdicts(&workspace_root, &extra_fs);
-        let verdict = positions
-            .verdicts
-            .get(selected.index)
-            .cloned()
-            .unwrap_or(EdgeVerdict::Writable);
-        if verdict.is_writable() {
-            self.status = format!(
-                "{name}: この引数のときだけ許します（{}）",
-                position.command_lines[0]
-            );
-            return;
-        }
-        // 絞ると書けない。絞りを戻し、予約も元どおりにする（取り直しで外れた予約を戻す）。
-        positions.narrow.remove(&key);
-        positions.approve.insert(key);
-        positions.refresh_verdicts(&workspace_root, &extra_fs);
-        let detail = match verdict {
-            EdgeVerdict::Rejected { detail } => detail,
-            EdgeVerdict::AlreadyDeclared | EdgeVerdict::Writable | EdgeVerdict::Widens { .. } => {
-                String::new()
-            }
-        };
-        self.status = format!(
-            "{name}: 記録どおりに絞ると検査に落ちるので絞れません（任意の引数のままにします。\
-             このエディタは作業ディレクトリを宣言しない）。検査の理由: {detail}"
-        );
     }
 
     /// [P5.5] 選んでいる位置の子の出力を捨てる／返すを切り替える（`o`。決定66(4)。既定は返す）。
@@ -646,6 +605,7 @@ impl App {
             PositionSource::Proposed | PositionSource::ReplacesSelfLoop => {
                 if let Some(positions) = self.pending.positions.as_mut() {
                     positions.editing = Some(TextInput::new(""));
+                    positions.editing_cwd = false;
                 }
                 self.status = format!(
                     "{name} の遷移先の新しい名前を入れてください（いま: {}。Enter で決める・空のまま Enter でやめる）",
@@ -655,14 +615,20 @@ impl App {
         }
     }
 
-    /// 遷移先の欄に居るときのキー。**1文字キーを操作に取らない**（名前が打てなくなる）。
+    /// 遷移先の欄（`Tab`）・作業ディレクトリの欄（`w`）に居るときのキー。**1文字キーを操作に取らない**（名前・パスが
+    /// 打てなくなる）。
     fn on_position_destination_key(&mut self, key: KeyEvent) {
+        let cwd_field = self.pending.positions.as_ref().is_some_and(|p| p.editing_cwd);
         match key.code {
+            KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab if cwd_field => {
+                self.apply_position_cwd()
+            }
             KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => self.apply_position_rename(),
             // 入力欄に居ても画面を離れられるようにする（平らな一覧の遷移先の欄と同じ）。打ちかけの名前は捨てる。
             KeyCode::Esc => {
                 if let Some(positions) = self.pending.positions.as_mut() {
                     positions.editing = None;
+                    positions.editing_cwd = false;
                 }
                 self.screen = Screen::Record;
             }

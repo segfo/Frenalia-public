@@ -73,7 +73,7 @@ fn fs_candidates_are_split_by_position_domain() {
             fs_event("C:/c/z", Some(CALC_SEQ), "C:/Windows/System32/calc.exe"),
         ],
     );
-    let candidates = from_session(&dir, &manifest, &PolicyFile::default());
+    let candidates = from_session(&dir, &manifest, &PolicyFile::default(), &harness_policy::position_domains::SplitPositions::new());
     let pairs = by_domain(&candidates);
     assert!(
         pairs.contains(&(Some(ENTRY_DOMAIN.to_string()), "C:/a/x".to_string())),
@@ -91,7 +91,7 @@ fn fs_candidates_are_split_by_position_domain() {
     assert!(candidates.unattributed.is_some());
 
     std::fs::remove_file(dir.process_audit_path()).expect("消す");
-    let old = from_session(&dir, &manifest, &PolicyFile::default());
+    let old = from_session(&dir, &manifest, &PolicyFile::default(), &harness_policy::position_domains::SplitPositions::new());
     assert_eq!(old.proposals.len(), 3);
     assert!(old.domains.iter().all(Option::is_none), "{:?}", old.domains);
     assert!(old.unattributed.is_none());
@@ -115,7 +115,7 @@ fn candidate_ids_are_one_sequence_across_domains() {
             fs_event("C:/a/x", Some(1), CMD),
         ],
     );
-    let candidates = from_session(&dir, &manifest, &PolicyFile::default());
+    let candidates = from_session(&dir, &manifest, &PolicyFile::default(), &harness_policy::position_domains::SplitPositions::new());
     let ids: Vec<(&str, &str, Option<&str>)> = candidates
         .proposals
         .iter()
@@ -142,7 +142,7 @@ fn candidate_ids_are_one_sequence_across_domains() {
             ),
         ],
     );
-    let candidates = from_session(&dir, &manifest, &PolicyFile::default());
+    let candidates = from_session(&dir, &manifest, &PolicyFile::default(), &harness_policy::position_domains::SplitPositions::new());
     let pairs = by_domain(&candidates);
     assert_eq!(
         pairs,
@@ -173,7 +173,7 @@ fn unattributed_fs_events_are_counted_and_not_approvable() {
             fs_event("C:/nobody/2", Some(999), CMD),
         ],
     );
-    let candidates = from_session(&dir, &manifest, &PolicyFile::default());
+    let candidates = from_session(&dir, &manifest, &PolicyFile::default(), &harness_policy::position_domains::SplitPositions::new());
     let values: Vec<&str> = candidates
         .proposals
         .iter()
@@ -204,7 +204,7 @@ fn a_childs_own_executable_goes_to_the_childs_domain() {
     let ws = workspace();
     let (dir, manifest) = seed_position_record(ws.path(), "s1", &[root(1, CMD), child(2, 1, TOOL)]);
     write_fs_events(&dir, &[fs_event("C:/a/x", Some(1), CMD)]);
-    let candidates = from_session(&dir, &manifest, &PolicyFile::default());
+    let candidates = from_session(&dir, &manifest, &PolicyFile::default(), &harness_policy::position_domains::SplitPositions::new());
     let execs: Vec<(Option<&str>, &str)> = candidates
         .proposals
         .iter()
@@ -234,12 +234,12 @@ fn show_prints_each_candidates_domain_with_the_same_ids() {
             fs_event("C:/b/y", Some(PWSH_SEQ), "C:/Program Files/PowerShell/7/pwsh.exe"),
         ],
     );
-    let candidates = load(&dir, &manifest, ws.path());
+    let candidates = load(&dir, &manifest, ws.path(), &harness_policy::position_domains::SplitPositions::new());
     let text = render(&candidates, 40);
     assert!(text.contains("fs-1     [workspace-shell] fs.read = C:/a/x"), "{text}");
     assert!(text.contains("fs-2     [pwsh] fs.read = C:/b/y"), "{text}");
 
     std::fs::remove_file(dir.process_audit_path()).expect("消す");
-    let old = load(&dir, &manifest, ws.path());
+    let old = load(&dir, &manifest, ws.path(), &harness_policy::position_domains::SplitPositions::new());
     assert_eq!(render(&old, 40), crate::aggregate::render(&old.fs, 40));
 }

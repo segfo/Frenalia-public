@@ -30,7 +30,9 @@ use harness_policy::policy_file::{self};
 use harness_policy::position_domains::PositionSource;
 
 use crate::position_approve::{self, DomainSelection, EdgeWrite, PositionPlan, PositionRequest};
-use crate::position_view::{key_of, position_edges, renamed_name};
+use crate::position_view::{
+    declared_cwds, key_of, position_edges, renamed_name, strict_destinations,
+};
 use crate::transition_approve::SourcedEdgeRef;
 use crate::tui::state::{App, Confirm, Modal};
 use crate::tui::transition::CandidateKey;
@@ -303,9 +305,12 @@ impl App {
             self.unapproved.clear();
             if let Some(positions) = self.pending.positions.as_mut() {
                 positions.approve.clear();
-                positions.narrow.clear();
                 positions.discard_output.clear();
+                positions.strict.clear();
+                positions.cwd.clear();
                 positions.renamed.clear();
+                // 分ける集合（決定67）は残す——書いた分けた行は既にあるリテラルの辺として引かれ、書かなかった分けた行は
+                // 分けたまま（ファイルの候補も同じ集合で作ってある。`PositionsState::split`のdoc）。
             }
         }
         self.pending.approve.clear();
@@ -381,6 +386,7 @@ impl App {
                 from_domain: from.clone(),
                 edge: target.edge_to(&to),
                 replaces_self_loop: false,
+                strict: false,
             }));
             Some(to)
         };
@@ -417,22 +423,25 @@ fn changed_count(plan: &PositionPlan) -> usize {
         + plan.unapproved.len()
 }
 
-/// 位置の行で選んだ位置の辺（付け替え・絞り方・出力の設定を当てたもの。形は[`position_edges`]の1か所）。
+/// 位置の行で選んだ位置の辺（付け替え・分けた行の引数・出力・作業ディレクトリを当てたもの。形は[`position_edges`]の
+/// 1か所）。Strict の行（`s`）は遷移先に印を付ける辺として渡す（決定67。印と辺を同じ1回の保存で書く）。
 fn selected_position_edges(positions: &PositionsState) -> Vec<EdgeWrite> {
     let assignment = &positions.view.assignment;
+    let strict = strict_destinations(assignment, &positions.renamed, &positions.strict);
     position_edges(
         assignment,
         &positions.renamed,
-        &positions.narrow,
         &positions.discard_output,
+        &declared_cwds(assignment, &positions.cwd, &positions.strict),
     )
-        .into_iter()
-        .zip(&assignment.positions)
-        .filter(|(_, position)| positions.approve.contains(&key_of(position)))
-        .map(|(add, _)| EdgeWrite {
-            replaces_self_loop: add.source == PositionSource::ReplacesSelfLoop,
-            from_domain: add.from_domain,
-            edge: add.edge,
-        })
-        .collect()
+    .into_iter()
+    .zip(&assignment.positions)
+    .filter(|(_, position)| positions.approve.contains(&key_of(position)))
+    .map(|(add, _)| EdgeWrite {
+        replaces_self_loop: add.source == PositionSource::ReplacesSelfLoop,
+        strict: strict.contains(&add.edge.to),
+        from_domain: add.from_domain,
+        edge: add.edge,
+    })
+    .collect()
 }

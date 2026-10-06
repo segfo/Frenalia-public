@@ -123,8 +123,13 @@ pub(super) fn run_show(
     // 位置の情報がある記録は候補をドメインごとに作る（画面と同じ入口・同じ番号。P4.5）。
     #[cfg(windows)]
     {
-        let candidates =
-            harness_policy_editor::position_candidates::load(&dir, &manifest, &workspace_root);
+        let candidates = harness_policy_editor::position_candidates::load(
+            &dir,
+            &manifest,
+            &workspace_root,
+            // CLI は位置を分けない（辺を書かないので分けた位置を作れない。決定67の検問2）。
+            &harness_policy::position_domains::SplitPositions::new(),
+        );
         print!(
             "{}",
             harness_policy_editor::position_candidates::render(&candidates, limit)
@@ -197,8 +202,13 @@ pub(super) fn run_approve(
     // 書く別の経路（P4.5）。
     #[cfg(windows)]
     let proposals = {
-        let candidates =
-            harness_policy_editor::position_candidates::load(&dir, &manifest, &workspace_root);
+        let candidates = harness_policy_editor::position_candidates::load(
+            &dir,
+            &manifest,
+            &workspace_root,
+            // CLI は位置を分けない（辺を書かないので分けた位置を作れない。決定67の検問2）。
+            &harness_policy::position_domains::SplitPositions::new(),
+        );
         if candidates.by_position() {
             return approve_by_position(
                 &workspace_root,

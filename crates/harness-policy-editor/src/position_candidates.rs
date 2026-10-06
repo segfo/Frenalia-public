@@ -31,7 +31,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use harness_policy::policy_file::{PolicyFile, ENTRY_DOMAIN};
-use harness_policy::position_domains::{partition_fs, Unattributed};
+use harness_policy::position_domains::{partition_fs, SplitPositions, Unattributed};
 use harness_policy::RuleProposal;
 
 use crate::aggregate::Aggregate;
@@ -61,9 +61,18 @@ impl SessionCandidates {
 /// 記録の候補を、`policy.json`を読んでから作る（[`from_session`]）。**画面の FS/ネットのタブと CLI の`show`・`approve`が
 /// 同じこれを通る**——同じ記録の候補番号が画面と CLI で同じになる（`B-13`）。`policy.json`が読めなければ位置を
 /// 割り当てられないので、今までどおりの1つの一覧にして理由を注記に出す（`B-10`）。
-pub fn load(dir: &RecordSessionDir, manifest: &RecordManifest, workspace_root: &Path) -> SessionCandidates {
+///
+/// `split`はコマンドラインごとに分ける位置（決定67）。画面は位置の木と**同じ集合**を渡す（`crate::position_view::load`の
+/// doc）。CLI は分けない（空の集合）——CLI は辺を書かないので分けた位置を作れない。画面が分けて書いた後は、既にある
+/// リテラルの辺を判定器で引くので、CLI も分けたドメインの候補を出す。
+pub fn load(
+    dir: &RecordSessionDir,
+    manifest: &RecordManifest,
+    workspace_root: &Path,
+    split: &SplitPositions,
+) -> SessionCandidates {
     match harness_policy::policy_file::load(workspace_root) {
-        Ok(file) => from_session(dir, manifest, &file),
+        Ok(file) => from_session(dir, manifest, &file, split),
         Err(e) => whole(
             dir,
             manifest,
@@ -92,8 +101,9 @@ pub fn from_session(
     dir: &RecordSessionDir,
     manifest: &RecordManifest,
     policy: &PolicyFile,
+    split: &SplitPositions,
 ) -> SessionCandidates {
-    let view = match crate::position_view::load(dir, manifest, policy) {
+    let view = match crate::position_view::load(dir, manifest, policy, split) {
         Ok(Some(view)) => view,
         Ok(None) => return whole(dir, manifest, None),
         Err(e) => {

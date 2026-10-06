@@ -31,12 +31,13 @@ use harness_change_ledger::path_rules::fold_for_pattern_comparison;
 use harness_config::FsAccess;
 use harness_policy::policy_file::{PolicyDomain, PolicyFile, ENTRY_DOMAIN};
 use harness_policy::position_domains::{
-    assign_domains, AssignError, Assignment, EdgeToAdd, Position, PositionSource, Unassigned,
+    assign_domains, script_argument, AssignError, Assignment, EdgeToAdd, Position,
+    PositionSource, SplitPositions, Unassigned,
 };
 use harness_policy::process_event::{parse_process_audit, ProcessAuditError};
 use harness_policy::process_tree::walk;
 use harness_policy::transition::{
-    self, editor_edge, AnyMarker, ArgvMatcher, ChildOutput, ExeMatcher, Resolution, SpawnAttempt,
+    self, editor_edge, ArgvMatcher, ChildOutput, ExeMatcher, Resolution, SpawnAttempt,
     TransitionGraph,
 };
 
@@ -67,14 +68,18 @@ pub struct PositionRow {
     pub startable: Startable,
 }
 
-/// 位置の同一性＝（割り当てたときの遷移元, 畳んだ exe）。画面の予約（承認する・引数を絞る）はこれで持つ
-/// ——遷移先の名前を変えても、指している行は同じだからである。
-pub type PositionKey = (String, String);
+/// 位置の同一性＝（割り当てたときの遷移元, 畳んだ exe, 割り当てたときの遷移先）。画面の予約（承認する・出力・Strict・
+/// 作業ディレクトリ）はこれで持つ——付け替え（`renamed`）は割り当ての名前に当てるので、遷移先の名前を変えても指している
+/// 行は同じである。**遷移先まで含める**のは、同じ（遷移元, exe）に位置が2つ以上あり得るため（コマンドラインごとに分けた
+/// 位置〔決定67〕と、既にあるリテラルの辺の位置と新しい提案が並ぶ形）。（遷移元, exe）だけで持つと、片方の予約がもう
+/// 片方の行（既にある辺の行を含む）にも当たり、書かない辺を書きに行く。
+pub type PositionKey = (String, String, String);
 
 pub fn key_of(position: &Position) -> PositionKey {
     (
         position.from_domain.clone(),
         fold_for_pattern_comparison(&position.exe),
+        position.to_domain.clone(),
     )
 }
 
@@ -132,10 +137,14 @@ pub enum PositionViewError {
 /// **パス2の記録**（パス2は`process-audit.jsonl`を書かない。`record_net`の`capture_argv: false`）は`Ok(None)`。
 ///
 /// 割り当てに渡す作業ディレクトリは記録のワークスペース（記録は作業ディレクトリを観測していない）。
+///
+/// `split`はコマンドラインごとに分ける位置（決定67。画面の`u`）。**位置の木とファイルの候補
+/// （`crate::position_candidates`）は同じ集合で呼ぶ**——違う集合で呼ぶと、候補が辺の作らないドメインへ振り分けられる。
 pub fn load(
     dir: &RecordSessionDir,
     manifest: &RecordManifest,
     policy: &PolicyFile,
+    split: &SplitPositions,
 ) -> Result<Option<PositionView>, PositionViewError> {
     if manifest.pass == 2 {
         return Ok(None);
@@ -146,17 +155,27 @@ pub fn load(
         Err(e) => return Err(PositionViewError::Unreadable(e)),
     };
     let log = parse_process_audit(&text).map_err(PositionViewError::Unparsable)?;
-    // 分ける位置（決定67）はエディタの画面が P5.10.2 で渡す。この段では分けない。
     let assignment = assign_domains(
         &log,
         policy,
         &manifest.workspace_root,
         &harness_sandbox::tier2a::domain_profile_name_problem,
-        &harness_policy::position_domains::SplitPositions::new(),
+        split,
     )
     .map_err(PositionViewError::Assign)?;
 
     let mut notes = unassigned_notes(&assignment);
+    // 分けようとして分けなかった位置（決定67(2)）。黙って1行のままにしない（`B-09`）。
+    for refused in &assignment.split_refused {
+        notes.push(format!(
+            "{} から {} の位置はコマンドラインごとに分けていません（引数が結び付かなかった起動 {}回・\
+             切り詰めの疑い {}回。振り分けられない起動を残さないため——決定67(2)）",
+            refused.from_domain,
+            refused.exe,
+            refused.argv_missing,
+            refused.argv_truncated
+        ));
+    }
     if log.skipped_lines > 0 {
         notes.push(format!(
             "process-audit.jsonl: 読めなかった行が{}行あります（その起動は木に出ていません）",
@@ -238,50 +257,121 @@ pub fn renamed_name<'a>(renamed: &'a BTreeMap<String, String>, name: &'a str) ->
     renamed.get(name).map(String::as_str).unwrap_or(name)
 }
 
-/// この位置を記録どおりのコマンドラインに絞れるか: 記録したコマンドラインが**ちょうど1通り**で、引数が結び付かな
-/// かった起動も切り詰められた疑いのある起動も無いとき（`plans/DESIGN-MAC.md` §5.1(6)、決定65 Q2）。
-pub fn can_narrow(position: &Position) -> bool {
-    position.command_lines.len() == 1 && position.argv_missing == 0 && position.argv_truncated == 0
-}
-
 /// 位置ごとの辺（[`Assignment::positions`]と同じ並び。既にある辺の位置も出どころつきで入れる）。
 ///
 /// 遷移元・遷移先の名前は`renamed`で置き換える（**名前ごと**——遷移先の名前を変えると、その位置から起きる子の
-/// 遷移元も一緒に変わる）。`narrow`に入っていて[`can_narrow`]な位置は記録したコマンドラインに絞り、他は任意の引数。
-/// `discard`に入っている位置は子の出力を捨てる辺にする（P5.5のキー`o`。決定66(4)）。
-/// 形は[`editor_edge`]の1か所（`B-05`。出力は`with_output`が替えるだけ）。
+/// 遷移元も一緒に変わる）。引数は位置が決める（[`Position::argv`]——コマンドラインごとに分けた位置〔決定67、画面の`u`〕は
+/// リテラル、他は任意）。`discard`に入っている位置は子の出力を捨てる辺にする（P5.5のキー`o`。決定66(4)）。
+/// `cwd`に入っている位置は作業ディレクトリを宣言する（決定67(3)。Strict の行と、`w`で宣言した行。[`declared_cwds`]）。
+/// 形は[`editor_edge`]の1か所（`B-05`。出力と作業ディレクトリは`with_output`・`with_cwd`が替えるだけ）。
 pub fn position_edges(
     assignment: &Assignment,
     renamed: &BTreeMap<String, String>,
-    narrow: &BTreeSet<PositionKey>,
     discard: &BTreeSet<PositionKey>,
+    cwd: &BTreeMap<PositionKey, String>,
 ) -> Vec<EdgeToAdd> {
     assignment
         .positions
         .iter()
         .map(|position| {
-            let argv = match position.command_lines.first() {
-                Some(line) if can_narrow(position) && narrow.contains(&key_of(position)) => {
-                    ArgvMatcher::Literal(line.clone())
-                }
-                _ => ArgvMatcher::Any(AnyMarker),
-            };
+            let key = key_of(position);
             EdgeToAdd {
                 from_domain: renamed_name(renamed, &position.from_domain).to_string(),
                 edge: editor_edge(
                     &position.exe,
-                    argv,
+                    position.argv(),
                     renamed_name(renamed, &position.to_domain),
                 )
-                .with_output(if discard.contains(&key_of(position)) {
+                .with_output(if discard.contains(&key) {
                     ChildOutput::Discard
                 } else {
                     ChildOutput::Return
-                }),
+                })
+                .with_cwd(cwd.get(&key).cloned()),
                 source: position.source,
             }
         })
         .collect()
+}
+
+/// 辺に書く作業ディレクトリ（[`position_edges`]の`cwd`）: `w`で宣言した値（`declared`）、無ければ Strict の行
+/// （`strict`）は候補（[`cwd_candidate`]）。**Strict の行は必ず作業ディレクトリを持つ**（決定66の追記の束。無いと
+/// 規則(e)に落ちる）。普通の行は`w`で宣言したときだけ（相対パスの引数を固定した行は宣言が要る——規則(d)）。
+pub fn declared_cwds(
+    assignment: &Assignment,
+    declared: &BTreeMap<PositionKey, String>,
+    strict: &BTreeSet<PositionKey>,
+) -> BTreeMap<PositionKey, String> {
+    assignment
+        .positions
+        .iter()
+        .filter_map(|position| {
+            let key = key_of(position);
+            let cwd = declared.get(&key).cloned().or_else(|| {
+                strict
+                    .contains(&key)
+                    .then(|| cwd_candidate(position).dir)
+            })?;
+            Some((key, cwd))
+        })
+        .collect()
+}
+
+/// Strict の印を付ける遷移先（付け替えを当てた名前）——`strict`に入っている位置の遷移先。
+pub fn strict_destinations(
+    assignment: &Assignment,
+    renamed: &BTreeMap<String, String>,
+    strict: &BTreeSet<PositionKey>,
+) -> BTreeSet<String> {
+    assignment
+        .positions
+        .iter()
+        .filter(|position| strict.contains(&key_of(position)))
+        .map(|position| renamed_name(renamed, &position.to_domain).to_string())
+        .collect()
+}
+
+/// 作業ディレクトリの候補（決定67(3)）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CwdCandidate {
+    pub dir: String,
+    /// 当てずっぽうの候補か（相対パスのスクリプトなのに、実行ファイルのフォルダを出している）。画面は「推定」と添える。
+    pub estimated: bool,
+}
+
+/// 作業ディレクトリの候補: 引数の中の**絶対パスのスクリプトのフォルダ**、無ければ**実行ファイルのフォルダ**
+/// （決定67(3)）。記録（ETW）には作業ディレクトリが残らないので候補でしかない——相対パスのスクリプトなら、
+/// 実際はスクリプトのある場所で走っていたはずで、実行ファイルのフォルダは推定になる。間違っていれば実行時に
+/// `CwdMismatch`（宣言した場所と実際の場所の両方が拒否の行に残る）で分かる。スクリプトの見分けは割り当ての名前と
+/// 同じ`script_argument`（写さない）。
+pub fn cwd_candidate(position: &Position) -> CwdCandidate {
+    let script = position
+        .fixed_command_line
+        .as_deref()
+        .and_then(script_argument);
+    match script {
+        Some(script) if script.absolute => CwdCandidate {
+            dir: parent_folder(&script.token),
+            estimated: false,
+        },
+        Some(_) => CwdCandidate {
+            dir: parent_folder(&position.exe),
+            estimated: true,
+        },
+        None => CwdCandidate {
+            dir: parent_folder(&position.exe),
+            estimated: false,
+        },
+    }
+}
+
+/// パスのフォルダ（書かれた綴りのまま。ドライブの直下なら`C:\`の形で根を残す）。
+fn parent_folder(path: &str) -> String {
+    match path.rfind(['\\', '/']) {
+        Some(at) if at == 2 && path.as_bytes().get(1) == Some(&b':') => path[..=at].to_string(),
+        Some(at) => path[..at].to_string(),
+        None => path.to_string(),
+    }
 }
 
 /// 自己ループ辺の置き換え（[`PositionSource::ReplacesSelfLoop`]）で取り除く辺: `from`の自己ループ辺のうち、
@@ -319,6 +409,8 @@ pub(crate) const PATTERN_SELF_LOOP: &str = "遷移元の自己ループ辺がパ
 ///   ファイルに2本当たる。P3b の注意1）。パターンの自己ループ辺なら[`EdgeVerdict::Rejected`]
 /// - `extra_fs`（`(ドメイン, 値, access)`）は各ドメインの宣言へ足してから聞く（ファイルの候補がドメインごとになる
 ///   P4.4 で、選んだ候補を渡す）
+/// - `strict`（付け替えを当てた遷移先の名前）には辺を足した後で Strict の印を付けてから聞く（決定67。画面の`s`）
+///   ——呼び出し元が書けるスクリプト・作業ディレクトリは規則(i)、固定していない辺は規則(e)が断る（エディタで写さない）
 /// - [`transition::check_all`]に落ちた辺は[`EdgeVerdict::Rejected`]（広げる辺は落ちない。決定66）
 /// - 全体が検査に通れば、判定器を組んで各辺の起動を引き直し、**書いた辺の遷移先に着かない**（既にあるパターンの辺と
 ///   重なる等。P3b の注意2）なら[`EdgeVerdict::Rejected`]。他の辺が検査に落ちる間は判定器を組めないので引き直さない
@@ -332,6 +424,7 @@ pub fn verdicts(
     workspace_root: &Path,
     edges: &[EdgeToAdd],
     extra_fs: &[(String, String, FsAccess)],
+    strict: &BTreeSet<String>,
 ) -> Vec<EdgeVerdict> {
     let mut file = policy.clone();
     for (domain, value, access) in extra_fs {
@@ -396,6 +489,10 @@ pub fn verdicts(
                 placed[*index] = Some((from.to_string(), *at));
             }
         }
+    }
+    // Strict の印（決定67）。遷移先のドメインは辺を足したときに作られるので、その後で付ける。
+    for name in strict {
+        domain_mut(&mut file, name).strict = true;
     }
 
     let workspace = workspace_root.to_string_lossy();
@@ -464,7 +561,8 @@ pub fn verdicts(
 
 /// 書いた後の判定器で、`from`から辺`edge`の起動（引数はリテラルならその綴り、任意なら空）が辺の遷移先に着くか。
 /// 着かなければ理由（`None`は着く）。位置の行の判定（[`verdicts`]）と確定（`crate::position_approve`）が同じこれを
-/// 通す（P3b の注意2。`B-05`）。
+/// 通す（P3b の注意2。`B-05`）。**作業ディレクトリを宣言した辺はその場所から呼んだものとして引く**（決定67(4)——
+/// 呼び出し元はその場所へ移ってから呼ぶ。ワークスペースから引くと、宣言どおりの辺がいつも`CwdMismatch`で着かない）。
 pub(crate) fn lands_elsewhere(
     graph: &TransitionGraph,
     from: &str,
@@ -482,7 +580,7 @@ pub(crate) fn lands_elsewhere(
         from_domain: from,
         exe,
         command_line,
-        cwd: workspace,
+        cwd: edge.cwd.as_deref().unwrap_or(workspace),
     }) {
         Resolution::Allowed(allowed) if allowed.to == edge.to => None,
         Resolution::Allowed(allowed) => Some(format!(

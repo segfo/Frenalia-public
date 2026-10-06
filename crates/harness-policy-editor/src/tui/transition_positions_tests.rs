@@ -18,7 +18,7 @@ use crate::position_view::position_view_tests::{
     child, root, seed_position_record, seed_record, user_example, with_command_line, workspace,
     CALC, CMD, MSPAINT, PWSH,
 };
-use crate::position_view::{position_edges, PositionKey};
+use crate::position_view::{position_edges, EdgeVerdict, PositionKey};
 use crate::tui::state::App;
 use crate::tui::transition::PendingTab;
 
@@ -167,38 +167,55 @@ fn a_store_app_position_says_why_it_cannot_start() {
     assert!(app.status.contains("ストアアプリ"), "{}", app.status);
 }
 
-/// `u`で記録どおりに絞ると相対パスの引数が検査に落ちるなら、**判定器の理由を言って絞らない**（任意の引数のまま。
-/// DESIGN-MAC §5.1(5)。相対かどうかはエディタが判定しない＝`check_all`の文言をそのまま出す）。
-/// 対の側: 絶対パスだけの引数なら絞れる。
+/// [P5.10.2] `u`は引数を記録どおりに固定して**コマンドラインごとの行に分ける**（決定67。P5.10 までは1通りのときだけ
+/// 「絞る」だった）。相対パスの引数を固定した行は、作業ディレクトリが無いと検査に落ちる（規則(d)、DESIGN-MAC §5.1(5)。
+/// 相対かどうかはエディタが判定しない＝`check_all`の文言をそのまま出す）——分けたうえで選ばず、理由を言う。前の`u`は
+/// 「このエディタは作業ディレクトリを宣言しない」ので絞らずに断っていたが、`w`という直し方ができた: 作業ディレクトリを
+/// 宣言すると書ける。対の側: 絶対パスだけの引数なら、分けた行は選んだまま。
 #[test]
-fn narrowing_a_position_with_a_relative_argument_is_refused_with_the_reason() {
+fn splitting_a_position_with_a_relative_argument_needs_a_cwd() {
     const TOOL: &str = "C:/x/tool.exe";
+    const RELATIVE: &str = "\"C:/x/tool.exe\" ./input.txt";
     let ws = workspace();
-    let relative = with_command_line(child(2, 1, TOOL), "\"C:/x/tool.exe\" ./input.txt");
+    let relative = with_command_line(child(2, 1, TOOL), RELATIVE);
     let mut app = app_with_record(ws.path(), &[root(1, CMD), relative]);
     press(&mut app, KeyCode::Char(' '));
     press(&mut app, KeyCode::Char('u'));
-    let positions = app.pending.positions.as_ref().unwrap();
-    assert!(positions.narrow.is_empty(), "絞ってはいけない");
-    assert!(
-        positions.approve.contains(&key_of(&app, TOOL)),
-        "予約は残す"
+    {
+        let positions = app.pending.positions.as_ref().unwrap();
+        let position = &positions.view.assignment.positions[0];
+        assert_eq!(position.fixed_command_line.as_deref(), Some(RELATIVE));
+        assert!(positions.approve.is_empty(), "検査に落ちる行は選ばない");
+        assert!(
+            matches!(&positions.verdicts[0], EdgeVerdict::Rejected { detail } if detail.contains("relative path")),
+            "{:?}",
+            positions.verdicts
+        );
+    }
+    assert!(app.status.contains("検査に落ちる"), "{}", app.status);
+    assert!(app.status.contains("w で作業ディレクトリ"), "{}", app.status);
+
+    // `w`で作業ディレクトリ（候補は実行ファイルのフォルダ）を宣言すると書ける。
+    press(&mut app, KeyCode::Char('w'));
+    assert_eq!(
+        app.pending.positions.as_ref().unwrap().editing.as_ref().map(|i| i.text().to_string()),
+        Some("C:/x".to_string())
     );
-    assert!(app.status.contains("絞れません"), "{}", app.status);
-    assert!(app.status.contains("relative path"), "{}", app.status);
+    press(&mut app, KeyCode::Enter);
+    press(&mut app, KeyCode::Char(' '));
+    let positions = app.pending.positions.as_ref().unwrap();
+    assert!(positions.approve.contains(&key_of(&app, TOOL)), "{}", app.status);
+    assert_eq!(positions.verdicts[0], EdgeVerdict::Writable);
 
     let ws = workspace();
     let absolute = with_command_line(child(2, 1, TOOL), "\"C:/x/tool.exe\" C:/x/input.txt");
     let mut app = app_with_record(ws.path(), &[root(1, CMD), absolute]);
     press(&mut app, KeyCode::Char(' '));
     press(&mut app, KeyCode::Char('u'));
+    let positions = app.pending.positions.as_ref().unwrap();
+    assert!(positions.view.assignment.positions[0].fixed_command_line.is_some());
     assert!(
-        app.pending
-            .positions
-            .as_ref()
-            .unwrap()
-            .narrow
-            .contains(&key_of(&app, TOOL)),
+        positions.approve.contains(&key_of(&app, TOOL)),
         "{}",
         app.status
     );
@@ -259,8 +276,8 @@ fn the_destination_field_renames_the_selected_position_and_its_children_follow()
     let edges = position_edges(
         &positions.view.assignment,
         &positions.renamed,
-        &positions.narrow,
         &positions.discard_output,
+        &std::collections::BTreeMap::new(),
     );
     let edge_of = |exe: &str| {
         edges

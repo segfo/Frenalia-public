@@ -80,7 +80,11 @@ pub(super) fn screen_keys(app: &App) -> Vec<KeyHint> {
             keys.push(press("Space 選ぶ/外す", KeyCode::Char(' ')));
             // 位置の木は位置ごとのドメインの記録にしか出ないので、`a`はいつも全タブの確定（P4.5）。
             keys.push(position_commit_hint(app));
-            keys.push(press("u 引数の広さ", KeyCode::Char('u')));
+            // [P5.10.2] 決定67: 引数を固定してコマンドラインごとに分ける・Strict・作業ディレクトリ。書く辺の形を変える設定
+            // なので`o`と並べる。
+            keys.push(press("u 引数を固定して分ける/戻す", KeyCode::Char('u')));
+            keys.push(press("s Strict", KeyCode::Char('s')));
+            keys.push(press("w 作業ディレクトリ", KeyCode::Char('w')));
             // [P5.5] 子の出力を捨てる／返す（決定66(4)）。`u`と同じく書く辺の形を変える設定なので隣に置く。
             keys.push(press("o 出力を捨てる/返す", KeyCode::Char('o')));
             keys.push(press("Tab 遷移先", KeyCode::Tab));

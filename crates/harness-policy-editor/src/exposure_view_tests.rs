@@ -235,4 +235,11 @@ fn the_details_say_whether_each_edge_is_ordinary_or_strict() {
         text.contains("［Strict］") && text.contains("入力を固定するので") && text.contains("secret"),
         "{text}"
     );
+    // [P5.10.2] Strict の辺は作業ディレクトリと「移ってから呼ぶ」を言う（決定67(4)。宣言画面の`s`の確認もこれを並べる）。
+    // 対の側: 普通の辺の明細には出ない（作業ディレクトリを宣言していない）。
+    assert!(
+        text.contains("作業ディレクトリ C:/work") && text.contains("移ってから呼ぶ"),
+        "{text}"
+    );
+    assert!(!ordinary.contains("移ってから呼ぶ"), "{ordinary}");
 }

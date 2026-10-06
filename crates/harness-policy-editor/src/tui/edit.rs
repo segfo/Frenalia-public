@@ -34,6 +34,38 @@ fn failure_note_block(manifest: &crate::session_dir::RecordManifest) -> String {
     }
 }
 
+/// パス1の記録の候補一覧。位置の情報がある記録は候補をドメインごとに作る（決定65(5)、P4.4）。CLI の`show`・`approve`と
+/// 同じ入口を通す（候補の番号が画面と CLI で同じになる。`policy.json`が読めないときの扱いもそこにある）。
+/// [`App::open_selected_session`]と、`u`で分け方を変えたときの作り直し（`tui::position_split`）が同じこれを通す。
+pub(super) fn pass1_view(
+    dir: &crate::session_dir::RecordSessionDir,
+    manifest: &crate::session_dir::RecordManifest,
+    workspace_root: &std::path::Path,
+    split: &harness_policy::position_domains::SplitPositions,
+) -> SessionView {
+    let candidates = crate::position_candidates::load(dir, manifest, workspace_root, split);
+    let aggregate = candidates.fs;
+    let mut notes = failure_note_block(manifest);
+    for note in &candidates.notes {
+        notes.push_str(note);
+        notes.push('\n');
+    }
+    // 収集器そのものが動いていない場合は、候補が0件である理由がここにしか無い（D-43）。
+    if !manifest.collector_started {
+        notes.push_str("警告: この記録では収集器が起動していません（FSアクセスは記録されていません）\n");
+    } else if !manifest.etw_available {
+        notes.push_str("警告: この記録ではETWセッションが張れていません（何も観測できていません）\n");
+    }
+    notes.push_str(&crate::aggregate::render_notes(&aggregate));
+    let tree = crate::aggregate::render_process_tree(&aggregate);
+    let data = SessionData {
+        fs: Some(Box::new(aggregate)),
+        net: None,
+    };
+    // 位置の情報が無い記録は`domains`が全部`None`＝ドメインの段の無い木（今までどおり）。
+    SessionView::new(data, notes, tree, candidates.proposals, candidates.domains)
+}
+
 impl App {
     /// 選択中のセッションを開いて候補を作る。**保存済みの集計値は使わず**、監査JSONLから
     /// 毎回計算し直す（正本はJSONLだけ、B-13）。
@@ -107,34 +139,9 @@ impl App {
             let domains = vec![None; proposals.len()];
             SessionView::new(data, notes, tree, proposals, domains)
         } else {
-            // 位置の情報がある記録は候補をドメインごとに作る（決定65(5)、P4.4）。CLI の`show`・`approve`と同じ
-            // 入口を通す（候補の番号が画面と CLI で同じになる。`policy.json`が読めないときの扱いもそこにある）。
-            let candidates =
-                crate::position_candidates::load(&entry.dir, &manifest, &self.workspace_root);
-            let aggregate = candidates.fs;
-            let mut notes = failure_note_block(&manifest);
-            for note in &candidates.notes {
-                notes.push_str(note);
-                notes.push('\n');
-            }
-            // 収集器そのものが動いていない場合は、候補が0件である理由がここにしか無い（D-43）。
-            if !manifest.collector_started {
-                notes.push_str(
-                    "警告: この記録では収集器が起動していません（FSアクセスは記録されていません）\n",
-                );
-            } else if !manifest.etw_available {
-                notes.push_str(
-                    "警告: この記録ではETWセッションが張れていません（何も観測できていません）\n",
-                );
-            }
-            notes.push_str(&crate::aggregate::render_notes(&aggregate));
-            let tree = crate::aggregate::render_process_tree(&aggregate);
-            let data = SessionData {
-                fs: Some(Box::new(aggregate)),
-                net: None,
-            };
-            // 位置の情報が無い記録は`domains`が全部`None`＝ドメインの段の無い木（今までどおり）。
-            SessionView::new(data, notes, tree, candidates.proposals, candidates.domains)
+            // 分ける位置（決定67）は位置の木と同じ集合（同じ記録のときだけ。`tui::position_split`）。
+            let split = self.position_split_for(&manifest.id);
+            pass1_view(&entry.dir, &manifest, &self.workspace_root, &split)
         };
         self.view = Some(view);
         self.rebuild_tree();

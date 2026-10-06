@@ -52,6 +52,7 @@ fn edge(from: &str, exe: &str, to: &str) -> EdgeWrite {
         from_domain: from.to_string(),
         edge: editor_edge(exe, ArgvMatcher::Any(AnyMarker), to),
         replaces_self_loop: false,
+        strict: false,
     }
 }
 
@@ -468,7 +469,7 @@ fn the_cli_approves_a_position_record_into_each_candidates_domain() {
             fs_event("C:/Users/x/c.txt", Some(3), CALC),
         ],
     );
-    let candidates = crate::position_candidates::load(&dir, &manifest, ws.path());
+    let candidates = crate::position_candidates::load(&dir, &manifest, ws.path(), &harness_policy::position_domains::SplitPositions::new());
     assert!(candidates.by_position());
     let id_of = |value: &str| -> (String, Option<String>) {
         let index = candidates
@@ -532,4 +533,52 @@ fn the_cli_approves_a_position_record_into_each_candidates_domain() {
     );
     assert!(file.domain("calc").is_none());
     assert!(approved(ws.path(), "pwsh", "C:/Users/x/b.txt"));
+}
+
+/// [P5.10.2] **Strict の行の辺（`EdgeWrite::strict`）は遷移先に印を付けて同じ1回の保存で書き**、明細に印・作業ディレクトリ・
+/// 「移ってから呼ぶ」が出る（決定67）。禁止側: 呼び出し元が書ける場所（ワークスペース）を作業ディレクトリにすると、書いた後の
+/// 検査（規則(i)）が全体を断り、1バイトも書かない。対: 印を付けない（普通の辺）なら同じ作業ディレクトリでも書ける。
+#[test]
+fn a_strict_write_marks_the_destination_and_a_writable_cwd_refuses_everything() {
+    let ws = workspace();
+    let fixed = editor_edge(
+        PWSH,
+        ArgvMatcher::Literal(format!("\"{PWSH}\" -File C:/tools/a.ps1")),
+        "logs",
+    )
+    .with_cwd(Some("C:/tools".to_string()));
+    let strict_write = |edge: TransitionEdge| EdgeWrite {
+        strict: true,
+        edge,
+        ..edge_for_strict()
+    };
+    let ok = plan(&request(ws.path(), Vec::new(), vec![strict_write(fixed.clone())])).expect("書ける");
+    assert_eq!(ok.strict_marked, vec!["logs".to_string()]);
+    assert!(ok.file.domain("logs").expect("遷移先").strict);
+    let text = confirmation_lines(ws.path(), &ok, &BTreeSet::new()).join("\n");
+    for needle in ["Strict の印を付けるドメイン 1個", "作業ディレクトリ C:/tools", "移ってから呼ぶ"] {
+        assert!(text.contains(needle), "{needle}:\n{text}");
+    }
+    commit(ws.path(), &ok, &policy_file::save).expect("書く");
+    assert!(policy_file::load(ws.path()).unwrap().domain("logs").unwrap().strict);
+
+    let ws = workspace();
+    let in_workspace = fixed.clone().with_cwd(Some(ws.path().to_string_lossy().into_owned()));
+    let refused = plan(&request(ws.path(), Vec::new(), vec![strict_write(in_workspace.clone())]));
+    assert!(refused.is_err(), "{:?}", refused.map(|p| p.strict_marked));
+    assert_eq!(bytes(ws.path()), None, "断った確定で書いた");
+    let ordinary = EdgeWrite {
+        strict: false,
+        ..strict_write(in_workspace)
+    };
+    let ordinary = plan(&request(ws.path(), Vec::new(), vec![ordinary])).expect("普通の辺は書ける");
+    assert!(ordinary.strict_marked.is_empty());
+    // 普通の辺でも作業ディレクトリを宣言すれば、呼び出し元はその場所から呼ぶ必要がある（明細の辺の行で言う）。
+    let text = confirmation_lines(ws.path(), &ordinary, &BTreeSet::new()).join("\n");
+    assert!(text.contains("移ってから呼ぶ") && !text.contains("Strict の印"), "{text}");
+}
+
+/// 入口のドメインから`PWSH`を起こす辺の書き込み（Strict の試験の土台。辺は呼び出し側が差し替える）。
+fn edge_for_strict() -> EdgeWrite {
+    edge(ENTRY_DOMAIN, PWSH, "logs")
 }

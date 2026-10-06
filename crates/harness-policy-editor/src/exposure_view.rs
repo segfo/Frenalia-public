@@ -101,6 +101,8 @@ pub struct StrictEdgeView {
     /// 辺の実行ファイル（書かれた綴り）。
     pub exe: String,
     pub to: String,
+    /// [P5.10.2] 辺が宣言する作業ディレクトリ（Strict の辺は必ず持つ。呼び出し元はこの場所から呼ぶ——決定67(4)）。
+    pub cwd: Option<String>,
 }
 
 /// `before` → `after`の変更で広がる遷移。`after`は書く予定の内容、`before`は読み込んだ`policy.json`。
@@ -152,6 +154,7 @@ pub fn widening(before: &PolicyFile, after: &PolicyFile, workspace_root: &Path) 
                 .into_iter()
                 .map(|edge| StrictEdgeView {
                     exe: exe_of(written(&edge.from, edge.edge_index)),
+                    cwd: written(&edge.from, edge.edge_index).and_then(|e| e.cwd.clone()),
                     from: edge.from,
                     to: edge.to,
                 })
@@ -212,6 +215,12 @@ pub fn lines(widening: &Widening) -> Vec<String> {
         ));
         for edge in &widening.strict_edges {
             lines.push(format!("  {} → {}（{}）［Strict］", edge.from, edge.to, edge.exe));
+            // [P5.10.2] 決定67(4): 宣言と違う場所からの呼び出しは今のまま断る（DESIGN-MAC-ENFORCEMENT §8.3）。
+            if let Some(cwd) = &edge.cwd {
+                lines.push(format!(
+                    "      作業ディレクトリ {cwd}——呼び出し元はこの場所へ移ってから呼ぶ必要があります（違う場所からは断られます）"
+                ));
+            }
         }
     }
     if !widening.pairs.is_empty() {

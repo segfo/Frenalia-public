@@ -502,6 +502,12 @@ impl App {
                                辺は出力を返す設定で書きます（変えるなら policy.json の辺に \"output\": \"discard\"）"
                     .to_string();
             }
+            // [P5.10.2] Strict（s）と作業ディレクトリ（w）も位置の木にだけある（決定67）。理由を言う（`B-32`）。
+            KeyCode::Char('s') | KeyCode::Char('w') => {
+                self.status = "Strict（s）と作業ディレクトリ（w）は「遷移・観測から」の位置の木で、u で引数を固定した\
+                               行にだけ付けられます。拒否からの辺は任意の引数で書きます"
+                    .to_string();
+            }
             KeyCode::Char('f') => {
                 self.pending.filter = self.pending.filter.next();
                 let rows = self.pending.visible().len();

@@ -3041,10 +3041,12 @@ fn reservation_sizes(app: &App) -> (usize, usize) {
         + app.pending.positions.as_ref().map_or(0, |p| p.approve.len())
         + app.declared_approval.reserved.len()
         + unmark;
+    // [P5.10.2] 位置の木の Strict の行（`s`。決定67）も数える——宣言画面の`s`と同じく、呼び出し元が子を操れなくなる向き。
     let removes = app.unapproved.len()
         + app.pending.remove.len()
         + app.declared_transitions.remove.len()
-        + (strict.len() - unmark);
+        + (strict.len() - unmark)
+        + app.pending.positions.as_ref().map_or(0, |p| p.strict.len());
     (adds, removes)
 }
 
@@ -3181,7 +3183,10 @@ fn no_key_has_opposite_directions_in_two_tabs_of_one_screen() {
         ("承認待ち", "FS/ネット", 'd', BY_ROW),
         ("承認待ち", "FS/ネット", 'R', ADDS),
         ("承認待ち", "遷移・拒否から", ' ', BY_ROW),
+        // [P5.10.2] 位置の木は選んで分けた行（`Space`→`u`）でも測る（選んだ行の`Space`は予約を外すだけで、減らす予約は作らない）。
         ("承認待ち", "位置の木", ' ', ADDS),
+        // [P5.10.2] Strict にする（決定67。`F3`の`s`と同じ「減らす」向き）。分けた行でだけ効く。
+        ("承認待ち", "位置の木", 's', REMOVES),
         ("宣言", "ファイル・通信", ' ', REMOVES),
         ("宣言", "ファイル・通信", 'A', REMOVES),
         ("宣言", "ファイル・通信", 'y', ADDS),
@@ -3233,11 +3238,18 @@ fn no_key_has_opposite_directions_in_two_tabs_of_one_screen() {
             "承認待ち",
             "位置の木",
             |row| {
+                // 前半の行は何も選んでいない木、後半の行は同じ行を`Space`で選んで`u`で分けた木（P5.10.2。`s`は分けた行に
+                // だけ効くので、分けた行で測らないと向きを見張れない）。
                 let mut app = positions_app(positions.path());
-                app.pending.positions.as_mut().expect("位置の木").row = row;
+                let rows = app.pending.positions.as_ref().map_or(0, |p| p.visible().len());
+                app.pending.positions.as_mut().expect("位置の木").row = row % rows;
+                if row >= rows {
+                    press(&mut app, KeyCode::Char(' '));
+                    press(&mut app, KeyCode::Char('u'));
+                }
                 app
             },
-            |app| app.pending.positions.as_ref().map_or(0, |p| p.visible().len()),
+            |app| 2 * app.pending.positions.as_ref().map_or(0, |p| p.visible().len()),
         ),
         tab_probe(
             "宣言",

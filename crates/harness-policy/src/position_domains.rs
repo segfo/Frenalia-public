@@ -160,6 +160,15 @@ impl Position {
     pub fn can_split(&self) -> bool {
         self.argv_missing == 0 && self.argv_truncated == 0 && !self.command_lines.is_empty()
     }
+
+    /// この位置の辺の引数: 分けた位置はコマンドラインのリテラル、他は任意（決定67(1)・決定65 Q2）。
+    /// [`Assignment::edges_to_add`]とエディタの位置の辺が同じこれを通す（`B-05`）。
+    pub fn argv(&self) -> ArgvMatcher {
+        match &self.fixed_command_line {
+            Some(line) => ArgvMatcher::Literal(line.clone()),
+            None => ArgvMatcher::Any(AnyMarker),
+        }
+    }
 }
 
 /// 位置の遷移先がどこから来たか。
@@ -267,14 +276,7 @@ impl Assignment {
                 from_domain: position.from_domain.clone(),
                 // 辺の形はエディタの遷移の承認と同じ1か所（`editor_edge`）で決める（`B-05`）。分けた位置は
                 // コマンドラインのリテラル（決定67(1)）。作業ディレクトリは決めない（記録に無い。エディタが足す）。
-                edge: editor_edge(
-                    &position.exe,
-                    match &position.fixed_command_line {
-                        Some(line) => ArgvMatcher::Literal(line.clone()),
-                        None => ArgvMatcher::Any(AnyMarker),
-                    },
-                    &position.to_domain,
-                ),
+                edge: editor_edge(&position.exe, position.argv(), &position.to_domain),
                 source: position.source,
             })
             .collect()
