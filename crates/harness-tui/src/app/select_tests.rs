@@ -513,3 +513,76 @@ fn a_ctrl_chord_does_not_answer_the_approval_dialog() {
         );
     }
 }
+
+/// Markdownに見える記号（見出し・太字・コード・リスト・入れ子・番号・引用・フェンス・空行）と全角文字を含むassistantの返答。
+/// 最後の行は全角文字だけで、画面の幅を超えて折り返す。
+const MARKDOWN_LOOKING: &str = "# 見出し\n\
+**太字** と `code` と _斜体_\n\
+- item 1\n  - 入れ子の item\n\
+1. 番号付き\n\
+\n\
+> 引用の行\n\
+```rust\n    let x = 1;\n```\n\
+これは画面の幅を超える長い日本語の行です。これは画面の幅を超える長い日本語の行です。これは画面の幅を超える長い日本語の行です。これは画面の幅を超える長い日本語の行です。";
+
+/// **[今の見え方の固定] Markdownに見える記号を含むassistantの返答は、記号のまま1行ずつ、色も飾りも付けずに描かれ、
+/// 選んで写すと原文がそのまま書かれる**（行の間は`CRLF`、空行も字下げも残り、折り返した長い行は1行に戻る）。
+///
+/// T5で返答の描き方を`crate::markdown`のPort越しにした。中身は今までと同じ描き方の`PlainText`なので、画面とコピーが
+/// 1文字も変わらないことをこれで固定する（`plans/PLAN-TUI-IMPROVEMENTS.md`§0のT5）。Markdownとして整形する実装へ
+/// 差し替える段（T9）では、この試験を**意図して**書き換える。
+#[test]
+fn markdown_looking_assistant_text_is_drawn_and_copied_verbatim() {
+    let mut app = app_with_items(&[MARKDOWN_LOOKING]);
+    let screen = draw(&mut app);
+    let source: Vec<&str> = MARKDOWN_LOOKING.lines().collect();
+    let (long, short) = source.split_last().expect("行がある");
+
+    // 原文の行は枠の中の左上から1行ずつ、記号のまま並ぶ（枠線の`│`の内側を、行末の空白を除いて読む）。
+    assert_eq!(screen.find("# 見出し"), (1, 1), "{}", screen.text());
+    let inner = |y: u16| {
+        let row = screen.row(y);
+        let row = row.strip_prefix('│').unwrap_or(&row);
+        row.strip_suffix('│').unwrap_or(row).trim_end().to_string()
+    };
+    for (k, line) in short.iter().enumerate() {
+        assert_eq!(inner(1 + k as u16), *line, "{k}行目\n{}", screen.text());
+    }
+    // 長い行は2行に折り返して描かれ、つなぐと原文の1行になる（全角48文字＝96桁で折り返す）。
+    let first = 1 + short.len() as u16;
+    assert_eq!(inner(first).chars().count(), 48, "{}", screen.text());
+    assert_eq!(format!("{}{}", inner(first), inner(first + 1)), *long);
+    assert_eq!(inner(first + 2), "", "折り返しが2行より多い");
+
+    // 記号のセルに色も飾りも付いていない（整形していない）。
+    for mark in [
+        "#",
+        "**",
+        "`code`",
+        "_斜体_",
+        "- item",
+        "  - 入れ子",
+        "1.",
+        "> 引用",
+        "```rust",
+        "    let",
+    ] {
+        let at = screen.find(mark);
+        let look = screen.style(at);
+        assert_eq!(
+            (look.fg, look.bg, look.add_modifier),
+            (Some(Color::Reset), Some(Color::Reset), Modifier::empty()),
+            "「{mark}」に見た目が付いた"
+        );
+    }
+
+    // 左上から長い行の終わりまで選んで写すと、原文がそのまま（行の間は`CRLF`）。
+    let (x, y) = screen.find_last("行です。");
+    drag(&mut app, (1, 1), (x + 10, y));
+    let (copied, other) = ctrl_c(&mut app);
+    assert_eq!(
+        copied.as_deref(),
+        Some(MARKDOWN_LOOKING.replace('\n', "\r\n").as_str()),
+        "{other}"
+    );
+}
