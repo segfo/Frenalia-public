@@ -192,8 +192,6 @@ pub(super) fn hint_rows(hints: &[KeyHint], look: HintLook, width: u16) -> u16 {
 }
 
 /// 描いた項目の矩形`drawn`（`hints`と同じ順）のうち、押せる項目を、押すと`click`（キー→動き）になる場所として登録する。
-/// 2回続けて押す項目（`KeyHint::twice`。`Esc×2=終了`）は[`Click::KeyTwice`]——入力欄の見出し（案内の文字のまま描く）にしか
-/// 無い。
 fn register_hints(
     targets: &mut Targets,
     hints: &[KeyHint],
@@ -202,12 +200,7 @@ fn register_hints(
 ) {
     for (hint, rect) in hints.iter().zip(drawn) {
         if let Some(key) = hint.key {
-            let pressed = if hint.twice {
-                Click::KeyTwice(key)
-            } else {
-                click(key)
-            };
-            targets.click(*rect, pressed);
+            targets.click(*rect, click(key));
         }
     }
 }
@@ -808,9 +801,12 @@ fn render_input_row(
 
 /// 入力欄を描く（右のボタンは[`render_input_row`]）。
 ///
-/// **上辺の見出しは、キーボードの人のための案内**（`AppState::input_key_hints`）。押せる項目はそのキーを押す場所として
-/// 登録する（9064b30から。区切りと括弧は押せない）。送信と中断は右のボタンにあるので見出しには無い
-/// ——同じ操作を2か所に並べない（ポリシーエディタの確認ダイアログが`y=書く`を見出しからボタンへ移したのと同じ）。
+/// **上辺の見出しは、キーボードの人のための案内**（`AppState::input_key_hints`）。**どの項目も押せないただの文字**
+/// （2026-10-06のユーザーの決定。`plans/PLAN-TUI-IMPROVEMENTS.md`§4.2——6ed0ee4からそれまでは押せる項目をそのキーを
+/// 押す場所として登録していた）。登録は`KeyHint::key`のある項目だけなので、全部`KeyHint::shown`のいまは何も登録しない
+/// （レビューパネルの`x=discard-all`を押せなくしたのと同じく、押せるかは項目の側で決める）。
+/// 送信と中断は右のボタンにあるので見出しには無い——同じ操作を2か所に並べない（ポリシーエディタの確認ダイアログが
+/// `y=書く`を見出しからボタンへ移したのと同じ）。
 /// 項目の途中では切らない（[`input_title`]）。
 fn render_input(
     f: &mut Frame,

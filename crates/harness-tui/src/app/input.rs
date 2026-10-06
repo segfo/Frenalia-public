@@ -160,31 +160,28 @@ impl AppState {
         }
     }
 
-    /// 入力欄の見出しに出すキーの案内（**押せば同じキーを押したのと同じ**。`app::pointer`）。
+    /// 入力欄の見出しに出すキーの案内。**どの項目も押せないただの文字**（[`KeyHint::shown`]。押しても何も起きない——
+    /// 2026-10-06のユーザーの決定、`plans/PLAN-TUI-IMPROVEMENTS.md`§4.2）。キーボードの人のための案内で、マウスで押す
+    /// 場所は入力欄の右の枠付きのボタン（[`Self::input_buttons`]）にある。それまでは`Enter=改行`・`Ctrl-C=コピー`が
+    /// そのキーを、`Esc×2=終了`が`Esc`を2回押した。ポリシーエディタのキー案内は押せるまま（この決定の範囲外）。
     ///
-    /// 送信と中断はここに無い——入力欄の右の枠付きのボタン（[`Self::input_buttons`]）へ移した（2026-10-03）。
-    /// 残るのはキーボードの人のための案内で、`PageUp/PageDown`は1つのキーに決まらないので押せない。`Enter=改行`は
-    /// 素のEnterが改行のとき（[`Self::enter_submits`]が偽）だけ出す。
+    /// 送信と中断はここに無い——入力欄の右のボタンへ移した（2026-10-03）。`Enter=改行`は素のEnterが改行のとき
+    /// （[`Self::enter_submits`]が偽）だけ出す。
     ///
     /// 3つめの項目は1つの場所を状態で使い分ける（項目を増やさない——見出しは幅が足りないと後ろから項目を落とす）。
     /// 写せる選択があれば`Ctrl-C=コピー`（`app::select`）。無ければ、`Esc`の二度押しが終了に数えられる間
     /// （[`Self::esc_would_count`]）だけ`Esc×2=終了`（`app::quit`）——止めるものが走っている間・重ねた枠が開いている間は
-    /// `Esc`が別の働きをするので出さない（効く操作を案内する、B-32）。`Esc×2=終了`は押すと`Esc`を2回続けて押す
-    /// （ポリシーエディタのキー案内の`Esc×2 終了`と同じ。`plans/POLICY-EDITOR-TOMOYO-DIG.md`決定62の
-    /// 「マウスで操作できるようにした」の表の5）。
+    /// `Esc`が別の働きをするので出さない（効くキーだけを案内する、B-32）。
     pub fn input_key_hints(&self) -> Vec<KeyHint> {
         let mut hints = Vec::new();
         if !self.enter_submits {
-            hints.push(KeyHint::press("Enter=改行", KeyCode::Enter));
+            hints.push(KeyHint::shown("Enter=改行"));
         }
         hints.push(KeyHint::shown("PageUp/PageDown=スクロール"));
         if self.has_copyable_selection() {
-            hints.push(KeyHint::press_key(
-                "Ctrl-C=コピー",
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            ));
+            hints.push(KeyHint::shown("Ctrl-C=コピー"));
         } else if self.esc_would_count() {
-            hints.push(KeyHint::press_twice("Esc×2=終了", KeyCode::Esc));
+            hints.push(KeyHint::shown("Esc×2=終了"));
         }
         hints
     }

@@ -656,48 +656,155 @@ fn running_app() -> AppState {
     app
 }
 
-/// **入力欄の見出しに残ったキー案内は、そのキーを押したのと同じ**（`Enter=改行`・`Esc×2=終了`は`Esc`を2回）。
-/// `PageUp/PageDown=スクロール`は1つのキーに決まらないので押せない。**送信と中断は見出しから外れて**、
-/// 入力欄の右のボタンにだけある（同じ操作を2か所に並べない）。応答中は`Esc`が中断なので`Esc×2=終了`は出ない
-/// （`app::quit`）。
+/// 入力欄とその周り（押した結果、何かが変わったかを見る）——入力・カーソル・入力欄の選択・transcriptの行数・
+/// さかのぼりの位置・上辺の知らせ・終了するか。
+fn input_and_around(app: &AppState) -> String {
+    format!(
+        "{:?} {} {:?} {} {} {:?} {}",
+        app.input,
+        app.input_cursor,
+        app.selection_range(),
+        app.transcript.len(),
+        app.scroll_offset(),
+        app.edge_notice.as_ref().map(|notice| notice.text.as_str()),
+        app.should_quit,
+    )
+}
+
+/// **入力欄の見出しの案内は、どれも押せないただの文字**（2026-10-06のユーザーの決定。`plans/PLAN-TUI-IMPROVEMENTS.md`§4.2。
+/// それまでは`Enter=改行`・`Ctrl-C=コピー`がそのキーを、`Esc×2=終了`が`Esc`を2回押した）。どの項目も、押しても——
+/// `Esc×2=終了`を2回押しても——何も変わらず、押されている形も付かず、以前から押せなかった`PageUp/PageDown=スクロール`と
+/// 同じ見た目（ボタンの形ではない）。
+///
+/// **どの状態でどの項目が出るかは変えていない**: 待機中は`Esc×2=終了`、応答中は出さない（`Esc`が中断なので。`app::quit`）、
+/// 入力欄に選択があれば`Ctrl-C=コピー`。送信と中断は見出しに無い（入力欄の右のボタンにだけある。同じ操作を2か所に並べない）。
+///
+/// **案内しているキーは効く**（対。押せないのは案内の文字で、キーではない——効く操作を案内する、B-32）: 同じ状態で
+/// キーを押すと、`Enter`は改行を入れ、`Esc`2回は終了し、`Ctrl+C`は写す。
 #[test]
-fn the_input_title_hints_press_their_keys() {
-    let mut app = running_app();
-    type_text(&mut app, "hi");
-    let screen = draw(&mut app);
-    let (top, _) = input_edges(&screen);
-    let title = screen.row(top);
-    let title = &title[..title.find('┐').expect("入力欄の右上の角")];
+fn the_input_title_hints_are_plain_labels_that_clicks_leave_alone() {
+    fn idle() -> AppState {
+        let mut app = app_with_transcript(3);
+        type_text(&mut app, "hi");
+        app
+    }
+    fn running() -> AppState {
+        let mut app = running_app();
+        type_text(&mut app, "hi");
+        app
+    }
+    fn selecting() -> AppState {
+        let mut app = idle();
+        press_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        app
+    }
+    type Case = (&'static str, fn() -> AppState, &'static [&'static str]);
+    let cases: [Case; 3] = [
+        (
+            "待機中",
+            idle,
+            &["Enter=改行", "PageUp/PageDown=スクロール", "Esc×2=終了"],
+        ),
+        (
+            "応答中",
+            running,
+            &["Enter=改行", "PageUp/PageDown=スクロール"],
+        ),
+        (
+            "入力欄の選択",
+            selecting,
+            &["Enter=改行", "PageUp/PageDown=スクロール", "Ctrl-C=コピー"],
+        ),
+    ];
+    let mut clickable = Vec::new();
+    for (case, make, labels) in cases {
+        // 出る項目は今までどおり。
+        let mut app = make();
+        let shown_labels: Vec<String> = app
+            .input_key_hints()
+            .into_iter()
+            .map(|hint| hint.label)
+            .collect();
+        assert_eq!(shown_labels, labels, "{case}: 見出しの項目が変わった");
+        let screen = draw(&mut app);
+        let (top, _) = input_edges(&screen);
+        let title = screen.row(top);
+        let title = &title[..title.find('┐').expect("入力欄の右上の角")];
+        assert!(
+            !title.contains("送") && !title.contains("中断"),
+            "{case}: 見出しに送信・中断が残っている: {title}"
+        );
+
+        // 見た目はどれも、以前から押せなかった`PageUp/PageDown=スクロール`と同じ（ボタンでも押されている形でもない）。
+        let plain = label_looks(&screen, "PageUp/PageDown=スクロール");
+        assert!(
+            plain
+                .iter()
+                .all(|look| !is_button(look) && !is_pressed(*look)),
+            "{case}: 押せない案内がボタンに見える: {plain:?}"
+        );
+        for label in labels {
+            assert_eq!(
+                label_looks(&screen, label),
+                plain,
+                "{case}: 「{label}」の見た目が押せない案内と違う"
+            );
+        }
+
+        // 押しても（2回押しても）何も変わらない。押されている形も付かない。
+        for label in labels {
+            let mut app = make();
+            draw(&mut app);
+            let before = input_and_around(&app);
+            let mut actions = Vec::new();
+            for _ in 0..2 {
+                let screen = draw(&mut app);
+                let Some(at) = screen.try_find(label) else {
+                    actions.push("（押した後で見出しから消えた）".to_string());
+                    break;
+                };
+                actions.push(shown(&click(&mut app, at)));
+            }
+            let after = input_and_around(&app);
+            let pressed = pressed_cells_outside(&draw(&mut app), Rect::default());
+            if actions.iter().any(|action| action != &shown(&None))
+                || before != after
+                || pressed > 0
+            {
+                clickable.push(format!(
+                    "{case}の「{label}」: 返った操作{actions:?}・{before} → {after}・押されている形{pressed}セル"
+                ));
+            }
+        }
+    }
     assert!(
-        !title.contains("送") && !title.contains("中") && !title.contains("Esc"),
-        "見出しに送信・中断が残っている: {title}"
+        clickable.is_empty(),
+        "押せない案内を押したら何かが起きた:\n{}",
+        clickable.join("\n")
     );
 
-    // `Enter=改行`を押すと、Enterを押したのと同じく改行が入る。
-    let mut by_key = running_app();
-    type_text(&mut by_key, "hi");
-    assert!(click(&mut app, screen.find("Enter=改行")).is_none());
-    assert!(press(&mut by_key, KeyCode::Enter).is_none());
-    assert_eq!(input_state(&app), input_state(&by_key));
-    assert_eq!(app.input, "hi\n");
-
-    let screen = draw(&mut app);
-    assert!(click(&mut app, screen.find("PageUp/PageDown=")).is_none());
-    assert_eq!(app.scroll_offset(), 0);
-    assert!(
-        screen.try_find("Esc×2").is_none(),
-        "応答中に終了の案内が出た"
+    // 対: 案内しているキーは、同じ状態で押せば効く。
+    for (case, make) in [("待機中", idle as fn() -> AppState), ("応答中", running)] {
+        let mut app = make();
+        assert!(press(&mut app, KeyCode::Enter).is_none(), "{case}");
+        assert_eq!(app.input, "hi\n", "{case}: `Enter`で改行が入らない");
+    }
+    let mut app = idle();
+    press(&mut app, KeyCode::Esc);
+    assert_eq!(
+        shown(&press(&mut app, KeyCode::Esc)),
+        shown(&Some(Action::Quit)),
+        "待機中の`Esc`2回で終了しない"
     );
-
-    // 応答していないときの`Esc×2=終了`は、`Esc`を2回押したのと同じく終了する。
-    let mut app = app_with_transcript(3);
-    type_text(&mut app, "hi");
-    let screen = draw(&mut app);
-    assert!(matches!(
-        click(&mut app, screen.find("Esc×2=終了")),
-        Some(Action::Quit)
-    ));
-    assert!(app.should_quit);
+    let mut app = selecting();
+    assert_eq!(
+        shown(&press_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        )),
+        shown(&Some(Action::Copy("i".to_string()))),
+        "入力欄の選択を`Ctrl+C`で写せない"
+    );
 }
 
 /// **入力欄の右隣に、枠で囲んだ「送信」と（応答中は）「中断」が並ぶ**——ユーザーが描いた図のとおり（VS Codeの統合
@@ -1398,7 +1505,7 @@ fn the_pressed_look_follows_the_button_that_was_pressed() {
 
 /// **押しても捨てるクリックと、ボタンの形ではない押せる項目には、押されている形を付けない**——
 /// (1) ボタンが別のボタンの居た場所へ動いた直後（300ms）の「中断」、(2) 承認ダイアログを開いた直後（D-106）の選択肢、
-/// (3) 入力欄の見出しのキー案内（`Enter=改行`。案内の文字のまま描いている）、(4) 承認ダイアログの押せない案内
+/// (3) レビューパネルの案内（`Tab diff`。案内の文字のまま描いている）、(4) 承認ダイアログの押せない案内
 /// （`PageUp/PageDown スクロール`）。窓を過ぎた選択肢（`[v] 中身`。押してもダイアログは開いたまま）は押されている形に
 /// なり、ほかの選択肢は普通の形のまま（対）。
 #[test]
@@ -1460,15 +1567,21 @@ fn discarded_clicks_and_plain_hints_get_no_pressed_look() {
         );
     }
 
-    // (3) 見出しのキー案内（押すとキーは押されるが、ボタンの形ではない）。
-    let mut app = running_app();
+    // (3) レビューパネルの案内（押すとキーは押されるが、ボタンの形ではない）。パネルの差分ペインは選んだハンクの見出しを
+    // 入れ替えた色で描くので、画面全体ではなく押した項目の見た目を見る。入力欄の見出しの案内は押せない（2026-10-06から。
+    // `the_input_title_hints_are_plain_labels_that_clicks_leave_alone`）。
+    let mut app = review_app(three_rows());
     let screen = draw(&mut app);
-    assert!(click(&mut app, screen.find("Enter=改行")).is_none());
-    assert_eq!(app.input, "\n", "試験の前提: 案内が押せていない");
+    assert!(click(&mut app, screen.find("Tab diff")).is_none());
     assert_eq!(
-        pressed_cells_outside(&draw(&mut app), Rect::default()),
-        0,
-        "見出しのキー案内に押されている形が付いた"
+        panel(&app).focus,
+        ReviewFocus::Diff,
+        "試験の前提: 案内が押せていない"
+    );
+    let looks = label_looks(&draw(&mut app), "Tab diff");
+    assert!(
+        looks.iter().all(|look| !is_pressed(*look)),
+        "パネルの案内に押されている形が付いた: {looks:?}"
     );
 
     // (4) 承認ダイアログの押せない案内。

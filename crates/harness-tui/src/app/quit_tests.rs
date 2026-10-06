@@ -192,15 +192,22 @@ fn another_key_or_a_click_between_the_escapes_starts_over() {
     assert!(!app.should_quit, "別のキーを挟んだのに終了した");
     assert_eq!(app.input, "a");
 
-    // 押せる場所のクリック（入力欄の見出しの`Enter=改行`）。
+    // 押せる場所のクリック（キーを押すもの——入力欄の右の「送信」。押すと送る）。2026-10-05まではここで入力欄の見出しの
+    // `Enter=改行`を押していたが、2026-10-06から見出しの案内は押せない（`plans/PLAN-TUI-IMPROVEMENTS.md`§4.2。押せる場所の
+    // 外と同じく数え直さない）。
     let mut app = idle_app();
+    type_text(&mut app, "hi");
     let screen = draw(&mut app);
     esc_at(&mut app, t0);
-    mouse_at(
+    let step = mouse_at(
         &mut app,
         MouseEventKind::Down(MouseButton::Left),
-        screen.find("Enter=改行"),
+        screen.find_last("送信"),
         t0 + MS,
+    );
+    assert!(
+        matches!(step, Step::Handled(Some(Action::Submit(_)))),
+        "試験の前提: 送信が押せていない: {step:?}"
     );
     assert_eq!(shown(&esc_at(&mut app, t0 + 2 * MS)), shown(&None));
     assert!(!app.should_quit, "クリックを挟んだのに終了した");
