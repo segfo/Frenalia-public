@@ -21,6 +21,8 @@
 //!   （`leak_tests`）が止める。
 //! - 対象はassistantの返答だけ。thinking・ツール出力・ユーザー入力は今までどおり`crate::ui`がそのまま描く。
 
+#[cfg(feature = "markdown-codewandler")]
+mod codewandler;
 mod plain;
 
 use harness_term::select::LineJoin;

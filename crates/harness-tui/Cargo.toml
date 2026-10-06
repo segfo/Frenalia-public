@@ -3,8 +3,19 @@ name = "harness-tui"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["markdown-codewandler"]
+# assistantの返答をMarkdownとして整形して描く実装（`src/markdown/codewandler/`）。**急場しのぎの依存**で、
+# いずれ別の実装へ差し替える（`plans/PLAN-TUI-IMPROVEMENTS.md`§1.2・§1.6）。切ると整形しない実装
+# （`src/markdown/plain.rs`）で描く。`cfg`を書くのは`src/markdown/mod.rs`の2か所だけ（Adapterのモジュール宣言と、
+# 実装の選択）。描画部品は依存にせず、出典とライセンス表記ごと`src/markdown/codewandler/render.rs`へ写して直す
+# （同§1.3の結論）——依存にするのは解析器だけ。
+markdown-codewandler = ["dep:codewandler-markdown-stream"]
+
 [dependencies]
 async-trait = "0.1.89"
+# Markdownの解析器（`markdown_stream`）。`markdown-codewandler`でだけ入る（上の`[features]`）。
+codewandler-markdown-stream = { version = "0.2.1", optional = true }
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures = "0.3.32"
 harness-cognition = { version = "0.1.0", path = "../harness-cognition" }
@@ -25,5 +36,9 @@ tracing-subscriber = "0.3"
 unicode-width = "0.2.2"
 
 [dev-dependencies]
+# 写す前の描画部品そのもの（`markdown_ratatui`）。**試験だけが使う**——写した描画部品
+# （`src/markdown/codewandler/render.rs`）が元と同じ出力を返すことを比べる相手（`codewandler/equivalence_tests.rs`）。
+# 製品のビルドには入らない。
+codewandler-markdown-ratatui = "0.2.1"
 # `review_flow_tests`: 実FS上のオーバーレイに対して「パネル操作→部分適用」を通しで確かめる。
 tempfile = "3.27.0"

@@ -409,6 +409,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "codewandler-markdown-ratatui"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89409b254cc08f6d2a26c8f087db67b67802789178b96f0750b6880343008f1d"
+dependencies = [
+ "codewandler-markdown-stream",
+ "ratatui",
+ "unicode-width",
+]
+
+[[package]]
+name = "codewandler-markdown-stream"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fedfd95e3176f60e03c841c0b78ac924e6cc26b9e02272314d30b7e2dc337d7f"
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1445,6 +1462,8 @@ name = "harness-tui"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "codewandler-markdown-ratatui",
+ "codewandler-markdown-stream",
  "crossterm",
  "futures",
  "harness-cognition",
