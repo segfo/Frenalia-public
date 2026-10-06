@@ -33,9 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use harness_cognition::CognitiveOrchestrator;
 use harness_core::{AgentEvent, LlmProvider, ProviderError, StopReason, ToolCtx, Usage};
-use harness_engine::{
-    AgentLoopConfig, ConversationState, PermissionGate, INVALID_TOOL_INPUT_PREFIX,
-};
+use harness_engine::{AgentLoopConfig, ConversationState, PermissionGate, RecordedOutcome};
 use harness_tools::ToolRegistry;
 
 /// `--output-format`の3値（§非対話モード「出力」）。
@@ -70,14 +68,27 @@ pub struct JsonToolCall {
     pub name: String,
     pub input: serde_json::Value,
     pub result: String,
-    /// `"allowed"` | `"denied"` | `"invalid"`。`PermissionGate`が拒否した呼び出しは`run_agent_loop`が
-    /// 合成するエラー`ToolResult`の文言（`permission denied by policy`接頭辞）で判別する
-    /// （`crates/harness-engine/src/lib.rs`のツールディスパッチ参照）。`"invalid"`はツールの入力として
-    /// 読めず、**判定にも実行にも進まなかった**呼び出し（知らない項目を含む等、D-101）。
+    /// `"allowed"` | `"denied"` | `"invalid"`。結果の文からの見分けは`harness_engine::RecordedOutcome`
+    /// の1か所が持つ（前の文の返事を読む道具`past_requests`と同じ見分け。綴りをここへ写さない）。
+    /// `"denied"`は`PermissionGate`が拒否した呼び出し、`"invalid"`はツールの入力として読めず、
+    /// **判定にも実行にも進まなかった**呼び出し（知らない項目を含む等、D-101）。
     pub decision: String,
 }
 
-const DENIAL_PREFIX: &str = "permission denied by policy";
+/// `decision`欄の値（[`JsonToolCall::decision`]）。**この欄の語彙はヘッドレスの JSON の契約**なので、
+/// 見分けの種類が増えても語彙は増やさない——種類を足すとこの`match`がビルドを落とすので、どの語へ畳むかを
+/// その場で決める。
+fn headless_decision(outcome: RecordedOutcome) -> &'static str {
+    match outcome {
+        RecordedOutcome::Denied => "denied",
+        // 判定にも実行にも進んでいないので、"allowed"と報告しない。
+        RecordedOutcome::InvalidInput => "invalid",
+        // 取り消した呼び出しと書き写しを断った呼び出しは`ToolFinished`を出さない（`harness_engine::turn`）
+        // ので、ここへは来ない。来たなら判定にも実行にも進んでいないので"invalid"へ畳む。
+        RecordedOutcome::Cancelled | RecordedOutcome::RefusedTranscription => "invalid",
+        RecordedOutcome::Ran | RecordedOutcome::RanWithError => "allowed",
+    }
+}
 
 /// `AgentEvent`列から`turns`/`usage`/`tool_calls`を畳み込む。`ToolCallProposed`と
 /// `ToolFinished`はidで対応付ける（`run_agent_loop`は同一idで両方を必ず1回ずつ発行する）。
@@ -98,14 +109,8 @@ fn record_event(
         }
         AgentEvent::ToolFinished { id, output } => {
             if let Some((name, input)) = pending.remove(id) {
-                let decision = if output.content.starts_with(DENIAL_PREFIX) {
-                    "denied"
-                } else if output.content.starts_with(INVALID_TOOL_INPUT_PREFIX) {
-                    // 判定にも実行にも進んでいないので、"allowed"と報告しない。
-                    "invalid"
-                } else {
-                    "allowed"
-                };
+                let decision =
+                    headless_decision(RecordedOutcome::of(&output.content, output.is_error));
                 tool_calls.push(JsonToolCall {
                     name,
                     input,

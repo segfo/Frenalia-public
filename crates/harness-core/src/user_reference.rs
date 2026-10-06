@@ -102,6 +102,10 @@ pub const MIN_HEX_SHAPE_CHARS: usize = 32;
 /// モデルへ伝える書き方（システムプロンプトと、ここの取り出しが同じ綴りを見る）。
 pub const SYNTAX_EXAMPLE: &str = "{{val:1}}";
 
+/// 書き写しを断った文（[`Transcription::refusal_ja`]）の頭。会話に残ったツールの結果を後から読む側
+/// （`harness_engine::RecordedOutcome`）が「断った」と見分けるのに使うので、綴りはここにだけ置く（B-05）。
+pub const TRANSCRIPTION_REFUSAL_PREFIX: &str = "書き写した値は実行しませんでした。";
+
 /// `messages`から、モデルが参照できる値を取り出す（並び順が番号になる。1つ目が`{{val:1}}`）。
 ///
 /// **人が書いた直近の文1つ**だけを見る（[`crate::human_turns`]。ツールの結果を運ぶ文と、会話を畳んだ
@@ -254,7 +258,7 @@ impl Transcription {
     /// 手で数え始め、1往復をまるごと使った。だから「数え直す必要はない」と明示する。
     pub fn refusal_ja(&self, menu: &str) -> String {
         format!(
-            "書き写した値は実行しませんでした。あなたが書いた{written}文字の値は、ハーネスが持っている値のどれかを写したものに見えますが、{differences}文字分違います（足す・消す・書き換えるの合計）。1文字でも違えば別のものが走ります。\n\n値を書き写さず、番号で指し直してください。文字を数え直す必要はありません。\n{menu}",
+            "{TRANSCRIPTION_REFUSAL_PREFIX}あなたが書いた{written}文字の値は、ハーネスが持っている値のどれかを写したものに見えますが、{differences}文字分違います（足す・消す・書き換えるの合計）。1文字でも違えば別のものが走ります。\n\n値を書き写さず、番号で指し直してください。文字を数え直す必要はありません。\n{menu}",
             written = self.written_chars,
             differences = self.differences,
         )

@@ -11,11 +11,21 @@
 //! 食い違わない。中身は`messages`だけで決まるので、2回呼んでも同じものが返る。
 //! ここを通らずに番号を振る経路を作らないこと。
 //!
+//! # 「本物の会話か」はここで持つ
+//!
+//! 会話を読む道具（`past_requests`）へ会話を渡してよいのは、置き場を**本物の会話**から組んだときだけである。
+//! その事実は[`References::from_conversation`]で組んだときにだけ立つ（[`References::conversation`]が`Some`）。
+//! [`References::from_messages`]は送る文から組むだけで、それが会話かどうかを知らないので立てない
+//! ——認知レイヤーは作業記憶から組み直した文を送るので、それを会話として読ませてはいけない
+//! （D-127「認知レイヤーの経路は未決」）。どちらで組むかを決めるのは`crate::turn::RawTurnRequest`の作り方である。
+//!
 //! # ここが守らないもの
 //!
 //! - **前の文の置き場は、会話に残っている人の文の数だけ毎ターン作り直す（上限なし）。** 長い値の無い文は
 //!   語を分けるだけで済むが、長い値のある文は毎回解読し直す。その費用は測っていない
 //! - **畳まれた文の値は指せない**（元の文が会話から消えている。`harness_core::human_turns`）
+
+use std::sync::Arc;
 
 use harness_core::human_turns::{human_turns, nth_back};
 use harness_core::{Message, ReferenceBook, SystemBlock, ValueStore};
@@ -65,14 +75,18 @@ pub fn value_store_for(messages: &[Message]) -> ValueStore {
 }
 
 /// 1ターンぶんの値の置き場（人の文ごと。D-127）。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct References {
     pub book: ReferenceBook,
+    /// 置き場を組んだ会話。**本物の会話から組んだときだけ`Some`**（[モジュールdoc](self)）。外からは書けない。
+    conversation: Option<Arc<[Message]>>,
 }
 
 impl References {
-    /// 会話の文から組む。人が書いた文（`harness_core::human_turns`）を新しい順に1つずつ置き場にする
+    /// 送る文から組む。人が書いた文（`harness_core::human_turns`）を新しい順に1つずつ置き場にする
     /// ——直近の文が`{{val:N}}`、その1つ前が`{{back:1:N}}`、…。ツールの結果の文と畳んだ要約の文は数えない。
+    ///
+    /// `messages`が会話そのものかは知らないので、会話は持たない（[`References::conversation`]は`None`）。
     pub fn from_messages(messages: &[Message]) -> Self {
         let mut stores = human_turns(messages)
             .into_iter()
@@ -84,7 +98,26 @@ impl References {
                 current,
                 back: stores.collect(),
             },
+            conversation: None,
         }
+    }
+
+    /// **本物の会話**から組む。置き場は[`References::from_messages`]と同じで、加えて会話を持つので、
+    /// 会話を読む道具（`Tool::call_in_conversation`）へ渡せる。
+    ///
+    /// `messages`が会話そのものだと**呼び出し側が知っているときだけ**使う（素朴ループのターン、
+    /// または会話から置き場を組んで`RawTurnRequest::with_references`で渡す呼び出し側）。
+    /// 会話を1回写すので、その分の費用がかかる（送る文の写しと同じ大きさ）。
+    pub fn from_conversation(messages: &[Message]) -> Self {
+        Self {
+            conversation: Some(Arc::from(messages)),
+            ..Self::from_messages(messages)
+        }
+    }
+
+    /// 置き場を組んだ会話。本物の会話から組んでいなければ`None`。
+    pub fn conversation(&self) -> Option<&[Message]> {
+        self.conversation.as_deref()
     }
 
     /// システムプロンプトの2つめの塊として送る一覧（`harness_core::ReferenceBook::render_menu`）。

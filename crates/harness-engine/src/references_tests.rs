@@ -109,3 +109,21 @@ fn the_menu_block_lists_current_values_only_and_never_the_contents() {
         None
     );
 }
+
+/// **会話を持つのは`from_conversation`で組んだときだけ**（道具へ会話が渡るかはここで決まる）。
+/// 置き場の中身はどちらで組んでも同じ。
+#[test]
+fn only_from_conversation_carries_the_conversation() {
+    let messages = vec![
+        user(&format!("これを実行して {}", hex('a'))),
+        assistant("実行しました"),
+        user("もう一度"),
+    ];
+    let as_conversation = References::from_conversation(&messages);
+    assert_eq!(as_conversation.conversation(), Some(&messages[..]));
+
+    // 対: 送る文から組んだだけなら会話は持たない（認知レイヤーの経路。D-127）。
+    let as_request = References::from_messages(&messages);
+    assert_eq!(as_request.conversation(), None);
+    assert_eq!(as_request.book, as_conversation.book);
+}

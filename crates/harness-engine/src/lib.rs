@@ -39,7 +39,8 @@ pub use references::{value_store_for, References};
 pub use session::{SessionStore, SessionSummary};
 pub use turn::{
     CompletedToolCall, EngineError, Executor, RawTurn, RawTurnRequest, RawTurnResult,
-    ToolCallDecision, TurnExecutor, TurnVisibility, INVALID_TOOL_INPUT_PREFIX,
+    RecordedOutcome, ToolCallDecision, TurnExecutor, TurnVisibility, CANCELLED_BEFORE_START,
+    DENIAL_PREFIX, INVALID_TOOL_INPUT_PREFIX,
 };
 
 /// TUI等のフロントエンドへ`AgentEvent`を流すための送信口。ヘッドレスCLIは`None`を渡し
