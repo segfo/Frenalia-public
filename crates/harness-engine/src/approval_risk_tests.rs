@@ -1183,3 +1183,75 @@ fn wrapping_is_read_from_the_direct_children_in_the_same_place() {
         &[text_layer(1, "Get-Date"), not_text_layer(2)]
     ));
 }
+
+/// **LLM が解読する数より多くの箇所を示したら、行は解けた包みにならない**——止めた印の段が残るので、
+/// 行への点数を数え、D-124 ルール2で高にする（解読していない5つ目に何が入っていても見落とさない）。
+/// 対照: 4つなら全部解けた包みで、行への点数は数えず要確認。
+#[test]
+fn more_located_places_than_are_decoded_keep_the_line_score_and_are_high() {
+    let places = [
+        "68656c6c6f",
+        "776f726c64",
+        "666f6f626172",
+        "62617a717578",
+        "4765742D44617465",
+    ];
+    let line = format!("iex ({})", places.join(" + "));
+    let ask = |n: usize| {
+        let mut model = FakeModel::quiet().with_risk(&line, 1.55);
+        model.needs_decoding = 0.9;
+        let locator = FakeLocator::answering(
+            places[..n]
+                .iter()
+                .map(|t| LocatedSpan {
+                    text: t.to_string(),
+                    encoding: PayloadEncoding::Hex,
+                })
+                .collect(),
+        );
+        run_with(&shell(&line), &[], Some(&model), Some(&locator))
+    };
+    let depth_limited = |out: &RiskOutcome| {
+        out.reasons.iter().any(|r| {
+            matches!(
+                r,
+                RiskReason::OpaqueObfuscation(ObfuscationCause::DepthLimited)
+            )
+        })
+    };
+
+    let cut = ask(5);
+    assert!(
+        matches!(
+            cut.extra_decoded.last().map(|l| &l.outcome),
+            Some(DecodeOutcome::CountLimit { .. })
+        ),
+        "{:?}",
+        cut.extra_decoded
+    );
+    assert_eq!(cut.severity(), Severity::High);
+    assert!(
+        has_model_reason(&cut, &Origin::Command),
+        "{:?}",
+        cut.reasons
+    );
+    assert!(depth_limited(&cut), "{:?}", cut.reasons);
+
+    let whole = ask(4);
+    assert!(
+        whole.extra_decoded.len() == 4
+            && whole
+                .extra_decoded
+                .iter()
+                .all(|l| matches!(l.outcome, DecodeOutcome::Text { .. })),
+        "{:?}",
+        whole.extra_decoded
+    );
+    assert_eq!(
+        whole.severity(),
+        Severity::NeedsReview,
+        "{:?}",
+        whole.reasons
+    );
+    assert!(!depth_limited(&whole));
+}

@@ -129,15 +129,94 @@ fn decoded_content_is_read_again_for_known_encodings() {
     );
 }
 
-/// 示す数には上限がある。
+fn count_limits(layers: &[DecodedLayer]) -> usize {
+    layers
+        .iter()
+        .filter(|l| matches!(l.outcome, DecodeOutcome::CountLimit { .. }))
+        .count()
+}
+
+/// 示す数には上限がある。**超えた分は黙って落とさず、止めた印の段を残す**（行の機械の解読と同じ）。
+/// 対照: 上限ちょうどなら印は無い。行に無い文字列は数に入らない。
 #[test]
-fn at_most_a_few_spans_are_decoded() {
+fn spans_beyond_the_cap_leave_a_count_limit_layer() {
     let line = "1,2 3,4 5,6 7,8 9,10";
     let spans: Vec<_> = ["1,2", "3,4", "5,6", "7,8", "9,10"]
         .iter()
         .map(|t| span(t, PayloadEncoding::CharCodes))
         .collect();
-    assert_eq!(decode_located(line, &spans).len(), MAX_LOCATED_SPANS);
+    let layers = decode_located(line, &spans);
+    assert_eq!(layers.len(), MAX_LOCATED_SPANS + 1, "{layers:?}");
+    assert_eq!(
+        layers.last().unwrap(),
+        &DecodedLayer {
+            depth: 1,
+            source: EncodedSource::LocatedByModel(PayloadEncoding::CharCodes),
+            outcome: DecodeOutcome::CountLimit {
+                max_layers: MAX_LOCATED_SPANS
+            },
+            in_file: None,
+        }
+    );
+
+    let exact = decode_located(line, &spans[..MAX_LOCATED_SPANS]);
+    assert_eq!(exact.len(), MAX_LOCATED_SPANS);
+    assert_eq!(count_limits(&exact), 0, "{exact:?}");
+    let mut with_invented = spans[..MAX_LOCATED_SPANS].to_vec();
+    with_invented.push(span("R2V0LURhdGU=", PayloadEncoding::Base64));
+    assert_eq!(count_limits(&decode_located(line, &with_invented)), 0);
+}
+
+/// 段の数の上限に達したら、**止めた印の段を最後に1つだけ残す**。入れ子の解読が先に上限に達した形（以前は
+/// 後から切り詰めて、入れ子が残した印ごと落としていた）と、上限ちょうどまで埋まってから次の箇所が来た形の両方。
+/// 対照: 上限に届かなければ印は無い。
+#[test]
+fn the_layer_count_cap_leaves_one_marker_at_the_end() {
+    let blob = b64(b"systeminfo");
+    let nested = |n: usize| {
+        b64(format!("[Convert]::FromBase64String('{blob}'); ")
+            .repeat(n)
+            .as_bytes())
+    };
+    let count_limit = DecodeOutcome::CountLimit {
+        max_layers: MAX_DECODED_LAYERS,
+    };
+
+    // 入れ子が上限を越える。
+    let outer = nested(MAX_DECODED_LAYERS + 3);
+    let layers = decode_located(
+        &format!("x {outer} y"),
+        &[span(&outer, PayloadEncoding::Base64)],
+    );
+    assert_eq!(layers.len(), MAX_DECODED_LAYERS + 1, "{layers:?}");
+    assert_eq!(layers.last().unwrap().outcome, count_limit);
+    assert_eq!(count_limits(&layers), 1);
+
+    // 上限ちょうどまで埋まり、次の箇所が来る。
+    let outer = nested(MAX_DECODED_LAYERS - 1);
+    let line = format!("x {outer} y 115,121 z");
+    let layers = decode_located(
+        &line,
+        &[
+            span(&outer, PayloadEncoding::Base64),
+            span("115,121", PayloadEncoding::CharCodes),
+        ],
+    );
+    assert_eq!(layers.len(), MAX_DECODED_LAYERS + 1, "{layers:?}");
+    let last = layers.last().unwrap();
+    assert_eq!(last.outcome, count_limit);
+    assert_eq!(
+        (last.depth, last.source),
+        (1, EncodedSource::LocatedByModel(PayloadEncoding::CharCodes))
+    );
+
+    let outer = nested(3);
+    let layers = decode_located(
+        &format!("x {outer} y"),
+        &[span(&outer, PayloadEncoding::Base64)],
+    );
+    assert_eq!(layers.len(), 4, "{layers:?}");
+    assert_eq!(count_limits(&layers), 0);
 }
 
 /// 解いた中身が大きすぎる圧縮データ（圧縮爆弾）は、上限で止めて「止めた」と残す。

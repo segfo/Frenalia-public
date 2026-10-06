@@ -311,8 +311,11 @@ impl RiskOutcome {
                 }
             }
             // 判定モデルも LLM フォールバックも、解読の上限の先は見ていない（行を判定しただけ）。
+            // LLM が場所を示して解読した段（`extra_decoded`）で止めた場合も同じ。
             RiskBasis::WithModel | RiskBasis::WithFallback => {
-                if hit_decode_limit(subject) {
+                if hit_decode_limit(decoded_layers(subject))
+                    || hit_decode_limit(&self.extra_decoded)
+                {
                     self.push_reason(RiskReason::OpaqueObfuscation(ObfuscationCause::DepthLimited));
                 }
             }
@@ -340,8 +343,8 @@ fn has_opaque_obfuscation(subject: &PermissionSubject) -> bool {
 }
 
 /// 解読の上限（深さ・大きさ・段数）で止めた段がある＝その先にまだ難読化が残っている（D-124 ルール2）。
-fn hit_decode_limit(subject: &PermissionSubject) -> bool {
-    decoded_layers(subject).iter().any(|l| {
+fn hit_decode_limit(layers: &[DecodedLayer]) -> bool {
+    layers.iter().any(|l| {
         matches!(
             l.outcome,
             DecodeOutcome::DepthLimit { .. }
