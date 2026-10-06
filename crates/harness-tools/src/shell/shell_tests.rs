@@ -1078,6 +1078,26 @@ mod tests {
             status.success(),
             "icacls must restrict the test folder: {status}"
         );
+        // [BUG-231] 前提の確認: このフォルダには低ILの印を**付けられない**こと。付けられてしまうなら、
+        // 以下は「付けられなかったときの文」を何も測らない。`icacls /inheritance:r`が受け継いだACE
+        // （本人のフル コントロールを含む）を消さずに残すと、こうなる——親フォルダの
+        // `SE_DACL_AUTO_INHERITED`が消えているときの症状である。
+        match harness_sandbox::tier1::win_restricted::set_low_integrity_label(dir.path()) {
+            Err(harness_sandbox::tier1::win_restricted::LabelError::AccessDenied { .. }) => {}
+            other => {
+                let acl = std::process::Command::new("icacls")
+                    .arg(dir.path())
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                    .unwrap_or_default();
+                panic!(
+                    "precondition: the restricted folder must refuse the low-integrity label, got \
+                     {other:?}. `icacls /inheritance:r` probably kept the inherited ACEs because \
+                     the parent folder lost SE_DACL_AUTO_INHERITED (docs/bugs/BUG-231.md). \
+                     Folder ACL:\n{acl}"
+                );
+            }
+        }
 
         let inside = dir.path().join("tier1-unlabeled-cwd.txt");
         let command = format!(

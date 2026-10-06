@@ -374,6 +374,19 @@ mod owner_only_dacl_tests {
         let key = dir.path().join("id_ed25519");
         std::fs::write(&key, b"not a real key").expect("seed the fake key");
 
+        // [BUG-231] 前提の確認: 鍵のDACLに「自動継承」の印（`SE_DACL_AUTO_INHERITED`）が
+        // 立っていること。印が無いと`icacls /inheritance:r`は受け継いだACEを消さず明示ACEとして
+        // 残し、`%TEMP%`から受け継いだ名前に引けないSIDの`/remove`が1332で落ちる——締め直しの
+        // 欠陥ではなく、試験の置き場が壊れているという意味になる。
+        assert!(
+            dacl_is_auto_inherited(&key),
+            "precondition: the fake key under {} must carry SE_DACL_AUTO_INHERITED, otherwise \
+             `icacls /inheritance:r` keeps the inherited ACEs as explicit ones and this test \
+             measures the broken parent instead of the hardening. Check whether %TEMP% lost the \
+             flag (docs/bugs/BUG-231.md)",
+            dir.path().display()
+        );
+
         // 明示ACEを1本足す（継承ではないので`/inheritance:r`では落ちない）。
         let granted = std::process::Command::new("icacls")
             .arg(&key)
@@ -404,5 +417,43 @@ mod owner_only_dacl_tests {
             after.contains(&me),
             "the owner must keep access, otherwise ssh.exe cannot read the key: {after:?}"
         );
+    }
+
+    /// `path`のDACLに`SE_DACL_AUTO_INHERITED`が立っているか（[BUG-231]の前提確認用）。
+    fn dacl_is_auto_inherited(path: &Path) -> bool {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows::Win32::Security::{
+            GetSecurityDescriptorControl, ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            SE_DACL_AUTO_INHERITED,
+        };
+        let wide: Vec<u16> = path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut sd = PSECURITY_DESCRIPTOR::default();
+            GetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                &mut sd,
+            )
+            .ok()
+            .expect("read the DACL");
+            let mut control: u16 = 0;
+            let mut revision: u32 = 0;
+            let read = GetSecurityDescriptorControl(sd, &mut control, &mut revision);
+            let _ = LocalFree(HLOCAL(sd.0));
+            read.expect("read the control bits");
+            control & SE_DACL_AUTO_INHERITED.0 != 0
+        }
     }
 }
