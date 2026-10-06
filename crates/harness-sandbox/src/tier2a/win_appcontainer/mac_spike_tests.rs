@@ -2232,7 +2232,15 @@ fn granting_traverse_through_a_junction_shows_where_the_ace_lands() {
     // （`FILE_TRAVERSE | FILE_READ_ATTRIBUTES` = 0xa0 = 160）。`SetNamedSecurityInfoW`が
     // パスを辿るためである。**この事実を固定する**——向きが変わったら（辿らなくなったら）
     // ここが赤くなり、残課題#68の記述を読み直す合図になる。
-    const TRAVERSE_AND_READ_ATTRIBUTES: u32 = 0xa0;
+    //
+    // **2026-10-06に期待値を0xa0から0x1000a0へ直した**（[BUG-230]）。マスクが変わったのは
+    // `cmd.exe`がドライブのルートを同期ハンドルで開けるよう、付与側が`SYNCHRONIZE`（0x100000）を
+    // 足したため（`traverse::TRAVERSE_ACE_MASK`）で、**向き（実体に付き、リンクには付かない）は
+    // 変わっていない**（同日の再測定で`on_link=None`・`on_real=Some(0x1000a0)`）。
+    // 他の試験と同じく定数は import せず、実測値のリテラルで固定する。
+    //
+    // [BUG-230]: ../../../../../docs/bugs/BUG-230.md
+    const TRAVERSE_AND_READ_ATTRIBUTES: u32 = 0xa0 | 0x0010_0000;
     assert_eq!(
         on_real,
         Some(TRAVERSE_AND_READ_ATTRIBUTES),
