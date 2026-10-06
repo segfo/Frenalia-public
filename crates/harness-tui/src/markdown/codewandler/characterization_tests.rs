@@ -28,11 +28,20 @@
 //! （`StreamParser::reset`が`*self = Self::default()`。計画書§1.3）ので、Adapter（計画書のT8）は解析器を作り直すときに
 //! `StreamParser::new_gfm`を使うこと。
 //!
-//! # 今の見え方で、直すもの（計画書のT7）
+//! # T7aで直したもの（折り返し）
 //!
-//! - **日本語は折り返さない**: 単語の区切りがASCIIの空白・タブ・改行だけ（描画部品の関数`atoms`）なので、日本語の
-//!   段落は丸ごと1語になり、幅を超えたまま1行で出る（[`a_long_japanese_list_item_is_not_wrapped`]・
-//!   [`a_long_japanese_blockquote_is_not_wrapped`]）
+//! - **日本語を折り返す**: 素の描画部品は単語の区切りがASCIIの空白・タブ・改行だけ（関数`atoms`）で、日本語の段落を
+//!   丸ごと1語として幅を超えたまま1行で出していた。全角文字の間でも分けるようにし、リストの続きの行は記号の幅だけ
+//!   字下げし、引用の続きの行にも縦線を付ける（[`a_long_japanese_list_item_wraps_under_the_text_after_the_bullet`]・
+//!   [`a_long_japanese_blockquote_repeats_the_bar_on_continuation_lines`]）
+//! - **英語の語の切れ目で分けた行は、末尾に空白を1つ残す**（コピーで1行に戻したとき、語の間に空白が残るように。
+//!   計画書§2）。分ける位置そのものは素の描画部品と同じ（[`a_plain_paragraph_wraps_at_ascii_spaces_and_a_soft_break_becomes_a_space`]・
+//!   [`a_task_list_shows_the_checkbox_as_an_html_string`]の幅40）
+//!
+//! 折り返しの約束（画面で1行に収まる・印でつなぐと元に戻る）は`super::wrap_tests`が確かめる。
+//!
+//! # 今の見え方で、まだ直していないもの（計画書のT7b）
+//!
 //! - **入れ子のリスト**は記号が1行目に重なって`• • • parent`になり、子と孫は記号を失って続きの行として出る
 //! - **詰めたリスト項目の中のコードブロック**は、項目の本文より前に出る（後ろに空白だけの行が残る）
 //! - **リスト直後の引用**は、リストとの間に空行が入らない（解析器が引用を`List`の中——最後の`ListItem`の後、
@@ -43,7 +52,7 @@
 //! - **リンク**はURLを捨て、文字だけを描く
 //! - コードブロックに2桁の字下げが付く
 //!
-//! 直したら、この試験の期待値を直した後の形へ書き換える（計画書§0のT7）。
+//! 直したら、この試験の期待値を直した後の形へ書き換える（計画書§0のT7b）。
 //!
 //! # 限界
 //!
@@ -181,21 +190,22 @@ fn widest(text: &Text<'_>) -> usize {
         .unwrap_or(0)
 }
 
-/// 普通の文章。ASCIIの空白で折り返す。段落の途中の改行（ソフト改行）は空白1つになる（`then it`）。
+/// 普通の文章。ASCIIの空白で折り返し、分けた所の空白は前の行の末尾に残す（T7a）。段落の途中の改行（ソフト改行）は
+/// 空白1つになる（`then it`）。
 #[test]
 fn a_plain_paragraph_wraps_at_ascii_spaces_and_a_soft_break_becomes_a_space() {
     assert_eq!(
         describe(&drawn(PARAGRAPH, 40)),
         [
-            "The quick brown fox jumps over the lazy",
-            "dog, and then it keeps running far",
+            "The quick brown fox jumps over the lazy ",
+            "dog, and then it keeps running far ",
             "beyond the edge of the screen.",
         ]
     );
     assert_eq!(
         describe(&drawn(PARAGRAPH, 80)),
         [
-            "The quick brown fox jumps over the lazy dog, and then it keeps running far",
+            "The quick brown fox jumps over the lazy dog, and then it keeps running far ",
             "beyond the edge of the screen.",
         ]
     );
@@ -213,27 +223,52 @@ fn a_bullet_list_uses_a_bullet_marker() {
     assert_same_at_both_widths(BULLET_LIST, &["• item 1", "• item 2"]);
 }
 
-/// **既知の不具合**: 幅を超える日本語のリスト項目を折り返さない。どちらの幅でも1行のまま出る（120桁）。
+/// 幅を超える日本語のリスト項目は全角文字の間で折り返し、続きの行は記号`• `の幅だけ字下げする（T7a。素の描画部品は
+/// 折り返さず、どちらの幅でも120桁の1行で出していた）。行頭の`、`は禁則を見ないため（共有の折り返し部品と同じ限界）。
 #[test]
-fn a_long_japanese_list_item_is_not_wrapped() {
-    assert_same_at_both_widths(
-        LONG_JAPANESE_LIST_ITEM,
-        &["• これは画面幅を超える長い日本語のリスト項目です。描画部品が自分で折り返すなら、二行目以降は記号の幅だけ字下げされます。"],
+fn a_long_japanese_list_item_wraps_under_the_text_after_the_bullet() {
+    assert_eq!(
+        describe(&drawn(LONG_JAPANESE_LIST_ITEM, 40)),
+        [
+            "• これは画面幅を超える長い日本語のリスト",
+            "  項目です。描画部品が自分で折り返すなら",
+            "  、二行目以降は記号の幅だけ字下げされま",
+            "  す。",
+        ]
+    );
+    assert_eq!(
+        describe(&drawn(LONG_JAPANESE_LIST_ITEM, 80)),
+        [
+            "• これは画面幅を超える長い日本語のリスト項目です。描画部品が自分で折り返すなら、",
+            "  二行目以降は記号の幅だけ字下げされます。",
+        ]
     );
     for width in WIDTHS {
-        assert_eq!(widest(&drawn(LONG_JAPANESE_LIST_ITEM, width)), 120);
+        assert!(widest(&drawn(LONG_JAPANESE_LIST_ITEM, width)) <= width);
     }
 }
 
-/// **既知の不具合**: 幅を超える日本語の引用を折り返さない。縦線`│ `は薄い書式で、1行のまま出る（104桁）。
+/// 幅を超える日本語の引用は全角文字の間で折り返し、続きの行にも縦線`│ `（薄い書式）を付ける（T7a。素の描画部品は
+/// 折り返さず、どちらの幅でも104桁の1行で出していた）。
 #[test]
-fn a_long_japanese_blockquote_is_not_wrapped() {
-    assert_same_at_both_widths(
-        LONG_JAPANESE_BLOCKQUOTE,
-        &["«muted|│ »これは画面幅を超える長い日本語の引用です。描画部品が自分で折り返すなら、二行目以降にも縦線が付きます。"],
+fn a_long_japanese_blockquote_repeats_the_bar_on_continuation_lines() {
+    assert_eq!(
+        describe(&drawn(LONG_JAPANESE_BLOCKQUOTE, 40)),
+        [
+            "«muted|│ »これは画面幅を超える長い日本語の引用で",
+            "«muted|│ »す。描画部品が自分で折り返すなら、二行",
+            "«muted|│ »目以降にも縦線が付きます。",
+        ]
+    );
+    assert_eq!(
+        describe(&drawn(LONG_JAPANESE_BLOCKQUOTE, 80)),
+        [
+            "«muted|│ »これは画面幅を超える長い日本語の引用です。描画部品が自分で折り返すなら、二行目",
+            "«muted|│ »以降にも縦線が付きます。",
+        ]
     );
     for width in WIDTHS {
-        assert_eq!(widest(&drawn(LONG_JAPANESE_BLOCKQUOTE, width)), 104);
+        assert!(widest(&drawn(LONG_JAPANESE_BLOCKQUOTE, width)) <= width);
     }
 }
 
@@ -280,15 +315,16 @@ fn a_blockquote_after_a_list_has_no_blank_line_before_it() {
     assert_same_at_both_widths(QUOTE_AFTER_LIST, &["• item", "«muted|│ »quote"]);
 }
 
-/// **既知の不具合**: タスクリストの印がHTMLの文字列のまま出る。その文字列もASCIIの空白で折り返す。
+/// **既知の不具合**: タスクリストの印がHTMLの文字列のまま出る。その文字列もASCIIの空白で折り返す
+/// （分けた所の空白は前の行の末尾に残る。T7a）。
 #[test]
 fn a_task_list_shows_the_checkbox_as_an_html_string() {
     assert_eq!(
         describe(&drawn(TASK_LIST, 40)),
         [
-            "• <input disabled=\"\" type=\"checkbox\">",
+            "• <input disabled=\"\" type=\"checkbox\"> ",
             "  todo",
-            "• <input checked=\"\" disabled=\"\"",
+            "• <input checked=\"\" disabled=\"\" ",
             "  type=\"checkbox\"> done",
         ]
     );

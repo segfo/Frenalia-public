@@ -1,12 +1,21 @@
 //! 写した描画部品（[`super::render`]）が、写す前の描画部品（`codewandler-markdown-ratatui` 0.2.1の
-//! `markdown_ratatui`）と**同じ出力を返す**ことを確かめる試験（計画書`plans/PLAN-TUI-IMPROVEMENTS.md`§0のT6）。
+//! `markdown_ratatui`）と**同じ出力を返す**ことを確かめる試験（計画書`plans/PLAN-TUI-IMPROVEMENTS.md`§0のT6・T7a）。
 //!
 //! # 何のためにあるのか
 //!
 //! 描画部品は「既存の動く実装を機械的に写してから直す」（計画書§1.3の結論。グローバル規約の「既存のリファレンス
-//! 実装をテンプレートにする」）。写す途中で1か所でも変わっていたら、それはT7で直す前から別物になっている。
+//! 実装をテンプレートにする」）。写す途中で1か所でも変わっていたら、それは直す前から別物になっている。
 //! だから写した直後に、元と出力が**1つも違わない**ことを、文字だけでなく書式と`Span`の切れ目まで含めて
-//! （`ratatui::text::Text`同士の`==`で）確かめる。
+//! （`ratatui::text::Text`同士の`==`で）確かめた（T6）。
+//!
+//! # T7a（折り返しを直した）の後に比べるもの
+//!
+//! T7aで直したのは**幅に合わせて行を分けるところだけ**である（全角文字の間で分ける・長い語を文字の間で切る・
+//! 幅の下限20をやめる・分けた所の空白を前の行の末尾に残す・コードと表の行を幅で切る・区切り線を字下げの後ろの幅に
+//! 収める）。だから、**元の描画部品の出力が幅に左右されない**入力と幅の組では、写しも元と1つも違ってはいけない。
+//! 「幅に左右されない」は[`original_ignores_width`]で決める——その幅で描いた結果が、どこでも分けない広い幅で
+//! 描いた結果と同じで、どの行もその幅に収まっている（元が折り返した・はみ出した・下限20へ切り上げた組を除く）。
+//! 外れた組の見え方は`super::characterization_tests`と`super::wrap_tests`が固定する。
 //!
 //! 入力は3組。
 //!
@@ -19,10 +28,11 @@
 //! # 限界
 //!
 //! - 同じであることを確かめるのは**ここに並べた入力についてだけ**。分岐を全部通しても、値の組み合わせを全部
-//!   試したことにはならない。写した手順（変えたのは冒頭の表記・`pub`の範囲・モジュールの宣言だけ）は
-//!   `render.rs`の冒頭に書いてある。
-//! - **計画書のT7で写しを直したら、この試験は役目を終える**（直した箇所で元と違うのが正しくなる）。T7では消すか、
-//!   直さない入力に絞る。
+//!   試したことにはならない。写した手順と、写した後に変えたものは`render.rs`の冒頭に書いてある。
+//! - 比べる組は[`original_ignores_width`]で選ぶので、選ばれる組が減っても試験は緑のまま残り得る。比べた組の数の
+//!   下限と、必ず比べる組（[`MUST_COMPARE`]）を確かめて、選び方が空回りしていないことを見る。
+//! - 計画書のT7bで構造の不具合（入れ子のリスト・タスクリスト・HTMLブロック・コードの字下げ・リンク）を直すと、
+//!   それらの入力は幅に関係なく元と違うのが正しくなる。T7bでさらに絞る。
 
 use std::collections::BTreeSet;
 
@@ -32,8 +42,8 @@ use ratatui::text::Text;
 use super::characterization_tests::{describe, CASES, WIDTHS};
 use super::render;
 
-/// 描画部品の分岐を全部通すための入力（モジュールdoc）。
-const BRANCH_INPUTS: [&str; 23] = [
+/// 描画部品の分岐を全部通すための入力（モジュールdoc）。`super::wrap_tests`も使う。
+pub(super) const BRANCH_INPUTS: [&str; 23] = [
     "",
     "Para one\nsoft line.  \nhard by two spaces\\\nhard by a backslash\nlast\n\nPara two\n",
     "## Sub *heading* with `code`, **bold** and [a link](http://x.y \"t\")\n",
@@ -90,26 +100,60 @@ fn assert_same(copied: &Text<'_>, original: &Text<'_>, what: &str) {
     );
 }
 
-/// 特性化試験の入力を幅40・80で描いた結果が、元と同じ。
+/// どこでも分けない十分に広い幅（[`original_ignores_width`]）。
+const WIDE: usize = 10_000;
+
+/// 元の描画部品の出力が、`width`桁で描いても幅に左右されないか（モジュールdoc）。`width`で描いた結果が
+/// どこでも分けない広い幅で描いた結果と同じで、どの行も`width`桁に収まっていれば真。
+fn original_ignores_width(src: &str, width: usize) -> bool {
+    let events = markdown_stream::parse_gfm(src);
+    let theme = markdown_ratatui::Theme::default();
+    let at_width = markdown_ratatui::render_with(&events, &theme, width);
+    at_width == markdown_ratatui::render_with(&events, &theme, WIDE)
+        && at_width.lines.iter().all(|line| line.width() <= width)
+}
+
+/// 選び方が空回りしていないことを見るために、**必ず比べる**組（入力・幅）。T7aで変えてはいけない書式を並べる——
+/// 短い箇条書き・番号付きリスト・見出し・コード・文中の書式とリンク・収まる表・引用の入れ子。
+const MUST_COMPARE: [(&str, usize); 9] = [
+    (super::characterization_tests::HEADING, 40),
+    (super::characterization_tests::BULLET_LIST, 40),
+    (super::characterization_tests::ORDERED_LIST, 40),
+    (super::characterization_tests::RUST_CODE_BLOCK, 40),
+    (super::characterization_tests::INLINE_STYLES_AND_LINK, 80),
+    (super::characterization_tests::TASK_LIST, 80),
+    (BRANCH_INPUTS[9], 40),
+    (BRANCH_INPUTS[5], 40),
+    (BRANCH_INPUTS[3], 120),
+];
+
+/// 特性化試験の入力を幅40・80で描いた結果が、元の出力が幅に左右されない組では元と同じ。
 #[test]
-fn the_copy_renders_every_characterization_case_exactly_like_the_original() {
+fn the_copy_renders_every_characterization_case_the_original_draws_regardless_of_width() {
     let mut compared = 0;
     for (name, src) in CASES {
         for width in WIDTHS {
+            if !original_ignores_width(src, width) {
+                continue;
+            }
             let (copied, original) = both(src, width, false);
             assert_same(&copied, &original, &format!("{name}・幅{width}"));
             compared += 1;
         }
     }
-    assert_eq!(compared, CASES.len() * WIDTHS.len());
+    // 14入力×2幅のうち、折り返す・はみ出すのは普通の文章（両方の幅）・日本語の2つ（両方の幅）・タスクリスト（幅40）。
+    assert_eq!(compared, CASES.len() * WIDTHS.len() - 7);
 }
 
-/// 分岐を通す入力を、どの幅・どちらの書式で描いても、元と同じ。
+/// 分岐を通す入力を、どちらの書式で描いても、元の出力が幅に左右されない組では元と同じ。
 #[test]
-fn the_copy_renders_every_branch_input_exactly_like_the_original() {
+fn the_copy_renders_every_branch_input_the_original_draws_regardless_of_width() {
     let mut compared = 0;
     for src in BRANCH_INPUTS {
         for width in BRANCH_WIDTHS {
+            if !original_ignores_width(src, width) {
+                continue;
+            }
             for no_color in [false, true] {
                 let (copied, original) = both(src, width, no_color);
                 assert_same(
@@ -121,18 +165,58 @@ fn the_copy_renders_every_branch_input_exactly_like_the_original() {
             }
         }
     }
-    assert_eq!(compared, BRANCH_INPUTS.len() * BRANCH_WIDTHS.len() * 2);
+    // 23入力×8幅×2書式のうち、半分を下回るほど外れたら選び方を疑う。
+    assert!(
+        compared >= BRANCH_INPUTS.len() * BRANCH_WIDTHS.len(),
+        "比べたのが{compared}組しか無い"
+    );
 }
 
-/// 既定の書式と幅で描く入口（`render`）も、元と同じ。
+/// 既定の書式と幅（80桁）で描く入口（`render`）も、元の出力が幅に左右されない入力では元と同じ。
 #[test]
-fn the_default_entry_point_renders_like_the_original() {
+fn the_default_entry_point_renders_like_the_original_when_the_width_does_not_matter() {
+    let mut compared = 0;
     for src in CASES.iter().map(|(_, src)| *src).chain(BRANCH_INPUTS) {
+        if !original_ignores_width(src, 80) {
+            continue;
+        }
         let events = markdown_stream::parse_gfm(src);
         assert_same(
             &render::render(&events),
             &markdown_ratatui::render(&events),
             &format!("{src:?}・既定の入口"),
+        );
+        compared += 1;
+    }
+    assert!(compared >= 20, "比べたのが{compared}入力しか無い");
+}
+
+/// **選び方の対照**: 必ず比べる組（[`MUST_COMPARE`]）は選ばれ、元が折り返した組・はみ出した組は外れる。
+/// 外れた組では、写しは実際に元と違う（T7aの直しが効いていて、外すのが必要だった）。
+#[test]
+fn the_comparison_keeps_the_formats_t7a_must_not_change_and_skips_the_wrapped_ones() {
+    for (src, width) in MUST_COMPARE {
+        assert!(
+            original_ignores_width(src, width),
+            "比べるはずの組が外れた: {src:?}・幅{width}"
+        );
+    }
+    let wrapped = [
+        (super::characterization_tests::PARAGRAPH, 40),
+        (super::characterization_tests::PARAGRAPH, 80),
+        (super::characterization_tests::LONG_JAPANESE_LIST_ITEM, 80),
+        (super::characterization_tests::LONG_JAPANESE_BLOCKQUOTE, 40),
+        (BRANCH_INPUTS[9], 24),
+    ];
+    for (src, width) in wrapped {
+        assert!(
+            !original_ignores_width(src, width),
+            "元が折り返す組なのに比べる側に入った: {src:?}・幅{width}"
+        );
+        let (copied, original) = both(src, width, false);
+        assert!(
+            copied != original,
+            "元が折り返す組で、写しが元と同じに描いた: {src:?}・幅{width}"
         );
     }
 }

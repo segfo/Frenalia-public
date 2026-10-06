@@ -9,8 +9,9 @@ default = ["markdown-codewandler"]
 # いずれ別の実装へ差し替える（`plans/PLAN-TUI-IMPROVEMENTS.md`§1.2・§1.6）。切ると整形しない実装
 # （`src/markdown/plain.rs`）で描く。`cfg`を書くのは`src/markdown/mod.rs`の2か所だけ（Adapterのモジュール宣言と、
 # 実装の選択）。描画部品は依存にせず、出典とライセンス表記ごと`src/markdown/codewandler/render.rs`へ写して直す
-# （同§1.3の結論）——依存にするのは解析器だけ。
-markdown-codewandler = ["dep:codewandler-markdown-stream"]
+# （同§1.3の結論）——codewandlerから依存にするのは解析器だけ。もう1つの`unicode-segmentation`は、写した描画部品の
+# 折り返し（T7a）が文字の区切りに使う。
+markdown-codewandler = ["dep:codewandler-markdown-stream", "dep:unicode-segmentation"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -33,6 +34,10 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = "0.3"
+# 写した描画部品が行を文字（書記素）の間で切るときの区切り（`src/markdown/codewandler/render/wrap.rs`）。
+# `markdown-codewandler`でだけ入る（上の`[features]`）。版はロックにあるもの（ratatuiが文字を数えるのに使う版）と同じ
+# ——範囲選択が文字を数える区切りと揃える。
+unicode-segmentation = { version = "1.13.3", optional = true }
 unicode-width = "0.2.2"
 
 [dev-dependencies]
