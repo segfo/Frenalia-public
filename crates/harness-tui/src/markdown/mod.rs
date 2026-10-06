@@ -12,12 +12,12 @@
 //! | [`StreamingMarkdown`] | Port。表示に要る能力だけ |
 //! | [`MarkdownView`] | Facade。**どの実装を使うかと、描く幅をどう決めるかを、ここ1か所で決める** |
 //! | [`plain::PlainText`] | 原文を1行ずつそのまま描く実装（整形しない。付け替える前のtranscriptと同じ見た目） |
-//! | `codewandler`（feature `markdown-codewandler`。既定で有効） | codewandlerで整形して描く実装の置き場。いまは写した描画部品と試験だけで、**製品はまだ使わない**（Adapterは計画書のT8、切り替えはT9） |
+//! | `codewandler`（feature `markdown-codewandler`。既定で有効） | codewandlerで整形して描く実装（Adapter`codewandler::CodewandlerMarkdown`と写した描画部品）の置き場。**製品はまだ使わない**（切り替えは計画書のT9） |
 //!
 //! # 限界
 //!
 //! - いまの実装は`PlainText`だけで、**まだ整形しない**（画面は付け替える前と1文字も変わらない）。
-//!   codewandlerの解析器を使う実装は`codewandler/`へ置き、[`Engine`]を`cfg`で選ぶ形で足す（計画書§0のT6〜T9）。
+//!   codewandlerで整形する実装は`codewandler/`にあり（計画書のT8）、[`Engine`]を`cfg`で選ぶ形でそちらへ切り替える（T9）。
 //! - codewandlerの名前は`codewandler/`と、実装を選ぶこのファイルの外には書かない。ソースを読んで数える試験
 //!   （`leak_tests`）が止める。
 //! - 対象はassistantの返答だけ。thinking・ツール出力・ユーザー入力は今までどおり`crate::ui`がそのまま描く。
@@ -65,7 +65,7 @@ pub(crate) trait StreamingMarkdown {
 ///
 /// **`lines`と`joins`は同じ長さで、`links`の区間はどれも指す行の文字の中に収まる**（不変条件）。実装はそう作り、
 /// [`MarkdownView::render`]が確かめる。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct Rendered {
     pub lines: Vec<Line<'static>>,
     /// `lines`と同じ長さ。実装が幅に合わせて自分で分けた続きの行は`Continues`（コピーでは元の1行に戻す。

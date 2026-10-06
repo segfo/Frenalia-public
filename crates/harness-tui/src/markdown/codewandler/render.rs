@@ -56,6 +56,10 @@
 //        青の下線で、文中にURLは出さない。画像は区間を返さない（代わりの文字の描き方は上流のまま）
 //   段落の末尾のハードな改行を捨てるのは`render/wrap.rs`の`fill`。
 //   T7bで直した構造を含まない入力では、今も元と1つも違わない（`super::equivalence_tests`が確かめる）。
+// - 計画書のT8で、既に何か描いた文書の続きとして描く口`render_lines_following`と、描いた結果をつなぐ口`append`を
+//   足した（上流に無い）。Adapter（`super::CodewandlerMarkdown`）が、確定した塊と書きかけの末尾を別々に解析して描くため。
+//   あわせて、製品が使わない口（`render`・`render_with`・`render_lines`・`Theme::no_color`・構文の色付け用に予約された
+//   書式の役割）に、試験でないビルドの「使われていない」の警告を止める印を付けた（それまではモジュール全体に付けていた）。
 // - **暫定の部品である**（計画書§1.6）。別の実装がPortの契約試験を通ったら、`markdown/codewandler/`ごと消す。
 // =================================================================================================
 
@@ -76,7 +80,7 @@ use ratatui::style::Style;
 use ratatui::text::{Span, Text};
 use unicode_width::UnicodeWidthStr;
 
-use crate::markdown::Rendered;
+use crate::markdown::{LinkSpan, Rendered};
 
 mod theme;
 mod wrap;
@@ -84,6 +88,11 @@ pub(crate) use theme::Theme;
 use wrap::{Piece, Sink, Token};
 
 /// Render a complete event stream with the default theme and width 80.
+///
+/// 【harness】**製品は使わない**——試験だけが使う（T8の時点。Adapterは[`render_lines_following`]を使う）。
+/// 試験でないビルドの「使われていない」の警告を止める（`crate::markdown::MarkdownView::reset`と同じ扱い）。
+/// 製品が使い始めたら外す。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn render(events: &[Event]) -> Text<'static> {
     render_with(events, &Theme::default(), 80)
 }
@@ -91,7 +100,12 @@ pub(crate) fn render(events: &[Event]) -> Text<'static> {
 /// Render a complete event stream with an explicit theme and wrap width.
 ///
 /// 【harness】行だけを返す（[`render_lines`]の`lines`）。続きの行の印とリンクの区間が要る使い道（Adapter。
-/// 計画書のT8）は[`render_lines`]を使う。
+/// 計画書のT8）は[`render_lines_following`]を使う。
+///
+/// 【harness】**製品は使わない**——試験だけが使う（T8の時点。Adapterは[`render_lines_following`]を使う）。
+/// 試験でないビルドの「使われていない」の警告を止める（`crate::markdown::MarkdownView::reset`と同じ扱い）。
+/// 製品が使い始めたら外す。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn render_with(events: &[Event], theme: &Theme, width: usize) -> Text<'static> {
     Text::from(render_lines(events, theme, width).lines)
 }
@@ -100,10 +114,50 @@ pub(crate) fn render_with(events: &[Event], theme: &Theme, width: usize) -> Text
 /// 合わせて自分で分けた続きの行は`Continues { indent }`、それ以外は`Break`（`render/wrap.rs`のモジュールdoc）。
 ///
 /// どの行も`width`桁を超えない。例外は、字下げの後に1文字も入らないほど狭い幅だけ（同じく`render/wrap.rs`）。
+///
+/// 【harness】**製品は使わない**——試験だけが使う（T8の時点。Adapterは[`render_lines_following`]を使う）。
+/// 試験でないビルドの「使われていない」の警告を止める（`crate::markdown::MarkdownView::reset`と同じ扱い）。
+/// 製品が使い始めたら外す。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn render_lines(events: &[Event], theme: &Theme, width: usize) -> Rendered {
+    render_lines_following(events, theme, width, false)
+}
+
+/// 【harness】[`render_lines`]と同じに描く。`follows`なら、**既に何か描いた文書の続きとして**描く（T8。Adapterが
+/// 確定した塊と書きかけの末尾を別々に解析して描き、[`append`]でつなぐため）。
+///
+/// 描画部品は最上位のブロックの間に空行を1つ置く（`Renderer::gap`）。置くのは**次のブロックが始まるとき**で、前に
+/// 何か描いていれば、そのブロックが何も描かなくても置く（中身の無いコードブロックでも空行だけが出る）。だから
+/// 「つなぐ2つが両方1行以上あれば間に空行」では決まらず、続きとして描く側が自分で置く——`follows`は、前の文書の
+/// 最後のブロックの後ろに空行を置く約束（`pending_gap`）と、前に描いたこと（`wrote_any`）を引き継ぐ。最上位の
+/// ブロックは閉じるときに必ず空行を約束するので、前の文書が何か描いていれば、約束は必ず残っている。
+///
+/// **前提**: 前の文書との境目が最上位のブロックの境目で、2つを続けて解析しても出来事が変わらないこと（Adapterは
+/// 境界を採るときに解析器でそれを確かめる）。前提が成り立つ入力で、続けて描いたものと同じになることは、Adapterの
+/// 試験（`super::stream_tests`）が、全文を1回で解析して描いたものとの比較で確かめる。
+pub(crate) fn render_lines_following(
+    events: &[Event],
+    theme: &Theme,
+    width: usize,
+    follows: bool,
+) -> Rendered {
     let mut r = Renderer::new(theme.clone(), width);
+    r.pending_gap = follows;
+    r.wrote_any = follows;
     r.feed(events);
     r.finish()
+}
+
+/// 【harness】`next`を`into`の後ろへつなぐ（T8）。`next`のリンクの区間の行は、つないだ位置のぶんずらす。間に何も
+/// 足さない——ブロックの間の空行は、`next`を[`render_lines_following`]で続きとして描いた側が持つ。
+pub(crate) fn append(into: &mut Rendered, next: &Rendered) {
+    let offset = into.lines.len();
+    into.lines.extend(next.lines.iter().cloned());
+    into.joins.extend(next.joins.iter().copied());
+    into.links.extend(next.links.iter().map(|link| LinkSpan {
+        line: link.line + offset,
+        ..link.clone()
+    }));
 }
 
 /// 【harness】段落の文字の1区間——文字と書式と、リンクの中ならそのリンクの番号（`wrap::Sink::add_link`。T7b）。

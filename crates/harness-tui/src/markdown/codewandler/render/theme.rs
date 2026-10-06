@@ -54,9 +54,15 @@ pub(crate) struct Theme {
     pub(crate) italic: Style,
     pub(crate) strike: Style,
     // syntax-highlighting roles for fenced code (reserved; v1 renders code uniformly)
+    // 【harness】製品は読まない（構文の色付けは入れない。計画書§1.2）。試験（`equivalence_tests`）だけが、元の描画部品と
+    // 同じ値かを読む。試験でないビルドの「使われていない」の警告を止める（T8）。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) kw: Style,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) str: Style,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) comment: Style,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) num: Style,
 }
 
@@ -83,6 +89,9 @@ impl Default for Theme {
 
 impl Theme {
     /// A theme that applies no styling (every role is the empty `Style`).
+    ///
+    /// 【harness】**製品は使わない**——試験だけが使う。試験でないビルドの「使われていない」の警告を止める（T8）。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn no_color() -> Self {
         let s = Style::new();
         Theme {
