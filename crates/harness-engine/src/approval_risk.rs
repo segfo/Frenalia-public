@@ -2,9 +2,11 @@
 //!
 //! # 何のためにあるのか
 //!
-//! 承認画面は、人が「このコマンドを走らせてよいか」を決めるための道具である。画面には**「危険度: 要確認」か
-//! 「危険度: 高」**のどちらかを出し、高のときは理由を並べる。**「要確認」は安全という意味ではない**——
+//! 承認画面は、人が「このコマンドを走らせてよいか」を決めるための道具である。画面には**「危険度: 要確認」
+//! 「危険度: 中」「危険度: 高」**のどれかを出し、中と高のときは理由を並べる。**「要確認」は安全という意味ではない**——
 //! 見つけた危険が無かった、というだけで、人が中身を確かめることに変わりはない（「低」「安全」と書かないのはそのため）。
+//! **「中」も安全ではない**——字面で場所を見る機械が被害を見つけ、中身を読む判定モデルが低いと言った、
+//! つまり**性質の違う2つの判定が食い違った**ことを表す（D-100 の 2026-10-06 追記）。
 //!
 //! # 流れ
 //!
@@ -20,8 +22,17 @@
 //!    ・解読できた各段（機械の解読・LLM が場所を示したもの）の中身を、機械の判定と判定モデルに通す
 //!      （「解けた包み」の途中の段は判定モデルへ聞かない。D-126）
 //!    ・ファイルからコードを読む（または run_program でコードを走らせる）なら、縛ったファイルの中身の危険度
-//! ④ どれか1つでも高なら「高」、それ以外は「要確認」
+//! ④ 段階を決める（[`RiskOutcome::severity`]。D-100 の 2026-10-06 追記）
+//!    ・判定モデルが高（行・流れ・解いた段・ファイルのどれか）、または解析しきれない難読化（D-124） → 「高」
+//!    ・機械だけが高で、機械が引っ掛けた材料を判定モデルが全部読んだうえで低い                  → 「中」
+//!    ・機械だけが高で、判定モデルを使えない・読んでいない材料に引っ掛けた                      → 「高」
+//!    ・どれも見つけない                                                                      → 「要確認」
 //! ```
+//!
+//! **「読んだうえで低い」に限る。** 上限（[`MAX_DECODED_TO_ASK`]・[`MAX_FILES_TO_ASK`]）で聞いていない材料、
+//! D-126 で点数を数えない行・段、呼び出しが失敗した材料に機械が引っ掛けたときは中へ下げない——読んでいないものを
+//! 根拠に下げない（D-124 と同じ向き）。材料は出どころ（[`Origin`]）でなく**位置**で数える（同じ深さの兄弟の段は
+//! 同じ`Origin`になるので、出どころでは「どの段を読んだか」を区別できない）。
 //!
 //! 判定モデルが無い・落ちているときは①だけで決め、画面には「機械判定のみ」と添える（[`RiskBasis`]）。
 //!
@@ -45,7 +56,11 @@
 //! - 解読が要りそうなのに、機械の解読も LLM が示した箇所の解読も何も取れなかったときは、注記を出すだけである
 //!   （LLM が場所を示さなかった・示した文字列が行に無かった・示された符号化として読めなかった）
 //! - 解けた包みの行では、塊の**外**にある平文を判定モデルが読まない（D-126）。システムの場所への被害は
-//!   機械の判定が拾うが、それ以外は要確認に落ちる
+//!   機械の判定が拾う（判定モデルが読んでいないので中へは下げず高）が、それ以外は要確認に落ちる
+//! - 「中」は判定モデルの低い点数で機械の高を下げたものなので、判定モデルが曲げられれば中に見える
+//!   （だから要確認までは下げず、黄で残す）。判定モデルを待つ間は機械の判定だけで出すので、高から中へ変わり得る
+
+use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 use futures::future::join;
@@ -99,12 +114,19 @@ pub const MAX_DECODED_TO_ASK: usize = 4;
 /// 縛ったファイルのうち、判定モデルへ中身の危険度を聞く数の上限（長さに比例して遅い。4,000字で約12秒）。
 pub const MAX_FILES_TO_ASK: usize = 3;
 
-/// 画面に出す危険度の段階。
+/// 画面に出す危険度の段階（決め方は[`RiskOutcome::severity`]）。
+///
+/// **中はここにだけ置き、判定モデルの点数の段階（[`RiskLevel`]）には足さない。** 点数で引く黄の帯は、無害な行と
+/// 危険な行の点数が重なるので外した（`harness_core::risk_check`の`RiskLevel`の doc）。中は帯ではなく、
+/// 2つの判定の食い違いである（D-100 の 2026-10-06 追記）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
     /// 見つけた危険は無い。**安全という意味ではない**（人が中身を確かめる）。
     NeedsReview,
-    /// 機械の判定か判定モデルのどれかが危険と見た。
+    /// 機械の判定は被害を見つけたが、機械が引っ掛けた材料を判定モデルが全部読んだうえで低いと見た。
+    /// **安全という意味ではない**（判定モデルは曲げられ得る）。
+    Medium,
+    /// 判定モデルが危険と見た・解析しきれない難読化がある・機械が被害を見つけて判定モデルがそれを読んでいない。
     High,
 }
 
@@ -112,15 +134,17 @@ impl Severity {
     pub fn label_ja(self) -> &'static str {
         match self {
             Severity::NeedsReview => "要確認",
+            Severity::Medium => "中",
             Severity::High => "高",
         }
     }
 
     /// 要約へ渡す段階（高のときだけ、固定の英文1行。[`RiskLevel::summary_instruction`]）。
+    /// **中は何も足さない**（判定モデルの低いと同じ扱い。D-100 の 2026-10-06 追記）。
     pub fn summary_hint(self) -> Option<RiskLevel> {
         match self {
             Severity::High => Some(RiskLevel::Danger),
-            Severity::NeedsReview => None,
+            Severity::Medium | Severity::NeedsReview => None,
         }
     }
 }
@@ -146,7 +170,7 @@ impl Origin {
     }
 }
 
-/// 「高」の理由1つ。
+/// 「中」「高」の理由1つ。
 #[derive(Debug, Clone, PartialEq)]
 pub enum RiskReason {
     /// 機械の判定（システムへの被害）。
@@ -253,22 +277,69 @@ pub enum RiskBasis {
 /// 組み立てた結果。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RiskOutcome {
-    /// 「高」の理由。空なら「要確認」。
+    /// 「中」「高」の理由。空なら「要確認」。段階は[`RiskOutcome::severity`]が決める。
     pub reasons: Vec<RiskReason>,
     pub notes: Vec<RiskNote>,
     pub basis: RiskBasis,
     /// LLM が場所を示し、ハーネスが解読した段（[`crate::encoded_span`]）。承認画面と要約に、
     /// 機械の解読（材料の`decoded`）と並べて出す。**表示と要約・判定のためだけで、照合に使わない。**
     pub extra_decoded: Vec<DecodedLayer>,
+    /// 数えた判定モデルの点数のうち最大のもの（線より下でも残す。「中」の行に出す）。D-126 で数えない
+    /// 行・流れ・途中の段の点数は入らない。判定モデルを使っていなければ`None`。
+    pub model_peak: Option<RiskVerdict>,
+    /// 機械が被害を見つけた材料のうち、判定モデルの点数を数えていないものがある（上限で聞いていない・
+    /// D-126 で数えない・呼び出しが失敗した）。立っていれば機械の高を中へ下げない。
+    pub unjudged_damage: bool,
+}
+
+/// 機械の判定・判定モデルが見た材料1つ。**位置で区別する**——同じ深さの兄弟の段は出どころ（[`Origin`]）が
+/// 同じになるので、出どころでは「判定モデルがどの段を読んだか」を数えられない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Material {
+    /// コマンドの行そのもの。
+    Line,
+    /// 機械の解読（材料の`decoded`）の位置。
+    Layer(usize),
+    /// LLM が場所を示して解読した段（`extra_decoded`）の位置。
+    Extra(usize),
+    /// 縛ったファイル（材料の`previews`）の位置。判定モデルへは並べ替えてから聞くが、元の位置で数える。
+    Preview(usize),
 }
 
 impl RiskOutcome {
+    /// 段階（D-100 の 2026-10-06 追記）。判定モデルが高・解析しきれない難読化 → 高。機械だけが高なら、
+    /// 判定モデルを使えて、機械が引っ掛けた材料を全部読んでいるときだけ中、そうでなければ高。何も無ければ要確認。
     pub fn severity(&self) -> Severity {
-        if self.reasons.is_empty() {
-            Severity::NeedsReview
-        } else {
-            Severity::High
+        let mut damage = false;
+        for reason in &self.reasons {
+            match reason {
+                RiskReason::Model { .. }
+                | RiskReason::Sequence(_)
+                | RiskReason::OpaqueObfuscation(_) => return Severity::High,
+                RiskReason::Damage { .. } => damage = true,
+            }
         }
+        match damage {
+            false => Severity::NeedsReview,
+            true if self.basis != RiskBasis::MachineOnly && !self.unjudged_damage => {
+                Severity::Medium
+            }
+            true => Severity::High,
+        }
+    }
+
+    /// 「中」のときだけ、判定モデルの点数の最大を1行で言う。**固定の言い回しと数値だけ**で、判定モデルが返した
+    /// 文字列は使わない。「安全」とは書かない。
+    pub fn model_low_ja(&self) -> Option<String> {
+        if self.severity() != Severity::Medium {
+            return None;
+        }
+        let peak = self.model_peak?;
+        Some(format!(
+            "判定モデル: 最大 {:.2} / 2（{}）——機械の判定と食い違うので「中」",
+            peak.score,
+            peak.level.reason_ja()
+        ))
     }
 
     /// 判定モデルを使えなかった理由（あれば）。会話の記録へ1回だけ書くのに使う。
@@ -288,6 +359,24 @@ impl RiskOutcome {
     fn note_model_error(&mut self, reason: String) {
         if self.model_error().is_none() {
             self.notes.push(RiskNote::ModelUnavailable(reason));
+        }
+    }
+
+    /// 数えた判定モデルの点数を最大へ入れる（理由にするかは呼び出し側）。
+    fn note_peak(&mut self, verdict: RiskVerdict) {
+        if self
+            .model_peak
+            .is_none_or(|peak| verdict.score > peak.score)
+        {
+            self.model_peak = Some(verdict);
+        }
+    }
+
+    /// 材料1つへの判定モデルの点数を数える——最大へ入れ、線を越えていれば理由にする。
+    fn count_model(&mut self, verdict: RiskVerdict, origin: Origin) {
+        self.note_peak(verdict);
+        if verdict.level == RiskLevel::Danger {
+            self.push_reason(RiskReason::Model { verdict, origin });
         }
     }
 
@@ -381,60 +470,76 @@ pub fn cache_key(subject: &PermissionSubject, history: &[String]) -> Option<Stri
     Some(key)
 }
 
-/// ①機械の判定だけで組み立てる（すぐ返る）。判定しない材料は`None`。
+/// ①機械の判定だけで組み立てる（すぐ返る）。判定しない材料は`None`。判定モデルは何も読んでいないので、
+/// 機械が被害を見つけていれば`unjudged_damage`が立つ（判定モデルを待つ間も、使えないときも高）。
 pub fn machine(subject: &PermissionSubject) -> Option<RiskOutcome> {
+    let (mut out, flagged) = machine_parts(subject)?;
+    out.unjudged_damage = !flagged.is_empty();
+    Some(out)
+}
+
+/// ①の本体。機械が被害を見つけた材料（位置）も返す——判定モデルがそれを全部読んだかを④で見る。
+fn machine_parts(subject: &PermissionSubject) -> Option<(RiskOutcome, BTreeSet<Material>)> {
     let mut out = RiskOutcome {
         reasons: Vec::new(),
         notes: Vec::new(),
         basis: RiskBasis::MachineOnly,
         extra_decoded: Vec::new(),
+        model_peak: None,
+        unjudged_damage: false,
     };
-    match subject {
-        PermissionSubject::Command(c) => add_damage(
-            &mut out,
-            system_damage::assess_line(&c.line),
-            Origin::Command,
-        ),
-        PermissionSubject::Program(p) => add_damage(
-            &mut out,
-            system_damage::assess_program(&p.program, &p.args),
-            Origin::Command,
-        ),
+    let mut flagged = BTreeSet::new();
+    let line_findings = match subject {
+        PermissionSubject::Command(c) => system_damage::assess_line(&c.line),
+        PermissionSubject::Program(p) => system_damage::assess_program(&p.program, &p.args),
         PermissionSubject::WritePath(_) | PermissionSubject::Text(_) => return None,
+    };
+    if add_damage(&mut out, line_findings, Origin::Command) {
+        flagged.insert(Material::Line);
     }
-    damage_in_decoded(&mut out, decoded_layers(subject));
-    for preview in previews(subject)
-        .iter()
-        .filter(|p| goes_to_machine(subject, p))
-    {
-        add_damage(
-            &mut out,
-            system_damage::assess_line(&preview.text),
-            Origin::File {
-                path: preview.rel_path.clone(),
-            },
-        );
+    let layers = damage_in_decoded(&mut out, decoded_layers(subject));
+    flagged.extend(layers.into_iter().map(Material::Layer));
+    for (i, preview) in previews(subject).iter().enumerate() {
+        if goes_to_machine(subject, preview)
+            && add_damage(
+                &mut out,
+                system_damage::assess_line(&preview.text),
+                Origin::File {
+                    path: preview.rel_path.clone(),
+                },
+            )
+        {
+            flagged.insert(Material::Preview(i));
+        }
     }
-    Some(out)
+    Some((out, flagged))
 }
 
-/// 機械の判定のうち「高」に当たるものを理由へ足す。
-fn add_damage(out: &mut RiskOutcome, findings: Vec<DamageFinding>, origin: Origin) {
+/// 機械の判定のうち「高」に当たるものを理由へ足す。1つでも当たれば`true`（同じ理由が既にあっても、
+/// この材料が当たったことに変わりはない）。
+fn add_damage(out: &mut RiskOutcome, findings: Vec<DamageFinding>, origin: Origin) -> bool {
+    let mut hit = false;
     for finding in findings.into_iter().filter(DamageFinding::is_high) {
+        hit = true;
         out.push_reason(RiskReason::Damage {
             finding,
             origin: origin.clone(),
         });
     }
+    hit
 }
 
-/// 解読できた段の中身に、機械の判定を掛ける。
-fn damage_in_decoded(out: &mut RiskOutcome, layers: &[DecodedLayer]) {
-    for layer in layers {
+/// 解読できた段の中身に、機械の判定を掛ける。当たった段の位置を返す。
+fn damage_in_decoded(out: &mut RiskOutcome, layers: &[DecodedLayer]) -> Vec<usize> {
+    let mut hit = Vec::new();
+    for (i, layer) in layers.iter().enumerate() {
         if let DecodeOutcome::Text { text, .. } = &layer.outcome {
-            add_damage(out, system_damage::assess_line(text), origin_of(layer));
+            if add_damage(out, system_damage::assess_line(text), origin_of(layer)) {
+                hit.push(i);
+            }
         }
     }
+    hit
 }
 
 /// その段をどこで見つけたか。ファイルの中で見つけた段は、**そのファイルの名前で言う**（D-122）
@@ -478,31 +583,29 @@ fn all_text<'a>(layers: impl Iterator<Item = &'a DecodedLayer>) -> bool {
 }
 
 /// 解読できた段の中身の危険度を判定モデルに聞く（上限[`MAX_DECODED_TO_ASK`]段）。解けた包みの途中の段は
-/// 聞かない（D-126）——上限は内側の段に使う。
+/// 聞かない（D-126）——上限は内側の段に使う。点数を数えた段は`judged`へ`material(位置)`で入れる。
 async fn model_on_decoded(
     out: &mut RiskOutcome,
     layers: &[DecodedLayer],
     model: &dyn DecisionModel,
+    judged: &mut BTreeSet<Material>,
+    material: fn(usize) -> Material,
 ) {
     let texts = layers
         .iter()
         .enumerate()
         .filter_map(|(i, layer)| match &layer.outcome {
             DecodeOutcome::Text { text, .. } if !wraps_decoded_text(layers, i) => {
-                Some((layer, text))
+                Some((i, layer, text))
             }
             _ => None,
         });
-    for (layer, text) in texts.take(MAX_DECODED_TO_ASK) {
+    for (i, layer, text) in texts.take(MAX_DECODED_TO_ASK) {
         match assess_command_risk(model, text).await {
             Ok(verdict) => {
                 out.basis = RiskBasis::WithModel;
-                if verdict.level == RiskLevel::Danger {
-                    out.push_reason(RiskReason::Model {
-                        verdict,
-                        origin: origin_of(layer),
-                    });
-                }
+                out.count_model(verdict, origin_of(layer));
+                judged.insert(material(i));
             }
             Err(e) => out.note_model_error(e.to_string()),
         }
@@ -519,12 +622,15 @@ pub async fn assess(
     locator: Option<&dyn SpanLocator>,
     fallback: Option<&dyn FallbackJudge>,
 ) -> Option<RiskOutcome> {
-    let mut out = machine(subject)?;
+    let (mut out, mut flagged) = machine_parts(subject)?;
+    // 判定モデル（またはフォールバック）の点数を数えた材料。④で、機械が引っ掛けた材料を全部含むかを見る。
+    let mut judged = BTreeSet::new();
     let Some(model) = model else {
         // 判定モデルを使わない設定。LLM フォールバックがあれば聞き、無ければ機械の判定だけで決める
         // （3段フォールバックの② → ③。D-125）。
-        consult_fallback(&mut out, subject, fallback).await;
+        consult_fallback(&mut out, subject, fallback, &mut judged).await;
         out.apply_fail_closed(subject);
+        out.unjudged_damage = !flagged.is_subset(&judged);
         return Some(out);
     };
     let line = subject_line(subject)?;
@@ -538,30 +644,22 @@ pub async fn assess(
     )
     .await;
     // 行と流れの危険度は保留する。行が解けた包みかは③の LLM の解読まで決まらない（D-126）。
-    let mut line_reasons = Vec::new();
+    let mut line_verdict = None;
     match risk {
         Ok(verdict) => {
             out.basis = RiskBasis::WithModel;
-            if verdict.level == RiskLevel::Danger {
-                line_reasons.push(RiskReason::Model {
-                    verdict,
-                    origin: Origin::Command,
-                });
-            }
+            line_verdict = Some(verdict);
         }
         Err(e) => out.note_model_error(e.to_string()),
     }
+    let mut sequence_verdict = None;
     let mut undecoded = None;
     match context {
         Ok(answers) => {
             out.basis = RiskBasis::WithModel;
             // 流れが空なら、流れの危険度はコマンドの危険度と同じものを測っているだけなので足さない。
             if !history.is_empty() {
-                if let Ok(verdict) = questions::read_sequence_risk(&answers) {
-                    if verdict.level == RiskLevel::Danger {
-                        line_reasons.push(RiskReason::Sequence(verdict));
-                    }
-                }
+                sequence_verdict = questions::read_sequence_risk(&answers).ok();
             }
             if let Ok(decode) = questions::read_needs_decoding(&answers) {
                 if decode.yes && decoded_texts(subject).is_empty() {
@@ -596,20 +694,38 @@ pub async fn assess(
         {
             out.notes.push(RiskNote::UndecodedPayload { probability });
         }
-        damage_in_decoded(&mut out, &located);
+        let hit = damage_in_decoded(&mut out, &located);
+        flagged.extend(hit.into_iter().map(Material::Extra));
         out.extra_decoded = located;
     }
-    // 解けた包みの行への点数は、中身でなく綴りに反応するので数えない（D-126）。
+    // 解けた包みの行への点数は、中身でなく綴りに反応するので数えない（D-126）。数えないなら、判定モデルは
+    // 行を読んでいない扱い（行の平文に機械が引っ掛けても中へ下げない）。
     if !line_wraps_decoded_text(decoded_layers(subject), &out.extra_decoded) {
-        for reason in line_reasons {
-            out.push_reason(reason);
+        if let Some(verdict) = line_verdict {
+            out.count_model(verdict, Origin::Command);
+            judged.insert(Material::Line);
+        }
+        // 流れの点数は最大にだけ入れ、行を読んだ根拠にはしない（他の問いと一緒に聞くと点数が下がる。
+        // `harness_core::risk_check::DANGER_FROM`）。
+        if let Some(verdict) = sequence_verdict {
+            out.note_peak(verdict);
+            if verdict.level == RiskLevel::Danger {
+                out.push_reason(RiskReason::Sequence(verdict));
+            }
         }
     }
 
     // ③ 解読できた段の中身（機械の解読と、LLM が場所を示したもの）。
-    model_on_decoded(&mut out, decoded_layers(subject), model).await;
+    model_on_decoded(
+        &mut out,
+        decoded_layers(subject),
+        model,
+        &mut judged,
+        Material::Layer,
+    )
+    .await;
     let extra = out.extra_decoded.clone();
-    model_on_decoded(&mut out, &extra, model).await;
+    model_on_decoded(&mut out, &extra, model, &mut judged, Material::Extra).await;
 
     // ③ 縛ったファイルの中身。**コードとして縛れたものは、必ず聞く。**
     //
@@ -627,20 +743,21 @@ pub async fn assess(
     // 拡張子の無いスクリプトや紛れた塊も見せる値がある。ただし1回が高価（長さ比例。4,000字で約10秒）
     // なので`MAX_FILES_TO_ASK`件まで。**どの件を落とすかで危険を見逃さないよう、スクリプトの拡張子を
     // 持つものを先に送る**（`zzz.py`が`aaa.txt`に押し出されない）。
-    let mut ordered: Vec<&FilePreview> = previews(subject).iter().collect();
-    ordered.sort_by_key(|p| !harness_core::has_script_extension(&p.rel_path));
-    for preview in ordered.into_iter().take(MAX_FILES_TO_ASK) {
+    //
+    // 並べ替えても、読んだ印は元の位置（`previews`の位置）で付ける——機械が引っ掛けた位置と突き合わせるため。
+    let mut ordered: Vec<(usize, &FilePreview)> = previews(subject).iter().enumerate().collect();
+    ordered.sort_by_key(|(_, p)| !harness_core::has_script_extension(&p.rel_path));
+    for (i, preview) in ordered.into_iter().take(MAX_FILES_TO_ASK) {
         match assess_source_risk(model, &preview.rel_path, &preview.text).await {
             Ok((verdict, cut)) => {
                 out.basis = RiskBasis::WithModel;
-                if verdict.level == RiskLevel::Danger {
-                    out.push_reason(RiskReason::Model {
-                        verdict,
-                        origin: Origin::File {
-                            path: preview.rel_path.clone(),
-                        },
-                    });
-                }
+                out.count_model(
+                    verdict,
+                    Origin::File {
+                        path: preview.rel_path.clone(),
+                    },
+                );
+                judged.insert(Material::Preview(i));
                 if cut || preview.truncated {
                     out.notes.push(RiskNote::FileCut {
                         path: preview.rel_path.clone(),
@@ -652,17 +769,21 @@ pub async fn assess(
     }
     // 判定モデルの呼び出しが全部失敗していれば basis は MachineOnly のまま。LLM フォールバックがあれば
     // 聞く（②）。それでも判定できなければ機械の fail-closed（③。D-124/D-125）。
-    consult_fallback(&mut out, subject, fallback).await;
+    consult_fallback(&mut out, subject, fallback, &mut judged).await;
     out.apply_fail_closed(subject);
+    // ④ 機械が引っ掛けた材料のうち、判定モデルが読んでいないものがあれば中へ下げない。
+    out.unjudged_damage = !flagged.is_subset(&judged);
     Some(out)
 }
 
 /// 判定モデルが使えなかった（basis が MachineOnly の）ときだけ、LLM フォールバック判定を聞く（D-125）。
 /// 判定できたら basis を `WithFallback` にして理由へ足す。判定できなければ何もしない（③の機械判定へ）。
+/// フォールバックが読むのは行だけなので、判定できたら行を読んだ印を付ける。
 async fn consult_fallback(
     out: &mut RiskOutcome,
     subject: &PermissionSubject,
     fallback: Option<&dyn FallbackJudge>,
+    judged: &mut BTreeSet<Material>,
 ) {
     if out.basis != RiskBasis::MachineOnly {
         return;
@@ -676,12 +797,8 @@ async fn consult_fallback(
     match fallback.judge(&line).await {
         Ok(Some(verdict)) => {
             out.basis = RiskBasis::WithFallback;
-            if verdict.level == RiskLevel::Danger {
-                out.push_reason(RiskReason::Model {
-                    verdict,
-                    origin: Origin::Command,
-                });
-            }
+            out.count_model(verdict, Origin::Command);
+            judged.insert(Material::Line);
         }
         Ok(None) => {}
         Err(e) => out.note_model_error(e),

@@ -91,6 +91,7 @@ impl PermissionView {
         };
         let style = match severity {
             Severity::High => LineStyle::Danger,
+            Severity::Medium => LineStyle::Warn,
             Severity::NeedsReview => LineStyle::Normal,
         };
         let mut out = vec![ApprovalLine::new(

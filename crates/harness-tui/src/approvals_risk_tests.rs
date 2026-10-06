@@ -369,6 +369,8 @@ async fn a_slow_check_does_not_hold_the_summary_past_the_wait() {
         notes: Vec::new(),
         basis: RiskBasis::WithModel,
         extra_decoded: Vec::new(),
+        model_peak: None,
+        unjudged_damage: false,
     };
     let (tx, rx) = oneshot::channel();
     let started = Instant::now();

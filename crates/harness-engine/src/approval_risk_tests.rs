@@ -696,6 +696,23 @@ fn reasons_are_written_with_fixed_wording() {
     assert_eq!(Severity::High.label_ja(), "高");
     assert_eq!(Severity::NeedsReview.label_ja(), "要確認");
     assert_eq!(Severity::NeedsReview.summary_hint(), None);
+    // 中（D-100 の 2026-10-06 追記）: ラベルと、判定モデルの点数の最大を言う固定の1行。要約へは何も足さない。
+    assert_eq!(Severity::Medium.label_ja(), "中");
+    assert_eq!(Severity::Medium.summary_hint(), None);
+    assert_eq!(Severity::High.summary_hint(), Some(RiskLevel::Danger));
+    let mut medium = machine(&shell(MACHINE_HIGH)).unwrap();
+    medium.basis = RiskBasis::WithModel;
+    medium.unjudged_damage = false;
+    medium.model_peak = Some(RiskVerdict::from_score(0.3).unwrap());
+    assert_eq!(medium.severity(), Severity::Medium);
+    assert_eq!(
+        medium.model_low_ja().as_deref(),
+        Some("判定モデル: 最大 0.30 / 2（低い）——機械の判定と食い違うので「中」")
+    );
+    // 対照: 高（読んでいない材料がある）には添えない。
+    medium.unjudged_damage = true;
+    assert_eq!(medium.severity(), Severity::High);
+    assert_eq!(medium.model_low_ja(), None);
 }
 
 /// **縛れたスクリプトの中身は、モデルが「読まない」と言っても必ず判定する。**
@@ -1254,4 +1271,247 @@ fn more_located_places_than_are_decoded_keep_the_line_score_and_are_high() {
         whole.reasons
     );
     assert!(!depth_limited(&whole));
+}
+
+// ---- D-100 の 2026-10-06 追記: 危険度を 要確認／中／高 の3段にする ----
+
+/// 機械の判定で「高」になる行（既存のフィクスチャ。`without_the_model_the_machine_judgement_alone_decides`）。
+const MACHINE_HIGH: &str = r"Remove-Item C:\Windows\System32\x";
+/// 機械の判定が当たるスクリプト（既存のフィクスチャ。`the_machine_judgement_reads_bound_scripts_but_not_notes`）。
+const BURIED_SCRIPT: &str =
+    "Write-Host 1\nRemove-Item -Recurse -Force $env:USERPROFILE\nWrite-Host 2\n";
+
+fn with_previews(line: &str, files: &[(&str, &str)]) -> PermissionSubject {
+    let mut c = CommandSubject::line_only(line);
+    for (path, text) in files {
+        c.previews.push(FilePreview {
+            rel_path: (*path).into(),
+            text: (*text).into(),
+            truncated: false,
+        });
+    }
+    PermissionSubject::Command(c)
+}
+
+fn peak(out: &RiskOutcome) -> Option<f32> {
+    out.model_peak.map(|v| v.score)
+}
+
+fn has_damage(out: &RiskOutcome, origin: &Origin) -> bool {
+    out.reasons
+        .iter()
+        .any(|r| matches!(r, RiskReason::Damage { origin: o, .. } if o == origin))
+}
+
+fn asked_source_of(model: &FakeModel, path: &str) -> bool {
+    model
+        .calls()
+        .iter()
+        .any(|(state, ids)| ids == &vec!["source_risk"] && state["path"] == path)
+}
+
+/// **機械が高・判定モデルが読んだうえで低い → 中。** 要約へは何も足さず、判定モデルの点数の最大を固定の1行で言う。
+/// 対照: 判定モデルも高 → 高。判定モデルが落ちている・使わない設定 → 高（読んでいないものを根拠に下げない）。
+#[test]
+fn machine_high_and_a_low_model_is_medium() {
+    let low = run(
+        &shell(MACHINE_HIGH),
+        &[],
+        Some(&FakeModel::quiet().with_risk(MACHINE_HIGH, 0.3)),
+    );
+    assert!(has_damage(&low, &Origin::Command), "{:?}", low.reasons);
+    assert_eq!(low.severity(), Severity::Medium, "{low:?}");
+    assert_eq!(low.severity().label_ja(), "中");
+    assert_eq!(low.severity().summary_hint(), None);
+    assert_eq!(peak(&low), Some(0.3));
+    assert!(!low.unjudged_damage);
+    let line = low.model_low_ja().expect("中には判定モデルの1行を添える");
+    assert!(line.contains("最大 0.30"), "{line}");
+    assert!(!line.contains("安全"), "{line}");
+
+    let high = run(
+        &shell(MACHINE_HIGH),
+        &[],
+        Some(&FakeModel::quiet().with_risk(MACHINE_HIGH, 1.8)),
+    );
+    assert_eq!(high.severity(), Severity::High);
+    assert_eq!(high.model_low_ja(), None);
+
+    let mut failing = FakeModel::quiet().with_risk(MACHINE_HIGH, 0.3);
+    failing.fail = true;
+    let failed = run(&shell(MACHINE_HIGH), &[], Some(&failing));
+    assert_eq!(failed.basis, RiskBasis::MachineOnly);
+    assert_eq!(failed.severity(), Severity::High);
+    assert_eq!(peak(&failed), None);
+
+    let without = run(&shell(MACHINE_HIGH), &[], None);
+    assert_eq!(without.severity(), Severity::High);
+    assert!(without.unjudged_damage);
+}
+
+/// **解けた包みの行の平文に機械が引っ掛けたら、中へ下げない**——行への点数は D-126 で数えないので、判定モデルは
+/// その平文を読んでいない扱い。数えない点数（1.55）は最大にも入らない。
+/// 対照: 被害が解いた段の中にあり、判定モデルがその段を低いと読んだなら中。
+#[test]
+fn damage_in_the_plain_part_of_a_wrapper_line_stays_high() {
+    let line = format!("{DANGEROUS}; {WRAPPER}");
+    let model = FakeModel::quiet()
+        .with_risk(&line, 1.55)
+        .with_risk("Write-Host hello", 0.05);
+    let out = run(
+        &with_layers(&line, vec![text_layer(1, "Write-Host hello")]),
+        &[],
+        Some(&model),
+    );
+    assert!(
+        has_damage(&out, &Origin::Command),
+        "対照が効いていない: 行の平文に機械が当たっていない {:?}",
+        out.reasons
+    );
+    assert!(
+        !has_model_reason(&out, &Origin::Command),
+        "{:?}",
+        out.reasons
+    );
+    assert!(out.unjudged_damage);
+    assert_eq!(out.severity(), Severity::High, "{out:?}");
+    assert_eq!(peak(&out), Some(0.05), "数えない行の点数が最大に入った");
+
+    let model = FakeModel::quiet()
+        .with_risk(WRAPPER, 1.55)
+        .with_risk(DANGEROUS, 0.3);
+    let out = run(
+        &with_layers(WRAPPER, vec![text_layer(1, DANGEROUS)]),
+        &[],
+        Some(&model),
+    );
+    assert!(
+        has_damage(&out, &Origin::Decoded { depth: 1 }),
+        "{:?}",
+        out.reasons
+    );
+    assert_eq!(out.severity(), Severity::Medium, "{out:?}");
+    assert_eq!(peak(&out), Some(0.3));
+}
+
+/// **判定モデルへ聞く上限（4段）の外の段に機械が引っ掛けたら、中へ下げない。** 5つの段は同じ深さの兄弟なので
+/// 出どころ（`Origin::Decoded { depth: 1 }`）は全部同じ——出どころで数えると、読んだ4段で5段目まで読んだことになる。
+/// 対照: 同じ被害が上限の内の段にあれば中。
+#[test]
+fn damage_in_a_layer_past_the_ask_limit_stays_high() {
+    let harmless = ["Get-Date", "Write-Host hello", "systeminfo", "Get-Location"];
+    let layers_with = |dangerous_at: usize| {
+        let mut texts: Vec<&str> = harmless.to_vec();
+        texts.insert(dangerous_at, DANGEROUS);
+        texts
+            .into_iter()
+            .map(|t| text_layer(1, t))
+            .collect::<Vec<_>>()
+    };
+    let model = || FakeModel::quiet().with_risk(DANGEROUS, 0.3);
+
+    let past = model();
+    let out = run(&with_layers(WRAPPER, layers_with(4)), &[], Some(&past));
+    assert!(
+        has_damage(&out, &Origin::Decoded { depth: 1 }),
+        "{:?}",
+        out.reasons
+    );
+    assert!(!asked_risk_of(&past, DANGEROUS), "5段目を聞いた");
+    assert!(out.unjudged_damage);
+    assert_eq!(out.severity(), Severity::High, "{out:?}");
+
+    let within = model();
+    let out = run(&with_layers(WRAPPER, layers_with(0)), &[], Some(&within));
+    assert!(asked_risk_of(&within, DANGEROUS));
+    assert!(!out.unjudged_damage);
+    assert_eq!(out.severity(), Severity::Medium, "{out:?}");
+}
+
+/// **判定モデルへ聞く上限（3つ）の外のファイルに機械が引っ掛けたら、中へ下げない。**
+/// 対照: 同じファイルが上限の内なら中——並べ替えでスクリプトが先に送られた場合も、元の位置で読んだ印が付く。
+#[test]
+fn damage_in_a_file_past_the_ask_limit_stays_high() {
+    let model = || {
+        let mut model = FakeModel::quiet();
+        model.source = 0.3;
+        model
+    };
+    let line = "pwsh ./run.ps1";
+    let damage_in_d = |out: &RiskOutcome| {
+        has_damage(
+            out,
+            &Origin::File {
+                path: "d.ps1".into(),
+            },
+        )
+    };
+
+    let past = model();
+    let out = run(
+        &with_previews(
+            line,
+            &[
+                ("a.ps1", "Write-Host a"),
+                ("b.ps1", "Write-Host b"),
+                ("c.ps1", "Write-Host c"),
+                ("d.ps1", BURIED_SCRIPT),
+            ],
+        ),
+        &[],
+        Some(&past),
+    );
+    assert!(damage_in_d(&out), "{:?}", out.reasons);
+    assert!(!asked_source_of(&past, "d.ps1"), "4つ目を聞いた");
+    assert!(out.unjudged_damage);
+    assert_eq!(out.severity(), Severity::High, "{out:?}");
+
+    let first = model();
+    let out = run(
+        &with_previews(
+            line,
+            &[
+                ("d.ps1", BURIED_SCRIPT),
+                ("a.ps1", "Write-Host a"),
+                ("b.ps1", "Write-Host b"),
+                ("c.ps1", "Write-Host c"),
+            ],
+        ),
+        &[],
+        Some(&first),
+    );
+    assert!(damage_in_d(&out), "{:?}", out.reasons);
+    assert_eq!(out.severity(), Severity::Medium, "{out:?}");
+
+    // 4つ目に置いても、他がスクリプトでなければ先に送られる（`zzz.py`が`aaa.txt`に押し出されない）。
+    let sorted = model();
+    let out = run(
+        &with_previews(
+            line,
+            &[
+                ("a.txt", "a"),
+                ("b.txt", "b"),
+                ("c.txt", "c"),
+                ("d.ps1", BURIED_SCRIPT),
+            ],
+        ),
+        &[],
+        Some(&sorted),
+    );
+    assert!(asked_source_of(&sorted, "d.ps1"));
+    assert!(damage_in_d(&out), "{:?}", out.reasons);
+    assert_eq!(out.severity(), Severity::Medium, "{out:?}");
+}
+
+/// 判定モデルの点数の最大は、線（1.5）より下でも残す。何も見つけなければ要確認で、中の1行は出さない。
+#[test]
+fn model_peak_is_kept_below_the_line() {
+    let out = run(
+        &shell("ls"),
+        &[],
+        Some(&FakeModel::quiet().with_risk("ls", 0.42)),
+    );
+    assert_eq!(out.severity(), Severity::NeedsReview);
+    assert_eq!(peak(&out), Some(0.42));
+    assert_eq!(out.model_low_ja(), None);
 }
