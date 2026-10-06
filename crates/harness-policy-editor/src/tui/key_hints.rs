@@ -221,8 +221,22 @@ pub(super) struct RecordButton {
     pub label: &'static str,
     /// 枠の下辺に添えるキーの綴り（`Enter`）。
     pub key_label: &'static str,
-    /// クリックしたときに押すキー。
+    /// このボタンが表す働き（押せるときにクリックで押すキー）。**押せない間も持つ**——働きが入れ替わった直後のクリックを
+    /// 捨てる窓（`tui::tick`が毎周これを見る。BUG-210）を、押せるかどうかの変化と切り離して数えるため。押せない
+    /// 「記録を開始」を狙った手が押せる「記録を開始」に当たっても、狙った働きと同じだからである（会話画面の
+    /// `buttons_took_each_others_place`が、押せるかどうかが変わっただけのボタンを数えないのと同じ）。
     pub key: KeyEvent,
+    /// いま押せるか。押せなければ押せない形で描き（`harness_term::button::Press::look`へ渡す。押した結果押せなくなった
+    /// ときは、押されている形が戻るまで押されている形）、押す場所を登録しない（[`Self::click_key`]）。**見た目と登録を
+    /// 同じこの値から取る**——別々に組むと「押せない見た目なのに押せる」がずれて生まれる（会話画面の`InputButton`と同じ形）。
+    pub pressable: bool,
+}
+
+impl RecordButton {
+    /// クリックで押すキー（押す場所に登録する値）。押せないボタンは`None`（登録しない）。
+    pub fn click_key(&self) -> Option<KeyEvent> {
+        self.pressable.then_some(self.key)
+    }
 }
 
 /// 記録画面の「記録」の枠の右隣に置く枠付きのボタン（`record_screen`が描く。2026-10-03）。
@@ -231,26 +245,36 @@ pub(super) struct RecordButton {
 /// （`harness_term::button::place_framed`）——ユーザーが会話画面を実機で見て図を描き、「ボタンと分かるように枠で
 /// 囲んだものを右に」と希望した。このエディタの記録のコマンド欄も、同じ日に枠の下辺へ載せたボタンだった。
 ///
-/// - 実行前は「記録を開始」（下辺に`Enter`）。コマンドが空でも押せる——押すと開始できない理由が出る
-///   （`App::start_recording`。押しても無反応にしない、B-23(c)）。
+/// - 実行前は「記録を開始」（下辺に`Enter`）。**コマンドが空（空白だけを含む）の間は押せない**——押せない形で描き、
+///   押しても何も起きない（`Enter`を押しても開始せず、知らせも出さずにコマンド欄へ移るだけ——`App::start_recording`）。
+///   押せる見た目にすると壊れて見える（効く操作だけを案内する、B-32。会話画面の空の入力欄の「送信」と同じ）。
+///   2026-10-03〜10-06は空でも押せて、押すと「記録するコマンドを入力してください」を出していた。2026-10-06にユーザーが
+///   「空の記録の開始では何も出さない」と決めた（`plans/PLAN-TUI-IMPROVEMENTS.md`§4.1）。
 /// - 実行中は、止められるときだけ「停止」／「停止を予約」（下辺に`Esc`。効かない操作を案内しない。B-32）。
 /// - 同じ場所で働きが入れ替わるので、入れ替わった直後の300msのクリックは捨てる（ここが返すキーを`tui::tick`が毎周見る。
-///   `tui::pointer`のモジュールdoc、[BUG-210](../../../../docs/bugs/BUG-210.md)）。
+///   `tui::pointer`のモジュールdoc、[BUG-210](../../../../docs/bugs/BUG-210.md)）。押せるかどうかが変わっただけでは
+///   入れ替わりに数えない（[`RecordButton::key`]）。
 ///
 /// キー案内の行（[`screen_keys`]）には出さない——同じ操作を2か所に並べない（会話画面の見出しから送信・中断を外したのと同じ）。
 pub(super) fn record_buttons(app: &App) -> Vec<RecordButton> {
-    let button = |label, key_label, code| RecordButton {
+    let button = |label, key_label, code, pressable| RecordButton {
         label,
         key_label,
         key: key(code),
+        pressable,
     };
     let Some(run) = app.run.as_ref().filter(|_| app.is_running()) else {
-        return vec![button("記録を開始", "Enter", KeyCode::Enter)];
+        return vec![button(
+            "記録を開始",
+            "Enter",
+            KeyCode::Enter,
+            !app.command.is_empty(),
+        )];
     };
     if run.phase.stop_takes_effect_now() {
-        vec![button("停止", "Esc", KeyCode::Esc)]
+        vec![button("停止", "Esc", KeyCode::Esc, true)]
     } else if run.phase.stop_can_be_queued() {
-        vec![button("停止を予約", "Esc", KeyCode::Esc)]
+        vec![button("停止を予約", "Esc", KeyCode::Esc, true)]
     } else {
         Vec::new()
     }

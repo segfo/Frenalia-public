@@ -6,29 +6,23 @@
 
 use super::*;
 
-/// 入力欄が空白だけのまま送ろうとしたときに出す知らせ（[`AppState::submit_input`]）。
-/// ポリシーエディタの「記録を開始」を空のコマンド欄で押したときの「記録するコマンドを入力してください」と同じ形。
-pub(crate) const EMPTY_SUBMIT_NOTICE: &str = "送る文字を入力してください";
-
 impl AppState {
+    /// 入力欄が空白だけか（送るものが無い）。[`Self::submit_input`]が何もしない条件と、「送信」を押せない形にする条件
+    /// （[`Self::input_buttons`]）を同じこれから取る——別々に書くと「押せない見た目なのに送れる」「押せる見た目なのに
+    /// 何も起きない」のずれが生まれる（B-05）。
+    fn input_is_blank(&self) -> bool {
+        self.input.trim().is_empty()
+    }
+
     /// 入力欄の内容を送る。送信キー（[`Self::on_key`]）と入力欄の右の「送信」ボタン（キーを押す。`app::pointer`）が
     /// どちらもここを通る。
     ///
-    /// **入力欄が空白だけなら送らず、理由を1行出す**（[`EMPTY_SUBMIT_NOTICE`]。押しても無反応にしない、B-23(c)——
-    /// ポリシーエディタの`start_recording`と同じ）。会話画面には知らせの行が無いので、付随的な通知（`TranscriptItem::Info`）
-    /// として transcript の末尾に出し、さかのぼっていたら末尾へ戻して見せる。**直前の項目が同じ知らせなら重ねない**
-    /// ——連打で transcript が埋まらないように（間に別の項目が入れば、次はまた出す）。
+    /// **入力欄が空白だけなら何もしない**——送らず、transcript に何も出さず、さかのぼりの位置も変えない（2026-10-06の
+    /// ユーザーの決定。`plans/PLAN-TUI-IMPROVEMENTS.md`§4.1）。その間「送信」ボタンは押せない形で描く
+    /// （[`Self::input_buttons`]）ので、何も起きないことは押す前から見えている。ポリシーエディタの`start_recording`も、
+    /// 空のコマンドでは知らせを出さない。
     pub(super) fn submit_input(&mut self) -> Option<Action> {
-        if self.input.trim().is_empty() {
-            let shown = matches!(
-                self.transcript.last(),
-                Some(TranscriptItem::Info(text)) if text == EMPTY_SUBMIT_NOTICE
-            );
-            if !shown {
-                self.transcript
-                    .push(TranscriptItem::Info(EMPTY_SUBMIT_NOTICE.to_string()));
-            }
-            self.scroll.reset();
+        if self.input_is_blank() {
             return None;
         }
         // A local submit starts a new visible turn. Even if the user had been
@@ -200,11 +194,13 @@ impl AppState {
     ///
     /// - **送信**はいつも出す。キーは設定と端末で変わる（[`Self::enter_submits`]・[`Self::host_is_vscode`]——
     ///   VS Codeの統合ターミナルはShift+EnterのShiftを落とすので`Alt+Enter`を案内する）ので、下辺に添える綴りもここで
-    ///   決める。**入力欄が空白だけでも押せる**（いつも押せる形で描く）——押すと送らずに理由を1行出す
-    ///   （[`Self::submit_input`]）。ポリシーエディタの「記録を開始」がコマンド欄が空でも押せるのと同じ作り
-    ///   （`key_hints::record_buttons`）。2026-10-03まではここで押せない形（灰色）にしていたが、ユーザーが2つの画面を
-    ///   見比べて「ボタンの色が違う。ポリシーエディタに合わせられる？」と言った（空の入力欄の「送信」が灰色、エディタの
-    ///   「記録を開始」がシアンに見えた。色の指定は両方ともシアンで、違いは押せない形かどうかだけだった）。
+    ///   決める。**入力欄が空白だけの間は押せない**（`pressable`が偽。押せない形で描き、押す場所を登録しない——
+    ///   `harness_term::button`の押せない形。押した結果空になった直後は、押されている形が戻るまで押されている形）。送信キーを押しても何も起きない（[`Self::submit_input`]）ので、押せる
+    ///   見た目にすると壊れて見える。ポリシーエディタの「記録を開始」も、コマンド欄が空の間は同じく押せない
+    ///   （`key_hints::record_buttons`）。消さずに残すのは、送る場所を最初から見せておくため。
+    ///   2026-10-03〜10-06は空でも押せる形で描き、押すと理由を1行出していた（ユーザーが2つの画面のボタンの色の違いを
+    ///   指摘したのに合わせた）が、2026-10-06にユーザーが「空の送信では何も出さない」と決め、押せない形に戻した
+    ///   （`plans/PLAN-TUI-IMPROVEMENTS.md`§4.1）。
     /// - **中断**は止めるものが走っている間（[`Self::can_cancel`]）だけ出す。走っていない間に`Esc`を押しても
     ///   何も止まらないので、効かない操作を案内しない（ポリシーエディタの記録画面の`Esc 停止`と同じ。B-32）。
     ///
@@ -227,13 +223,15 @@ impl AppState {
         let mut buttons = vec![InputButton {
             label: "送信",
             key_label,
-            key: Some(key),
+            key,
+            pressable: !self.input_is_blank(),
         }];
         if self.can_cancel() {
             buttons.push(InputButton {
                 label: "中断",
                 key_label: "Esc",
-                key: Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                key: KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+                pressable: true,
             });
         }
         buttons

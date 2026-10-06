@@ -861,7 +861,7 @@ fn draw_modal(
             harness_term::button::span(
                 label,
                 color,
-                press.look(Some(&pointer::ButtonId::Modal(label))),
+                press.look(&pointer::ButtonId::Modal(label), true),
             )
         })
         .collect();

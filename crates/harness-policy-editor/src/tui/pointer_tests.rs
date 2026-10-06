@@ -18,6 +18,7 @@ use crossterm::event::{MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 
 use super::*;
+use crate::tui::state::RecordField;
 
 /// 試験の端末の大きさ（キー案内が全部入る幅）。
 const SIZE: (u16, u16) = (300, 40);
@@ -1020,14 +1021,16 @@ fn record_screen_with_command(ws: &std::path::Path) -> App {
 }
 
 /// **「記録」の枠の右隣の、枠で囲んだボタンは、そのキーを押したのと同じ**（2026-10-03、会話画面の入力欄の右の
-/// 「送信」「中断」と同じ形・同じ部品）。実行前は「記録を開始」（下辺に`Enter`。コマンドが空でも押せて、キーと同じく
-/// 理由が出る）、記録中は「停止」（下辺に`Esc`）。どちらもキー案内の行には無い（同じ操作を2か所に並べない）。
-/// ボタンは枠の右隣で、枠の下端にそろい、画面の右端で終わる。
+/// 「送信」「中断」と同じ形・同じ部品）。実行前は「記録を開始」（下辺に`Enter`）、記録中は「停止」（下辺に`Esc`）。
+/// どちらもキー案内の行には無い（同じ操作を2か所に並べない）。ボタンは枠の右隣で、枠の下端にそろい、画面の右端で終わる。
+///
+/// コマンドが空の間の「記録を開始」は押せない形で、押しても何も起きない（キーの`Enter`とは同じにならない）ので、ここでは
+/// 見ない——[`the_start_button_looks_unavailable_and_does_nothing_while_the_command_is_empty`]が見る（2026-10-06に
+/// 「コマンドが空」の場合をここから外した。それまでは空でも押せて、キーと同じく理由が出ることをここで固定していた）。
 #[test]
 fn the_record_buttons_do_what_their_keys_do() {
     type Make = fn(&std::path::Path) -> App;
-    let empty: Make = |ws| App::new(ws.to_path_buf(), harness_core::RequireSandbox::None);
-    let cases: [(&str, Make, &str, &str, KeyCode); 3] = [
+    let cases: [(&str, Make, &str, &str, KeyCode); 2] = [
         (
             "開始",
             record_screen_with_command,
@@ -1035,7 +1038,6 @@ fn the_record_buttons_do_what_their_keys_do() {
             "Enter",
             KeyCode::Enter,
         ),
-        ("コマンドが空", empty, "記録を開始", "Enter", KeyCode::Enter),
         (
             "記録中の停止",
             running_record_screen,
@@ -1085,17 +1087,8 @@ fn the_record_buttons_do_what_their_keys_do() {
             &[k(key)],
         );
     }
-    // 空のコマンドで押すと、キーと同じく開始できない理由が出る（無反応にしない）。
-    let ws = workspace();
-    let mut app = empty(ws.path());
-    let grid = frame(&mut app, SIZE.0, SIZE.1);
-    let action = click(
-        &mut app,
-        cell_of(&grid, Some(right_of_record_box(&grid)), "記録を開始", None),
-    );
-    assert_eq!(action_kind(&action), "なし");
-    assert!(app.status.contains("コマンドを入力"), "{}", app.status);
     // 押せば始まる（許可側）。
+    let ws = workspace();
     let mut app = record_screen_with_command(ws.path());
     let grid = frame(&mut app, SIZE.0, SIZE.1);
     let action = click(
@@ -1103,6 +1096,98 @@ fn the_record_buttons_do_what_their_keys_do() {
         cell_of(&grid, Some(right_of_record_box(&grid)), "記録を開始", None),
     );
     assert_eq!(action_kind(&action), "パス1を開始");
+}
+
+/// 「記録を開始」の見た目——文言の色・枠の色・文言が太字か・押されている形（色の入れ替え）か。どれも描いたセルから読む。
+fn start_button_look(
+    grid: &[Vec<String>],
+    looks: &[Vec<ratatui::style::Style>],
+) -> (
+    Option<ratatui::style::Color>,
+    Option<ratatui::style::Color>,
+    bool,
+    bool,
+) {
+    let button = record_button(grid, "記録を開始");
+    let (x, y) = cell_of(grid, Some(button), "記録を開始", None);
+    let label = looks[usize::from(y)][usize::from(x)];
+    let border = looks[usize::from(button.y)][usize::from(button.x)];
+    (
+        label.fg,
+        border.fg,
+        label.add_modifier.contains(ratatui::style::Modifier::BOLD),
+        is_pressed(label),
+    )
+}
+
+/// **コマンドが空（空白だけを含む）の間、「記録を開始」は押せない形（枠も文言も暗い灰色、太字にしない）で描かれ、押しても
+/// 何も起きない**——知らせの行もフォーカスも、ほかの状態も1つも変わらない（2026-10-06のユーザーの決定「空のまま記録を
+/// 開始しても何も出さない」、`plans/PLAN-TUI-IMPROVEMENTS.md`§4.1。押しても何も起きないのに押せる見た目だと壊れて見える
+/// ので、会話画面の空の入力欄の「送信」と同じく押せない形にした——効く操作だけを案内する、B-32）。押した後も押されている
+/// 形にならない。コマンドを打てば同じ場所で押せる形に変わり、押せば記録が始まる（対）。文言の上と枠線の上の両方を押す。
+///
+/// 2026-10-03〜10-06は、空でも押せる形で描き、押すと知らせの行に「記録するコマンドを入力してください」を出していた
+/// （[`the_record_buttons_do_what_their_keys_do`]の「コマンドが空」の場合がそれを固定していた）。
+#[test]
+fn the_start_button_looks_unavailable_and_does_nothing_while_the_command_is_empty() {
+    use ratatui::style::Color;
+    let unavailable = (Some(Color::DarkGray), Some(Color::DarkGray), false, false);
+    for blank in ["", "   "] {
+        let ws = workspace();
+        let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+        app.command.set_text(blank);
+        app.status = "前からの知らせ".to_string();
+        let (grid, looks) = frame_with_looks(&mut app);
+        assert_eq!(
+            start_button_look(&grid, &looks),
+            unavailable,
+            "{blank:?}: 押せない形でない"
+        );
+        let before = snapshot(&app);
+        let button = record_button(&grid, "記録を開始");
+        let label = cell_of(&grid, Some(button), "記録を開始", None);
+        for place in [label, (button.x, button.y)] {
+            assert_eq!(
+                action_kind(&click(&mut app, place)),
+                "なし",
+                "{blank:?} {place:?}"
+            );
+            assert_eq!(
+                snapshot(&app),
+                before,
+                "{blank:?} {place:?}: 押せないはずの「記録を開始」で何か変わった"
+            );
+        }
+        let (grid, looks) = frame_with_looks(&mut app);
+        assert_eq!(
+            start_button_look(&grid, &looks),
+            unavailable,
+            "{blank:?}: 押した後に押せない形でなくなった"
+        );
+    }
+
+    // 対: コマンドを打てば同じ場所で押せる形になり、押せば始まる。
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    let (grid, _) = frame_with_looks(&mut app);
+    let empty_at = record_button(&grid, "記録を開始");
+    app.record_focus = RecordField::Command;
+    for c in "cargo build".chars() {
+        press(&mut app, KeyCode::Char(c));
+    }
+    let (grid, looks) = frame_with_looks(&mut app);
+    assert_eq!(
+        record_button(&grid, "記録を開始"),
+        empty_at,
+        "打つとボタンの場所が動いた"
+    );
+    assert_eq!(
+        start_button_look(&grid, &looks),
+        (Some(Color::Cyan), Some(Color::Cyan), true, false),
+        "打っても押せる形にならない"
+    );
+    let at = cell_of(&grid, Some(empty_at), "記録を開始", None);
+    assert_eq!(action_kind(&click(&mut app, at)), "パス1を開始");
 }
 
 /// **狭い端末では、「記録」の枠に34桁（ラベル12桁・値20桁・枠線2桁）を残せる形を選ぶ**——キーを添える形 → キーを
@@ -1659,6 +1744,31 @@ fn keys_still_work_right_after_the_record_button_changes() {
         changed + ms(40),
     );
     assert!(stop_requested(&app), "窓の中の`Esc`が捨てられた");
+}
+
+/// **コマンドを打って「記録を開始」が押せない形から押せる形に変わっても、働きが入れ替わったとは数えない**（BUG-210の窓に
+/// 入らない）——打った直後の周回で押しても記録が始まる。窓は「狙ったボタンとは別の働きに当たる」クリックを捨てるための
+/// もので、押せない「記録を開始」を狙った手が押せる「記録を開始」に当たっても、狙った働きと同じである（会話画面の
+/// `buttons_took_each_others_place`が、押せるかどうかが変わっただけのボタンを数えないのと同じ）。
+#[test]
+fn typing_a_command_does_not_count_as_the_record_button_changing_its_work() {
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    app.record_focus = RecordField::Command;
+    let t0 = std::time::Instant::now();
+    loop_turn(&mut app, t0);
+    handle_event_at(
+        &mut app,
+        crossterm::event::Event::Key(k(KeyCode::Char('x'))),
+        t0 + ms(10),
+    );
+    let (grid, _) = loop_turn(&mut app, t0 + ms(20));
+    let at = cell_of(&grid, Some(right_of_record_box(&grid)), "記録を開始", None);
+    assert_eq!(
+        action_kind(&click_at(&mut app, at, t0 + ms(30))),
+        "パス1を開始",
+        "打った直後のクリックを捨てた"
+    );
 }
 
 /// **起動直後の最初の働きは「変わった」と数えない**（BUG-210）——起動して最初の周回のすぐ後に押しても、記録が始まる。

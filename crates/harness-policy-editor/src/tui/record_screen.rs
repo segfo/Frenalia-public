@@ -160,27 +160,31 @@ const FORM_MIN_WIDTH: u16 = LABEL_WIDTH + harness_term::button::KEEP_TEXT_WIDTH 
 /// 狭ければキーを落とした短い形、それも入らなければ置かない（枠が幅いっぱい。キーは今までどおり効く）。
 /// 枠の中の右下に置かないのは、記録中の段階の1行（スピナー・経過・ゲージ・観測件数）が右へ長く伸びて重なるため。
 /// 押すとそのキーを押したのと同じで、押した瞬間から押されている形で描く（`tui::pointer`のモジュールdoc）。
+/// 押せないボタン（コマンドが空の間の「記録を開始」）は押せない形で描き、押す場所を登録しない（`RecordButton::click_key`）。
 fn draw_form(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
     let buttons = super::key_hints::record_buttons(app);
     // 押されている形は「記録」の枠の右のボタンという名前に付く（押すと文言が変わっても同じボタン。`ButtonId::Record`）。
+    // 押せないボタンは、押されていなければ押せない形（`Press::look`）。
     let framed: Vec<harness_term::button::Framed> = buttons
         .iter()
         .map(|button| harness_term::button::Framed {
             label: button.label,
             key: button.key_label,
-            look: app.press.look(Some(&ButtonId::Record)),
+            look: app.press.look(&ButtonId::Record, button.pressable),
         })
         .collect();
     let (area, row) = harness_term::button::place_framed(area, &framed, FORM_MIN_WIDTH);
     if let Some(row) = row {
         for (button, rect) in buttons.iter().zip(row.draw(frame, Color::Cyan)) {
-            targets.click(
-                rect,
-                Click::Button {
-                    id: ButtonId::Record,
-                    key: button.key,
-                },
-            );
+            if let Some(key) = button.click_key() {
+                targets.click(
+                    rect,
+                    Click::Button {
+                        id: ButtonId::Record,
+                        key,
+                    },
+                );
+            }
         }
     }
     let block = Block::default().borders(Borders::ALL).title(" 記録 ");

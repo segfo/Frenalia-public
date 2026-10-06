@@ -47,7 +47,12 @@
 //!   押した後でボタンの位置が動いても押したボタンに付いて動き、その場所へ来た別のボタンには付かない（会話画面の
 //!   「送信」は、応答が始まると現れる「中断」に押されて左へずれる）。押した結果ボタンが消えたら（閉じた確認ダイアログ）、
 //!   それ自体が押した反応なので何も付かない。
-//! - 押せないボタンは押されている形にならない（[`Press::look`]は押せないボタンに[`Look::Disabled`]を返す）。
+//! - 押されていないうちから押せないボタンは押されている形にならない（押す場所が無いので押せない）。**押した結果
+//!   押せなくなったボタンは、押されている形が戻るまで押されている形のまま**で、戻ったら押せない形になる（[`Press::look`]）
+//!   ——会話画面の「送信」は押すと入力欄が空になって押せなくなるので、押した瞬間に押せない形へ変えると押した色が一度も
+//!   見えない（「記録を開始」を押して文言が変わっても同じ名前にしているのと同じ理由）。2026-10-06に、「送信」を空の間
+//!   押せない形に戻したときに決めた（それまでは押せないボタンをいつも押せない形にしていたが、押せない形を使う画面が
+//!   無い間に決めたものだった）。
 //! - タブには付けない（[`crate::tab`]）。押したタブが選ばれた見た目に変わり、それが残ること自体が押した反応である。
 //!
 //! # いまは押せないボタンは薄く描く（[`Look::Disabled`]）
@@ -56,11 +61,12 @@
 //! （呼び出し側の責務）。消さずに残すのは、**ボタンの置き場所そのものを見せておく**ため——押せない間にボタンが
 //! 消えると、最初に画面を見たときに何を押せばよいのか分からない。
 //!
-//! **いまこの形を使う画面は無い。** 2026-10-03までは会話画面の「送信」が、入力欄が空白だけの間この形だった。
-//! ユーザーがポリシーエディタと見比べて「ボタンの色が違う。ポリシーエディタに合わせられる？」と言い（灰色の「送信」と
-//! シアンの「記録を開始」。色の指定は同じで、違いはこの形かどうかだけだった）、「送信」もエディタの「記録を開始」と同じく
-//! いつも押せる形にして、空のまま押したら理由を出すようにした（押しても無反応にしない、B-23(c)）。形そのものは、
-//! 押せない間があるボタンを置くときのために部品に残す。
+//! **いまこの形を使うのは2か所**——会話画面の「送信」（入力欄が空白だけの間）と、ポリシーエディタの「記録を開始」
+//! （コマンド欄が空の間）。どちらも押しても何も起きない間で、押せる見た目にすると壊れて見える（効く操作だけを案内する、
+//! B-32）。2026-10-03〜10-06は、ユーザーが2つの画面のボタンの色の違い（灰色の「送信」とシアンの「記録を開始」）を
+//! 指摘したのに合わせて「送信」もいつも押せる形にし、両方とも空のまま押したら理由を1行出していたが、2026-10-06に
+//! ユーザーが「空の送信・空の記録の開始では何も出さない」と決め、「送信」をこの形に戻し、「記録を開始」もこの形に
+//! した（`plans/PLAN-TUI-IMPROVEMENTS.md`§4.1）。
 //!
 //! # 辺に載せるボタンの並べ方
 //!
@@ -222,20 +228,20 @@ impl<K: PartialEq> Press<K> {
         done
     }
 
-    /// ボタン`button`の見た目。`None`はいま押せないボタンで[`Look::Disabled`]（押されていても押されている形にしない）。
-    /// いま押されているボタンなら[`Look::Pressed`]、ほかは[`Look::Normal`]。
-    pub fn look(&self, button: Option<&K>) -> Look {
-        match button {
-            None => Look::Disabled,
-            Some(button)
-                if self
-                    .held
-                    .as_ref()
-                    .is_some_and(|held| held.button == *button) =>
-            {
-                Look::Pressed
-            }
-            Some(_) => Look::Normal,
+    /// ボタン`button`の見た目。`pressable`はいま押せるか。
+    ///
+    /// いま押されているボタンなら、**押せなくても**[`Look::Pressed`]（押した結果押せなくなったボタン。モジュールdoc
+    /// 「押した瞬間の見た目」）。押されていなければ、押せるなら[`Look::Normal`]、押せないなら[`Look::Disabled`]。
+    /// 押せないボタンの名前も渡す——名前が無いと、押した結果押せなくなったボタンを見分けられない。
+    pub fn look(&self, button: &K, pressable: bool) -> Look {
+        let held = self
+            .held
+            .as_ref()
+            .is_some_and(|held| held.button == *button);
+        match (held, pressable) {
+            (true, _) => Look::Pressed,
+            (false, true) => Look::Normal,
+            (false, false) => Look::Disabled,
         }
     }
 }
@@ -650,29 +656,50 @@ mod tests {
     // --- 押した瞬間の見た目 ---
 
     /// **押した瞬間に押されている形になり、離していても[`PRESSED_AT_LEAST`]が過ぎるまでは戻らず、過ぎたら戻る。**
-    /// 押していないボタンは普通の形のまま、押せないボタン（`None`）は押されていても押せない形。時刻は作って渡す。
+    /// 押していないボタンは普通の形のまま。時刻は作って渡す。
+    ///
+    /// **押せないボタン**は、押されていなければ押せない形。**押した結果押せなくなったボタン**（会話画面の「送信」は押すと
+    /// 入力欄が空になって押せなくなる）は、押されている形が戻るまで押されている形で、戻ったら押せない形（2026-10-06。
+    /// それまでは押せないボタンをいつも押せない形にしていたが、押せない形を使う画面が無い間に決めたもので、「送信」を
+    /// 押せない形に戻すと押した色が一度も見えなくなった）。
     #[test]
     fn a_press_shows_until_released_and_at_least_the_minimum_time() {
         let t0 = Instant::now();
         let mut press: Press<&str> = Press::default();
-        assert_eq!(press.look(Some(&"送信")), Look::Normal);
-        press.down("送信", t0);
-        assert_eq!(press.look(Some(&"送信")), Look::Pressed);
+        assert_eq!(press.look(&"送信", true), Look::Normal);
         assert_eq!(
-            press.look(Some(&"中断")),
+            press.look(&"送信", false),
+            Look::Disabled,
+            "押していない、押せないボタン"
+        );
+        press.down("送信", t0);
+        assert_eq!(press.look(&"送信", true), Look::Pressed);
+        assert_eq!(
+            press.look(&"送信", false),
+            Look::Pressed,
+            "押した結果押せなくなったボタン"
+        );
+        assert_eq!(
+            press.look(&"中断", true),
             Look::Normal,
             "押していないボタン"
         );
-        assert_eq!(press.look(None), Look::Disabled, "押せないボタン");
+        assert_eq!(
+            press.look(&"中断", false),
+            Look::Disabled,
+            "押していない、押せないボタン"
+        );
 
         // 最低時間の前に離した: 離したことだけ覚えて、まだ戻さない。
         let early = t0 + PRESSED_AT_LEAST - Duration::from_millis(1);
         assert!(!press.up(t0 + Duration::from_millis(80)));
         assert!(!press.tick(early));
-        assert_eq!(press.look(Some(&"送信")), Look::Pressed);
-        // 過ぎたら戻る。
+        assert_eq!(press.look(&"送信", true), Look::Pressed);
+        assert_eq!(press.look(&"送信", false), Look::Pressed);
+        // 過ぎたら戻る（押せなくなったボタンは押せない形へ）。
         assert!(press.tick(t0 + PRESSED_AT_LEAST));
-        assert_eq!(press.look(Some(&"送信")), Look::Normal);
+        assert_eq!(press.look(&"送信", true), Look::Normal);
+        assert_eq!(press.look(&"送信", false), Look::Disabled);
         assert!(!press.tick(t0 + PRESSED_AT_LEAST), "戻した後は何も変えない");
     }
 
@@ -684,9 +711,9 @@ mod tests {
         let mut press: Press<&str> = Press::default();
         press.down("記録", t0);
         assert!(!press.tick(t0 + Duration::from_secs(5)));
-        assert_eq!(press.look(Some(&"記録")), Look::Pressed);
+        assert_eq!(press.look(&"記録", true), Look::Pressed);
         assert!(press.up(t0 + Duration::from_secs(5)));
-        assert_eq!(press.look(Some(&"記録")), Look::Normal);
+        assert_eq!(press.look(&"記録", true), Look::Normal);
     }
 
     /// **左ボタンを離す・ボタンを押さずに動く・別の場所を押すは、どれも離したことになる**（離したことが報告されない端末
@@ -704,7 +731,7 @@ mod tests {
             let mut press: Press<&str> = Press::default();
             press.down("送信", t0);
             assert!(press.pointer(kind, later), "{kind:?}");
-            assert_eq!(press.look(Some(&"送信")), Look::Normal, "{kind:?}");
+            assert_eq!(press.look(&"送信", true), Look::Normal, "{kind:?}");
         }
         for kind in [
             MouseEventKind::Drag(MouseButton::Left),
@@ -716,13 +743,13 @@ mod tests {
             press.down("送信", t0);
             assert!(!press.pointer(kind, later), "{kind:?}");
             assert!(!press.tick(later), "{kind:?}: 離したことになった");
-            assert_eq!(press.look(Some(&"送信")), Look::Pressed, "{kind:?}");
+            assert_eq!(press.look(&"送信", true), Look::Pressed, "{kind:?}");
         }
         let mut press: Press<&str> = Press::default();
         press.down("送信", t0);
         press.down("中断", t0 + Duration::from_millis(10));
-        assert_eq!(press.look(Some(&"送信")), Look::Normal);
-        assert_eq!(press.look(Some(&"中断")), Look::Pressed);
+        assert_eq!(press.look(&"送信", true), Look::Normal);
+        assert_eq!(press.look(&"中断", true), Look::Pressed);
     }
 
     /// **狭いときは、キーを添える形 → キーを落とした短い形 → 置かない**。どの形でも左に`keep`桁が残り、ボタンは途中で

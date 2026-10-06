@@ -20,8 +20,8 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
-    spinner_glyph, wait_figures, AppState, Click, DrawFeedback, KeyHint, NoticeTone, Targets,
-    ToolCardStatus, TranscriptItem, WaitClock, Wheel, SPINNER_FRAMES,
+    spinner_glyph, wait_figures, AppState, Click, DrawFeedback, InputButton, KeyHint, NoticeTone,
+    Targets, ToolCardStatus, TranscriptItem, WaitClock, Wheel, SPINNER_FRAMES,
 };
 
 /// 入力欄が自動で伸びる最大行数。これを超えると内部スクロールする（カーソル行が
@@ -163,7 +163,7 @@ fn hint_spans(hints: &[KeyHint], look: HintLook) -> Vec<Span<'static>> {
             (HintLook::Buttons(press), Some(key)) => harness_term::button::span(
                 &hint.label,
                 BUTTON_COLOR,
-                press.look(Some(&hint_click(look, key))),
+                press.look(&hint_click(look, key), true),
             ),
             (HintLook::Buttons(_), None) => {
                 Span::styled(hint.label.clone(), Style::default().fg(Color::DarkGray))
@@ -755,21 +755,18 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
 ///
 /// **折り返しの幅を測る[`input_text_width`]と、実際に描く[`render_input_row`]が同じこれを通る**——別々に組むと、
 /// 測った幅と描いた幅がずれて、折り返しの位置が1桁狂う（`B-05`）。押したときの動き（押せないボタンは`None`）も
-/// ここで作る——**見た目を選ぶ名前と登録する値を同じこれから取る**（別々に組むと、押されている形が登録した値と
-/// 違う名前に付く。`app::pointer`のモジュールdoc）。
+/// ここで作る——**見た目を選ぶ名前と登録する値を同じ`InputButton`から取る**（別々に組むと、押されている形が登録した
+/// 値と違う名前に付く。`app::pointer`のモジュールdoc）。押せないボタンにも名前を渡す——押した結果押せなくなった
+/// 「送信」を、押されている形が戻るまで押されている形で描くため（`harness_term::button::Press::look`）。
 fn input_framed(app: &AppState) -> (Vec<Option<Click>>, Vec<harness_term::button::Framed<'_>>) {
     let buttons = app.input_buttons();
-    let clicks: Vec<Option<Click>> = buttons
-        .iter()
-        .map(|b| b.key.map(Click::InputButton))
-        .collect();
+    let clicks: Vec<Option<Click>> = buttons.iter().map(InputButton::click).collect();
     let framed = buttons
         .iter()
-        .zip(&clicks)
-        .map(|(b, click)| harness_term::button::Framed {
+        .map(|b| harness_term::button::Framed {
             label: b.label,
             key: b.key_label,
-            look: app.press.look(click.as_ref()),
+            look: app.press.look(&b.name(), b.pressable),
         })
         .collect();
     (clicks, framed)

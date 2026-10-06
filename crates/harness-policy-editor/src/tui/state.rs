@@ -1641,7 +1641,12 @@ impl App {
         fields[next]
     }
 
-    /// 記録を開始する。**開始できない理由は必ず出す**（押しても無反応にしない、B-23(c)）。
+    /// 記録を開始する。記録中に押したら、開始できない理由と止め方を出す（押しても無反応にしない、B-23(c)）。
+    ///
+    /// **コマンドが空（空白だけを含む）なら何も出さない**——知らせの行は変えず、コマンド欄へ移るだけ（移るのは知らせでは
+    /// なく、次に打つ場所へ連れて行く動き）。2026-10-06のユーザーの決定（`plans/PLAN-TUI-IMPROVEMENTS.md`§4.1。会話画面の
+    /// 空の送信も同じ）。その間「記録を開始」のボタンは押せない形で描く（`key_hints::record_buttons`）ので、何も起きない
+    /// ことは押す前から見えている。2026-10-06までは「記録するコマンドを入力してください」を出していた。
     fn start_recording(&mut self) -> Option<Action> {
         if self.is_running() {
             self.status =
@@ -1650,7 +1655,6 @@ impl App {
             return None;
         }
         if self.command.is_empty() {
-            self.status = "記録するコマンドを入力してください".to_string();
             self.record_focus = RecordField::Command;
             return None;
         }

@@ -60,21 +60,35 @@ fn pressing_enter_with_a_command_starts_pass1() {
     assert!(app.is_running(), "開始したら実行中として扱う");
 }
 
-/// コマンドが空なら開始しない。**押しても無反応にはしない**——理由を出す（B-32）。
+/// コマンドが空（空白だけを含む）なら開始しない。**知らせの行には何も出さない**（前からの知らせもそのまま）——2026-10-06の
+/// ユーザーの決定（`plans/PLAN-TUI-IMPROVEMENTS.md`§4.1）。フォーカスはコマンド欄へ移す（知らせではなく、次に打つ場所へ
+/// 連れて行く動き）。許可側（コマンドがあれば始まる）は[`pressing_enter_with_a_command_starts_pass1`]。
+///
+/// 2026-08-11（`68cfaa0`）〜10-06は「記録するコマンドを入力してください」を出していた（この試験はそれを固定していた
+/// `pressing_enter_without_a_command_explains_instead_of_starting`を書き換えた）。
 #[test]
-fn pressing_enter_without_a_command_explains_instead_of_starting() {
-    let ws = workspace();
-    let mut app = app_with(&ws);
+fn pressing_enter_without_a_command_neither_starts_nor_says_anything() {
+    for blank in ["", "   "] {
+        let ws = workspace();
+        let mut app = app_with(&ws);
+        app.command.set_text(blank);
+        app.record_focus = RecordField::Cwd;
+        app.status = "前からの知らせ".to_string();
 
-    let action = app.on_key(key(KeyCode::Enter));
+        let action = app.on_key(key(KeyCode::Enter));
 
-    assert!(action.is_none());
-    assert!(!app.is_running());
-    assert!(
-        app.status.contains("コマンドを入力"),
-        "無言で何も起きないと、壊れているのか入力が足りないのか区別できない: {}",
-        app.status
-    );
+        assert!(action.is_none(), "{blank:?}");
+        assert!(!app.is_running(), "{blank:?}");
+        assert_eq!(
+            app.status, "前からの知らせ",
+            "{blank:?}: 知らせの行が変わった"
+        );
+        assert_eq!(
+            app.record_focus,
+            RecordField::Command,
+            "{blank:?}: コマンド欄へ移っていない"
+        );
+    }
 }
 
 /// 実行中の二重起動は止める。**止めた理由と、止め方（Esc）を出す**（B-23(c)）。

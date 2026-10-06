@@ -801,93 +801,166 @@ fn the_send_button_sends_like_the_send_key() {
     assert!(screen.try_find("Enter=改行").is_none(), "{}", screen.text());
 }
 
-/// 入力欄が空白だけのまま送ったときの知らせ（ポリシーエディタの「記録するコマンドを入力してください」と同じ形）。
-const EMPTY_NOTICE: &str = "送る文字を入力してください";
+/// 入力欄が空白だけの3通り（空・空白だけ・改行だけ）。
+const BLANK_INPUTS: [&str; 3] = ["", "   ", "\n"];
 
-/// transcriptに積まれた、空のまま送ったときの知らせの数。
-fn empty_notices(app: &AppState) -> usize {
-    app.transcript
-        .iter()
-        .filter(|item| matches!(item, TranscriptItem::Info(text) if text == EMPTY_NOTICE))
-        .count()
+/// 空白だけの入力`blank`を入れ、末尾から5行さかのぼった画面（transcriptは100行——さかのぼれる長さ）。
+fn blank_input_scrolled_back(blank: &str) -> AppState {
+    let mut app = app_with_transcript(100);
+    app.scroll_lines(5);
+    app.input = blank.to_string();
+    app.input_cursor = blank.chars().count();
+    app
 }
 
-/// **入力が空白だけでも、「送信」はいつも押せる形（枠も文言もシアン、文言は太字）で描かれ、押すと送らずに理由を1行
-/// 出す**——ポリシーエディタの「記録を開始」がコマンド欄が空でも押せて、押すと理由を出すのと同じ作り（2026-10-03、
-/// 「ボタンの色はポリシーエディタに合わせられる？」。それまでは灰色で押せなかった）。知らせは画面に描かれ、2回押しても
-/// 1行だけ（連打で埋めない）。さかのぼっていたら末尾へ戻して見せる。送信キーで空のまま送っても、同じ知らせが同じ1行に
-/// 重なる。打てば同じ場所・同じ見た目のボタンが送る（対）。送った後にまた空で押せば、間に項目が入ったので知らせは
-/// もう1行出る（重ねないのは直前が同じ知らせのときだけ）。見た目は描いたセルの色と太字で、押す位置は描いたセルで見る。
+/// 空のまま送ったときに変わってはいけないもの——transcript（項目の数と最後の項目）・さかのぼりの位置・入力欄。
+fn untouched_by_blank_submit(app: &AppState) -> String {
+    format!(
+        "last={:?} scroll={} input={}",
+        app.transcript.last(),
+        app.scroll_offset(),
+        input_state(app)
+    )
+}
+
+/// 「送信」の見た目——文言の色・枠の色・文言が太字か・押されている形（色の入れ替え）か。どれも描いたセルから読む。
+fn send_button_look(screen: &Screen) -> (Option<Color>, Option<Color>, bool, bool) {
+    let frame = framed_button(screen, "送信");
+    let label = screen.style(screen.find_last("送信"));
+    (
+        label.fg,
+        screen.style((frame.x, frame.y)).fg,
+        label.add_modifier.contains(Modifier::BOLD),
+        label.add_modifier.contains(Modifier::REVERSED),
+    )
+}
+
+/// 押せない形（`harness_term::button`の`Look::Disabled`）: 枠も文言も暗い灰色、太字にしない。
+const SEND_UNAVAILABLE: (Option<Color>, Option<Color>, bool, bool) =
+    (Some(Color::DarkGray), Some(Color::DarkGray), false, false);
+/// 押せる形: 枠も文言もシアン、文言は太字。
+const SEND_AVAILABLE: (Option<Color>, Option<Color>, bool, bool) =
+    (Some(Color::Cyan), Some(Color::Cyan), true, false);
+
+/// **入力が空白だけの間、「送信」は押せない形（枠も文言も暗い灰色、太字にしない）で描かれ、押しても何も起きない**——
+/// transcriptに何も出ず、さかのぼりの位置も入力欄も変わらない（2026-10-06のユーザーの決定「空の送信では何も出さない」、
+/// `plans/PLAN-TUI-IMPROVEMENTS.md`§4.1。押しても何も起きないのに押せる見た目だと壊れて見えるので、押せない形に戻した
+/// ——「中断」を止めるものがある間だけ出すのと同じく、効く操作だけを案内する。B-32）。押した後も押されている形にならない。
+/// 打てば同じ場所で押せる形に変わり、打った直後に押しても送る（押せるかどうかが変わっただけでは、ボタンが動いた直後の
+/// 窓に入らない）。送ると入力欄が空に戻るので、押されている形が戻った後はまた押せない形になる（対）。文言の上と
+/// 枠線の上の両方を押す。
+///
+/// 2026-10-03〜10-06は、空でもいつも押せる形で描き、押すと「送る文字を入力してください」を transcript に1行出していた
+/// （この試験はその形を固定していた`the_send_button_stays_pressable_and_explains_when_the_input_is_blank`を書き換えた）。
 #[test]
-fn the_send_button_stays_pressable_and_explains_when_the_input_is_blank() {
-    for blank in ["", "   ", "\n"] {
-        let mut app = app_with_transcript(100);
-        app.scroll_lines(5);
-        app.input = blank.to_string();
-        app.input_cursor = blank.chars().count();
+fn the_send_button_looks_unavailable_and_does_nothing_while_the_input_is_blank() {
+    for blank in BLANK_INPUTS {
+        let mut app = blank_input_scrolled_back(blank);
         let screen = draw(&mut app);
+        assert_eq!(
+            app.scroll_offset(),
+            5,
+            "{blank:?}: 試験の前提: さかのぼっていない"
+        );
+        assert_eq!(
+            send_button_look(&screen),
+            SEND_UNAVAILABLE,
+            "{blank:?}: 押せない形でない"
+        );
+        let before = untouched_by_blank_submit(&app);
         let frame = framed_button(&screen, "送信");
-        let at = screen.find_last("送信");
-        let look = screen.style(at);
-        assert_eq!(
-            look.fg,
-            Some(Color::Cyan),
-            "{blank:?}: 文言が押せる色でない"
-        );
-        assert_eq!(
-            screen.style((frame.x, frame.y)).fg,
-            Some(Color::Cyan),
-            "{blank:?}: 枠が押せる色でない"
-        );
-        assert!(look.add_modifier.contains(Modifier::BOLD), "{blank:?}");
-        for place in [at, (frame.x, frame.y)] {
+        for place in [screen.find_last("送信"), (frame.x, frame.y)] {
             assert!(
                 click(&mut app, place).is_none(),
-                "{blank:?}: 空のまま送った"
+                "{blank:?} {place:?}: 空のまま送った"
+            );
+            assert_eq!(
+                untouched_by_blank_submit(&app),
+                before,
+                "{blank:?} {place:?}: 押せないはずの送信で何か変わった"
             );
         }
-        assert_eq!(app.input, blank, "{blank:?}: 入力欄が変わった");
         assert_eq!(
-            empty_notices(&app),
-            1,
-            "{blank:?}: 知らせが1行でない: {:?}",
-            app.transcript.last()
-        );
-        assert_eq!(app.scroll_offset(), 0, "{blank:?}: 末尾へ戻っていない");
-        let screen = draw(&mut app);
-        assert!(
-            screen.try_find(EMPTY_NOTICE).is_some(),
-            "{blank:?}: 知らせが画面に無い:\n{}",
-            screen.text()
+            send_button_look(&draw(&mut app)),
+            SEND_UNAVAILABLE,
+            "{blank:?}: 押した後に押せない形でなくなった"
         );
     }
 
-    // 送信キーで空のまま送っても、同じ知らせ（ボタンと合わせて1行）。
+    // 対: 打てば同じ場所で押せる形になり、打った直後に押しても送る。
     let mut app = app_with_transcript(3);
-    let blank = draw(&mut app);
-    let blank_at = blank.find_last("送信");
-    let blank_look = blank.style(blank_at);
-    assert!(press_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)).is_none());
-    assert_eq!(empty_notices(&app), 1, "送信キーで知らせが出ない");
-    let screen = draw(&mut app);
-    assert!(click(&mut app, screen.find_last("送信")).is_none());
-    assert_eq!(empty_notices(&app), 1, "キーとボタンで知らせが2行になった");
-
-    // 対: 打てば同じ場所・同じ見た目のボタンが送る（押した直後の押されている形は、離して戻してから見比べる）。
-    release(&mut app);
+    let blank_at = draw(&mut app).find_last("送信");
     type_text(&mut app, "hi");
     let screen = draw(&mut app);
     let at = screen.find_last("送信");
     assert_eq!(at, blank_at, "打つと送信の場所が動いた");
-    assert_eq!(screen.style(at), blank_look, "打つと送信の見た目が変わった");
-    assert!(matches!(
-        click(&mut app, at),
-        Some(Action::Submit(ref text)) if text == "hi"
-    ));
-    // 送った後（間に「> hi」が入った）に空で押すと、知らせはもう1行出る。
-    draw(&mut app);
-    assert!(click(&mut app, at).is_none());
-    assert_eq!(empty_notices(&app), 2, "{:?}", app.transcript);
+    assert_eq!(
+        send_button_look(&screen),
+        SEND_AVAILABLE,
+        "打っても押せる形にならない"
+    );
+    let sent = click(&mut app, at);
+    assert!(
+        matches!(sent, Some(Action::Submit(ref text)) if text == "hi"),
+        "{sent:?}"
+    );
+    // 送ると入力欄は空に戻る。押されている形が戻るまでは押されている形のまま（押した色が一度も見えないと押した反応が
+    // 無い。`harness_term::button::Press::look`）で、戻ったら押せない形。
+    assert!(
+        send_button_look(&draw(&mut app)).3,
+        "送った直後の送信が押されている形でない"
+    );
+    release(&mut app);
+    assert_eq!(
+        send_button_look(&draw(&mut app)),
+        SEND_UNAVAILABLE,
+        "送った後の空の入力欄で押せない形に戻らない"
+    );
+}
+
+/// **送信キーで空白だけの入力を送っても何も起きない**——transcriptに何も出ず、さかのぼりの位置も入力欄も変わらない
+/// （2026-10-06のユーザーの決定。上の試験と同じ）。送信キーは設定と端末で3通り（既定の`Shift+Enter`・VS Codeの
+/// `Alt+Enter`・`enter_submits`の素の`Enter`）あり、どれも`submit_input`を通る。続けて押しても同じ。
+/// 許可側（文字があれば同じキーで送る）は`the_send_button_sends_like_the_send_key`が見ている。
+#[test]
+fn the_send_key_does_nothing_while_the_input_is_blank() {
+    type Setup = fn(&mut AppState);
+    let keys: [(&str, Setup, KeyEvent); 3] = [
+        (
+            "既定",
+            |_| {},
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        ),
+        (
+            "VS Code",
+            |app| app.host_is_vscode = true,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+        ),
+        (
+            "enter_submits",
+            |app| app.enter_submits = true,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ),
+    ];
+    for (case, setup, key) in keys {
+        for blank in BLANK_INPUTS {
+            let mut app = blank_input_scrolled_back(blank);
+            setup(&mut app);
+            draw(&mut app);
+            let before = untouched_by_blank_submit(&app);
+            for nth in 1..=2 {
+                assert!(
+                    press_key(&mut app, key).is_none(),
+                    "{case} {blank:?} {nth}回目: 空のまま送った"
+                );
+                assert_eq!(
+                    untouched_by_blank_submit(&app),
+                    before,
+                    "{case} {blank:?} {nth}回目: 何か変わった"
+                );
+            }
+        }
+    }
 }
 
 /// **「中断」は止めるものが走っている間だけ出る**——応答中のターン（`TurnStarted`〜`TurnCompleted`）と、
@@ -1258,7 +1331,14 @@ fn a_pressed_input_button_is_reversed_until_released_and_the_minimum_time_passes
     );
     assert_eq!(pressed_cells_outside(&screen, Rect::default()), 0);
 
-    // 押したまま最低時間が過ぎても戻らない。その後で離すと、その場で戻して描き直す。
+    // 押したまま最低時間が過ぎても戻らない。その後で離すと、その場で戻して描き直す。送った後の入力欄は空で「送信」は
+    // 押せない（2026-10-06から。押す場所が無い）ので、もう一度打ってから押す。
+    type_text(&mut app, "again");
+    assert_eq!(
+        draw(&mut app).find_last("送信"),
+        at,
+        "試験の前提: 送信が動いた"
+    );
     let t1 = t0 + Duration::from_secs(1);
     mouse_at(&mut app, MouseEventKind::Down(MouseButton::Left), at, t1);
     app.tick_at(t1 + Duration::from_secs(1));
