@@ -35,7 +35,9 @@ use std::process::Command;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harness_core::{BlockKind, CompletionRequest, StopReason, StreamEvent, Usage};
 use harness_policy::policy_file;
-use harness_policy::process_event::{parse_process_audit, ProcessInstance, PROCESS_AUDIT_FILE};
+use harness_policy::process_event::{
+    parse_process_audit, ProcessAuditLog, ProcessInstance, PROCESS_AUDIT_FILE,
+};
 use harness_policy_editor::tui::state::App;
 use harness_sandbox::tier2a::spawnd::client::DAEMON_STDERR_ENV;
 use harness_sandbox::tier2a::spawnd::transitions::{pending_path, read_from, PendingRecord};
@@ -181,6 +183,29 @@ pub fn record(
     leaf_output: &str,
     leaf: &str,
 ) -> PathBuf {
+    let (dir, tree) = record_tree(ws, script, leaf_output);
+    let root = scope_root(&tree);
+    let middle = child_named(&tree.instances, root, &shell.exe);
+    child_named(&tree.instances, middle, leaf);
+    dir
+}
+
+/// 記録の根（`harness-policy-editor record`が起こした最初のシェル）。
+pub fn scope_root(tree: &ProcessAuditLog) -> &ProcessInstance {
+    tree.instances
+        .iter()
+        .find(|i| i.is_scope_root)
+        .expect("記録の根が木にある")
+}
+
+/// パス1で`script`を1回記録し、記録のディレクトリと木を返す。記録の標準出力（小文字にしたもの）が
+/// `expected_output`を含むことを確かめる（**無ければ記録の中で走るはずのものが走っていない**）。
+/// 木の形は呼び出し側が確かめる（[`record`]は「根 → 中の段 → 葉」の1本）。
+pub fn record_tree(
+    ws: &Path,
+    script: &Script,
+    expected_output: &str,
+) -> (PathBuf, ProcessAuditLog) {
     let before = record_dirs(ws);
     let output = Command::new(editor_exe())
         .args([
@@ -206,8 +231,8 @@ pub fn record(
     );
     assert!(output.status.success(), "record が失敗した: {stderr}");
     assert!(
-        stdout.to_ascii_lowercase().contains(leaf_output),
-        "記録の中で連鎖の葉が走っていない（出力に {leaf_output} が無い）"
+        stdout.to_ascii_lowercase().contains(expected_output),
+        "記録の中で走るはずのものが走っていない（出力に {expected_output} が無い）"
     );
 
     let dir = record_dirs(ws)
@@ -224,14 +249,7 @@ pub fn record(
             i.seq, i.parent_seq, i.parent_seq_source, i.is_scope_root, i.image_path, i.argv
         );
     }
-    let root = tree
-        .instances
-        .iter()
-        .find(|i| i.is_scope_root)
-        .expect("記録の根が木にある");
-    let middle = child_named(&tree.instances, root, &shell.exe);
-    child_named(&tree.instances, middle, leaf);
-    dir
+    (dir, tree)
 }
 
 /// `parent`の子で実行ファイル名が`name`のインスタンス（無ければ落とす）。
@@ -325,6 +343,18 @@ impl Arm {
 
 /// `script`を`run_shell`で1回撃つ。**撃つ前に`pending.jsonl`を消す**（前の腕の拒否を数えない）。
 pub fn run_arm(harness: &Path, ws: &Path, case: &str, script: &Script) -> Arm {
+    run_arm_with(harness, ws, case, script, &[])
+}
+
+/// [`run_arm`]に`harness.exe`の引数を足して撃つ（入口のドメインに通信を許す`--net-allow-domain`など）。
+/// 足した引数は決まった引数の後ろに並ぶ。
+pub fn run_arm_with(
+    harness: &Path,
+    ws: &Path,
+    case: &str,
+    script: &Script,
+    extra_args: &[&str],
+) -> Arm {
     let queue = pending_path(ws);
     let _ = std::fs::remove_file(&queue);
     let line = &script.line;
@@ -368,6 +398,7 @@ pub fn run_arm(harness: &Path, ws: &Path, case: &str, script: &Script) -> Arm {
             "tier2a",
             "--enforce-transitions",
         ])
+        .args(extra_args)
         .env(
             "HARNESS_TEST_RECALL_DATA_ROOT",
             scratch.join("recall-memory"),

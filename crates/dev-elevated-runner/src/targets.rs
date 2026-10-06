@@ -788,6 +788,27 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture",
         ],
     ),
+    // 広げる遷移（決定66）の実機E2E。パス1で2つの子（中の段のシェル・cmd）がワークスペースの外の目印を
+    // 読む行を記録し、エディタの画面で子のドメインの読み取りと位置の辺を承認し（cmd の辺は出力を捨てる）、
+    // `harness.exe --enforce-transitions`（e2e-mock のビルド）で子だけが目印を読めること・標準入力が届くこと・
+    // 出力を捨てる辺・子のドメインからの拒否・子の通信を測る
+    // （`crates/harness-policy-editor/tests/widening_transitions_e2e.rs`）。⑥は外部（example.com）への到達性が要る。
+    // フィルタはテスト関数名と一致させる（0件マッチは`check_tests_actually_ran`が非0で落とす、BUG-056同型）。
+    (
+        "e2e-policy-editor-widening",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "widening_transitions_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "a_widening_edge_written_by_the_editor_lets_the_child_use_its_own_domain_and_no_more",
+        ],
+    ),
     // ポリシーエディタのパス2（Tier2aでのドメイン記録）の実機E2E。WFPの出口強制daemonを
     // 起こすため管理者権限と外部への到達性が要る（`crates/harness-policy-editor/tests/
     // record_net_e2e.rs`）。**2本目は対のテスト**で、生ソケットがWFPに落とされることを
