@@ -139,6 +139,94 @@ fn checking_whether_the_dacl_is_writable_keeps_the_auto_inherited_flag() {
     );
 }
 
+/// [BUG-231] **この開発機の`C:\`へ、落とされた自動継承の印を戻す**（1回きりの復旧。冪等）。
+///
+/// ハーネスの祖先への書込が`C:\`の印を落としていた（09-28〜10-05の間。BUG-231の年表）。修正は
+/// これから書くノードの印を保つだけで、既に消えた印は戻さない。`C:\`へ書くには管理者権限が要るので、
+/// `dev-elevated-run.exe restore-c-root-auto-inherit`経由で撃つ。
+///
+/// - 印が既にあれば何もしない。
+/// - 書く前のSDDLを`C:\harness-e2e\_acl-backup\`へ控える（戻したくなったらこれを見る）。
+/// - 書くのは`C:\`1ノードだけ（カーネル経由。子孫へは配らない）。ACEの並びが書く前と同じで、
+///   印が立ったことを読み返して確かめる。
+///
+/// 戻す側（印を外す）キーは作らない——OSの元の状態へ戻すだけで、控えのSDDLがあるため。
+#[test]
+#[ignore = "C:\\ の DACL を書き換える（管理者権限が要る）。dev-elevated-run.exe restore-c-root-auto-inherit 経由で撃つ"]
+fn restore_c_root_auto_inherited() {
+    let root = Path::new("C:\\");
+    assert!(
+        crate::tier2a::privhelper::is_elevated(),
+        "writing the DACL of C:\\ needs administrator rights: run it via \
+         `dev-elevated-run.exe restore-c-root-auto-inherit`"
+    );
+    if has_ai(root) {
+        println!(
+            "C:\\ already carries AI ({}); nothing to do",
+            control_text(root)
+        );
+        return;
+    }
+
+    let before_aces = describe_dacl_aces_for_test(root);
+    let backup_dir = Path::new("C:\\harness-e2e\\_acl-backup");
+    std::fs::create_dir_all(backup_dir).expect("create the backup dir");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = backup_dir.join(format!("sddl-C_root-{stamp}.txt"));
+    std::fs::write(&backup, sddl_of(root)).expect("write the SDDL backup");
+    println!("backed up the SDDL of C:\\ to {}", backup.display());
+
+    set_auto_inherited(root, true);
+
+    assert_eq!(
+        describe_dacl_aces_for_test(root),
+        before_aces,
+        "the ACE list of C:\\ must be unchanged; restore it from {}",
+        backup.display()
+    );
+    println!("C:\\ now carries AI ({})", control_text(root));
+}
+
+/// `path`のセキュリティ記述子（所有者・グループ・DACL）をSDDLで返す（控え用）。
+fn sddl_of(path: &Path) -> String {
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
+    unsafe {
+        let path_w = long_path_wide(path);
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut sd,
+        )
+        .ok()
+        .expect("read the security descriptor");
+        let mut text = windows::core::PWSTR::null();
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
+            &mut text,
+            None,
+        )
+        .expect("convert to SDDL");
+        let out = text.to_string().expect("SDDL is valid UTF-16");
+        let _ = LocalFree(HLOCAL(text.0 as *mut _));
+        let _ = LocalFree(HLOCAL(sd.0));
+        out
+    }
+}
+
 fn describe_dacl_aces_for_test(path: &Path) -> Vec<String> {
     super::test_support::describe_dacl_aces(path).expect("list the ACEs")
 }

@@ -1205,6 +1205,24 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "vhd_ntfs_remove",
         ],
     ),
+    // [BUG-231] この開発機の`C:\`へ、ハーネスの祖先への書込が落とした「自動継承」の印を戻す
+    // （1回きりの復旧。印が既にあれば何もしない冪等な形で、書く前のSDDLを
+    // `C:\harness-e2e\_acl-backup\`へ控える）。戻す側のキーは作らない——OSの元の状態へ戻すだけで、
+    // 控えのSDDLがあるため。
+    (
+        "restore-c-root-auto-inherit",
+        &[
+            "test",
+            "-p",
+            "harness-sandbox",
+            "--lib",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "restore_c_root_auto_inherited",
+        ],
+    ),
     // 残課題#53の計測（`crates/harness-mcp/tests/loopback_drop_probe.rs`）: ループバックの
     // 接続要求を**どの部品がどの理由で捨てているか**を`pktmon`に名指しさせる。
     // **開始・報告・停止を3つのキーに分けてある**——昇格側プロセスへ呼び出し元の環境変数が
