@@ -346,7 +346,7 @@ fn first_unescaped_uppercase(pattern: &str) -> Option<char> {
 // ---------------------------------------------------------------------------
 
 /// 畳み込み済みのパスが絶対か（`c:/…` か `//server/…`）。
-fn is_absolute_path(folded: &str) -> bool {
+pub(crate) fn is_absolute_path(folded: &str) -> bool {
     let bytes = folded.as_bytes();
     if folded.starts_with("//") {
         return true;
@@ -359,7 +359,7 @@ fn is_absolute_path(folded: &str) -> bool {
 /// **`CreateProcess`の引数解析を再現するものではない**（§15が完全互換を目指さないと定めている
 /// のと同じ理由で、ここでも目指さない）。**検査のためだけに使う**ので、割り方が粗いぶんは
 /// 「cwdを余分に要求する」側へ外れる。
-fn split_command_line(command_line: &str) -> Vec<String> {
+pub(crate) fn split_command_line(command_line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;

@@ -580,11 +580,13 @@ fn editor_edge_is_the_only_shape_the_editor_writes() {
             source: PositionSource::Proposed,
             instances: vec![2],
             command_lines: Vec::new(),
+            fixed_command_line: None,
             argv_missing: 0,
             argv_truncated: 0,
         }],
         roots: Vec::new(),
         unassigned: Vec::new(),
+        split_refused: Vec::new(),
     };
     let expected =
         transition::editor_edge(EXE, ArgvMatcher::Any(transition::AnyMarker), "pwsh");
@@ -593,6 +595,15 @@ fn editor_edge_is_the_only_shape_the_editor_writes() {
     assert_eq!(from_positions.len(), 1);
     assert_eq!(from_positions[0].edge, expected, "位置ごとの割り当ての辺の形が違う");
     assert_eq!(edge_for(&any(EXE), "pwsh"), expected, "遷移タブの承認の辺の形が違う");
+
+    // [P5.10.1] コマンドラインごとに分けた位置（決定67）の辺も同じ形——リテラルの引数で作った遷移タブの辺と等しい。
+    let mut split = assignment.clone();
+    split.positions[0].fixed_command_line = Some("pwsh -c x".to_string());
+    assert_eq!(
+        split.edges_to_add()[0].edge,
+        edge_for(&literal(EXE, "pwsh -c x"), "pwsh"),
+        "分けた位置の辺の形が違う"
+    );
 
     // 対の側: リテラルの引数で作った辺は、任意の引数の辺と等しくない。
     assert_ne!(edge_for(&literal(EXE, "pwsh -c x"), "pwsh"), expected);

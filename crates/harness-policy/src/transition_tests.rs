@@ -649,6 +649,28 @@ fn with_output_changes_only_the_output_of_an_editor_edge() {
     );
 }
 
+/// [P5.10.1] **作業ディレクトリだけを替える**（決定67(3)。Strict の辺と相対パスの引数の辺はエディタが作業ディレクトリを
+/// 宣言する）。形の持ち主は`editor_edge`のまま——作業ディレクトリ以外の欄が変わったら赤くなる。`None`で宣言を外す（対の側）。
+#[test]
+fn with_cwd_changes_only_the_cwd_of_an_editor_edge() {
+    let base = editor_edge(
+        r"C:\Python312\python.exe",
+        ArgvMatcher::Literal(r"python C:\tools\mv.py".to_string()),
+        "python-mv",
+    );
+    let declared = base.clone().with_cwd(Some(r"C:\tools".to_string()));
+    assert_eq!(declared.cwd.as_deref(), Some(r"C:\tools"));
+    assert_eq!(
+        TransitionEdge {
+            cwd: None,
+            ..declared.clone()
+        },
+        base,
+        "the cwd must be the only difference (the shape stays editor_edge's)"
+    );
+    assert_eq!(declared.with_cwd(None), base);
+}
+
 #[test]
 fn a_widening_edge_returns_the_childs_output_and_is_not_strict() {
     let declared = Declared::new()

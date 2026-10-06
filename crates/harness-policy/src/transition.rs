@@ -182,7 +182,9 @@ impl EnvOverride {
 /// 両方これを呼ぶ——写すと、片方だけ`cwd`を書き始めたときに「同じ位置の辺なのに経路で形が違う」が起きる。
 /// `cwd`を書かない理由は、観測に作業ディレクトリが無く、拒否側の作業ディレクトリは「ここでしか起こしては
 /// いけない」という意思ではないためである（意思でないものを宣言へ書くと、別の場所から走らせたときに
-/// 理由の分からない拒否になる）。環境変数の差分も書かない（普通の辺では呼び出し元の環境変数がそのまま届く。決定66(5)）。
+/// 理由の分からない拒否になる）。**例外は人が欄で決めた作業ディレクトリ**で、Strict の辺と相対パスの引数を固定した辺に
+/// [`TransitionEdge::with_cwd`]で足す（決定67(3)。候補はエディタが出し、人が直す——意思として宣言する）。
+/// 環境変数の差分も書かない（普通の辺では呼び出し元の環境変数がそのまま届く。決定66(5)）。
 pub fn editor_edge(exe: &str, argv: ArgvMatcher, to: &str) -> TransitionEdge {
     TransitionEdge {
         exe: ExeMatcher::Literal(exe.to_string()),
@@ -199,6 +201,14 @@ impl TransitionEdge {
     /// ——出力以外の欄を作り直す口を増やさない（`B-05`）。
     pub fn with_output(mut self, output: ChildOutput) -> Self {
         self.output = output;
+        self
+    }
+
+    /// 作業ディレクトリの宣言だけを替えた辺（決定67(3)。Strict の辺と、相対パスの引数を固定した辺はエディタが宣言する）。
+    /// `with_output`と同じ形——形の持ち主は[`editor_edge`]のまま（`B-05`）。宣言した辺では、呼び出し元はその場所へ
+    /// 移ってから呼ぶ必要がある（違えば[`TransitionDenial::CwdMismatch`]。`plans/DESIGN-MAC-ENFORCEMENT.md` §8.3）。
+    pub fn with_cwd(mut self, cwd: Option<String>) -> Self {
+        self.cwd = cwd;
         self
     }
 }
@@ -930,9 +940,11 @@ fn compile_argv(matcher: &ArgvMatcher) -> Result<CompiledMatcher, regex::Error> 
     })
 }
 
-/// 編集時検査（[`check_all`]の本体と、綴りを見る関数群）。
+/// 編集時検査（[`check_all`]の本体と、綴りを見る関数群）。コマンドラインの語の割り方と絶対パスの見分けは、位置の
+/// 割り当て（分けた位置の名前・スクリプトの語。決定67）も同じものを使う（写さない、`B-05`）。
 #[path = "transition_check.rs"]
 mod transition_check;
+pub(crate) use transition_check::{is_absolute_path, split_command_line};
 
 /// 1つのドメインから見た遷移の形（届く範囲の権限・起動で届くドメイン・最長の連鎖）と、自己ループ辺の一覧
 /// （ポリシーエディタの宣言画面の遷移タブ、`plans/PLAN-POLICY-EDITOR-POSITION-DOMAINS.md` の P4.2）。

@@ -80,7 +80,17 @@ fn limit_27(name: &str) -> Option<String> {
 }
 
 fn assign(log: &ProcessAuditLog, policy: &PolicyFile) -> Assignment {
-    assign_domains(log, policy, Path::new(WS), &limit_27).expect("検査に通る policy.json")
+    assign_split(log, policy, &[])
+}
+
+/// `split`の（遷移元, 実行ファイル）の位置をコマンドラインごとに分けて割り当てる（決定67(1)）。実行ファイルは
+/// 判定器と同じ畳み方で鍵にする（[`split_key`]と同じ）。
+fn assign_split(log: &ProcessAuditLog, policy: &PolicyFile, split: &[(&str, &str)]) -> Assignment {
+    let split: SplitPositions = split
+        .iter()
+        .map(|(from, exe)| (from.to_string(), fold_for_pattern_comparison(exe)))
+        .collect();
+    assign_domains(log, policy, Path::new(WS), &limit_27, &split).expect("検査に通る policy.json")
 }
 
 /// 提案した位置を辺として書く（P4 のエディタと同じく[`Assignment::domains_to_add`]・
@@ -706,19 +716,29 @@ fn a_policy_that_fails_the_check_is_an_error() {
         ENTRY_DOMAIN,
         vec![any_edge("calc.exe", ENTRY_DOMAIN)],
     )]);
-    match assign_domains(&recorded, &broken, Path::new(WS), &limit_27) {
+    match assign_domains(&recorded, &broken, Path::new(WS), &limit_27, &SplitPositions::new()) {
         Err(AssignError::PolicyRejected(_)) => {}
         other => panic!("検査に落ちる policy.json は割り当てない: {other:?}"),
     }
 
     // 対の側: 空の policy.json なら割り当てる。
-    assert!(assign_domains(&recorded, &PolicyFile::default(), Path::new(WS), &limit_27).is_ok());
+    assert!(assign_domains(
+        &recorded,
+        &PolicyFile::default(),
+        Path::new(WS),
+        &limit_27,
+        &SplitPositions::new()
+    ).is_ok());
 }
 
-/// 既にある辺に当たったが判定器が許可を答えない（宣言した作業ディレクトリと違う）なら、提案もしない
-/// ——足すと既にある辺と食い違う。同じ実行ファイルでも、その辺に当たらない引数の起動は提案する。
+/// [P5.10.1] **作業ディレクトリを宣言した既にある辺（Strict の辺・相対パスの引数の辺）に当たる起動は、その辺の位置に
+/// なる**（決定67(3)）。記録は作業ディレクトリを持たないので、判定器へはワークスペースを渡して`CwdMismatch`になる。
+/// その辺だけが実行ファイルと引数で当たっているので、**宣言の作業ディレクトリで起きたものとみなして引き直す**——
+/// 直さないと、エディタが Strict の辺を書いた直後に同じ記録を読み直したとき、その起動が「既にある辺と食い違う起動」に
+/// なり、そのファイル操作がどのドメインにも引けなくなる（P5.10.1 の前は`ExistingEdgeUnresolvable`だった）。
+/// 同じ実行ファイルでも、その辺に当たらない引数の起動は今までどおり新しい名前で提案する（対の側）。
 #[test]
-fn an_existing_edge_the_resolver_cannot_answer_is_left_unassigned() {
+fn an_existing_edge_with_a_declared_cwd_takes_its_launch() {
     let fixed = TransitionEdge {
         exe: ExeMatcher::Literal(PWSH.to_string()),
         argv: ArgvMatcher::Literal(format!("\"{PWSH}\"")),
@@ -742,14 +762,57 @@ fn an_existing_edge_the_resolver_cannot_answer_is_left_unassigned() {
         &log(vec![root(10, CMD), child(11, 10, PWSH), other_argv]),
         &policy,
     );
+    assert_eq!(assignment.unassigned, vec![]);
+    assert_eq!(
+        shape_of(&assignment),
+        vec![
+            pos(1, ENTRY_DOMAIN, PWSH, "fixed", PositionSource::ExistingEdge),
+            pos(1, ENTRY_DOMAIN, PWSH, "pwsh", PositionSource::Proposed),
+        ]
+    );
+    assert_eq!(assignment.positions[0].instances, vec![11]);
+    assert_eq!(assignment.positions[1].instances, vec![12]);
+}
+
+/// 既にある辺に当たったが判定器が許可を答えない（パターンの辺が2本当たる）なら、提案もしない
+/// ——足すと既にある辺と食い違う。同じ実行ファイルでも、その辺に当たらない引数の起動は提案する。
+#[test]
+fn an_existing_edge_the_resolver_cannot_answer_is_left_unassigned() {
+    let pattern = |pattern: &str, to: &str| TransitionEdge {
+        exe: ExeMatcher::Pattern(pattern.to_string()),
+        argv: ArgvMatcher::Literal(format!("\"{PWSH}\"")),
+        cwd: None,
+        to: to.to_string(),
+        env: None,
+        output: ChildOutput::Return,
+    };
+    let policy = file(vec![
+        domain(
+            ENTRY_DOMAIN,
+            vec![
+                pattern(r"c:/program files/powershell/7/pwsh\.exe", "one"),
+                pattern(r"c:/program files/.*/pwsh\.exe", "two"),
+            ],
+        ),
+        domain("one", vec![]),
+        domain("two", vec![]),
+    ]);
+    let other_argv = ProcessInstance {
+        argv: ArgvBinding::Exact {
+            command_line: "pwsh -NoProfile".to_string(),
+            truncation: ArgvTruncation::None,
+        },
+        ..child(12, 10, PWSH)
+    };
+    let assignment = assign(
+        &log(vec![root(10, CMD), child(11, 10, PWSH), other_argv]),
+        &policy,
+    );
     assert_eq!(
         assignment.unassigned,
         vec![unassigned(
             11,
-            Unassigned::ExistingEdgeUnresolvable(TransitionDenial::CwdMismatch {
-                declared: "c:/elsewhere".to_string(),
-                actual: "c:/work".to_string(),
-            })
+            Unassigned::ExistingEdgeUnresolvable(TransitionDenial::AmbiguousPattern { matched: 2 })
         )]
     );
     // 対の側: その辺に当たらない引数の起動は、新しい名前で提案する。
@@ -832,4 +895,389 @@ fn a_proposed_name_does_not_reuse_a_declared_domain() {
             ENTRY_DOMAIN.to_string()
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// [P5.10.1] 引数を固定した位置をコマンドラインごとに分ける（決定67）
+// ---------------------------------------------------------------------------
+
+const PYTHON: &str = "C:/Python312/python.exe";
+const MV: &str = r"python C:\tools\mv.py C:\data\test.txt C:\data\test1.txt";
+const REMOVE: &str = r"python C:\tools\remove.py C:\data\test1.txt";
+
+/// 引数`command_line`が結び付いた子。
+fn ran(seq: u64, parent: u64, image: &str, command_line: &str) -> ProcessInstance {
+    ProcessInstance {
+        argv: ArgvBinding::Exact {
+            command_line: command_line.to_string(),
+            truncation: ArgvTruncation::None,
+        },
+        ..child(seq, parent, image)
+    }
+}
+
+/// 決定67の発端の例: 同じ`python.exe`で`mv.py`と`remove.py`を動かす。
+fn two_scripts() -> Vec<ProcessInstance> {
+    vec![
+        root(10, CMD),
+        ran(11, 10, PYTHON, MV),
+        ran(12, 10, PYTHON, REMOVE),
+    ]
+}
+
+/// `seq`の起動が`path`へ書いた行。
+fn wrote(seq: u64, path: &str) -> FsAuditEvent {
+    FsAuditEvent::observed(FsAuditKind::Etw, path, FsAccess::ReadWrite, true, "", 1)
+        .with_process_sequence_number(seq)
+}
+
+fn paths(events: &[&FsAuditEvent]) -> Vec<String> {
+    events.iter().filter_map(|e| e.path.clone()).collect()
+}
+
+/// `from`のドメインから`exe`をコマンドライン`command_line`で起こしたときの判定（許可なら遷移先）。
+fn resolve_line(
+    graph: &TransitionGraph,
+    from: &str,
+    exe: &str,
+    command_line: &str,
+) -> Result<String, TransitionDenial> {
+    match graph.resolve(SpawnAttempt {
+        from_domain: from,
+        exe,
+        command_line,
+        cwd: WS,
+    }) {
+        Resolution::Allowed(allowed) => Ok(allowed.to.to_string()),
+        Resolution::Denied(denial) => Err(denial),
+    }
+}
+
+/// **決定67の発端。** 分けなければ（今まで・引数が任意の位置）、`mv.py`と`remove.py`は1つのドメインを共有し、
+/// `remove.py`のドメインが`mv.py`の書いたファイルの権限も持つ。分けると、各スクリプトのドメインは自分の起動が
+/// 触った分だけを持ち、Spawn Daemon と同じ判定器は各コマンドラインを各ドメインへ送り、記録に無いコマンドラインは
+/// 断る（`NoMatchingEdge`）。辺は`edges_to_add`（エディタが書く形）のリテラルの引数。
+#[test]
+fn splitting_a_script_runner_gives_each_script_its_own_domain() {
+    let events = vec![wrote(11, "C:/data/test.txt"), wrote(12, "C:/data/test1.txt")];
+
+    // 分けない（空の集合）: 1つの位置に2つの起動、ドメイン python が両方の書込を持つ（穴の再現）。
+    let joined = assign(&log(two_scripts()), &PolicyFile::default());
+    assert_eq!(
+        shape_of(&joined),
+        vec![pos(1, ENTRY_DOMAIN, PYTHON, "python", PositionSource::Proposed)]
+    );
+    assert_eq!(joined.positions[0].fixed_command_line, None);
+    assert_eq!(
+        paths(&partition_fs(&events, &joined).by_domain["python"].events),
+        vec!["C:/data/test.txt".to_string(), "C:/data/test1.txt".to_string()]
+    );
+
+    // 分ける: コマンドラインごとの位置・ドメイン。
+    let split = assign_split(&log(two_scripts()), &PolicyFile::default(), &[(ENTRY_DOMAIN, PYTHON)]);
+    assert_eq!(
+        shape_of(&split),
+        vec![
+            pos(1, ENTRY_DOMAIN, PYTHON, "python-mv", PositionSource::Proposed),
+            pos(1, ENTRY_DOMAIN, PYTHON, "python-remove", PositionSource::Proposed),
+        ]
+    );
+    assert_eq!(split.positions[0].fixed_command_line.as_deref(), Some(MV));
+    assert_eq!(split.positions[1].fixed_command_line.as_deref(), Some(REMOVE));
+    assert_eq!(split.positions[0].instances, vec![11]);
+    assert_eq!(split.positions[1].instances, vec![12]);
+    assert_eq!(split.split_refused, vec![]);
+    let partition = partition_fs(&events, &split);
+    assert_eq!(
+        paths(&partition.by_domain["python-remove"].events),
+        vec!["C:/data/test1.txt".to_string()],
+        "remove.py のドメインに mv.py の書いた test.txt の権限が入ってはいけない"
+    );
+    assert_eq!(
+        paths(&partition.by_domain["python-mv"].events),
+        vec!["C:/data/test.txt".to_string()]
+    );
+
+    // 書く辺は引数のリテラル（形は editor_edge）。判定器が各コマンドラインを各ドメインへ送る。
+    let edges = split.edges_to_add();
+    assert_eq!(
+        edges.iter().map(|e| e.edge.argv.clone()).collect::<Vec<_>>(),
+        vec![
+            ArgvMatcher::Literal(MV.to_string()),
+            ArgvMatcher::Literal(REMOVE.to_string())
+        ]
+    );
+    assert!(edges.iter().all(|e| e.edge.cwd.is_none()), "作業ディレクトリは割り当てが決めない（エディタが足す）");
+    let mut policy = PolicyFile::default();
+    write_proposals(&mut policy, &split);
+    let graph = graph(&policy);
+    assert_eq!(resolve_line(&graph, ENTRY_DOMAIN, PYTHON, MV), ok("python-mv"));
+    assert_eq!(resolve_line(&graph, ENTRY_DOMAIN, PYTHON, REMOVE), ok("python-remove"));
+    assert_eq!(
+        resolve_line(&graph, ENTRY_DOMAIN, PYTHON, r"python C:\tools\other.py"),
+        NO_EDGE,
+        "記録に無いコマンドラインは通さない"
+    );
+    // 判定器と同じ畳み方で束ねる: 大小・区切りだけ違う綴りは同じ辺に当たる。
+    assert_eq!(
+        resolve_line(&graph, ENTRY_DOMAIN, PYTHON, &MV.to_uppercase()),
+        ok("python-mv")
+    );
+}
+
+/// **欠けたコマンドラインが1つでもあれば分けない**（決定67(2)。今の`u`と同じ前例）。分けなかった位置と理由の件数を
+/// `split_refused`に出し、位置は1つ（任意の引数）のまま。切り詰めの疑いも同じ。分けない位置は他の位置の分け方に
+/// 影響しない（対の側: 同じ記録の別の遷移元の位置は分ける）。
+#[test]
+fn a_position_with_a_missing_or_truncated_command_line_is_not_split() {
+    let missing = ProcessInstance {
+        argv: ArgvBinding::Missing {
+            reason: ArgvMissingReason::NoArgvObserved,
+        },
+        ..child(13, 10, PYTHON)
+    };
+    let truncated = ProcessInstance {
+        argv: ArgvBinding::Exact {
+            command_line: "pwsh -c long".to_string(),
+            truncation: ArgvTruncation::Suspected,
+        },
+        ..child(22, 20, PWSH)
+    };
+    let mut instances = two_scripts();
+    instances.push(missing);
+    instances.extend([
+        root(20, CMD),
+        ran(21, 20, PWSH, "pwsh -NoProfile"),
+        truncated,
+        root(30, NOTEPAD),
+        ran(31, 30, CALC, "calc"),
+        ran(32, 30, CALC, "calc -x"),
+    ]);
+    // NOTEPAD を根にした記録の根の位置は入口のドメインなので、calc の鍵も入口のドメインで書く。
+    let assignment = assign_split(
+        &log(instances),
+        &PolicyFile::default(),
+        &[(ENTRY_DOMAIN, PYTHON), (ENTRY_DOMAIN, PWSH), (ENTRY_DOMAIN, CALC)],
+    );
+    assert_eq!(
+        assignment.split_refused,
+        vec![
+            SplitRefused {
+                from_domain: ENTRY_DOMAIN.to_string(),
+                exe: PWSH.to_string(),
+                argv_missing: 0,
+                argv_truncated: 1,
+            },
+            SplitRefused {
+                from_domain: ENTRY_DOMAIN.to_string(),
+                exe: PYTHON.to_string(),
+                argv_missing: 1,
+                argv_truncated: 0,
+            },
+        ]
+    );
+    assert_eq!(
+        shape_of(&assignment),
+        vec![
+            pos(1, ENTRY_DOMAIN, CALC, "calc", PositionSource::Proposed),
+            pos(1, ENTRY_DOMAIN, CALC, "calc-2", PositionSource::Proposed),
+            pos(1, ENTRY_DOMAIN, PWSH, "pwsh", PositionSource::Proposed),
+            pos(1, ENTRY_DOMAIN, PYTHON, "python", PositionSource::Proposed),
+        ]
+    );
+    let python = &assignment.positions[3];
+    assert_eq!(python.fixed_command_line, None);
+    assert_eq!(python.instances, vec![11, 12, 13]);
+    assert!(!python.can_split(), "欠けがある位置は分けられない");
+    assert!(!assignment.positions[2].can_split(), "切り詰めの疑いがある位置は分けられない");
+    // 対の側: 欠けの無い位置は分けられる（分けた後の位置も）。
+    assert!(assign(&log(two_scripts()), &PolicyFile::default()).positions[0].can_split());
+    assert!(assignment.positions[0].can_split());
+}
+
+/// **分けた位置の名前**（決定67の「分けた位置のドメイン名」）: スクリプトの拡張子を持つ語があれば
+/// `<葉名>-<語幹>`、無ければ`<葉名>`（使われていれば`<葉名>-2`から）。語幹の形が名前の検査に落ちたら、切らずに
+/// `<葉名>`の形へ倒す。語幹は葉名と同じく`[a-z0-9-]`へ寄せる。どの名前も名前の検査を通る。
+#[test]
+fn split_names_use_the_script_stem_or_fall_back_to_the_leaf() {
+    let long = r"python C:\tools\a_script_whose_name_is_far_too_long.py";
+    let assignment = assign_split(
+        &log(vec![
+            root(10, CMD),
+            ran(11, 10, PYTHON, r#"python "C:\My Tools\Log_Report.PY" --since today"#),
+            ran(12, 10, PYTHON, "python -c print(1)"),
+            ran(13, 10, PYTHON, "python -V"),
+            ran(14, 10, PYTHON, long),
+        ]),
+        &PolicyFile::default(),
+        &[(ENTRY_DOMAIN, PYTHON)],
+    );
+    let names: BTreeMap<String, String> = assignment
+        .positions
+        .iter()
+        .map(|p| {
+            (
+                p.fixed_command_line.clone().expect("分けた位置"),
+                p.to_domain.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        names[r#"python "C:\My Tools\Log_Report.PY" --since today"#],
+        "python-log-report"
+    );
+    // 語幹の無い2つと、長すぎる語幹から倒した1つが`<葉名>`・`<葉名>-N`を分け合う（順は名前の元と綴りで決まる）。
+    let mut leaf_names: Vec<&str> = [long, "python -V", "python -c print(1)"]
+        .iter()
+        .map(|line| names[*line].as_str())
+        .collect();
+    leaf_names.sort();
+    assert_eq!(leaf_names, vec!["python", "python-2", "python-3"]);
+    assert!(assignment.unassigned.is_empty(), "長い語幹で断らない");
+    assert!(names.values().all(|name| limit_27(name).is_none()));
+}
+
+/// **2回の記録で名前が同じ**——通し番号と並びを変えても、同じコマンドラインの位置は同じ名前になる
+/// （名前は遷移元・名前の元・実行ファイル・コマンドラインの順で決まる）。
+#[test]
+fn split_names_are_stable_across_runs() {
+    let a = assign_split(
+        &log(two_scripts()),
+        &PolicyFile::default(),
+        &[(ENTRY_DOMAIN, PYTHON)],
+    );
+    let b = assign_split(
+        &log(vec![
+            root(50, CMD),
+            ran(51, 50, PYTHON, REMOVE),
+            ran(52, 50, PYTHON, MV),
+            ran(53, 50, PYTHON, REMOVE),
+        ]),
+        &PolicyFile::default(),
+        &[(ENTRY_DOMAIN, PYTHON)],
+    );
+    assert_eq!(shape_of(&a), shape_of(&b));
+    assert_eq!(b.positions[1].instances, vec![51, 53]);
+}
+
+/// **子孫は分けた後のドメインを遷移元にする**（決定67(1)。親を先に解く割り当てのまま）。分けたドメインを遷移元に
+/// した位置もさらに分けられる（鍵は分けた後のドメイン名）。
+#[test]
+fn the_descendants_of_a_split_position_start_from_the_split_domain() {
+    let instances = vec![
+        root(10, CMD),
+        ran(11, 10, PYTHON, MV),
+        ran(12, 11, CMD, "cmd /c dir"),
+        ran(13, 11, CMD, "cmd /c ver"),
+        ran(14, 10, PYTHON, REMOVE),
+        ran(15, 14, CMD, "cmd /c dir"),
+    ];
+    let assignment = assign_split(
+        &log(instances.clone()),
+        &PolicyFile::default(),
+        &[(ENTRY_DOMAIN, PYTHON)],
+    );
+    assert_eq!(
+        shape_of(&assignment),
+        vec![
+            pos(1, ENTRY_DOMAIN, PYTHON, "python-mv", PositionSource::Proposed),
+            pos(1, ENTRY_DOMAIN, PYTHON, "python-remove", PositionSource::Proposed),
+            pos(2, "python-mv", CMD, "cmd", PositionSource::Proposed),
+            pos(2, "python-remove", CMD, "cmd-2", PositionSource::Proposed),
+        ]
+    );
+    let nested = assign_split(
+        &log(instances),
+        &PolicyFile::default(),
+        &[(ENTRY_DOMAIN, PYTHON), ("python-mv", CMD)],
+    );
+    let under_mv: Vec<(String, Option<String>)> = nested
+        .positions
+        .iter()
+        .filter(|p| p.from_domain == "python-mv")
+        .map(|p| (p.to_domain.clone(), p.fixed_command_line.clone()))
+        .collect();
+    assert_eq!(
+        under_mv,
+        vec![
+            ("cmd".to_string(), Some("cmd /c dir".to_string())),
+            ("cmd-2".to_string(), Some("cmd /c ver".to_string())),
+        ]
+    );
+    // 対の側: python-remove の下の cmd は分けていない。
+    assert!(nested
+        .positions
+        .iter()
+        .any(|p| p.from_domain == "python-remove" && p.fixed_command_line.is_none()));
+}
+
+/// **書いた後の記録では、分けた辺は既にある辺として引かれる**（判定器のリテラルの辺。分ける集合を渡さなくてよい）。
+/// 記録に無い新しいコマンドラインだけが新しい位置になる。
+#[test]
+fn split_edges_once_written_are_found_as_existing_edges() {
+    let split = assign_split(&log(two_scripts()), &PolicyFile::default(), &[(ENTRY_DOMAIN, PYTHON)]);
+    let mut policy = PolicyFile::default();
+    write_proposals(&mut policy, &split);
+
+    let mut next = two_scripts();
+    next.push(ran(13, 10, PYTHON, r"python C:\tools\other.py"));
+    let again = assign(&log(next), &policy);
+    assert_eq!(
+        shape_of(&again),
+        vec![
+            pos(1, ENTRY_DOMAIN, PYTHON, "python", PositionSource::Proposed),
+            pos(1, ENTRY_DOMAIN, PYTHON, "python-mv", PositionSource::ExistingEdge),
+            pos(1, ENTRY_DOMAIN, PYTHON, "python-remove", PositionSource::ExistingEdge),
+        ]
+    );
+    assert_eq!(again.positions[0].instances, vec![13]);
+}
+
+/// **相対パスの引数を持つ分けた辺は、作業ディレクトリを宣言しないと検査に落ちる**（規則(d)、`plans/DESIGN-MAC.md`
+/// §5.1(5)）。割り当ては作業ディレクトリを決めない（記録に無い）——エディタが`with_cwd`で宣言すると通る。
+#[test]
+fn a_split_edge_with_a_relative_argument_needs_a_declared_cwd() {
+    let assignment = assign_split(
+        &log(vec![root(10, CMD), ran(11, 10, PYTHON, "python mv.py test.txt")]),
+        &PolicyFile::default(),
+        &[(ENTRY_DOMAIN, PYTHON)],
+    );
+    assert_eq!(assignment.positions[0].to_domain, "python-mv");
+    let mut policy = PolicyFile::default();
+    write_proposals(&mut policy, &assignment);
+    let input = policy.transition_graph_input(Some(WS), &[]);
+    let rejections = crate::transition::check_all(&input).expect("外形は壊れていない");
+    assert_eq!(rejections.len(), 1);
+    assert!(rejections[0].reason.contains("relative path"), "{rejections:?}");
+
+    // 対の側: 作業ディレクトリを宣言すると通る。
+    let edge = &mut policy
+        .domains
+        .iter_mut()
+        .find(|d| d.name == ENTRY_DOMAIN)
+        .expect("入口")
+        .process
+        .transitions[0];
+    *edge = edge.clone().with_cwd(Some(r"C:\tools".to_string()));
+    let input = policy.transition_graph_input(Some(WS), &[]);
+    assert_eq!(crate::transition::check_all(&input).expect("外形"), vec![]);
+}
+
+/// コマンドラインの中のスクリプト（名前と、エディタの作業ディレクトリの候補が同じこれを通る）: `argv[0]`の後ろで、
+/// 拡張子が`harness_core::SCRIPT_EXTENSIONS`のどれかである最初の語。引用符は外す。絶対パスかどうかを持つ。
+#[test]
+fn the_script_argument_is_the_first_word_after_argv0_with_a_script_extension() {
+    let script = |line: &str| script_argument(line).map(|s| (s.token, s.absolute));
+    assert_eq!(
+        script(r#"python "C:\My Tools\a.py" b.py"#),
+        Some((r"C:\My Tools\a.py".to_string(), true))
+    );
+    assert_eq!(
+        script("powershell.exe -File run.PS1"),
+        Some(("run.PS1".to_string(), false))
+    );
+    // argv[0] は数えない（呼び出し元が書いた綴りそのもの）。
+    assert_eq!(script(r"C:\tools\x.py --flag"), None);
+    assert_eq!(script("python -c print(1)"), None);
+    assert_eq!(script(""), None);
 }

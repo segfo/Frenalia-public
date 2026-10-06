@@ -146,11 +146,13 @@ pub fn load(
         Err(e) => return Err(PositionViewError::Unreadable(e)),
     };
     let log = parse_process_audit(&text).map_err(PositionViewError::Unparsable)?;
+    // 分ける位置（決定67）はエディタの画面が P5.10.2 で渡す。この段では分けない。
     let assignment = assign_domains(
         &log,
         policy,
         &manifest.workspace_root,
         &harness_sandbox::tier2a::domain_profile_name_problem,
+        &harness_policy::position_domains::SplitPositions::new(),
     )
     .map_err(PositionViewError::Assign)?;
 
