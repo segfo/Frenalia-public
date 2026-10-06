@@ -1,11 +1,12 @@
-//! **素の**描画部品（`codewandler-markdown-ratatui` 0.2.1の`markdown_ratatui::render_with`。手を入れる前のもの）が、
-//! 今どう描くかを固定する試験（特性化試験。計画書`plans/PLAN-TUI-IMPROVEMENTS.md`§0のT6）。
+//! **写した**描画部品（[`super::render`]。出典は`codewandler-markdown-ratatui` 0.2.1）が、今どう描くかを固定する試験
+//! （特性化試験。計画書`plans/PLAN-TUI-IMPROVEMENTS.md`§0のT6で作り、T7a・T7bで期待値を書き換える）。
 //!
 //! # 何のためにあるのか
 //!
-//! 描画部品は写して直す（計画書§1.3の結論・§1.5）。直す前の見え方を、**良いものも悪いものも「今はこう描く」として**
-//! 記録しておく——直した後に何が変わったのかを、この記録との差として言えるようにするため。
-//! 写した描画部品が元と同じに描くことは`super::equivalence_tests`が確かめ、ここに並べた入力をそのまま使う。
+//! 描画部品は写して直す（計画書§1.3の結論・§1.5）。見え方を、**良いものも悪いものも「今はこう描く」として**
+//! 記録しておく——直したときに何が変わったのかを、この記録の書き換えとして言えるようにするため。
+//! T6で作ったときは素の描画部品（`markdown_ratatui::render_with`）を描かせていた。写しが素のものと同じに描くことを
+//! 確かめてから（`super::equivalence_tests`。ここに並べた入力をそのまま使う）、直す相手である写しへ向け替えた。
 //!
 //! 入力は2組。
 //!
@@ -49,7 +50,7 @@
 //! - [`describe`]は書式を名前で書くだけで、`Span`の切れ目（単語ごとに別の`Span`になっていること）は残さない。
 //!   切れ目まで含めた一致は`super::equivalence_tests`が`Text`同士の比較で見る。
 
-use markdown_ratatui::Theme;
+use super::render::{self, Theme};
 use ratatui::style::Style;
 use ratatui::text::Text;
 use unicode_width::UnicodeWidthStr;
@@ -100,9 +101,9 @@ pub(super) const CASES: [(&str, &str); 14] = [
 /// 描く幅（モジュールdoc）。
 pub(super) const WIDTHS: [usize; 2] = [40, 80];
 
-/// 素の描画部品で、既定の書式のまま`width`桁で描く。
-fn original(src: &str, width: usize) -> Text<'static> {
-    markdown_ratatui::render_with(&markdown_stream::parse_gfm(src), &Theme::default(), width)
+/// 写した描画部品で、既定の書式のまま`width`桁で描く。
+fn drawn(src: &str, width: usize) -> Text<'static> {
+    render::render_with(&markdown_stream::parse_gfm(src), &Theme::default(), width)
 }
 
 /// `Theme::default()`の役割ごとの書式と、その名前。
@@ -162,7 +163,7 @@ pub(super) fn describe(text: &Text<'_>) -> Vec<String> {
 /// `src`を両方の幅で描いて、どちらも`expected`になることを確かめる（幅で見え方が変わらない入力用）。
 fn assert_same_at_both_widths(src: &str, expected: &[&str]) {
     for width in WIDTHS {
-        assert_eq!(describe(&original(src, width)), expected, "幅{width}");
+        assert_eq!(describe(&drawn(src, width)), expected, "幅{width}");
     }
 }
 
@@ -184,7 +185,7 @@ fn widest(text: &Text<'_>) -> usize {
 #[test]
 fn a_plain_paragraph_wraps_at_ascii_spaces_and_a_soft_break_becomes_a_space() {
     assert_eq!(
-        describe(&original(PARAGRAPH, 40)),
+        describe(&drawn(PARAGRAPH, 40)),
         [
             "The quick brown fox jumps over the lazy",
             "dog, and then it keeps running far",
@@ -192,7 +193,7 @@ fn a_plain_paragraph_wraps_at_ascii_spaces_and_a_soft_break_becomes_a_space() {
         ]
     );
     assert_eq!(
-        describe(&original(PARAGRAPH, 80)),
+        describe(&drawn(PARAGRAPH, 80)),
         [
             "The quick brown fox jumps over the lazy dog, and then it keeps running far",
             "beyond the edge of the screen.",
@@ -220,7 +221,7 @@ fn a_long_japanese_list_item_is_not_wrapped() {
         &["• これは画面幅を超える長い日本語のリスト項目です。描画部品が自分で折り返すなら、二行目以降は記号の幅だけ字下げされます。"],
     );
     for width in WIDTHS {
-        assert_eq!(widest(&original(LONG_JAPANESE_LIST_ITEM, width)), 120);
+        assert_eq!(widest(&drawn(LONG_JAPANESE_LIST_ITEM, width)), 120);
     }
 }
 
@@ -232,7 +233,7 @@ fn a_long_japanese_blockquote_is_not_wrapped() {
         &["«muted|│ »これは画面幅を超える長い日本語の引用です。描画部品が自分で折り返すなら、二行目以降にも縦線が付きます。"],
     );
     for width in WIDTHS {
-        assert_eq!(widest(&original(LONG_JAPANESE_BLOCKQUOTE, width)), 104);
+        assert_eq!(widest(&drawn(LONG_JAPANESE_BLOCKQUOTE, width)), 104);
     }
 }
 
@@ -283,7 +284,7 @@ fn a_blockquote_after_a_list_has_no_blank_line_before_it() {
 #[test]
 fn a_task_list_shows_the_checkbox_as_an_html_string() {
     assert_eq!(
-        describe(&original(TASK_LIST, 40)),
+        describe(&drawn(TASK_LIST, 40)),
         [
             "• <input disabled=\"\" type=\"checkbox\">",
             "  todo",
@@ -292,7 +293,7 @@ fn a_task_list_shows_the_checkbox_as_an_html_string() {
         ]
     );
     assert_eq!(
-        describe(&original(TASK_LIST, 80)),
+        describe(&drawn(TASK_LIST, 80)),
         [
             "• <input disabled=\"\" type=\"checkbox\"> todo",
             "• <input checked=\"\" disabled=\"\" type=\"checkbox\"> done",
