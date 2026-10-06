@@ -22,8 +22,8 @@
 //!   （位置の鍵は〔親のドメイン, exe〕、決定65 Q1）ので、根の綴りが違っても同じ位置になる
 //! - `calc`・`mspaint`は Windows 11 ではストアアプリで、遷移の強制を積んだ構成では起こせない
 //!   （`Startable::NotThroughTheAppModel`）。System32 の`hostname.exe`・`whoami.exe`で代える。
-//!   どちらもファイルの候補が出ない（子が親の持たないファイルを触らない）ので、決定65(6)の暫定
-//!   （広がる位置は P5 まで書けない）に当たらない
+//!   どちらもファイルの候補が出ない（子が親の持たないファイルを触らない）ので、鎖は広げる遷移にならない
+//!   （書いた当時の決定65(6)の暫定「広がる位置は P5 まで書けない」は、決定66で外した。P5.3）
 //! - **中の段は、ストアアプリでない`pwsh`があればそれ、無ければ`powershell.exe`（System32 の 5.1）**である
 //!   （[`middle_shell`]。ドメインの名前は葉名で`pwsh`か`powershell`）。選ぶのは`harness_sandbox`の
 //!   `shell_candidates_from`を生成禁止（`ChildProcessPolicy::Restricted`）で呼んだ候補の先頭で、`harness.exe`が
@@ -649,8 +649,8 @@ fn approve_positions(
         let current = app.pending.positions.as_ref().unwrap();
         assert_eq!(current.row, i, "選択が行を1つずつ下りていない");
         if chain.contains(&name.as_str()) {
-            // 書けない判定（とくに広げる向き＝決定65(6)の暫定）になったら、その判定の文言を出して止める
-            // ——そのときは連鎖のプログラムを選び直す（P4.md の Step 3）。
+            // 書けない判定になったら、その判定の文言を出して止める——そのときは連鎖のプログラムを選び直す
+            // （P4.md の Step 3。広げる向きは決定66から書ける＝`is_writable`）。
             assert!(
                 verdict.is_writable(),
                 "鎖の位置 {name}（添字 {index}）が書けない判定: {verdict:?}"

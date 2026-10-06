@@ -469,8 +469,8 @@ impl App {
             self.status = format!("{name}: {note}");
             return;
         }
-        if let Some(note) = selected.verdict.note() {
-            self.status = format!("{name}: {note}");
+        if !selected.verdict.is_writable() {
+            self.status = format!("{name}: {}", selected.verdict.note().unwrap_or_default());
             return;
         }
         let key = key_of(&selected.position);
@@ -486,7 +486,13 @@ impl App {
             self.status = format!("{name} の承認をやめました");
         } else {
             positions.approve.insert(key);
-            self.status = format!("{name} を許します（→ {}）", selected.to);
+            // 広げる辺は書けるが、書くと何が呼び出し元の手に渡るかを予約した時点でも言う（決定66）。
+            let widens = selected
+                .verdict
+                .note()
+                .map(|note| format!("。{note}"))
+                .unwrap_or_default();
+            self.status = format!("{name} を許します（→ {}）{widens}", selected.to);
         }
     }
 
@@ -562,8 +568,10 @@ impl App {
         positions.approve.insert(key);
         positions.refresh_verdicts(&workspace_root, &extra_fs);
         let detail = match verdict {
-            EdgeVerdict::Widens { detail } | EdgeVerdict::Rejected { detail } => detail,
-            EdgeVerdict::AlreadyDeclared | EdgeVerdict::Writable => String::new(),
+            EdgeVerdict::Rejected { detail } => detail,
+            EdgeVerdict::AlreadyDeclared | EdgeVerdict::Writable | EdgeVerdict::Widens { .. } => {
+                String::new()
+            }
         };
         self.status = format!(
             "{name}: 記録どおりに絞ると検査に落ちるので絞れません（任意の引数のままにします。\

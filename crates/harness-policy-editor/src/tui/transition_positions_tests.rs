@@ -486,12 +486,12 @@ fn clicking_a_position_row_and_its_mark_does_what_the_keys_do() {
     );
 }
 
-/// **子が親の持たないファイルを触る位置は P5 まで書けない**（決定65(6) の暫定）。FS/ネットのタブで子のドメインの
-/// 候補（`C:/secret/x`）を選ぶと、観測のタブのその位置は判定器が広げる向きと答え、行と`Space`が「P5まで書けません」と
-/// 言って予約できない（P4.4 でファイルの候補がドメインごとになってから出る）。
-/// 対の側: 選ぶ前は書ける見込みで、`Space`で予約できる。
+/// **子が親の持たないファイルを触る位置は広げる遷移として書ける**（決定66。決定65(6) の暫定「P5 まで書けない」を
+/// 外した）。FS/ネットのタブで子のドメインの候補（`C:/secret/x`）を選ぶと、観測のタブのその位置は判定器が広げると
+/// 答え、行と説明欄が「呼び出し元が子を通して使えるようになる権限」を言い、`Space`で予約できる（予約の文言も同じことを
+/// 言う）。対の側: 選ぶ前は狭める向きで、行に「広げる」は出ない。
 #[test]
-fn a_widening_position_says_it_cannot_be_written_until_p5() {
+fn a_widening_position_can_be_reserved_and_says_what_it_hands_over() {
     use crate::position_candidates::position_candidates_tests::{fs_event, write_fs_events};
     let ws = workspace();
     let (dir, _) = seed_position_record(ws.path(), "s1", &[root(1, CMD), child(2, 1, CALC)]);
@@ -503,8 +503,13 @@ fn a_widening_position_says_it_cannot_be_written_until_p5() {
         ],
     );
 
-    // 対の側（選ぶ前）: 書ける見込み。
+    // 対の側（選ぶ前）: 書ける見込みで、広げない。
     let mut app = open_observed_tab(ws.path());
+    assert!(
+        !screen(&app).iter().any(|l| squash(l).contains("広げる")),
+        "{}",
+        screen(&app).join("\n")
+    );
     press(&mut app, KeyCode::Char(' '));
     assert!(
         app.pending
@@ -550,13 +555,35 @@ fn a_widening_position_says_it_cannot_be_written_until_p5() {
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("calc.exe") && squash(l).contains("P5まで書けません")),
+            .any(|l| l.contains("calc.exe") && squash(l).contains("広げる")),
+        "{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines.iter().any(|l| squash(l).contains("P5まで")),
+        "{}",
+        lines.join("\n")
+    );
+    // 説明欄（選んでいる位置）に、子を通して使えるようになる権限そのものが出る。
+    select(&mut app, CALC);
+    let lines = screen(&app);
+    assert!(
+        lines.iter().any(|l| squash(l).contains("C:/secret/x")),
         "{}",
         lines.join("\n")
     );
     press(&mut app, KeyCode::Char(' '));
-    assert!(app.pending.positions.as_ref().unwrap().approve.is_empty());
-    assert!(app.status.contains("P5まで書けません"), "{}", app.status);
+    assert!(
+        app.pending
+            .positions
+            .as_ref()
+            .unwrap()
+            .approve
+            .contains(&key_of(&app, CALC)),
+        "{}",
+        app.status
+    );
+    assert!(app.status.contains("広げる"), "{}", app.status);
 }
 
 /// **位置ごとのドメインの記録では、「遷移・拒否から」のタブの`a`も、位置の辺と拒否からの予約を1つの確定にまとめる**

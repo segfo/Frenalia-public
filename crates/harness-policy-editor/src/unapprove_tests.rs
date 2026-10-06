@@ -439,3 +439,46 @@ fn removing_a_declaration_also_revokes_its_approval_but_keeps_the_others() {
     assert!(!approvals.is_approved(ws.path(), removed));
     assert!(approvals.is_approved(ws.path(), kept));
 }
+
+
+/// [P5.3、決定66] **遷移元から宣言を取り消すと、その遷移元から出る辺が広がり得る**——遷移先の届く範囲から差し引く
+/// 「遷移元が自分で宣言している権限」が減るためである。広がる辺は確定の明細の材料（[`UnapprovePlan::widening`]）に出る。
+/// 対の側: 遷移先の宣言を取り消しても、辺は広がらない（材料は空）。
+#[test]
+fn unapproving_from_the_source_shows_the_edge_it_widens() {
+    use harness_policy::policy_file::ENTRY_DOMAIN;
+    use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
+
+    let mut entry = PolicyDomain::new(ENTRY_DOMAIN);
+    entry.fs.read.push("C:/Users/x/proj/**".to_string());
+    entry.process.transitions.push(editor_edge(
+        "C:/Users/x/tools/tool.exe",
+        ArgvMatcher::Any(AnyMarker),
+        "tool",
+    ));
+    let mut tool = PolicyDomain::new("tool");
+    tool.fs.read.push("C:/Users/x/proj/a.txt".to_string());
+    let ws = workspace_with(vec![entry, tool]);
+
+    let widening = plan(
+        ws.path(),
+        &[target(ENTRY_DOMAIN, SettingsKey::FsRead, "C:/Users/x/proj/**")],
+    )
+    .expect("plan")
+    .widening;
+    assert_eq!(widening.edges.len(), 1, "{widening:?}");
+    assert_eq!(widening.edges[0].from, ENTRY_DOMAIN);
+    assert_eq!(widening.edges[0].to, "tool");
+    assert_eq!(
+        widening.edges[0].newly_usable.fs,
+        vec![("C:/Users/x/proj/a.txt".to_string(), "read")]
+    );
+
+    let narrowing = plan(
+        ws.path(),
+        &[target("tool", SettingsKey::FsRead, "C:/Users/x/proj/a.txt")],
+    )
+    .expect("plan")
+    .widening;
+    assert!(narrowing.is_empty(), "{narrowing:?}");
+}

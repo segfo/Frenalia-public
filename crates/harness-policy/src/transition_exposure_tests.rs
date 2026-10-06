@@ -41,6 +41,24 @@ impl Decl {
         self
     }
 
+    /// Strict の印（決定66の追記）。
+    fn strict(mut self) -> Self {
+        self.0.strict = true;
+        self
+    }
+
+    /// 引数をリテラルにし、作業ディレクトリを宣言した辺（Strict の束を満たす形）。
+    fn fixed_edge(mut self, exe: &str, to: &str) -> Self {
+        self.0.process.transitions.push(TransitionEdge {
+            exe: ExeMatcher::Literal(exe.to_string()),
+            argv: ArgvMatcher::Literal(format!("\"{exe}\" --run")),
+            cwd: Some("C:/t".to_string()),
+            to: to.to_string(),
+            env: None,
+        });
+        self
+    }
+
     /// 任意の引数で`exe`を起こすと`to`へ移る辺（エディタが書く形）。
     fn edge(mut self, exe: &str, to: &str) -> Self {
         self.0.process.transitions.push(TransitionEdge {
@@ -254,6 +272,54 @@ fn an_edge_that_existed_before_reports_only_what_the_edit_added() {
                 newly_usable: rights(&[("C:/c/**", "read")], &[]),
             },
         ],
+    );
+}
+
+/// **Strict のドメインへ入る辺は、呼び出し元が子を通して使える権限に数えない**（決定66の追記。入力が固定されて
+/// いて、呼び出し元は子に決めた操作しかさせられない）。同じ形でも印が無ければ全部を数える（対）。
+#[test]
+fn an_edge_entering_a_strict_domain_hands_nothing_to_the_caller() {
+    let before = |logs: Decl| file(vec![Decl::new("a"), logs]);
+    let after = |logs: Decl| file(vec![Decl::new("a").fixed_edge("C:/t/analyze.exe", "logs"), logs]);
+    let logs = || Decl::new("logs").read("C:/logs/**");
+
+    let strict_after = after(logs().strict());
+    assert_eq!(newly(&strict_after, "a", "logs"), Rights::default());
+    assert!(delta(&before(logs().strict()), &strict_after, provisional_net_capable)
+        .edges
+        .is_empty());
+
+    let plain_after = after(logs());
+    let handed = rights(&[("C:/logs/**", "read")], &[]);
+    assert_eq!(newly(&plain_after, "a", "logs"), handed);
+    assert_eq!(
+        delta(&before(logs()), &plain_after, provisional_net_capable).edges,
+        vec![EdgeExposure {
+            from: "a".to_string(),
+            edge_index: 0,
+            to: "logs".to_string(),
+            newly_usable: handed,
+        }],
+    );
+}
+
+/// 遷移先の**先にある** Strict の辺も、届く範囲に数えない（閉包が Strict の辺を辿らない。§19.3.4 の付け替え）。
+/// 印が無ければ、固定してあるだけの辺の先も届く範囲に入る（対）。
+#[test]
+fn a_strict_edge_behind_the_destination_hands_nothing_behind_it() {
+    let policy = |logs: Decl| {
+        file(vec![
+            Decl::new("a").edge("C:/t/relay.exe", "relay"),
+            Decl::new("relay").fixed_edge("C:/t/analyze.exe", "logs"),
+            logs,
+        ])
+    };
+    let logs = || Decl::new("logs").read("C:/logs/**");
+
+    assert_eq!(newly(&policy(logs().strict()), "a", "relay"), Rights::default());
+    assert_eq!(
+        newly(&policy(logs()), "a", "relay"),
+        rights(&[("C:/logs/**", "read")], &[])
     );
 }
 

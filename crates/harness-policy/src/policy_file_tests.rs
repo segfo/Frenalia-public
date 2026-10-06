@@ -551,30 +551,31 @@ fn save_writes_a_policy_whose_transitions_pass_the_checks() {
     load(ws.path()).expect("and loads back");
 }
 
-/// **禁止側（対）**: 遷移先へ許可を足して辺が「広げる遷移」に変わったら、**何も書かない**。
+/// **禁止側（対）**: 辺はそのままでも、宣言の変更で既存の辺が検査に落ちるようになったら、**何も書かない**
+/// （BUG-188）。いまその形を作るのは遷移先に Strict の印を付けたとき（入る辺に入力の固定が要る。決定66の追記）。
 ///
 /// かつては検査せずに書いていたので、ファイル宣言の承認がこの形を作れた——書いた直後から
 /// `harness.exe`もエディタも`policy.json`を読めなくなり、手でJSONを直すしか戻す手段が無かった。
 /// 元のファイルが残っていること（上書きしていないこと）まで見る。
+///
+/// 遷移先へ許可を足して辺が「広げる遷移」に変わるだけなら、決定66から**書ける**（普通のモード。対）。
 #[test]
 fn save_refuses_a_policy_that_load_would_reject_and_leaves_the_file_alone() {
     let ws = workspace();
     save(ws.path(), &entry_with_an_edge_to_an_empty_domain()).expect("setup");
     let before = std::fs::read_to_string(path(ws.path())).unwrap();
 
-    let mut widened = load(ws.path()).expect("setup loads");
-    widened
+    let mut marked = load(ws.path()).expect("setup loads");
+    marked
         .domains
         .iter_mut()
         .find(|d| d.name == "iso")
         .unwrap()
-        .fs
-        .read
-        .push("C:/secrets/**".to_string());
+        .strict = true;
 
-    match save(ws.path(), &widened).expect_err("a widening edge without fixing must not be saved") {
+    match save(ws.path(), &marked).expect_err("an unfixed edge into a strict domain must not be saved") {
         PolicyFileError::WouldRejectTransitions { reason, .. } => assert!(
-            reason.contains("widens"),
+            reason.contains("is strict"),
             "the reason should be the checker's own words: {reason}"
         ),
         other => panic!("unexpected error: {other}"),
@@ -585,6 +586,19 @@ fn save_refuses_a_policy_that_load_would_reject_and_leaves_the_file_alone() {
         "the refused save overwrote policy.json"
     );
     load(ws.path()).expect("the file on disk must still load");
+
+    // 対: 遷移先へ許可を足して広げるだけなら書ける（決定66）。
+    let mut widened = load(ws.path()).expect("setup loads");
+    widened
+        .domains
+        .iter_mut()
+        .find(|d| d.name == "iso")
+        .unwrap()
+        .fs
+        .read
+        .push("C:/secrets/**".to_string());
+    save(ws.path(), &widened).expect("a widening edge saves in the ordinary mode");
+    load(ws.path()).expect("and loads back");
 }
 
 /// **直すために読む口（[`load_for_repair`]）は、遷移の検査に落ちる宣言も読み、落ちた理由を返す。**

@@ -101,6 +101,9 @@ pub struct ApprovePlan<'a> {
     pub classes: Vec<PathClass>,
     /// 拒否ではないが読んでおくべきこと（`gate`の警告）。
     pub warnings: Vec<String>,
+    /// この承認で広がる遷移（遷移先のドメインへ足すと、そこへの辺が呼び出し元へ渡す権限が増える。決定66）。
+    /// 確認の画面と CLI が[`crate::exposure_view::lines`]で並べる。
+    pub widening: crate::exposure_view::Widening,
 }
 
 impl ApprovePlan<'_> {
@@ -131,6 +134,7 @@ pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveErro
     )?;
 
     let mut file = policy_file::load(req.workspace_root)?;
+    let before = file.clone();
     let report = file.merge_approved(
         &accepted,
         &ApprovalContext {
@@ -148,6 +152,7 @@ pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveErro
         &accepted,
     ));
 
+    let widening = crate::exposure_view::widening(&before, &file, req.workspace_root);
     Ok(ApprovePlan {
         accepted,
         domain: req.domain,
@@ -155,6 +160,7 @@ pub fn plan<'a>(req: &ApproveRequest<'a>) -> Result<ApprovePlan<'a>, ApproveErro
         report,
         classes,
         warnings,
+        widening,
     })
 }
 

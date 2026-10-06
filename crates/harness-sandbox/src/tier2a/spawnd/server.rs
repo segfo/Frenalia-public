@@ -819,7 +819,7 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
     };
 
     // §8.3: 辺が`cwd`を宣言していれば**その値を渡す**（検査するだけでは足りない）。
-    // 宣言が無い辺は定義から「狭める／同値」なので、呼び出し元の実cwdをそのまま渡す。
+    // 宣言が無い辺は呼び出し元の実cwdをそのまま渡す（決定66(6)。広げる辺でも同じ——守る線は子のドメインの権限）。
     let effective_cwd = declared_cwd.unwrap_or(request.cwd);
     // [段階6f-1] 呼び出し元の申告を使うが、**harnessが所有する名前だけは系統の値で強制する**。
     let env = env_for_nested(&caller.base_env, request.env.as_deref(), env_policy);

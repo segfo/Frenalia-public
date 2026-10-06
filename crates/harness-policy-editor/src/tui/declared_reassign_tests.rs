@@ -285,3 +285,36 @@ fn approving_and_reassigning_the_same_row_carries_the_new_approval() {
     assert!(approved(&ws, FsAccess::ReadExec, REGISTRY), "{}", app.status);
     assert!(!approved(&ws, FsAccess::Read, REGISTRY));
 }
+
+/// [P5.3、決定66] **付け替えで遷移が広がるなら、確認に「広がる遷移」が出る**（`reassign_lines`が明細の材料
+/// ＝`ReassignPlan::widening`を並べる。材料の計算は`reassign_tests`が固定する）。
+#[test]
+fn reassign_lines_list_the_transitions_a_reassignment_widens() {
+    use crate::exposure_view::{WidenedEdge, Widening};
+    use harness_policy::transition_listing::Rights;
+
+    let plan = crate::reassign::ReassignPlan {
+        widening: Widening {
+            edges: vec![WidenedEdge {
+                from: "shell".to_string(),
+                exe: "C:/Users/x/tools/cargo.exe".to_string(),
+                to: "cargo".to_string(),
+                newly_usable: Rights {
+                    fs: vec![(SSH.to_string(), "read")],
+                    net: Vec::new(),
+                },
+            }],
+            uncounted: None,
+        },
+        ..Default::default()
+    };
+    let text = super::reassign_lines(&plan).join("\n");
+    assert!(text.contains("広がる遷移 1本"), "{text}");
+    assert!(text.contains("shell → cargo"), "{text}");
+    assert!(
+        !super::reassign_lines(&crate::reassign::ReassignPlan::default())
+            .iter()
+            .any(|l| l.contains("広がる遷移")),
+        "広がらない付け替えでは出さない"
+    );
+}

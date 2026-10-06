@@ -41,7 +41,7 @@ impl GraphFacts<'_> {
                         reason,
                     })
                 };
-                for reason in self.check_edge(view, index, edge) {
+                for reason in self.check_edge(view, edge) {
                     reject(reason);
                 }
                 // 同じリテラルの組が2本あると、解決規則の段1が1本に定まらない。
@@ -67,12 +67,7 @@ impl GraphFacts<'_> {
 
     /// 辺1本に対する検査。落ちた理由をすべて返す（最初の1件で打ち切らない——
     /// 直すたびに次の理由が出てくる形にすると、編集の周回が理由の数だけ増える）。
-    fn check_edge(
-        &self,
-        view: &DomainView<'_>,
-        edge_index: usize,
-        edge: &TransitionEdge,
-    ) -> Vec<String> {
+    fn check_edge(&self, view: &DomainView<'_>, edge: &TransitionEdge) -> Vec<String> {
         let mut reasons = Vec::new();
 
         // (h) 遷移先ドメイン名（§19.3.14）。
@@ -105,29 +100,33 @@ impl GraphFacts<'_> {
             }
         }
 
-        let direction = self.direction(view.name, edge_index, &edge.to);
-
-        // (g) パターン付きの辺は「狭める／同値」に限る（§19.3.5・§19.3.9）。
-        let has_pattern = matches!(edge.exe, ExeMatcher::Pattern(_))
-            || matches!(edge.argv, ArgvMatcher::Pattern(_));
-        if has_pattern && direction == Direction::WiderOrUnknown {
+        // (g) **実行ファイルの**パターンは「狭める／同値」の辺に限る（§19.3.5。決定66(7)で維持）。パターンが覆う場所に
+        // 呼び出し元が exe を置けると、広い遷移先で任意のコードが走る。**引数のパターンは広げる辺でも許す**
+        // （決定66(2)が§19.3.9の「狭める／同値に限る」を覆した。守る線は子のドメインの権限）。
+        // 寿命: 実行ファイルの同一性照合（§20項目7）が入った日に外す（決定66の「各項目の寿命」）。
+        if matches!(edge.exe, ExeMatcher::Pattern(_))
+            && self.direction(view.name, &edge.to) == Direction::WiderOrUnknown
+        {
             reasons.push(
-                "a pattern edge may only narrow or keep the same rights: the caller can usually \
-                 write somewhere the pattern covers, and then arbitrary code runs in the wider \
-                 domain. Declare the exact path, or make the target domain no wider than this one."
+                "an executable pattern may only narrow or keep the same rights: the caller can \
+                 usually write somewhere the pattern covers, and then arbitrary code runs in the \
+                 wider domain. Declare the exact path, or make the target domain no wider than \
+                 this one."
                     .to_string(),
             );
         }
 
-        // (e) 広げる／証明できない遷移は、呼び出し元支配の入力を固定する（§19.1）。
-        if direction == Direction::WiderOrUnknown && !is_fully_fixed(edge) {
-            reasons.push(
-                "this transition widens (or cannot be proven to narrow) the effective rights, so \
-                 every caller-controlled input must be fixed by the policy: declare argv as a \
-                 literal and declare cwd. Without that, allowing this edge hands the wider \
-                 domain's rights to the caller."
-                    .to_string(),
-            );
+        // (e) **Strict のドメインへ入る辺は、呼び出し元支配の入力を固定する**（決定66の追記）。旧(e)（§19.1。広げる／
+        // 証明できない辺は固定必須）の意味を、「広げるか」ではなく遷移先の Strict の印で掛ける——印の無いドメインへ
+        // 入る辺は広げても固定しなくてよい（決定66。守る線は子のドメインの権限）。印の判定は[`GraphFacts::enters_strict`]
+        // の1か所、束の形は[`is_fully_fixed`]の1か所が持つ。
+        if self.enters_strict(view.name, &edge.to) && !is_fully_fixed(edge) {
+            reasons.push(format!(
+                "target domain {:?} is strict, so every caller-controlled input of an edge entering \
+                 it must be fixed by the policy: declare argv as a literal and declare cwd. Without \
+                 that, the caller can make the strict domain do whatever it likes with its rights.",
+                edge.to
+            ));
         }
 
         // (d) 相対パスの引数を含む辺は`cwd`必須（§5.1(5)）。
@@ -228,9 +227,8 @@ impl GraphFacts<'_> {
             .iter()
             .map(|root| fold_for_pattern_comparison(root))
             .collect();
-        // ここは**辺を取り除かずに**数える。問いは向きではなく「この呼び出し元は、
-        // その固定値を書き換えられるか」なので、実際に届く範囲をそのまま見る。
-        let rights = self.rights_of(self.reachable_from(domain, None));
+        // 問いは「この呼び出し元は、その固定値を書き換えられるか」なので、実際に届く範囲（到達閉包）を見る。
+        let rights = self.rights_of(self.reachable_from(domain));
         for (value, access) in &rights.fs {
             if *access == FsAccess::ReadWrite {
                 roots.push(fold_for_pattern_comparison(

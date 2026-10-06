@@ -11,9 +11,11 @@
 //!
 //! # 部分適用しない
 //!
-//! 1件でも書けなければ何も書かない（`crate::approve`・`crate::transition_approve`と同じ判断）。とくに**広がる辺が
-//! 1本でもあれば全体を断る**——このエディタは入力（引数と作業ディレクトリ）を固定した辺を書かないので、広げる辺は
-//! 編集時検査に落ちる。**これは決定65(6) の暫定**で、入力を絞った遷移（P5）が入った日に外す。
+//! 1件でも書けなければ何も書かない（`crate::approve`・`crate::transition_approve`と同じ判断）。**広がる辺は書ける**
+//! （決定66。守る線は子のドメインの権限）——決定65(6) の暫定「広がる辺が1本でもあれば全体を断る」は P5.3 で外した。
+//! 代わりに確認の明細に「広がる遷移」と、呼び出し元が子を通して使えるようになる権限を出す（[`PositionPlan::widening`]）。
+//! いま書けない辺を作るのは Strict の印（入る辺に入力の固定が要り、このエディタは作業ディレクトリを宣言しない）などで、
+//! それが1本でもあれば全体を断る。
 //!
 //! # 判定は写さない（`B-13`）
 //!
@@ -157,6 +159,9 @@ pub struct PositionPlan {
     pub unapprove_not_found: Vec<UnapproveTarget>,
     /// `policy.json`に無かったので宣言の無いドメインとして作るもの（名前の順）。
     pub created_domains: Vec<String>,
+    /// この確定で広がる遷移（足す辺と、ファイルの宣言の承認・取り消しで渡す権限が増える既存の辺。決定66）。
+    /// [`confirmation_lines`]が[`crate::exposure_view::lines`]で並べる。
+    pub widening: crate::exposure_view::Widening,
 }
 
 impl PositionPlan {
@@ -289,6 +294,7 @@ pub fn plan(req: &PositionRequest<'_>) -> Result<PositionPlan, PositionApproveEr
 
     // (3) 読むのは1回。
     let mut file = policy_file::load(req.workspace_root)?;
+    let before = file.clone();
     let known_before: BTreeSet<String> = file.domains.iter().map(|d| d.name.clone()).collect();
 
     // (4) 取り消し（遷移元ごと。足すより先——同じ辺を消してから違う形で足し直せる）。
@@ -343,7 +349,6 @@ pub fn plan(req: &PositionRequest<'_>) -> Result<PositionPlan, PositionApproveEr
 
     // (6) 辺を遷移元ごとに足す。
     let (mut edges_added, mut already_declared) = (Vec::new(), Vec::new());
-    let mut added_at: Vec<(String, usize)> = Vec::new();
     let mut created_domains: Vec<String> = Vec::new();
     for from in distinct(req.edges.iter().map(|w| w.from_domain.as_str())) {
         let add: Vec<TransitionEdge> = req
@@ -369,7 +374,6 @@ pub fn plan(req: &PositionRequest<'_>) -> Result<PositionPlan, PositionApproveEr
                 edges_added.push((from.to_string(), edge));
             }
         }
-        added_at.extend(report.added.iter().map(|index| (from.to_string(), *index)));
         created_domains.extend(report.created_domains);
     }
 
@@ -441,8 +445,9 @@ pub fn plan(req: &PositionRequest<'_>) -> Result<PositionPlan, PositionApproveEr
         }
     }
 
-    // (9) 全部を足した後で1回だけ検査する。広げる辺が1本でもあれば全体を断る（決定65(6) の暫定）。
-    check_added(&file, req.workspace_root, &added_at)?;
+    // (9) 全部を足した後で1回だけ検査する。書けない辺（Strict のドメインへ入る辺など）が1本でもあれば全体を断る。
+    // 広がる辺は書ける（決定66）ので、ここでは断らずに明細の材料（`widening`）にする。
+    check_added(&file, req.workspace_root)?;
 
     // (10) 書いた後の判定器で、足した辺の起動が辺の遷移先に着くかを引き直す（P3b の注意2）。
     if !edges_added.is_empty() {
@@ -463,7 +468,9 @@ pub fn plan(req: &PositionRequest<'_>) -> Result<PositionPlan, PositionApproveEr
 
     created_domains.sort();
     created_domains.dedup();
+    let widening = crate::exposure_view::widening(&before, &file, req.workspace_root);
     Ok(PositionPlan {
+        widening,
         file,
         fs,
         warnings,
@@ -637,6 +644,8 @@ pub fn confirmation_lines(
     for warning in &plan.warnings {
         lines.push(format!("  ! {warning}"));
     }
+    // **広がる遷移は判断材料**（書くと呼び出し元の手に何が渡るか）なので、明細より先に出す。
+    lines.extend(crate::exposure_view::lines(&plan.widening));
     if !plan.created_domains.is_empty() {
         lines.push(String::new());
         lines.push(format!(

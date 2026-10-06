@@ -34,6 +34,14 @@
 //! 「宣言の上では用意されない」遷移先（通信を宣言している・許可が付かない宣言がある）は**断らずに書く**
 //! ——警告は画面が[`crate::transition_destination::Outlook`]で出す（`Startable`と同じ姿勢。
 //! 書けるが通らないことを見えるところへ出し、判断はユーザーに残す）。
+//!
+//! # 広げる遷移も書ける（2026-10-06、決定66。`plans/position-domains/P5.md`の P5.3）
+//!
+//! 遷移先が呼び出し元より広い権限に届く辺も、入力（引数・作業ディレクトリ）を固定せずに書ける——守る線は子の
+//! ドメインの権限（OSが強制する）である。決定65(6) の暫定（「P5 まで書けない」・`WidensWithoutFixing`）は外した。
+//! 書くと呼び出し元が子を通して何を使えるようになるかは、確認の画面が[`crate::exposure_view`]で見せる。
+//! 書けないのは Strict の印が付いたドメインへ入る辺（入力の固定が要り、このエディタは作業ディレクトリを宣言しない。
+//! 決定66の追記）で、検査の理由をそのまま[`TransitionApproveError::Rejected`]で返す。
 
 use std::path::Path;
 
@@ -181,18 +189,6 @@ pub enum TransitionApproveError {
     /// 遷移先の名前が、`harness.exe`の入れ物（AppContainerプロファイル）の名前にできない。
     #[error("遷移先ドメイン「{to_domain}」には書けません（何も書いていません）: {reason}")]
     DestinationName { to_domain: String, reason: String },
-    /// 足そうとした辺が「広げる遷移」で、固定（引数と作業ディレクトリ）が無いので検査に落ちた。
-    ///
-    /// **検査の理由をそのまま出すだけでは足りない**——検査は「argvをリテラルにしcwdを宣言せよ」と
-    /// 言うが、このエディタは作業ディレクトリを宣言しない（[`edge_for`]）ので、その直し方は取れない。
-    #[error(
-        "遷移先「{to_domain}」は、呼び出し元より広い権限に届く（または狭いと証明できない）ので、\
-         引数と作業ディレクトリを固定した遷移としてしか宣言できません。このエディタは作業ディレクトリを\
-         宣言しないので書けません（何も書いていません）。\n\
-         遷移先と、そこから辿れるドメインのファイル・通信の宣言を呼び出し元の宣言の範囲に収めるか、\
-         宣言を持たないドメインを遷移先にしてください。\n検査の理由:\n{detail}"
-    )]
-    WidensWithoutFixing { to_domain: String, detail: String },
     #[error(transparent)]
     PolicyFile(#[from] PolicyFileError),
 }
@@ -288,12 +284,7 @@ pub fn plan(req: &TransitionRequest<'_>) -> Result<TransitionPlan, TransitionApp
             added.push(target.clone());
         }
     }
-    let added_at: Vec<(String, usize)> = report
-        .added
-        .iter()
-        .map(|index| (req.from_domain.to_string(), *index))
-        .collect();
-    check_added(&file, req.workspace_root, &added_at)?;
+    check_added(&file, req.workspace_root)?;
 
     Ok(TransitionPlan {
         created_to_domain: report.created_domains.contains(&to_domain),
@@ -322,7 +313,7 @@ pub struct EdgeChanges<'a> {
 /// 区別する**（`B-09`。[`TransitionPlan`]と同じ理由）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EdgeChangeReport {
-    /// 足した辺の、遷移元の`transitions`への添字（[`EdgeChanges::add`]の順）。[`check_added`]へ渡す。
+    /// 足した辺の、遷移元の`transitions`への添字（[`EdgeChanges::add`]の順）。
     pub added: Vec<usize>,
     /// 足そうとしたが同じ`(exe, argv)`の辺が既にあった（[`EdgeChanges::add`]への添字）。
     pub already_declared: Vec<usize>,
@@ -410,10 +401,9 @@ pub fn apply_edge_changes(file: &mut PolicyFile, changes: &EdgeChanges<'_>) -> E
 
 /// 足した辺を書いた後の`file`を検査する（**書く前に検査する**——ここで落ちれば`policy.json`は元のままである）。
 ///
-/// [`transition::check_all`]（`policy_file::load`が読むたびに掛けている検査そのもの）に落ちたら、
-/// `added`（`(遷移元, transitions への添字)`）のうち広げる向きの辺があれば
-/// [`TransitionApproveError::WidensWithoutFixing`]（このエディタで取れる直し方を言い直す）、無ければ
-/// [`TransitionApproveError::Rejected`]。**向きの規則はここで書かない**——[`transition::edge_direction`]に聞く（`B-13`）。
+/// [`transition::check_all`]（`policy_file::load`が読むたびに掛けている検査そのもの）に落ちたら
+/// [`TransitionApproveError::Rejected`]（検査の理由をそのまま出す）。**広げる辺は落ちない**（決定66）——このエディタが
+/// 書く辺を落とすのは、Strict の印が付いたドメインへ入る辺（入力の固定が要る。決定66の追記）などである。
 ///
 /// **`policy.json`の外で書込を許した場所は空で渡す**——エディタはそれを知らない
 /// （`--fs-allow`はharnessの起動ごとの指定で、書く時点では原理的に分からない）。
@@ -421,11 +411,7 @@ pub fn apply_edge_changes(file: &mut PolicyFile, changes: &EdgeChanges<'_>) -> E
 /// （残課題 サンドボックス周辺 #65。`policy_file::load_for_session`のdoc）。
 /// **このエディタが書く辺は固定した遷移にならない**（`cwd`を宣言しない。[`edge_for`]）ので、
 /// 足した辺がそれで落ちることは無い（試験`an_edge_this_editor_writes_survives_the_writable_places_harness_adds`）。
-pub fn check_added(
-    file: &PolicyFile,
-    workspace_root: &Path,
-    added: &[(String, usize)],
-) -> Result<(), TransitionApproveError> {
+pub fn check_added(file: &PolicyFile, workspace_root: &Path) -> Result<(), TransitionApproveError> {
     let workspace = workspace_root.to_string_lossy();
     let input = file.transition_graph_input(Some(workspace.as_ref()), &[]);
     let rejected = match transition::check_all(&input) {
@@ -435,25 +421,7 @@ pub fn check_added(
     if rejected.is_empty() {
         return Ok(());
     }
-    let detail = rejected.join("\n");
-    // 足した辺が「広げる遷移」だったなら、このエディタで取れる直し方を言い直す（変種のdoc）。
-    let widening = added.iter().find(|(from, index)| {
-        matches!(
-            transition::edge_direction(&input, from, *index),
-            Ok(Some(transition::Direction::WiderOrUnknown))
-        )
-    });
-    Err(match widening {
-        Some((from, index)) => TransitionApproveError::WidensWithoutFixing {
-            to_domain: file
-                .domain(from)
-                .and_then(|domain| domain.process.transitions.get(*index))
-                .map(|edge| edge.to.clone())
-                .unwrap_or_default(),
-            detail,
-        },
-        None => TransitionApproveError::Rejected(detail),
-    })
+    Err(TransitionApproveError::Rejected(rejected.join("\n")))
 }
 
 /// 決まった内容を書く。**`false`は「書く必要が無かった」**（`B-09`）。

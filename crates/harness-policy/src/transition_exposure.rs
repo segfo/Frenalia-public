@@ -20,12 +20,17 @@
 //!   2本あると**互いを正当化して**「どちらも広げない」と出てしまうためである
 //! - 自己ループ辺は何も渡さない（子は呼び出し元と同じドメインで、子が辿れる辺は呼び出し元も自分で辿れる。
 //!   [`super::Direction::Same`]と同じ扱い）
+//! - **Strict の印が付いたドメインへ入る辺は何も渡さない**（決定66の追記。入力が固定されていて、呼び出し元は子に
+//!   決めた操作しかさせられない）。遷移先の先にある Strict の辺も、閉包が辿らないので数えない（§19.3.4 の付け替え）。
+//!   **向き（[`super::Direction`]）はこの除外を通さない**——子のドメインが広いことは変わらず、規則(g)（実行ファイルの
+//!   パターンは広げる辺で断る。決定66(7)）は Strict の辺にも掛かるためである。除外の持ち主は
+//!   [`GraphFacts::usable_through`]の1か所
 //!
 //! # ここで計算しないもの（判定を2つ持たない。`B-13`）
 //!
 //! - **到達閉包と権限の和**は[`super::GraphFacts`]の`reachable_from`・`rights_of`を呼ぶだけ——向きの判定・
-//!   [`super::rights_summary`]と同じもの。閉包が辿る辺の条件（今は固定辺を辿らない。P5.3 で strict の辺へ
-//!   付け替える）が変われば、ここも同時に従う
+//!   [`super::rights_summary`]と同じもの。閉包が辿る辺の条件（Strict の辺を辿らない。P5.3 で「書き方の形」から
+//!   付け替えた）が変われば、ここも同時に従う
 //! - **覆うか**は判定器の包含[`super::fs_covers`]、**場所が重なるか**は覆うかの唯一の規則
 //!   [`crate::insufficient::covers`]と、宣言値が開く範囲（[`crate::normalize::literal_prefix`]・
 //!   [`crate::normalize::declared_scope`]。付与層と同じ境目）を組むだけ
@@ -34,10 +39,6 @@
 //!
 //! # 限界（同じ場所に書く）
 //!
-//! - **Strict の辺（決定66の追記）をまだ区別しない。** Strict の辺は入力が固定されて呼び出し元が子を操れないので
-//!   「呼び出し元が子を通して使える権限」に数えない、と決めたが、その印（ドメインの`strict`）は P5.4a で足す。
-//!   閉包の側は`reachable_from`の付け替え（P5.3）で従い、遷移先そのものの印は、印が入った段で
-//!   [`GraphFacts::newly_usable_rights`]の先頭で見る
 //! - **宣言されていない遷移先には空を返す**（[`super::rights_summary`]と同じ）。向きの判定に使うときは、
 //!   未宣言を「証明できない」へ倒す判定（[`super::GraphFacts::direction`]の先頭）を先に通すこと
 //! - **組み合わせの書く側は、ドメインの宣言（`read_write`）だけを数える。** 宣言の外で書ける場所
@@ -107,7 +108,7 @@ pub fn newly_usable(
     to: &str,
 ) -> Result<crate::transition_listing::Rights, GraphError> {
     let facts = GraphFacts::new(input)?;
-    Ok(facts.newly_usable_rights(from, to).listed())
+    Ok(facts.usable_through(from, to).listed())
 }
 
 /// 変更（`before` → `after`）で、辺ごとに増えた「呼び出し元が子を通して使える権限」と、新しく生まれた
@@ -133,10 +134,10 @@ where
     for view in &after.domains {
         let before_view = before_facts.by_name.get(view.name);
         for (edge_index, edge) in view.process.transitions.iter().enumerate() {
-            let now = after_facts.newly_usable_rights(view.name, &edge.to);
+            let now = after_facts.usable_through(view.name, &edge.to);
             let added = match before_view {
                 Some(before_view) if before_view.process.transitions.contains(edge) => {
-                    subtract(now, &before_facts.newly_usable_rights(view.name, &edge.to))
+                    subtract(now, &before_facts.usable_through(view.name, &edge.to))
                 }
                 _ => now,
             };
@@ -171,12 +172,14 @@ pub fn provisional_net_capable(domain: &DomainView<'_>) -> bool {
 }
 
 impl<'a> GraphFacts<'a> {
-    /// [`newly_usable`]の本体。向きの判定（P5.3）もこれを呼ぶ——数え方を2つ持たない（`B-13`）。
+    /// 遷移先の届く範囲の権限 − 遷移元が自分で宣言している権限（モジュールdoc）。**向きの判定**
+    /// （[`GraphFacts::direction`]）と[`GraphFacts::usable_through`]がこれを呼ぶ——数え方を2つ持たない（`B-13`）。
+    /// 当の辺が Strict のドメインへ入るかは見ない（見るのは[`GraphFacts::usable_through`]）。
     pub(super) fn newly_usable_rights(&self, from: &str, to: &str) -> Rights<'a> {
         if from == to {
             return Rights::default();
         }
-        let reachable = self.rights_of(self.reachable_from(to, None));
+        let reachable = self.rights_of(self.reachable_from(to));
         let own = self.rights_of(
             self.by_name
                 .get_key_value(from)
@@ -186,10 +189,20 @@ impl<'a> GraphFacts<'a> {
         );
         subtract(reachable, &own)
     }
+
+    /// [`newly_usable`]・[`exposure_delta`]の本体: `from`から`to`へ入る辺で、**呼び出し元が子を通して**新しく使える
+    /// 権限。Strict の印が付いたドメインへ入る辺は空（決定66の追記。印の判定は[`GraphFacts::enters_strict`]の1か所）。
+    fn usable_through(&self, from: &str, to: &str) -> Rights<'a> {
+        if self.enters_strict(from, to) {
+            return Rights::default();
+        }
+        self.newly_usable_rights(from, to)
+    }
 }
 
 impl Rights<'_> {
-    fn is_empty(&self) -> bool {
+    /// 何も無いか（向きの判定〔[`super::GraphFacts::direction`]〕もこれで「狭める」を決める）。
+    pub(super) fn is_empty(&self) -> bool {
         self.fs.is_empty() && self.net.is_empty()
     }
 }
@@ -197,7 +210,7 @@ impl Rights<'_> {
 /// `minuend`のうち、`subtrahend`に**覆われない**ものだけを残す。
 ///
 /// 覆うかは判定器と同じ[`fs_covers`]・通信先の一致（`rights_of`が小文字へ畳んだ綴り）で見る。
-/// `super::rights_contained(inner, outer)`は「この差が空か」と同じ問いである。
+/// 「狭める」（[`super::Direction::Narrower`]）は「この差が空か」である（包含を別に書かない）。
 fn subtract<'a>(minuend: Rights<'a>, subtrahend: &Rights<'_>) -> Rights<'a> {
     Rights {
         fs: minuend

@@ -141,8 +141,9 @@ pub enum PolicyFileError {
     /// 書こうとした内容が、遷移の編集時検査に落ちる（書くと`harness.exe`もエディタも読めなくなる）。
     #[error(
         "policy.json を書いていません（{path}）——書くと遷移の宣言が検査に通らなくなり、\
-         harness.exe もエディタもこのファイルを読めなくなります（たとえば、遷移先のドメインへ\
-         許可を足した・遷移元から許可を外した結果、その遷移が広げる向きになったとき）。\
+         harness.exe もエディタもこのファイルを読めなくなります（たとえば、許可を足した・外した結果、\
+         実行ファイルをパターンで書いた遷移が広げる向きになったとき、固定した遷移の固定値を書ける場所に\
+         なったとき、Strict の印が付いたドメインへ入る遷移が入力を固定していないとき）。\
          先に該当する遷移の宣言を取り消してください: {reason}"
     )]
     WouldRejectTransitions { path: PathBuf, reason: String },
@@ -517,6 +518,7 @@ impl PolicyFile {
                         .map(|d| d.as_str())
                         .collect(),
                     process: &domain.process,
+                    strict: domain.strict,
                 })
                 .collect(),
             caller_writable_roots: workspace_root

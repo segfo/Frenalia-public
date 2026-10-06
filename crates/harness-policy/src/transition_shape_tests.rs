@@ -158,25 +158,30 @@ fn a_two_domain_cycle_is_unbounded() {
     assert!(self_loops(&policy.transition_graph_input(None, &[])).is_empty());
 }
 
-/// 固定辺の先の権限は届く範囲に数えない（§19.3.4。権限が渡らない）が、連鎖の段数には数える
-/// （起こせることに変わりはない）。
+/// Strict の辺（Strict の印が付いたドメインへ入る、入力を固定した辺）の先の権限は届く範囲に数えない（§19.3.4 を
+/// 決定66の追記で付け替えた。権限が呼び出し元へ渡らない）が、連鎖の段数には数える（起こせることに変わりはない）。
 #[test]
-fn a_fixed_edge_is_excluded_from_rights_but_counted_in_the_chain() {
-    let fixed = file(vec![
-        domain(
-            "a",
-            &[],
-            vec![fixed_edge_to(
-                "C:/tools/py.exe",
-                "py.exe C:/scripts/d.py",
-                "C:/scripts",
-                "b",
-            )],
-        ),
-        domain("b", &["C:/secret/**"], vec![]),
-    ]);
-    let input = fixed.transition_graph_input(None, &[]);
-    let from_a = shape_of(&fixed, "a");
+fn a_strict_edge_is_excluded_from_rights_but_counted_in_the_chain() {
+    let policy = |strict: bool| {
+        let mut b = domain("b", &["C:/secret/**"], vec![]);
+        b.strict = strict;
+        file(vec![
+            domain(
+                "a",
+                &[],
+                vec![fixed_edge_to(
+                    "C:/tools/py.exe",
+                    "py.exe C:/scripts/d.py",
+                    "C:/scripts",
+                    "b",
+                )],
+            ),
+            b,
+        ])
+    };
+    let strict = policy(true);
+    let input = strict.transition_graph_input(None, &[]);
+    let from_a = shape_of(&strict, "a");
     assert!(!has_read(&from_a, "C:/secret/**"), "{:?}", from_a.rights);
     assert!(from_a.reachable.is_empty(), "{:?}", from_a.reachable);
     assert_eq!(
@@ -188,7 +193,16 @@ fn a_fixed_edge_is_excluded_from_rights_but_counted_in_the_chain() {
     );
     assert_eq!(from_a.rights, rights_summary(&input, "a").unwrap());
 
-    // 対の側: 同じ辺を任意の引数にすると、権限が届き、届くドメインに入る。
+    // 対の側1: 同じ固定の辺でも、遷移先に印が無ければ普通の辺——権限が届き、届くドメインに入る
+    // （鍵は書き方の形ではなく印。決定66の追記）。
+    let merely_fixed = policy(false);
+    let input = merely_fixed.transition_graph_input(None, &[]);
+    let from_a = shape_of(&merely_fixed, "a");
+    assert!(has_read(&from_a, "C:/secret/**"), "{:?}", from_a.rights);
+    assert_eq!(from_a.reachable, names(&["b"]));
+    assert_eq!(from_a.rights, rights_summary(&input, "a").unwrap());
+
+    // 対の側2: 任意の引数の辺も同じく届く。
     let open = file(vec![
         domain("a", &[], vec![edge_to("C:/tools/py.exe", "b")]),
         domain("b", &["C:/secret/**"], vec![]),

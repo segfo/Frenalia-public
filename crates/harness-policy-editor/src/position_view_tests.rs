@@ -221,13 +221,14 @@ fn unassigned_instances_are_counted_by_reason_in_the_notes() {
     assert!(notes.contains("親が記録に無い起動 1件"), "{notes}");
 }
 
-/// **広げる辺は判定器（`edge_direction`）が答え、エディタは写さない**（`B-13`）。遷移先のドメインに呼び出し元の
-/// 持たないファイルを足して聞くと、その辺（とそこへ届く辺）は`Widens`で、文言は「P5まで書けません」
-/// （決定65(6) の暫定）。対の側: 足さなければ全部`Writable`（新しく提案したドメインは宣言を持たないので狭める向き）。
+/// **広げる辺は判定器（`transition::newly_usable`）が答え、エディタは写さない**（`B-13`）。遷移先のドメインに呼び出し元の
+/// 持たないファイルを足して聞くと、その辺（とそこへ届く辺）は`Widens`——**書ける**（決定66）で、呼び出し元が子を通して
+/// 使えるようになる権限を持ち、文言はそれを言う。対の側: 足さなければ全部`Writable`（新しく提案したドメインは宣言を
+/// 持たないので狭める向き）。
 ///
 /// **P4.3 の画面だけでは広げる行は作れない**——位置の遷移先は新しい名前で宣言が無い（既存の名前への付け替えは
 /// 断る）。ファイルの候補がドメインごとになる P4.4 で、選んだ候補を`extra_fs`として渡したときに初めて出る
-/// （画面の試験は P4.4 の`a_widening_position_says_it_cannot_be_written_until_p5`）。
+/// （画面の試験は`a_widening_position_can_be_reserved_and_says_what_it_hands_over`）。
 #[test]
 fn a_widening_position_is_judged_by_the_checker() {
     let ws = workspace();
@@ -255,21 +256,19 @@ fn a_widening_position_is_judged_by_the_checker() {
         FsAccess::Read,
     )];
     let widened = verdicts(&policy, ws.path(), &edges, &secret);
+    let handed = vec![("C:/secret/**".to_string(), "read")];
     assert!(
-        matches!(&widened[index_of("calc")], EdgeVerdict::Widens { detail } if !detail.is_empty()),
+        matches!(&widened[index_of("calc")], EdgeVerdict::Widens { newly } if newly.fs == handed),
         "{widened:?}"
     );
-    assert!(
-        widened[index_of("calc")]
-            .note()
-            .is_some_and(|note| note.contains("P5まで書けません")),
-        "{:?}",
-        widened[index_of("calc")].note()
-    );
+    assert!(widened[index_of("calc")].is_writable(), "広げる辺は書ける（決定66）");
+    let note = widened[index_of("calc")].note().unwrap_or_default();
+    assert!(note.contains("広げる") && note.contains("ファイル1件"), "{note}");
+    assert!(!note.contains("P5まで"), "{note}");
     // pwsh へ遷移すると calc まで届くので、入口のドメインから pwsh への辺も広げる向きになる（閉包で数える、§19.3.4）。
     assert!(matches!(
-        widened[index_of("pwsh")],
-        EdgeVerdict::Widens { .. }
+        &widened[index_of("pwsh")],
+        EdgeVerdict::Widens { newly } if newly.fs == handed
     ));
     assert_eq!(widened[index_of("mspaint")], EdgeVerdict::Writable);
     assert_eq!(

@@ -901,8 +901,8 @@ fn run_unapprove(
             plan.emptied_domains.join(", ")
         );
     }
-    println!();
-    println!("{}", harness_policy_editor::unapprove::ACE_NOTICE);
+    harness_policy_editor::exposure_view::lines(&plan.widening).iter().for_each(|l| println!("{l}"));
+    println!("\n{}", harness_policy_editor::unapprove::ACE_NOTICE);
 
     if plan.is_empty() {
         return if plan.not_found.is_empty() {

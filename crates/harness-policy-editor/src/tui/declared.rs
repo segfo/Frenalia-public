@@ -389,6 +389,8 @@ impl App {
                     .to_string(),
             );
         }
+        // 遷移元の宣言を外すと、その遷移元から出る辺が広がり得る（決定66。付け替えの分は`reassign_lines`が出す）。
+        lines.extend(crate::exposure_view::lines(&plan.widening));
         if !plan.removed.is_empty() {
             lines.push(String::new());
             // 文言の持ち主は`unapprove`（表示側で書き写さない）。

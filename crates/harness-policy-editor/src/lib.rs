@@ -103,6 +103,9 @@ pub mod audit_tail;
 pub mod exclusion;
 /// パス2の実行前に「そのコマンドの実行ファイルへ届くか」を測る（純粋関数、警告のみ）。
 pub mod exec_reach;
+/// 確定の明細に**広がる遷移**（書くと呼び出し元が子を通して新しく使えるようになる権限）を出す（決定66、P5.3）。
+/// 数えるのは`harness_policy::transition::exposure_delta`で、ここは並べるだけ。
+pub mod exposure_view;
 pub mod net_aggregate;
 /// 記録したプロセスの木から、承認待ちの「遷移・観測から」に出す**位置の木**と、各位置の辺を書けるかの見込み
 /// （決定65、P4.3）。判定は`harness_policy`の判定器に聞く。行ごとの「起こせるか」が[`transition_candidates`]の

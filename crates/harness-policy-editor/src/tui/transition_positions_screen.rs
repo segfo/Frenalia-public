@@ -268,10 +268,19 @@ fn notes_text(app: &App, positions: &PositionsState) -> String {
                 text.push('\n');
             }
         }
-        if let Some(EdgeVerdict::Widens { detail } | EdgeVerdict::Rejected { detail }) =
-            positions.verdicts.get(index)
-        {
-            text.push_str(&format!("書けない理由（検査）: {detail}\n"));
+        match positions.verdicts.get(index) {
+            Some(EdgeVerdict::Rejected { detail }) => {
+                text.push_str(&format!("書けない理由（検査）: {detail}\n"));
+            }
+            // 広げる辺は書ける（決定66）。書くと呼び出し元が子を通して使えるようになる権限そのものを出す。
+            Some(EdgeVerdict::Widens { newly }) => {
+                text.push_str("広げる遷移——書くと、呼び出し元は子を通して次の権限を使えるようになります:\n");
+                for line in crate::exposure_view::rights_lines(newly, "  ") {
+                    text.push_str(&line);
+                    text.push('\n');
+                }
+            }
+            _ => {}
         }
         text.push_str(&format!(
             "選択中: {} から {}（→ {}）\n",

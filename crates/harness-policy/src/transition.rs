@@ -179,6 +179,10 @@ pub struct DomainView<'a> {
     /// このドメインが宣言している通信先。
     pub net: Vec<&'a str>,
     pub process: &'a TransitionRules,
+    /// **Strict の印**（`policy.json`のドメインの`strict`。決定66の追記）。真なら、このドメインへ入る辺は
+    /// 入力を固定しなければ書けず（編集時検査）、固定した辺は到達閉包で辿らない（呼び出し元が子を操れないので、
+    /// 子の権限が呼び出し元へ渡らない）。印の効かせ方はここ（[`GraphFacts::enters_strict`]）が唯一の持ち主である。
+    pub strict: bool,
 }
 
 /// 検査・構築の入力一式。
@@ -252,23 +256,31 @@ impl std::error::Error for GraphError {}
 // 向きと、固定されているか
 // ---------------------------------------------------------------------------
 
-/// 遷移の向き（§19.1）。
+/// 遷移の向き（決定66の「表示用の向きの定義」。`plans/POLICY-EDITOR-TOMOYO-DIG.md`）。
 ///
-/// # 比べるのは「その辺が無かったとしたら」である
+/// # 比べるのは「遷移先の届く範囲」と「遷移元が自分で宣言している権限」である
 ///
-/// 有効権限は到達閉包で数える（§19.3.4）が、**判定する当の辺を含んだまま比べてはならない**。
-/// 含めると遷移元の閉包が遷移先の閉包を必ず飲み込むので、**どんな辺も「狭める」に見える**
-/// ——検査が常に通る、つまり何も検査していないのと同じになる。
+/// 遷移先の側は到達閉包（§19.3.4。Strict の辺は辿らない）の権限の和、遷移元の側は**自分の宣言だけ**で数え、
+/// 前者が後者に覆われなければ「広げる」（[`GraphFacts::newly_usable_rights`]が空でない）。遷移元を自分の宣言だけで
+/// 数えるのは決定65(5)（親は自分が触った分だけを持つ）に沿うためで、**閉包から当の辺を除いて数える旧来の方式は
+/// 採らない**——同じ遷移先への辺が2本あると互いを正当化して「どちらも広げない」と出てしまう。
+/// §19.1が挙げる中継ドメインの罠（FSは狭いが広いドメインへの辺を持つドメインを1枚挟む）は、遷移先の側を閉包で
+/// 数えるので落ちる。
 ///
-/// したがって遷移元の側は**その辺を取り除いたグラフ**で数える。問いは
-/// 「**この辺を足すと、遷移元は新しく何かへ手が届くようになるか**」である。
-/// §19.1が挙げる中継ドメインの罠（FSは狭いが広いドメインへの辺を持つドメインを1枚挟む）は、
-/// この数え方で落ちる——中継の閉包には広い権限が入っているからである。
+/// # 何に使うか（**決定66で「広げる」は書けなくなる理由ではなくなった**）
+///
+/// 広げる辺も入力を固定せずに書ける（守る線は子のドメインの権限。決定66）。向きを使うのは、規則(g)
+/// （実行ファイルのパターンは広げる辺で断る。決定66(7)）・表示（エディタ）・ハンドルの引き継ぎの式
+/// （[`Allowed::inherit_handles`]。P5.4b で辺ごとの出力の設定へ付け替える）である。
+///
+/// **Strict の辺も向きはそのまま数える**——呼び出し元が子を通して使える権限（[`newly_usable`]）には数えないが、
+/// 子のドメインが広いことに変わりはなく、規則(g)の理由（パターンが覆う場所に置いた別の exe が広いドメインで走る）は
+/// Strict でも残るためである。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// 遷移先＝遷移元。**既定でそのまま許可してよい**（§19.1の1行目）。
     Same,
-    /// 遷移先の有効権限が遷移元の有効権限に含まれることを**証明できた**。
+    /// 遷移先の届く範囲の権限が、遷移元が自分で宣言している権限に覆われることを**証明できた**。
     Narrower,
     /// 広げる、または**証明できなかった**。§19.1の3行目はこの2つを同じ扱いにしている
     /// ——判定できないものを「広げない」側へ倒すと、実装時に無言のfail-openになるためである。
@@ -296,13 +308,17 @@ pub enum EnvPolicy {
 pub struct Allowed<'a> {
     pub to: &'a str,
     /// `lpCurrentDirectory`へ渡す値。`None`なら呼び出し元の実cwdをそのまま渡す
-    /// （§8.3。cwd宣言が要らない辺は定義から「狭める／同値」で、詐称して得られる権限が無い）。
+    /// （§8.3。決定66(6): 作業ディレクトリを宣言しない辺は、広げる辺でも呼び出し元の場所を引き継ぐ）。
     pub cwd: Option<&'a str>,
     pub env: &'a EnvPolicy,
     /// 呼び出し元のハンドル（stdioを含む）を引き継がせてよいか。
     ///
     /// **`false`なら、Daemonは自分で作ったもの以外を1つも渡してはならない**（§19.1）。
     /// stdinも同様に断つ——固定argvのシェルは、stdinが端末でなければそこからコマンドを読む。
+    ///
+    /// 式は「固定していない、かつ広げない」（[`TransitionGraph::build`]）で、**P5.3（決定66）では据え置いた**——
+    /// 固定していない広げる辺も書けるようになったが、その辺の子には呼び出し元の標準入出力を渡さない（安全側）。
+    /// P5.4b で辺ごとの出力の設定と Strict の印へ付け替える（`plans/position-domains/P5.md`）。
     ///
     /// # 誰が従うのか（**2026-09-20まで誰も従っていなかった**）
     ///
@@ -323,9 +339,10 @@ pub struct Allowed<'a> {
     ///
     /// # なぜ`inherit_handles`から読み取らせないのか
     ///
-    /// 今は「`inherit_handles == false` ⇔ 固定辺」が成り立つが、それは編集時検査が
-    /// 「広げる辺は固定必須」を課している**結果**であって、型が保証していない。
-    /// 読み手が裏の事情に頼ると、検査の規則が変わった日に黙って外れる。
+    /// かつては「`inherit_handles == false` ⇔ 固定辺」が成り立っていたが、それは編集時検査が
+    /// 「広げる辺は固定必須」を課していた**結果**であって、型が保証していなかった。**実際に P5.3（決定66）で
+    /// 崩れた**——固定していない広げる辺も書けるようになり、その辺は`inherit_handles == false`かつ`fixed == false`
+    /// である。読み手が裏の事情に頼っていたら、ここで黙って外れていた。
     pub fixed: bool,
 }
 
@@ -467,8 +484,8 @@ impl TransitionGraph {
         let mut domains = BTreeMap::new();
         for view in &input.domains {
             let mut edges = Vec::with_capacity(view.process.transitions.len());
-            for (edge_index, edge) in view.process.transitions.iter().enumerate() {
-                let direction = facts.direction(view.name, edge_index, &edge.to);
+            for edge in &view.process.transitions {
+                let direction = facts.direction(view.name, &edge.to);
                 let fixed = is_fully_fixed(edge);
                 edges.push(CompiledEdge {
                     // `compile_matcher`は検査が通った後にしか呼ばれないので、
@@ -569,11 +586,9 @@ pub fn check_all(input: &GraphInput<'_>) -> Result<Vec<Rejection>, GraphError> {
     Ok(GraphFacts::new(input)?.check_all())
 }
 
-/// `from`の`edge_index`番目の辺の向き（§19.1・§19.3.4）。**検査に落ちる宣言でも答える**
+/// `from`の`edge_index`番目の辺の向き（[`Direction`]）。**検査に落ちる宣言でも答える**
 /// （[`TransitionGraph::build`]を通さない）。辺が無ければ`None`。
 ///
-/// 検査に落ちた理由を**人へ説明し直す**ために使う——ポリシーエディタは作業ディレクトリを宣言しない
-/// ので、「広げる遷移は固定が要る」と言われても直しようが無く、別の言い方が要る。
 /// **向きの規則はここで書かない。** [`GraphFacts::direction`]ただ1つを呼ぶ（`B-13`）。
 pub fn edge_direction(
     input: &GraphInput<'_>,
@@ -589,7 +604,7 @@ pub fn edge_direction(
     else {
         return Ok(None);
     };
-    Ok(Some(facts.direction(from, edge_index, &edge.to)))
+    Ok(Some(facts.direction(from, &edge.to)))
 }
 
 /// 固定辺で**固定したファイル**（起こす実行ファイルと、`argv[0]`以降の絶対パスらしいトークン）を、
@@ -622,7 +637,7 @@ pub fn rights_summary(
     domain: &str,
 ) -> Result<crate::transition_listing::Rights, GraphError> {
     let facts = GraphFacts::new(input)?;
-    Ok(facts.rights_of(facts.reachable_from(domain, None)).listed())
+    Ok(facts.rights_of(facts.reachable_from(domain)).listed())
 }
 
 /// 検査と向きの判定が共有する、グラフから導かれる事実。
@@ -664,10 +679,11 @@ impl<'a> GraphFacts<'a> {
         Ok(Self { input, by_name })
     }
 
-    /// `from`の`edge_index`番目の辺が向いている向き（§19.1・§19.3.4）。
+    /// `from`から`to`へ入る辺が向いている向き（[`Direction`]のdoc）。
     ///
-    /// 遷移元の側は**その辺を取り除いて**数える（[`Direction`]のdoc）。
-    fn direction(&self, from: &str, edge_index: usize, to: &str) -> Direction {
+    /// 遷移先の届く範囲が、遷移元が自分で宣言している権限に覆われるか（[`GraphFacts::newly_usable_rights`]が空か）
+    /// で決める——数え方を[`newly_usable`]と2つ持たない（`B-13`）。
+    fn direction(&self, from: &str, to: &str) -> Direction {
         if from == to {
             return Direction::Same;
         }
@@ -675,23 +691,39 @@ impl<'a> GraphFacts<'a> {
             // 片方が宣言されていないなら証明できない。**保守側へ倒す**（§19.1の3行目）。
             return Direction::WiderOrUnknown;
         }
-        let from_rights = self.rights_of(self.reachable_from(from, Some((from, edge_index))));
-        let to_rights = self.rights_of(self.reachable_from(to, None));
-        if rights_contained(&to_rights, &from_rights) {
+        if self.newly_usable_rights(from, to).is_empty() {
             Direction::Narrower
         } else {
             Direction::WiderOrUnknown
         }
     }
 
+    /// `from`から`to`へ入る辺が**Strict の印が付いたドメインへ入る**か（決定66の追記。印の判定の唯一の持ち主——
+    /// 規則(e)・閉包・呼び出し元が使える権限の3つがこれを呼ぶ）。
+    ///
+    /// **自己ループ辺は入る辺に数えない**——呼び出し元は既にそのドメインに居て、印が守る権利を自分で持っている
+    /// （[`Direction::Same`]・[`newly_usable`]の自己ループと同じ扱い）。
+    fn enters_strict(&self, from: &str, to: &str) -> bool {
+        from != to && self.by_name.get(to).is_some_and(|view| view.strict)
+    }
+
+    /// **Strict の辺**＝Strict のドメインへ入り、入力（引数・作業ディレクトリ）を固定した辺。到達閉包はこれを辿らない。
+    ///
+    /// 固定していない Strict のドメインへの辺は編集時検査が断る（規則(e)）が、検査に落ちる宣言でも答える関数
+    /// （[`shape`]・[`rights_summary`]）のために、ここでも固定を確かめる——入力が本当に固定されていなければ
+    /// 呼び出し元は子を操れるので、辿らない理由（§19.3.4）が成り立たない。
+    fn is_strict_edge(&self, from: &str, edge: &TransitionEdge) -> bool {
+        self.enters_strict(from, &edge.to) && is_fully_fixed(edge)
+    }
+
     /// `start`から辿れるドメインの集合（自分自身を含む）。
     ///
-    /// **固定辺は辿らない**（[`is_fully_fixed`]のdoc）。**閉路があっても止まる**——
-    /// 訪問済みを持つ素朴な深さ優先探索なので、§19.3.2のcollapse（自己ループ辺）を
+    /// **Strict の辺は辿らない**（[`GraphFacts::is_strict_edge`]。§19.3.4 の「閉包は固定辺を辿らない」を、
+    /// 決定66の追記で「書き方の形」から「Strict の辺」へ付け替えた——入力が固定され呼び出し元が子を操れないので、
+    /// その先の権限は呼び出し元へ渡らない）。印の無いドメインへの辺は、固定してあっても辿る。
+    /// **閉路があっても止まる**——訪問済みを持つ素朴な深さ優先探索なので、§19.3.2のcollapse（自己ループ辺）を
     /// 禁じる必要が無い（§19.3.1の限定詞）。
-    ///
-    /// `skip`は「この辺だけ無かったことにする」指定で、向きの判定に使う。
-    fn reachable_from(&self, start: &str, skip: Option<(&str, usize)>) -> BTreeSet<&'a str> {
+    fn reachable_from(&self, start: &str) -> BTreeSet<&'a str> {
         let mut seen: BTreeSet<&'a str> = BTreeSet::new();
         let mut stack: Vec<&'a str> = Vec::new();
         if let Some((name, _)) = self.by_name.get_key_value(start) {
@@ -704,8 +736,8 @@ impl<'a> GraphFacts<'a> {
             let Some(view) = self.by_name.get(current) else {
                 continue;
             };
-            for (index, edge) in view.process.transitions.iter().enumerate() {
-                if skip == Some((current, index)) || is_fully_fixed(edge) {
+            for edge in &view.process.transitions {
+                if self.is_strict_edge(current, edge) {
                     continue;
                 }
                 if let Some((target, _)) = self.by_name.get_key_value(edge.to.as_str()) {
@@ -732,15 +764,6 @@ impl<'a> GraphFacts<'a> {
         }
         rights
     }
-}
-
-/// `inner ⊆ outer` を**証明できたか**。証明できないときは`false`（§19.1の3行目）。
-fn rights_contained(inner: &Rights<'_>, outer: &Rights<'_>) -> bool {
-    inner.net.iter().all(|d| outer.net.contains(d))
-        && inner
-            .fs
-            .iter()
-            .all(|needed| outer.fs.iter().any(|granted| fs_covers(granted, needed)))
 }
 
 /// `granted`が`needed`を覆うか。**覆うと証明できるときだけ`true`**。
@@ -789,24 +812,21 @@ fn path_covered_by(root: &str, path: &str) -> bool {
 // 辺そのものの性質
 // ---------------------------------------------------------------------------
 
-/// 呼び出し元支配の入力が**全部**固定されている辺か。
+/// 呼び出し元支配の入力が**全部**固定されている辺か（argvがリテラルで、cwdが宣言されている）。
 ///
-/// # なぜ構文だけで決めるのか
+/// # 何に使うか（決定66の追記で鍵が変わった）
 ///
-/// §19.1は「広げる遷移は固定を必須にする」と定め、§19.3.4は「固定辺は到達閉包から除外する」と
-/// 定めている。**この2つを素直に読むと循環する**——向きを知るには閉包が要り、閉包を計算するには
-/// どの辺が固定かを知る必要がある。
+/// かつては「広げる遷移は固定必須」（§19.1）と「固定辺は到達閉包から除外」（§19.3.4）の両方がこの形を鍵にして
+/// いた。決定66で広げる辺の固定必須を外し、追記で**鍵を Strict の印へ付け替えた**——いまこの形は
+/// **Strict の束の定義**（Strict のドメインへ入る辺が満たすべき形。規則(e)・[`GraphFacts::is_strict_edge`]）として
+/// 使う。固定は構文だけで決める（向きを知るには閉包が要り、閉包はどの辺を辿るかを知る必要があるので、
+/// 形を構文で決めて循環を断つ）。
 ///
-/// **循環を断つために、固定は構文だけで決める**（argvがリテラルで、cwdが宣言されている）。
-/// そのうえで、**この条件を満たす辺は向きに関わらずstdinと継承ハンドルも断つ**
-/// （[`Allowed::inherit_handles`]が`false`になる）。
-///
-/// **断たないと閉包の除外が不健全になる**——呼び出し元がstdinでコードを渡せるなら、
-/// その辺は権限を受け渡しているので数えなければならない。
-///
-/// **代償**: 狭める辺でもリテラルargvを書いた瞬間にstdioの引き継ぎが消える。
-/// 逃げ道は`argv: any`の辺で、粒度と引き継ぎのどちらを取るかをユーザーが選べる
-/// （§19.1が「逃げ道は`argv: any`の辺」と書いているのと同じ形）。
+/// **この段（P5.3）ではまだ形そのものを鍵にしている箇所が3つ残る**——規則(i)（固定値の書込可否）・
+/// [`Allowed::fixed`]（Daemon の起こす直前の検査）・[`Allowed::inherit_handles`]の式で、P5.4a・P5.4b で
+/// Strict の印へ付け替える（`plans/position-domains/P5.md`）。この条件を満たす辺は向きに関わらず
+/// stdinと継承ハンドルも断つ（Strict の辺で閉包の除外を健全にするため——呼び出し元がstdinでコードを
+/// 渡せるなら、その辺は権限を受け渡している）。
 fn is_fully_fixed(edge: &TransitionEdge) -> bool {
     matches!(edge.argv, ArgvMatcher::Literal(_)) && edge.cwd.is_some()
 }

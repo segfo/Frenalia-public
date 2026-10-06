@@ -23,14 +23,15 @@
 //!
 //! # 最長の連鎖は全部の辺を数える
 //!
-//! 固定辺（argv・cwd を全部固定した辺）は到達閉包から外れる（§19.3.4）——**権限が呼び出し元へ渡らない**
-//! からである。起こせないからではない。連鎖の段数が問うのは「何回続けて起こせるか」なので、固定辺も、
+//! Strict の辺（Strict の印が付いたドメインへ入る、argv・cwd を全部固定した辺。決定66の追記）は到達閉包から外れる
+//! （§19.3.4 を「書き方の形」から付け替えた）——**権限が呼び出し元へ渡らない**からである。起こせないからではない。
+//! 印の無いドメインへの辺は、固定してあっても閉包に入る。連鎖の段数が問うのは「何回続けて起こせるか」なので、Strict の辺も、
 //! 宣言されていない遷移先への辺も1段に数える。閉路は禁じていない（§19.3.1 の限定詞。§19.3.2 の
 //! collapse＝自己ループ辺は閉路そのもの）ので、起点から閉路へ届けば**上限なし**と答え、その閉路を返す。
 //!
 //! # 限界
 //!
-//! - 「起動で届くドメイン」は到達閉包そのもの（権限を数えた範囲と同じ集合）なので、**固定辺の先と、
+//! - 「起動で届くドメイン」は到達閉包そのもの（権限を数えた範囲と同じ集合）なので、**Strict の辺の先と、
 //!   宣言されていない遷移先は入らない**。それらは最長の連鎖の経路には現れる
 //! - 段数はドメインの段数である。同じドメインの中で何本のプロセスが走るか（資源）は範囲外（§19.3.6）
 
@@ -42,10 +43,10 @@ use super::{rights_summary, GraphError, GraphFacts, GraphInput};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransitionShape {
     /// 届く範囲の権限。**[`super::rights_summary`]と同じ値**（モデル向けのツールと同じ）。
-    /// 固定辺の先は入らない（§19.3.4）。
+    /// Strict の辺の先は入らない（§19.3.4）。
     pub rights: crate::transition_listing::Rights,
     /// 起動で届くドメイン（自分を除く・名前の順）。**到達閉包そのもの**で、権限を数えた範囲と同じ集合。
-    /// 固定辺の先と、宣言されていない遷移先は入らない（モジュールdocの限界）。
+    /// Strict の辺の先と、宣言されていない遷移先は入らない（モジュールdocの限界）。
     pub reachable: Vec<String>,
     pub longest_chain: LongestChain,
 }
@@ -53,7 +54,7 @@ pub struct TransitionShape {
 /// 起点から続けて起こせる遷移の段数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LongestChain {
-    /// 起点から閉路へ届かない。`path[0]`が起点で`path.len() == steps + 1`。**固定辺も数える**。
+    /// 起点から閉路へ届かない。`path[0]`が起点で`path.len() == steps + 1`。**Strict の辺も数える**。
     /// 同じ段数の経路が2つ以上あれば、宣言の順で先の辺を採る。
     Finite { steps: usize, path: Vec<String> },
     /// 起点から閉路へ届く（自己ループ辺を含む）。`cycle`はその閉路のドメインを順に並べたもの
@@ -77,7 +78,7 @@ pub fn shape(input: &GraphInput<'_>, from: &str) -> Result<TransitionShape, Grap
     let facts = GraphFacts::new(input)?;
     let rights = rights_summary(input, from)?;
     let reachable = facts
-        .reachable_from(from, None)
+        .reachable_from(from)
         .into_iter()
         .filter(|name| *name != from)
         .map(str::to_string)
@@ -120,7 +121,7 @@ fn longest_chain(facts: &GraphFacts<'_>, from: &str) -> LongestChain {
         successors: Vec<String>,
         cursor: usize,
     }
-    // 遷移先を宣言の順で、重複を除いて。**固定辺も数える**（モジュールdoc）。
+    // 遷移先を宣言の順で、重複を除いて。**Strict の辺も数える**（モジュールdoc）。
     // 宣言されていないドメインは辺を持たない。
     let successors = |name: &str| -> Vec<String> {
         let mut out: Vec<String> = Vec::new();

@@ -980,15 +980,39 @@ fn two_denials_from_two_domains_are_written_with_one_save() {
         vec![(WHOAMI.to_string(), "tool".to_string())]
     );
 
-    // 対の側: 遷移先 wide は C:/secret/** を読む。pwsh は同じものを読むので狭める向き、入口のドメインは読まないので
-    // 広げる向き。1回の確定なので、pwsh の辺も書かれない。
-    let other = tempfile::tempdir().unwrap();
+    // 遷移先 wide は C:/secret/** を読む。pwsh は同じものを読むので狭める向き、入口のドメインは読まないので
+    // 広げる向き。広げる辺も書ける（決定66）ので、1回の確定で両方が書かれ、確認に広がる遷移が出る。
     let reading = |name: &str| {
         let mut domain = PolicyDomain::new(name);
         domain.fs.read.push("C:/secret/**".to_string());
         domain
     };
-    save_domains(other.path(), vec![reading("pwsh"), reading("wide")]);
+    let widening = tempfile::tempdir().unwrap();
+    save_domains(widening.path(), vec![reading("pwsh"), reading("wide")]);
+    write_denials(
+        widening.path(),
+        &[(Some("pwsh"), HOSTNAME, "hostname"), (Some(ENTRY_DOMAIN), WHOAMI, "whoami")],
+    );
+    let mut app = denied_tab(widening.path());
+    for (from, exe) in [(Some("pwsh"), HOSTNAME), (Some(ENTRY_DOMAIN), WHOAMI)] {
+        select_denial(&mut app, from, exe);
+        press(&mut app, KeyCode::Char(' '));
+    }
+    app.pending.destination.input = TextInput::new("wide");
+    press(&mut app, KeyCode::Char('a'));
+    let lines = app.modal.as_ref().map(|m| m.lines.join("\n")).unwrap_or_default();
+    assert!(lines.contains("広がる遷移 1本"), "{lines}");
+    app.modal = None;
+    app.commit_transition();
+    assert_eq!(edges_of(widening.path(), "pwsh").len(), 1, "{}", app.status);
+    assert_eq!(edges_of(widening.path(), ENTRY_DOMAIN).len(), 1, "{}", app.status);
+
+    // 対の側: wide に Strict の印があると、入る辺は入力の固定が要り、このエディタは書けない（決定66の追記）。
+    // 1回の確定なので、どちらの辺も書かれず policy.json は1バイトも変わらない。
+    let other = tempfile::tempdir().unwrap();
+    let mut strict = reading("wide");
+    strict.strict = true;
+    save_domains(other.path(), vec![reading("pwsh"), strict]);
     let before = std::fs::read(policy_file::path(other.path())).unwrap();
     write_denials(
         other.path(),

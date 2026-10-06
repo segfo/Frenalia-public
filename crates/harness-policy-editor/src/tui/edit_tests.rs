@@ -226,10 +226,52 @@ fn pressing_approve_shows_the_diff_without_writing_anything() {
         "マシンに残る変更があるかどうかが承認の判断材料: {:?}",
         modal.lines
     );
+    // 遷移が1本も無いので、広がる遷移は出ない（`approving_into_a_transition_destination_lists_the_widened_edge`の対）。
+    assert!(
+        !modal.lines.iter().any(|l| l.contains("広がる遷移")),
+        "{:?}",
+        modal.lines
+    );
     assert!(
         !crate::policy_file::path(ws.path()).exists(),
         "確認前に書いてはいけない"
     );
+}
+
+/// [P5.3、決定66] **遷移の遷移先になっているドメインへ承認すると、その遷移が呼び出し元へ新しく渡す権限が確認に出る**
+/// （広げる遷移は書ける。書く前に、承認で何が呼び出し元の手に渡るかを読ませる）。
+#[test]
+fn approving_into_a_transition_destination_lists_the_widened_edge() {
+    use harness_policy::policy_file::ENTRY_DOMAIN;
+    use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
+
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+    let mut entry = crate::policy_file::PolicyDomain::new(ENTRY_DOMAIN);
+    entry.process.transitions.push(editor_edge(
+        "C:/Users/me/tools/cargo.exe",
+        ArgvMatcher::Any(AnyMarker),
+        "cargo",
+    ));
+    crate::policy_file::save(
+        ws.path(),
+        &crate::policy_file::PolicyFile {
+            domains: vec![crate::policy_file::PolicyDomain::new("cargo"), entry],
+            ..Default::default()
+        },
+    )
+    .expect("setup");
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+
+    app.on_key(key(KeyCode::Char('a')));
+
+    let modal = app.modal.as_ref().expect("差分のモーダルが出る");
+    assert_eq!(modal.confirm, Confirm::Approval);
+    let text = modal.lines.join("\n");
+    assert!(text.contains("広がる遷移 1本"), "{text}");
+    assert!(text.contains(&format!("{ENTRY_DOMAIN} → cargo")), "{text}");
 }
 
 /// `y`で実際に`policy.json`が増える（許可側。B-35の対）。次はパス2、というガイドまで含めて固定する。

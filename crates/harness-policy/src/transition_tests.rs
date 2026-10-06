@@ -43,6 +43,7 @@ struct DeclaredDomain {
     fs: Vec<(String, FsAccess)>,
     net: Vec<String>,
     process: TransitionRules,
+    strict: bool,
 }
 
 /// テスト中に借りっぱなしにできる形でドメインを並べるための持ち物。
@@ -83,7 +84,18 @@ impl Declared {
             fs,
             net,
             process,
+            strict: false,
         });
+        self
+    }
+
+    /// 既に並べた`name`のドメインに Strict の印を付ける（決定66の追記）。
+    fn mark_strict(mut self, name: &str) -> Self {
+        self.domains
+            .iter_mut()
+            .find(|d| d.name == name)
+            .expect("mark a domain that was declared")
+            .strict = true;
         self
     }
 
@@ -97,6 +109,7 @@ impl Declared {
                     fs: domain.fs.iter().map(|(p, a)| (p.as_str(), *a)).collect(),
                     net: domain.net.iter().map(|d| d.as_str()).collect(),
                     process: &domain.process,
+                    strict: domain.strict,
                 })
                 .collect(),
             caller_writable_roots: Vec::new(),
@@ -123,6 +136,13 @@ fn assert_rejects(input: &GraphInput<'_>, needle: &str) {
 fn assert_accepts(input: &GraphInput<'_>) {
     let found = reasons(input);
     assert!(found.is_empty(), "expected no rejection, got {found:#?}");
+}
+
+/// `from`の`index`番目の辺の向き（[`edge_direction`]）。
+fn direction_of(input: &GraphInput<'_>, from: &str, index: usize) -> Direction {
+    edge_direction(input, from, index)
+        .expect("the shape itself is valid")
+        .expect("the edge exists")
 }
 
 // ---------------------------------------------------------------------------
@@ -313,11 +333,13 @@ fn two_identical_literal_edges_are_rejected_at_edit_time() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. 向き（同値・狭めるは固定なしで通る／広げるは固定必須）
+// 3. 向きと Strict の印（決定66とその追記: 広げる辺は固定なしで通る／Strict のドメインへ入る辺は固定必須）
 // ---------------------------------------------------------------------------
 
+/// **広げる辺も入力を固定せずに書ける**（決定66。守る線は子のドメインの権限）。印の付いていないドメインへ入る辺には
+/// 固定の束が掛からない。向きは「広げる」と答え続ける（表示と規則(g)が使う）。
 #[test]
-fn a_same_domain_edge_needs_no_fixing_but_a_widening_one_does() {
+fn a_widening_edge_needs_no_fixing_unless_it_enters_a_strict_domain() {
     // 同値（collapse）。自己ループ辺であり、閉路があっても計算が止まることも同時に見ている。
     let same = Declared::new().domain(
         "shell",
@@ -328,8 +350,9 @@ fn a_same_domain_edge_needs_no_fixing_but_a_widening_one_does() {
         )]),
     );
     assert_accepts(&same.input());
+    assert_eq!(direction_of(&same.input(), "shell", 0), Direction::Same);
 
-    // 広げる: 遷移先だけが`C:/secret`を読める。
+    // 広げる: 遷移先だけが`C:/secret`を読める。普通のモードでは書ける。
     let widening = Declared::new()
         .domain(
             "narrow",
@@ -340,13 +363,62 @@ fn a_same_domain_edge_needs_no_fixing_but_a_widening_one_does() {
             )]),
         )
         .domain_with_fs("wide", vec![("C:/secret", FsAccess::Read)], rules(vec![]));
-    assert_rejects(
-        &widening.input(),
-        "every caller-controlled input must be fixed",
+    assert_accepts(&widening.input());
+    assert_eq!(
+        direction_of(&widening.input(), "narrow", 0),
+        Direction::WiderOrUnknown
     );
+
+    // 対: 同じ辺でも、遷移先に Strict の印があれば固定の束（引数のリテラル・作業ディレクトリ）が要る。
+    let strict = widening.mark_strict("wide");
+    assert_rejects(&strict.input(), "is strict");
 }
 
-/// 狭める向きは証明できたときだけ通る。**遷移先の権限が遷移元に覆われている**ことを見る。
+/// **Strict の束の鍵は「広げるか」ではなく印である**（決定66の追記）。狭める辺でも、印の付いたドメインへ入るなら
+/// 引数のリテラルと作業ディレクトリの宣言が両方要る。両方あれば通り、片方だけでは落ちる。
+#[test]
+fn an_edge_entering_a_strict_domain_must_fix_argv_and_cwd_whatever_its_direction() {
+    let declared = |argv: ArgvMatcher, cwd: Option<&str>| {
+        Declared::new()
+            .domain_with_fs(
+                "wide",
+                vec![("C:/logs/**", FsAccess::Read)],
+                rules(vec![TransitionEdge {
+                    exe: literal_exe(r"C:\tools\analyze.exe"),
+                    argv,
+                    cwd: cwd.map(str::to_string),
+                    to: "logs".to_string(),
+                    env: None,
+                }]),
+            )
+            .domain_with_fs("logs", vec![("C:/logs/**", FsAccess::Read)], rules(vec![]))
+            .mark_strict("logs")
+    };
+    let fixed_argv = || literal_argv(r#""C:\tools\analyze.exe" --summary"#);
+
+    let any = declared(any_argv(), None);
+    assert_eq!(direction_of(&any.input(), "wide", 0), Direction::Narrower);
+    assert_rejects(&any.input(), "is strict");
+    assert_rejects(&declared(fixed_argv(), None).input(), "is strict");
+    assert_rejects(&declared(any_argv(), Some(r"C:\tools")).input(), "is strict");
+    assert_accepts(&declared(fixed_argv(), Some(r"C:\tools")).input());
+}
+
+/// 自己ループ辺は Strict のドメインへ「入る」辺ではない——呼び出し元が既にそのドメインに居て、印が守る権利を
+/// 自分で持っている（決定66の追記が掛ける相手は、印の付いたドメインへ入る辺）。
+#[test]
+fn a_self_loop_inside_a_strict_domain_is_not_an_entering_edge() {
+    let declared = Declared::new()
+        .domain_with_fs(
+            "logs",
+            vec![("C:/logs/**", FsAccess::Read)],
+            rules(vec![edge(literal_exe(r"C:\x\pwsh.exe"), any_argv(), "logs")]),
+        )
+        .mark_strict("logs");
+    assert_accepts(&declared.input());
+}
+
+/// 狭める向きは証明できたときだけ。**遷移先の届く範囲が、遷移元が自分で宣言している権限に覆われている**ことを見る。
 #[test]
 fn a_narrowing_edge_is_accepted_when_containment_can_be_proven() {
     let declared = Declared::new()
@@ -361,12 +433,34 @@ fn a_narrowing_edge_is_accepted_when_containment_can_be_proven() {
         )
         .domain_with_fs("narrow", vec![("C:/ws/src", FsAccess::Read)], rules(vec![]));
     assert_accepts(&declared.input());
+    assert_eq!(direction_of(&declared.input(), "wide", 0), Direction::Narrower);
+}
+
+/// **並行する2本の辺は互いを正当化しない**（決定66の「表示用の向きの定義」）。`a`は`wide`と、その一部しか持たない
+/// `part`への辺を持つ。旧来の「その辺を除いた遷移元の閉包」で数えると、`a → part`は`a → wide`に覆われて「狭める」に
+/// 見えた。いまは遷移元の**自分の宣言**と比べるので、どちらも「広げる」。
+#[test]
+fn two_parallel_edges_do_not_justify_each_other_in_the_direction() {
+    let declared = Declared::new()
+        .domain(
+            "a",
+            rules(vec![
+                edge(literal_exe(r"C:\x\wide.exe"), any_argv(), "wide"),
+                edge(literal_exe(r"C:\x\part.exe"), any_argv(), "part"),
+            ]),
+        )
+        .domain_with_fs("wide", vec![("C:/secret/**", FsAccess::Read)], rules(vec![]))
+        .domain_with_fs("part", vec![("C:/secret/a", FsAccess::Read)], rules(vec![]));
+    let input = declared.input();
+    assert_eq!(direction_of(&input, "a", 0), Direction::WiderOrUnknown);
+    assert_eq!(direction_of(&input, "a", 1), Direction::WiderOrUnknown);
 }
 
 /// **この1本が閉包の歯である。** 中継ドメインを1枚挟むと、辺ごとに比べる実装では素通りする。
 ///
 /// `cmd`自身は何も持たず、`relay`も何も持たないが、`relay`は`wide`への辺を持つ。
-/// したがって`cmd → relay`を許すことは、`cmd`へ`wide`の権限を渡すことと等価である。
+/// したがって`cmd → relay`を許すことは、`cmd`へ`wide`の権限を渡すことと等価である。決定66で書けるようになったが、
+/// 向きは「広げる」のままで、呼び出し元が子を通して使えるようになる権限に`wide`の分が入る。
 #[test]
 fn a_relay_domain_cannot_launder_wider_rights_through_an_empty_middle() {
     let declared = Declared::new()
@@ -392,18 +486,25 @@ fn a_relay_domain_cannot_launder_wider_rights_through_an_empty_middle() {
             vec![("C:/secret/**", FsAccess::ReadWrite)],
             rules(vec![]),
         );
-    assert_rejects(
-        &declared.input(),
-        "every caller-controlled input must be fixed",
+    let input = declared.input();
+    assert_accepts(&input);
+    assert_eq!(direction_of(&input, "cmd", 0), Direction::WiderOrUnknown);
+    let handed = newly_usable(&input, "cmd", "relay").unwrap();
+    assert!(
+        handed
+            .fs
+            .contains(&("C:/secret/**".to_string(), "read_write")),
+        "{handed:?}"
     );
 }
 
-/// 固定辺は閉包から辿らないので、その先の広さは手前へ染み上がらない（§19.3.4の但し書き）。
+/// **Strict の辺は閉包から辿らない**ので、その先の広さは手前へ染み上がらない（§19.3.4 の但し書きを、決定66の追記で
+/// 「書き方の形」から「Strict の辺」へ付け替えた）。
 ///
-/// **上のテストと同じ形で、中継から先の辺だけを固定辺にしてある**——
-/// 除外が効いていなければ、こちらも同じ理由で落ちる。
+/// **上のテストと同じ形で、中継から先の辺だけを固定してある。** 遷移先に印が無い（固定してあるだけの辺）なら
+/// 閉包に入って`cmd → relay`は「広げる」、印があれば辿らず「狭める」——鍵が書き方ではなく印であることの対。
 #[test]
-fn a_fixed_edge_does_not_propagate_the_width_behind_it() {
+fn a_strict_edge_does_not_propagate_the_width_behind_it_but_a_merely_fixed_one_does() {
     let declared = Declared::new()
         .domain(
             "cmd",
@@ -428,7 +529,17 @@ fn a_fixed_edge_does_not_propagate_the_width_behind_it() {
             vec![("C:/secret/**", FsAccess::ReadWrite)],
             rules(vec![]),
         );
-    assert_accepts(&declared.input());
+    assert_eq!(
+        direction_of(&declared.input(), "cmd", 0),
+        Direction::WiderOrUnknown,
+        "a fixed edge into an unmarked domain is an ordinary edge: its width counts"
+    );
+
+    let strict = declared.mark_strict("wide");
+    let input = strict.input();
+    assert_accepts(&input);
+    assert_eq!(direction_of(&input, "cmd", 0), Direction::Narrower);
+    assert!(newly_usable(&input, "cmd", "relay").unwrap().fs.is_empty());
 }
 
 /// 通信の宣言も権限として数える（FSだけ見ていると、外へ出られるドメインへの遷移が素通りする）。
@@ -444,10 +555,92 @@ fn network_declarations_count_as_rights_too() {
             )]),
         )
         .domain_with_net("online", vec!["example.com"], rules(vec![]));
-    assert_rejects(
-        &declared.input(),
-        "every caller-controlled input must be fixed",
+    assert_eq!(
+        direction_of(&declared.input(), "offline", 0),
+        Direction::WiderOrUnknown
     );
+}
+
+/// 規則(g): **実行ファイルのパターンは広げる辺で断り続ける**（決定66(7)。パターンが覆う場所に呼び出し元が exe を
+/// 置けると、広い遷移先で任意のコードが走る）。**引数のパターンは広げる辺でも許す**（決定66(2)）。狭める辺なら
+/// 実行ファイルのパターンも通る（対）。
+#[test]
+fn an_exe_pattern_may_only_narrow_but_an_argv_pattern_may_widen() {
+    let with_edge = |edge: TransitionEdge, target_fs: Vec<(&str, FsAccess)>| {
+        Declared::new()
+            .domain_with_fs("src", vec![("C:/ws/**", FsAccess::Read)], rules(vec![edge]))
+            .domain_with_fs("dst", target_fs, rules(vec![]))
+    };
+    let exe_pattern = || TransitionEdge {
+        exe: ExeMatcher::Pattern(r"c:/tools/[a-z]+\.exe".to_string()),
+        argv: any_argv(),
+        cwd: None,
+        to: "dst".to_string(),
+        env: None,
+    };
+    let argv_pattern = || TransitionEdge {
+        exe: literal_exe(r"C:\python\python.exe"),
+        argv: ArgvMatcher::Pattern(r#""c:/python/python\.exe" .*\.py"#.to_string()),
+        cwd: None,
+        to: "dst".to_string(),
+        env: None,
+    };
+    let wider = || vec![("C:/secret/**", FsAccess::Read)];
+    let narrower = || vec![("C:/ws/src", FsAccess::Read)];
+
+    assert_rejects(
+        &with_edge(exe_pattern(), wider()).input(),
+        "an executable pattern may only narrow",
+    );
+    assert_accepts(&with_edge(exe_pattern(), narrower()).input());
+    assert_accepts(&with_edge(argv_pattern(), wider()).input());
+}
+
+/// Strict の辺でも、遷移先の権限が広いなら**実行ファイルのパターンは断る**——Strict の束は引数を固定するが、
+/// パターンが覆う場所に置かれた別の exe が Strict のドメインで走るのは止めない（決定66(7)の理由はそのまま残る）。
+#[test]
+fn an_exe_pattern_into_a_wider_strict_domain_is_still_refused() {
+    let declared = Declared::new()
+        .domain(
+            "src",
+            rules(vec![TransitionEdge {
+                exe: ExeMatcher::Pattern(r"c:/tools/[a-z]+\.exe".to_string()),
+                argv: literal_argv("analyze --summary"),
+                cwd: Some(r"C:\tools".to_string()),
+                to: "logs".to_string(),
+                env: None,
+            }]),
+        )
+        .domain_with_fs("logs", vec![("C:/logs/**", FsAccess::Read)], rules(vec![]))
+        .mark_strict("logs");
+    assert_rejects(&declared.input(), "an executable pattern may only narrow");
+}
+
+/// **ハンドルの引き継ぎの式はこの段では据え置く**（`plans/position-domains/P5.md` の P5.3。安全側）。広げる辺は
+/// 固定しなくても書けるようになったが、Daemon は呼び出し元の標準入出力を子へ渡さない（P5.4b で辺ごとの出力の設定へ
+/// 付け替える）。固定の検査も、固定していない辺には掛からない。
+#[test]
+fn a_widening_edge_does_not_inherit_the_callers_handles_until_p5_4b() {
+    let declared = Declared::new()
+        .domain(
+            "narrow",
+            rules(vec![edge(literal_exe(r"C:\x\pwsh.exe"), any_argv(), "wide")]),
+        )
+        .domain_with_fs("wide", vec![("C:/secret", FsAccess::Read)], rules(vec![]));
+    let input = declared.input();
+    let graph = TransitionGraph::build(&input).expect("a widening edge is valid now");
+    let Resolution::Allowed(allowed) = graph.resolve(SpawnAttempt {
+        from_domain: "narrow",
+        exe: r"C:\x\pwsh.exe",
+        command_line: "pwsh -NoProfile",
+        cwd: r"C:\ws",
+    }) else {
+        panic!("the widening edge should resolve");
+    };
+    assert_eq!(allowed.to, "wide");
+    assert_eq!(allowed.direction, Direction::WiderOrUnknown);
+    assert!(!allowed.inherit_handles);
+    assert!(!allowed.fixed);
 }
 
 // ---------------------------------------------------------------------------

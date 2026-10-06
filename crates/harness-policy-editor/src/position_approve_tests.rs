@@ -132,60 +132,67 @@ fn three_domains(ws: &Path) -> PositionRequest<'_> {
     )
 }
 
-/// **広がる辺が1本でもあれば全体を断る**（部分適用しない。決定65(6) の暫定——P5 で入力を絞った辺が入るまで）。
-/// 書ける辺とファイルの宣言が一緒でも、何も書かず`policy.json`は1バイトも変わらない。理由に広げる辺の遷移先が出る。
-/// 対の側: 広げる辺を外すと通り、書ける。
+/// **広がる辺も書ける**（決定66。守る線は子のドメインの権限）。書ける辺・ファイルの宣言と一緒に1回で書き、確認の明細に
+/// 「広がる遷移N本」と、その辺で呼び出し元が子を通して使えるようになる権限が出る（狭める辺は出ない）。
+///
+/// 対の側（禁止側）: **書けない辺が1本でもあれば全体を断る**（部分適用しない）——いま書けない辺を作るのは Strict の印
+/// （このエディタは入力を固定した辺を書かない）。書ける辺とファイルの宣言が一緒でも何も書かず、`policy.json`は
+/// 1バイトも変わらない。
 #[test]
-fn a_widening_edge_refuses_the_whole_confirmation() {
-    let ws = workspace();
-    seed(
-        ws.path(),
-        vec![domain_reading("secret", "C:/Users/x/secret/**")],
-    );
-    let before = bytes(ws.path());
+fn a_widening_edge_is_written_and_the_confirmation_lists_what_it_hands_over() {
     let fs = || {
         vec![select(
             ENTRY_DOMAIN,
             vec![proposal("fs-1", SettingsKey::FsRead, "C:/Users/x/a.txt")],
         )]
     };
-
-    let widening = plan(&request(
-        ws.path(),
-        fs(),
+    let edges = || {
         vec![
             edge(ENTRY_DOMAIN, CALC, "calc"),
             edge(ENTRY_DOMAIN, "C:/Users/x/tools/peek.exe", "secret"),
-        ],
-    ));
-    match &widening {
-        Err(PositionApproveError::Transition(TransitionApproveError::WidensWithoutFixing {
-            to_domain,
-            ..
-        })) => assert_eq!(to_domain, "secret"),
-        other => panic!("広げる辺が全体を断っていない: {other:?}"),
+        ]
+    };
+
+    // 禁止側: 遷移先 secret に Strict の印。
+    let ws = workspace();
+    let mut strict = domain_reading("secret", "C:/Users/x/secret/**");
+    strict.strict = true;
+    seed(ws.path(), vec![strict]);
+    let before = bytes(ws.path());
+    match plan(&request(ws.path(), fs(), edges())) {
+        Err(PositionApproveError::Transition(TransitionApproveError::Rejected(detail))) => {
+            assert!(detail.contains("is strict"), "{detail}")
+        }
+        other => panic!("Strict のドメインへの辺が全体を断っていない: {other:?}"),
     }
-    assert!(
-        widening.unwrap_err().to_string().contains("secret"),
-        "理由に遷移先が出ていない"
-    );
     assert_eq!(
         bytes(ws.path()),
         before,
         "断った確定で policy.json が変わった"
     );
 
-    let ok = plan(&request(
+    // 許可側: 印が無ければ、広げる辺も一緒に書ける。
+    let ws = workspace();
+    seed(
         ws.path(),
-        fs(),
-        vec![edge(ENTRY_DOMAIN, CALC, "calc")],
-    ))
-    .expect("広げる辺を外すと通るはず");
+        vec![domain_reading("secret", "C:/Users/x/secret/**")],
+    );
+    let ok = plan(&request(ws.path(), fs(), edges())).expect("広げる辺が断られた");
+    assert_eq!(ok.widening.edges.len(), 1, "{:?}", ok.widening);
+    assert_eq!(ok.widening.edges[0].to, "secret");
+    assert_eq!(
+        ok.widening.edges[0].newly_usable.fs,
+        vec![("C:/Users/x/secret/**".to_string(), "read")]
+    );
+    let lines = confirmation_lines(ws.path(), &ok, &BTreeSet::new()).join("\n");
+    assert!(lines.contains("広がる遷移 1本"), "{lines}");
+    assert!(lines.contains("C:/Users/x/secret/**"), "{lines}");
+    assert!(!lines.contains("→ calc（"), "狭める辺まで広がる遷移に出た: {lines}");
     assert!(commit(ws.path(), &ok, &policy_file::save).expect("書けるはず"));
     let file = policy_file::load(ws.path()).expect("load");
     let entry = file.domain(ENTRY_DOMAIN).expect("入口のドメイン");
     assert_eq!(entry.fs.read, vec!["C:/Users/x/a.txt".to_string()]);
-    assert_eq!(entry.process.transitions.len(), 1);
+    assert_eq!(entry.process.transitions.len(), 2);
 }
 
 /// **1回の確定は、何ドメイン分でも`save`をちょうど1回だけ呼ぶ**（別々に書くと片方だけ書けた状態が残る）。

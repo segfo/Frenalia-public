@@ -12,7 +12,7 @@
 //! # 判定はしない（`B-13`）
 //!
 //! - 位置の割り当て: [`assign_domains`]（Spawn Daemon と同じ判定器で既にある辺を引く）
-//! - 書けるか: [`transition::check_all`]・[`transition::edge_direction`]・[`TransitionGraph::resolve`]に聞く
+//! - 書けるか・広げるか: [`transition::check_all`]・[`TransitionGraph::resolve`]・[`transition::newly_usable`]に聞く
 //!   （[`verdicts`]）。相対パスの引数・広げる向きをここで判定し直さない
 //! - 辺を足す: [`crate::transition_approve::apply_edge_changes`]（遷移タブの承認と同じ部品）
 //!
@@ -36,7 +36,7 @@ use harness_policy::position_domains::{
 use harness_policy::process_event::{parse_process_audit, ProcessAuditError};
 use harness_policy::process_tree::walk;
 use harness_policy::transition::{
-    self, editor_edge, AnyMarker, ArgvMatcher, Direction, ExeMatcher, Resolution, SpawnAttempt,
+    self, editor_edge, AnyMarker, ArgvMatcher, ExeMatcher, Resolution, SpawnAttempt,
     TransitionGraph,
 };
 
@@ -83,30 +83,33 @@ pub fn key_of(position: &Position) -> PositionKey {
 pub enum EdgeVerdict {
     /// `policy.json`に既にある辺（書かない）。
     AlreadyDeclared,
-    /// 書ける見込み。
+    /// 書ける見込みで、広げない（呼び出し元が子を通して新しく使える権限が無い）。
     Writable,
-    /// 広げる向き（遷移先の権限が呼び出し元より広い、または狭いと証明できない）なので検査に落ちる。
-    /// **このエディタは入力（引数と作業ディレクトリ）を固定した辺を書かないので、P5 まで書けない**（決定65(6)）。
-    Widens { detail: String },
-    /// 広げる以外の理由で書けない（相対パスの引数・書いた後に別の辺に当たる・パターンの自己ループ辺）。
+    /// **書ける見込みで、広げる**（決定66。遷移先の届く範囲に、呼び出し元が自分で宣言していない権限がある）。
+    /// `newly`は書くと呼び出し元が子を通して使えるようになる権限（`transition::newly_usable`の答え）。
+    /// 決定65(6) の暫定「P5 まで書けない」は P5.3 で外した。
+    Widens {
+        newly: harness_policy::transition_listing::Rights,
+    },
+    /// 書けない（相対パスの引数・Strict の印が付いたドメインへ入る・書いた後に別の辺に当たる・パターンの自己ループ辺）。
     Rejected { detail: String },
 }
 
 impl EdgeVerdict {
+    /// 予約して書けるか（[`EdgeVerdict::Writable`]と[`EdgeVerdict::Widens`]）。
     pub fn is_writable(&self) -> bool {
-        matches!(self, EdgeVerdict::Writable)
+        matches!(self, EdgeVerdict::Writable | EdgeVerdict::Widens { .. })
     }
 
-    /// 行と状態の文言に出す一言（書ける・宣言済みなら`None`——宣言済みは出どころの欄が言う）。
-    ///
-    /// **「P5まで書けません」は暫定の文言**（決定65の寿命）。入力を絞った遷移が入った日に、この文言と
-    /// `transition_approve::TransitionApproveError::WidensWithoutFixing`を外す（変種そのものは残る）。
+    /// 行と状態の文言に出す一言（広げずに書ける・宣言済みなら`None`——宣言済みは出どころの欄が言う）。
+    /// 広げる辺は書けるが、**書くと何が呼び出し元の手に渡るか**を一言で言う（権限そのものは説明欄と確認の明細）。
     pub fn note(&self) -> Option<String> {
         match self {
             EdgeVerdict::AlreadyDeclared | EdgeVerdict::Writable => None,
-            EdgeVerdict::Widens { .. } => {
-                Some("P5まで書けません（遷移先の権限が呼び出し元より広い——決定65(6)）".to_string())
-            }
+            EdgeVerdict::Widens { newly } => Some(format!(
+                "広げる——書くと呼び出し元は子を通して{}を使えます",
+                crate::exposure_view::rights_count(newly)
+            )),
             EdgeVerdict::Rejected { detail } => Some(format!(
                 "書けません: {}",
                 detail.lines().next().unwrap_or_default()
@@ -307,10 +310,11 @@ pub(crate) const PATTERN_SELF_LOOP: &str = "遷移元の自己ループ辺がパ
 ///   ファイルに2本当たる。P3b の注意1）。パターンの自己ループ辺なら[`EdgeVerdict::Rejected`]
 /// - `extra_fs`（`(ドメイン, 値, access)`）は各ドメインの宣言へ足してから聞く（ファイルの候補がドメインごとになる
 ///   P4.4 で、選んだ候補を渡す）
-/// - [`transition::check_all`]に落ちた辺は、[`transition::edge_direction`]が広げる向きと答えれば
-///   [`EdgeVerdict::Widens`]、そうでなければ[`EdgeVerdict::Rejected`]
+/// - [`transition::check_all`]に落ちた辺は[`EdgeVerdict::Rejected`]（広げる辺は落ちない。決定66）
 /// - 全体が検査に通れば、判定器を組んで各辺の起動を引き直し、**書いた辺の遷移先に着かない**（既にあるパターンの辺と
 ///   重なる等。P3b の注意2）なら[`EdgeVerdict::Rejected`]。他の辺が検査に落ちる間は判定器を組めないので引き直さない
+/// - 落ちなかった辺は、[`transition::newly_usable`]（呼び出し元が子を通して新しく使える権限）が空でなければ
+///   [`EdgeVerdict::Widens`]、空なら[`EdgeVerdict::Writable`]。**向きの規則はここで書かない**（`B-13`）
 ///
 /// **全部を一度に足す**——予約の有無で他の行の判定が動くと、何を選べば何が書けるのかが追えない。選んだものだけで
 /// 検査し直すのは確定（P4.5）である。
@@ -411,10 +415,8 @@ pub fn verdicts(
         if reasons.is_empty() {
             continue;
         }
-        let detail = reasons.join("\n");
-        verdicts[index] = Some(match transition::edge_direction(&input, from, *at) {
-            Ok(Some(Direction::WiderOrUnknown)) => EdgeVerdict::Widens { detail },
-            _ => EdgeVerdict::Rejected { detail },
+        verdicts[index] = Some(EdgeVerdict::Rejected {
+            detail: reasons.join("\n"),
         });
     }
 
@@ -428,6 +430,19 @@ pub fn verdicts(
                 if let Some(detail) = lands_elsewhere(&graph, &add.from_domain, &add.edge, &workspace) {
                     verdicts[index] = Some(EdgeVerdict::Rejected { detail });
                 }
+            }
+        }
+    }
+
+    // 書ける辺のうち、呼び出し元が子を通して新しく使える権限があるものは「広げる」（決定66。書けることは変わらない）。
+    for (index, at) in placed.iter().enumerate() {
+        let Some((from, _)) = at else { continue };
+        if verdicts[index].is_some() {
+            continue;
+        }
+        if let Ok(newly) = transition::newly_usable(&input, from, &edges[index].edge.to) {
+            if !newly.is_empty() {
+                verdicts[index] = Some(EdgeVerdict::Widens { newly });
             }
         }
     }

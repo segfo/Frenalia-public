@@ -97,6 +97,9 @@ pub struct UnapprovePlan {
     pub not_found: Vec<UnapproveTarget>,
     /// この取り消しで宣言が1件も無くなるドメイン（**ドメイン自体は残す**。モジュールdoc）。
     pub emptied_domains: Vec<String>,
+    /// この取り消しで広がる遷移（遷移元の宣言を減らすと、その遷移元から出る辺が呼び出し元へ渡す権限が増える。
+    /// 決定66）。確認の画面と CLI が[`crate::exposure_view::lines`]で並べる。
+    pub widening: crate::exposure_view::Widening,
 }
 
 impl UnapprovePlan {
@@ -112,6 +115,7 @@ pub fn plan(
     targets: &[UnapproveTarget],
 ) -> Result<UnapprovePlan, UnapproveError> {
     let mut file = policy_file::load(workspace_root)?;
+    let before = file.clone();
     let mut removed = Vec::new();
     let mut not_found = Vec::new();
 
@@ -137,11 +141,13 @@ pub fn plan(
         .map(|d| d.name.clone())
         .collect();
 
+    let widening = crate::exposure_view::widening(&before, &file, workspace_root);
     Ok(UnapprovePlan {
         file,
         removed,
         not_found,
         emptied_domains,
+        widening,
     })
 }
 

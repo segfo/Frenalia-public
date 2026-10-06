@@ -62,6 +62,7 @@ impl Declared {
                     fs: domain.fs.iter().map(|(p, a)| (p.as_str(), *a)).collect(),
                     net: domain.net.iter().map(|d| d.as_str()).collect(),
                     process: &domain.process,
+                    strict: false,
                 })
                 .collect(),
             caller_writable_roots: Vec::new(),

@@ -175,6 +175,8 @@ impl App {
             for warning in &plan.warnings {
                 lines.push(format!("  ! {warning}"));
             }
+            // **広がる遷移も判断材料**（遷移先のドメインへ足すと、そこへの辺が呼び出し元へ渡す権限が増える。決定66）。
+            lines.extend(crate::exposure_view::lines(&plan.widening));
 
             lines.extend(approve::group_by_key(
                 &plan.report.added,
@@ -211,6 +213,8 @@ impl App {
             for target in &plan.removed {
                 lines.push(format!("    - {} {}", target.key.dotted(), target.value));
             }
+            // 遷移元の宣言を外すと、その遷移元から出る辺が広がり得る（決定66）。
+            lines.extend(crate::exposure_view::lines(&plan.widening));
             lines.push(String::new());
             lines.extend(crate::unapprove::ACE_NOTICE.lines().map(str::to_string));
         }

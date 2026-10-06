@@ -291,6 +291,8 @@ pub(crate) fn reassign_lines(plan: &ReassignPlan) -> Vec<String> {
             reassignment.from.value
         ));
     }
+    // 付け替えで遷移が広がるなら、その辺と呼び出し元が子を通して使えるようになる権限（決定66）。
+    lines.extend(crate::exposure_view::lines(&plan.widening));
     if !plan.changes.is_empty() {
         lines.push(String::new());
         // 文言の持ち主は`reassign`（表示側で書き写さない）。

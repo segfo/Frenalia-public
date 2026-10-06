@@ -124,3 +124,51 @@ fn reserving_the_same_declaration_for_both_ends_with_it_removed() {
     );
     assert!(!is_approved(&ws), "and its approval does not survive");
 }
+
+/// [P5.3、決定66] **遷移元から宣言を取り消すと、その遷移元から出る辺が広がり得る**（遷移先の届く範囲から差し引く
+/// 「遷移元が自分で宣言している権限」が減る）。確認の画面に広がる遷移と、呼び出し元が子を通して使えるようになる
+/// 権限が出る。対の側: 遷移先の宣言を取り消しても広がらないので出ない。
+#[test]
+fn unapproving_from_a_transition_source_lists_the_widened_edge() {
+    use harness_policy::policy_file::ENTRY_DOMAIN;
+    use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
+
+    let ws = tempfile::tempdir().expect("tempdir");
+    let mut entry = PolicyDomain::new(ENTRY_DOMAIN);
+    entry.fs.read.push("C:/Users/x/proj/**".to_string());
+    entry.process.transitions.push(editor_edge(
+        "C:/Users/x/tools/tool.exe",
+        ArgvMatcher::Any(AnyMarker),
+        "tool",
+    ));
+    let mut tool = PolicyDomain::new("tool");
+    tool.fs.read.push("C:/Users/x/proj/a.txt".to_string());
+    crate::policy_file::save(
+        ws.path(),
+        &PolicyFile {
+            schema_version: crate::policy_file::POLICY_SCHEMA_VERSION,
+            domains: vec![tool, entry],
+        },
+    )
+    .expect("save");
+    let target = |domain: &str, value: &str| UnapproveTarget {
+        domain: domain.to_string(),
+        key: SettingsKey::FsRead,
+        value: value.to_string(),
+    };
+
+    let mut app = App::new(PathBuf::from(ws.path()), harness_core::RequireSandbox::None);
+    app.on_key(key(KeyCode::F(3)));
+    app.unapproved.insert(target(ENTRY_DOMAIN, "C:/Users/x/proj/**"));
+    app.on_key(key(KeyCode::Char('a')));
+    let text = app.modal.as_ref().expect("a confirmation dialog").lines.join("\n");
+    assert!(text.contains("広がる遷移 1本"), "{text}");
+    assert!(text.contains("C:/Users/x/proj/a.txt"), "{text}");
+
+    app.modal = None;
+    app.unapproved.clear();
+    app.unapproved.insert(target("tool", "C:/Users/x/proj/a.txt"));
+    app.on_key(key(KeyCode::Char('a')));
+    let text = app.modal.as_ref().expect("a confirmation dialog").lines.join("\n");
+    assert!(!text.contains("広がる遷移"), "{text}");
+}

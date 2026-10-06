@@ -112,6 +112,9 @@ pub struct ReassignPlan {
     pub refused: Vec<(Reassignment, String)>,
     /// 元の宣言が`policy.json`に無かった指定。
     pub not_found: Vec<Reassignment>,
+    /// この付け替えで広がる遷移（遷移先・遷移元の宣言が変わると、辺が呼び出し元へ渡す権限が増え得る。決定66）。
+    /// 確認の画面が[`crate::exposure_view::lines`]で並べる。
+    pub widening: crate::exposure_view::Widening,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -219,6 +222,7 @@ pub fn plan(
             carries_approval,
         });
     }
+    out.widening = crate::exposure_view::widening(&original, &file, workspace_root);
     out.file = file;
     Ok(out)
 }

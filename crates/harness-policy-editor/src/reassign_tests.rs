@@ -415,3 +415,60 @@ fn widening_follows_the_inclusion_of_accesses_and_the_scope() {
     let recursive = target(SettingsKey::FsRead, "C:/x/**");
     assert!(!widens(&recursive, SettingsKey::FsRead, "C:/x"));
 }
+
+/// [P5.3、決定66] **遷移先の宣言を付け替えると、そこへの辺が広がり得る**。広がる辺は確定の明細の材料
+/// （[`ReassignPlan::widening`]）に出る。対の側: 付け替えても遷移元が覆う範囲に収まるなら材料は空。
+#[test]
+fn reassigning_a_declaration_of_the_destination_shows_the_edge_it_widens() {
+    use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
+
+    let mut shell = PolicyDomain::new("shell");
+    shell.fs.read.push(REGISTRY.to_string());
+    shell.process.transitions.push(editor_edge(
+        "C:/Users/x/tools/cargo.exe",
+        ArgvMatcher::Any(AnyMarker),
+        "cargo",
+    ));
+    let dir = tempfile::tempdir().expect("tempdir");
+    crate::policy_file::save(
+        dir.path(),
+        &PolicyFile {
+            schema_version: crate::policy_file::POLICY_SCHEMA_VERSION,
+            domains: vec![cargo_without_widening(), shell],
+        },
+    )
+    .expect("save");
+
+    // CACHE（REGISTRY の配下）を REGISTRY の外のファイルへ付け替える: shell はそれを持たないので、shell → cargo が広がる。
+    let widened = plan_none(
+        dir.path(),
+        &[reassignment(target(SettingsKey::FsRead, CACHE), SettingsKey::FsRead, OUTSIDE)],
+    );
+    assert_eq!(widened.widening.edges.len(), 1, "{:?}", widened.widening);
+    assert_eq!(widened.widening.edges[0].from, "shell");
+    assert_eq!(
+        widened.widening.edges[0].newly_usable.fs,
+        vec![(OUTSIDE.to_string(), "read")]
+    );
+
+    // 対: CACHE を REGISTRY の配下の別の場所へ付け替えるだけなら、shell が覆うので広がらない。
+    let inside = plan_none(
+        dir.path(),
+        &[reassignment(
+            target(SettingsKey::FsRead, CACHE),
+            SettingsKey::FsRead,
+            "C:/Users/x/.cargo/registry/index",
+        )],
+    );
+    assert!(inside.widening.is_empty(), "{:?}", inside.widening);
+}
+
+/// `shell`の宣言（`REGISTRY`）の外にあるファイル。
+const OUTSIDE: &str = "C:/Users/x/data/report.txt";
+
+/// `shell`の宣言（`REGISTRY`）に覆われる宣言だけを持つ`cargo`（`shell → cargo`は狭める向き）。
+fn cargo_without_widening() -> PolicyDomain {
+    let mut domain = PolicyDomain::new("cargo");
+    domain.fs.read.push(CACHE.to_string());
+    domain
+}

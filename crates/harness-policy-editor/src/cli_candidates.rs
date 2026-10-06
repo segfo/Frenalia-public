@@ -264,6 +264,10 @@ pub(super) fn run_approve(
     for warning in &plan.warnings {
         println!("  ! {warning}");
     }
+    // 遷移先のドメインへ足すと、そこへの辺が呼び出し元へ渡す権限が増える（決定66。TUI の確認と同じ部品）。
+    for line in harness_policy_editor::exposure_view::lines(&plan.widening) {
+        println!("{line}");
+    }
 
     // **承認の実質的な判断材料**: 実際にマシンのACLを変えるのはworkspace外の分だけである。
     let outside: Vec<&str> = plan

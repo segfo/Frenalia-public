@@ -188,22 +188,44 @@ fn declare_domain_with_read(ws: &Path, name: &str, value: &str) {
     policy_file::save(ws, &file).expect("setup");
 }
 
-/// **禁止側**: 遷移先が呼び出し元より広い権限に届く遷移は、**このエディタの言葉で**断る。
-///
-/// 検査は「argvをリテラルにしcwdを宣言せよ」と言うが、このエディタは作業ディレクトリを宣言しない
-/// ので、その直し方は取れない。そのまま見せると、ユーザーは取れない手を探すことになる。
+/// **許可側**: 遷移先が呼び出し元より広い権限に届く遷移（広げる遷移）も、入力を固定せずに書ける（決定66。守る線は
+/// 子のドメインの権限）。書くと呼び出し元が子を通して何を使えるようになるかは、確定の明細と同じ部品
+/// （[`crate::exposure_view::widening`]）で列挙できる。
 #[test]
-fn a_widening_destination_is_refused_with_a_fix_this_editor_can_take() {
+fn a_widening_destination_can_be_written_and_what_it_hands_over_is_listed() {
     let tmp = tempfile::tempdir().unwrap();
     declare_domain_with_read(tmp.path(), "wide", "C:/secrets/**");
+    let before = policy_file::load(tmp.path()).unwrap();
+
+    let plan = plan(&request_to(tmp.path(), "wide", &[any("C:/curl.exe")], &[]))
+        .expect("広げる遷移が断られた");
+    let widening = crate::exposure_view::widening(&before, &plan.file, tmp.path());
+    assert_eq!(widening.edges.len(), 1, "{widening:?}");
+    assert_eq!(widening.edges[0].to, "wide");
+    assert_eq!(
+        widening.edges[0].newly_usable.fs,
+        vec![("C:/secrets/**".to_string(), "read")]
+    );
+    assert!(commit(tmp.path(), &plan).expect("書けない"));
+    assert_eq!(listed(tmp.path())[0].to_domain, "wide");
+}
+
+/// **禁止側（対）**: 遷移先に Strict の印があれば、入る辺は引数と作業ディレクトリを固定しなければ書けない（決定66の
+/// 追記）。このエディタは作業ディレクトリを宣言しない（[`edge_for`]）ので書けず、検査の理由をそのまま出して何も書かない。
+#[test]
+fn a_strict_destination_is_refused_because_this_editor_does_not_fix_inputs() {
+    let tmp = tempfile::tempdir().unwrap();
+    declare_domain_with_read(tmp.path(), "wide", "C:/secrets/**");
+    let mut file = policy_file::load(tmp.path()).unwrap();
+    file.domains.iter_mut().find(|d| d.name == "wide").unwrap().strict = true;
+    policy_file::save(tmp.path(), &file).expect("setup");
     let before = std::fs::read_to_string(policy_file::path(tmp.path())).unwrap();
 
     match plan(&request_to(tmp.path(), "wide", &[any("C:/curl.exe")], &[])) {
-        Err(TransitionApproveError::WidensWithoutFixing { to_domain, detail }) => {
-            assert_eq!(to_domain, "wide");
-            assert!(detail.contains("widens"), "検査の理由が落ちている: {detail}");
+        Err(TransitionApproveError::Rejected(detail)) => {
+            assert!(detail.contains("is strict"), "検査の理由が落ちている: {detail}");
         }
-        other => panic!("広げる遷移が別の形で返った: {other:?}"),
+        other => panic!("Strict のドメインへの辺が別の形で返った: {other:?}"),
     }
     assert_eq!(
         std::fs::read_to_string(policy_file::path(tmp.path())).unwrap(),
@@ -309,14 +331,28 @@ fn an_edge_this_editor_writes_survives_the_writable_places_harness_adds() {
 ///
 /// 遷移先へ許可を足すと、そこへの遷移が「広げる遷移」に変わる。かつては`policy_file::save`が検査せずに
 /// 書いたので、承認した直後から`harness.exe`もエディタも`policy.json`を読めなくなった——別ドメインへの
-/// 遷移を書けるようにした回に、この画面の操作だけで踏める形になった。
+/// 遷移を書けるようにした回に、この画面の操作だけで踏める形になった（BUG-188）。
+///
+/// [2026-10-06、P5.3] 決定66で広げる遷移そのものは書けるようになった。いま壊す形を作るのは、実行ファイルを
+/// パターンで書いた辺（手で書いたもの）——広げる向きになると規則(g)が断る（決定66(7)）。エディタが書く辺の先へ
+/// 足す承認は書け、**その承認で辺が呼び出し元へ新しく渡す権限が明細の材料（`ApprovePlan::widening`）に出る**。
 #[test]
 fn approving_a_file_declaration_into_the_destination_cannot_break_the_transitions() {
     use harness_policy::{generalize::SettingsKey, RuleProposal};
 
     let tmp = tempfile::tempdir().unwrap();
-    let plan = plan(&request_to(tmp.path(), "iso", &[any("C:/curl.exe")], &[])).expect("setup");
-    commit(tmp.path(), &plan).expect("setup");
+    let mut file = policy_file::load(tmp.path()).unwrap();
+    let mut entry = PolicyDomain::new(ENTRY_DOMAIN);
+    entry.process.transitions.push(TransitionEdge {
+        exe: ExeMatcher::Pattern("c:/tools/[a-z]+\\.exe".to_string()),
+        argv: ArgvMatcher::Any(AnyMarker),
+        cwd: None,
+        to: "iso".to_string(),
+        env: None,
+    });
+    file.domains.push(entry);
+    file.domains.push(PolicyDomain::new("iso"));
+    policy_file::save(tmp.path(), &file).expect("setup: 遷移先が空なら狭める向きで書ける");
 
     let proposals = vec![RuleProposal {
         id: "fs-1".to_string(),
@@ -338,22 +374,50 @@ fn approving_a_file_declaration_into_the_destination_cannot_break_the_transition
         now_unix_ms: 1,
     };
 
-    // 禁止側: 遷移先にだけ足す → 書かない。
+    // 禁止側: 実行ファイルをパターンで書いた辺の先にだけ足す → 規則(g)に落ちるので書かない。
     let widening = crate::approve::plan(&approve_into("iso")).expect("plan");
     match crate::approve::commit(tmp.path(), &widening) {
         Err(crate::approve::ApproveError::PolicyFile(
-            policy_file::PolicyFileError::WouldRejectTransitions { .. },
-        )) => {}
+            policy_file::PolicyFileError::WouldRejectTransitions { reason, .. },
+        )) => assert!(reason.contains("executable pattern"), "{reason}"),
         other => panic!("遷移を壊す承認が書かれた: {other:?}"),
     }
     let file = policy_file::load(tmp.path()).expect("policy.jsonが読めなくなった");
     assert!(file.domain("iso").unwrap().fs.read.is_empty());
 
-    // 許可側（対）: 呼び出し元にも同じ宣言があれば狭める遷移のままなので、書ける。
+    // 許可側（対）: 呼び出し元にも同じ宣言があれば狭める遷移のままなので、書ける。広がる遷移も出ない。
     let into_entry = crate::approve::plan(&approve_into(ENTRY_DOMAIN)).expect("plan");
     crate::approve::commit(tmp.path(), &into_entry).expect("呼び出し元への承認が書けない");
     let narrowing = crate::approve::plan(&approve_into("iso")).expect("plan");
+    assert!(narrowing.widening.is_empty(), "{:?}", narrowing.widening);
     crate::approve::commit(tmp.path(), &narrowing).expect("狭める遷移のままの承認が書けない");
+
+    // 許可側2（決定66）: エディタが書く辺（リテラルの exe）の先へ、呼び出し元の持たない宣言を足す承認は書ける。
+    // その承認で辺が呼び出し元へ新しく渡す権限が、明細の材料に出る。
+    let edge_plan = plan(&request_to(tmp.path(), "lit", &[any("C:/curl.exe")], &[])).expect("setup");
+    commit(tmp.path(), &edge_plan).expect("setup");
+    let secret = vec![RuleProposal {
+        id: "fs-2".to_string(),
+        key: SettingsKey::FsRead,
+        value: "C:/Users/x/secret/**".to_string(),
+        evidence: Vec::new(),
+        warnings: Vec::new(),
+    }];
+    let accept_secret = vec!["fs-2".to_string()];
+    let into_lit = crate::approve::plan(&crate::approve::ApproveRequest {
+        proposals: &secret,
+        accept_ids: &accept_secret,
+        ..approve_into("lit")
+    })
+    .expect("plan");
+    assert_eq!(into_lit.widening.edges.len(), 1, "{:?}", into_lit.widening);
+    assert_eq!(into_lit.widening.edges[0].from, ENTRY_DOMAIN);
+    assert_eq!(into_lit.widening.edges[0].to, "lit");
+    assert_eq!(
+        into_lit.widening.edges[0].newly_usable.fs,
+        vec![("C:/Users/x/secret/**".to_string(), "read")]
+    );
+    crate::approve::commit(tmp.path(), &into_lit).expect("広げる承認が書けない");
 }
 
 /// 引数を絞る承認もできる（観測された引数のときだけ通る辺）。
