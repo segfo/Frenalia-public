@@ -190,6 +190,10 @@ const EXTERNAL_ENV_VARS: &[&str] = &[
     "USERPROFILE",
     "VISUAL",
     "windir",
+    // Windows Terminal が自分の中で動くプログラムへ付ける。`harness-term/examples/mouse_probe.rs`
+    // （端末がマウスの事象を渡すかを実機で確かめるプログラム。`plans/PLAN-TUI-IMPROVEMENTS.md`のT10）が、
+    // どの端末で測ったかを集計に添えるために読む。
+    "WT_SESSION",
 ];
 
 const TEST_PREFIX: &str = "HARNESS_TEST_";
