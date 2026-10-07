@@ -381,6 +381,25 @@ pub fn approved_fs_values(
     out
 }
 
+/// [決定69(1)] モデルへ見せる遷移の一覧の権限欄に載せてよい通信の宛先——**どれかのドメインで承認済み**のもの。
+///
+/// ファイルの[`approved_fs_values`]と同じ理由で要る：権限欄は到達できる全ドメインの和で、どのドメインの
+/// 宣言かを持たない（`harness_policy::transition::rights_summary`）。未承認の宛先を載せると、
+/// **出口に入っていない宛先をモデルへ伝える**ことになる。
+pub fn approved_net_values(
+    policy: &PolicyFile,
+    approved: &dyn Fn(DeclarationRef<'_>) -> bool,
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for domain in &policy.domains {
+        for value in domain_net(domain, approved).allow_domains {
+            // 権限欄は小文字へ畳んだ綴りで比べる（`rights_summary`と同じ）。
+            out.insert(value.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
 /// [残課題 サンドボックス周辺 #65] **`policy.json`の外で書込を許した場所**の一覧。
 /// 遷移の編集時検査が「呼び出し元から書ける場所」として数える
 /// （`harness_policy::policy_file::load_for_session`のdoc）。

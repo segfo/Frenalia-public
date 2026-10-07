@@ -41,7 +41,9 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         policy,
         writable_outside_policy,
         domain_fs_grants,
+        domains_net,
         approved_fs_values,
+        approved_net_values,
         policy_learn: policy_learn_enabled,
         wfp_prelude,
         write_mode,
@@ -57,89 +59,46 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     #[cfg(windows)]
     let mut transition_facts: Option<std::sync::Arc<harness_core::TransitionFacts>> = None;
 
-    // Tier2a preflightが成功した後、このhost process用のDaemonを1本だけ起こす。
-    // 起動できなければTier2aセッション自体を開始せず、直接spawnへは降格しない。
-    //
-    // **用意（1）とDaemonの起動（3）は別の関数である**（`startup::transitions`のモジュールdoc）。
-    // 間にドメインごとの中継プロキシとWFPの適用（2）が入るのがP7の形で、いまはまだ2が無い。
+    // **手順1: 遷移先ドメインの用意**（`startup::transitions`のモジュールdocの順序）。**Daemonはまだ起こさない**
+    // ——間にドメインごとの中継プロキシ（手順2a）とWFPの適用（手順3）が入り、出口（`internetClient`）を
+    // 表へ積むのはWFPが立った後（手順4a）である。Daemonを先に起こすと、出口の有無が確定する前に
+    // `Hello`で表を渡してしまう。
     #[cfg(windows)]
-    let spawn_daemon = if shell_tier.tier == harness_core::ShellTier::Tier2a {
-        let provisioned = match super::transitions::provision(
+    let mut provisioned_transitions = if shell_tier.tier == harness_core::ShellTier::Tier2a {
+        match super::transitions::provision(
             policy,
             &workspace_root,
             &write_mode,
             &domain_fs_grants,
             writable_outside_policy,
             &approved_fs_values,
+            &approved_net_values,
         ) {
-            Ok(provisioned) => provisioned,
-            Err(code) => return code,
-        };
-        transition_facts = Some(provisioned.facts.clone());
-        match super::transitions::start_daemon(
-            provisioned,
-            &mut tools,
-            shell_tier.tier,
-            &mut transition_facts,
-        ) {
-            Ok(daemon) => Some(daemon),
+            Ok(provisioned) => {
+                transition_facts = Some(provisioned.facts.clone());
+                Some(provisioned)
+            }
             Err(code) => return code,
         }
     } else {
         None
     };
 
-    let _session_proxy = if net_proxy.domain_policy_enabled {
-        match harness_tools::net_proxy::spawn_local_proxy(&net_proxy).await {
-            Ok(Some(proxy)) => {
-                net_proxy.proxy_addr = Some(proxy.addr);
-                Some(proxy)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                if shell_tier.tier == harness_core::ShellTier::Tier2a {
-                    eprintln!(
-                        "warning: failed to start session-scoped local proxy; Tier2a domain \
-                         enforcement will remain fail-closed instead of opening network: {e}"
-                    );
-                } else {
-                    eprintln!(
-                        "warning: failed to start session-scoped local proxy; run_shell will try \
-                         a per-command proxy instead: {e}"
-                    );
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let _session_fake_dns = if net_proxy.domain_policy_enabled {
-        match harness_tools::fake_dns::spawn_fake_dns(&harness_tools::fake_dns::FakeDnsConfig {
-            allow_domains: net_proxy.allow_domains.clone(),
-            policy_required: net_proxy.domain_policy_enabled,
-            audit_log_path: net_proxy.audit_log_path.clone(),
-            preferred_port: Some(53),
-        })
-        .await
-        {
-            Ok(agent) => {
-                net_proxy.fake_dns_addr = Some(agent.addr);
-                Some(agent)
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to start session-scoped Fake DNS diagnostic agent; run_shell \
-                     will try a per-command Fake DNS agent instead: {e}"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let net_loopback_ports =
-        net_loopback_ports_for_agents(net_proxy.proxy_addr, net_proxy.fake_dns_addr);
+    // **手順2a: ドメインごとの中継プロキシ**（決定69）。用意できた遷移先のうち、承認済みの通信の宛先を
+    // 持つドメインに1本ずつ立てる。WFPの項目は下で一緒に積み、`internetClient`はWFPが立った後に積む。
+    #[cfg(windows)]
+    let mut domain_egress = super::transitions::start_domain_egress(
+        provisioned_transitions.as_ref(),
+        &domains_net,
+        net_proxy.audit_log_path.clone(),
+    )
+    .await;
+
+    // **手順2b: 入口（セッション）の中継プロキシと名前解決**（`net_sources::start_session_agents`。
+    // 2026-10-07に`run_agent`から移した——P7.6 で手順が増えて本体が上限を超えたため）。
+    let session_agents =
+        super::net_sources::start_session_agents(&mut net_proxy, shell_tier.tier).await;
+    let net_loopback_ports = session_agents.loopback_ports();
 
     // MCP手順1〜3（D-38/D-39、`startup::mcp`のモジュールdoc）: 承認照合 → サーバごとの
     // AppContainerプロファイル作成 → サーバ専用プロキシ起動。**プロセスはまだ起こさない**——
@@ -153,8 +112,16 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         net_proxy.audit_log_path.clone(),
     )
     .await;
+    // [決定69 の前例の(3)] **WFPの項目は1つの`ApplyRules`で積む**——MCPサーバの分と、ドメインごとの出口の分。
+    // 欄（`mcp_profiles`）を使い回すのは、昇格側（`harness-netfilterd.exe`）が古い個体でも読む欄だからである
+    // （新しい欄を足すと、古い個体が欄を捨てて`internetClient`だけが効く＝fail-openになる）。
     #[cfg(windows)]
-    let mcp_netfilter_entries = mcp_startup.netfilter_entries();
+    let mcp_netfilter_entries: Vec<harness_sandbox::tier2a::netfilterd::McpNetfilterPolicy> =
+        mcp_startup
+            .netfilter_entries()
+            .into_iter()
+            .chain(domain_egress.netfilter_entries())
+            .collect();
 
     // M15.7: OS監査収集器を**netfilterdの昇格トークンから連鎖起動する**ための接続先を先に作る
     // （追加UACを出さない経路）。netfilterdが起動しない構成ではこのパイプは使われず、
@@ -432,6 +399,30 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     if net_wfp.is_some() {
         net_proxy.enforced_by_wfp = true;
     }
+
+    // **手順4: 出口を表へ付ける（WFPが立った回だけ）／立たなければ畳む。** 逆順にすると、既定拒否が
+    // 効くまでの間だけ`internetClient`を持った子が走れる窓ができる（`domain_egress`のモジュールdoc）。
+    // **手順5: Spawn Daemonを起こす**——表はここで確定している（`Hello`で渡す値がもう変わらない）。
+    #[cfg(windows)]
+    let spawn_daemon = match provisioned_transitions.take() {
+        Some(mut provisioned) => {
+            super::transitions::attach_domain_egress(
+                &mut domain_egress,
+                &mut provisioned,
+                net_wfp.is_some(),
+            );
+            match super::transitions::start_daemon(
+                provisioned,
+                &mut tools,
+                shell_tier.tier,
+                &mut transition_facts,
+            ) {
+                Ok(daemon) => Some(daemon),
+                Err(code) => return code,
+            }
+        }
+        None => None,
+    };
 
     // M15.7: OS監査によるFSアクセス拒否の収集（`--policy-learn`、`plans/DESIGN-SANDBOX-APPPOLICY.md` §11）。
     //

@@ -38,7 +38,6 @@ pub(crate) fn validate_and_merge_net_allow_domains(
 
 // loopback許可ポートの算出は`harness_tools::net_proxy`が持つ（Proxy/Fake DNSを起こす側と
 // 同じ場所。ポリシーエディタのパス2も同じ関数を使う）。ここは再エクスポートだけ。
-pub(crate) use harness_tools::net_proxy::net_loopback_ports_for_agents;
 
 fn event_string<'a>(event: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     event.get(key).and_then(|v| v.as_str())

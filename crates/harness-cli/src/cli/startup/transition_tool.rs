@@ -42,9 +42,10 @@ pub(super) fn should_expose(
 /// 一覧と権限の要約の計算は[`harness_policy::transition_listing`]が持つ。
 /// **ここへ写さない**——段階⑦のポリシーエディタの画面も同じものを使う。
 ///
-/// [#30] **権限欄（`rights_fs`）には、このマシンで承認済みの宣言だけを載せる**（`approved_fs_values`、
-/// `harness_sandbox::tier2a::policy_fs::approved_fs_values`が作る）。未承認の宣言には許可が付かないので、載せると
-/// 付いていない許可をモデルへ伝えることになる。辺と判定の入力は変えない（Daemonと同じグラフのまま）。
+/// [#30・決定69(1)] **権限欄には、このマシンで承認済みの宣言だけを載せる**（ファイルは`approved_fs_values`、
+/// 通信は`approved_net_values`。どちらも`harness_sandbox::tier2a::policy_fs`が作る）。未承認の宣言には
+/// 許可が付かない（通信は出口に入らない）ので、載せると**持っていない権限**をモデルへ伝えることになる。
+/// 辺と判定の入力は変えない（Daemonと同じグラフのまま）。
 ///
 /// **`provisioned_domains`はDaemonへ渡すのと同じ表から作ること**（`domain_provision`が実際に用意できた
 /// 遷移先の`policy_domain`）。「いま起こせるか」はその表に在るかで決まる——別に数えると、
@@ -55,6 +56,7 @@ pub(super) fn facts_from_policy(
     workspace_root: &str,
     writable_outside_policy: &[String],
     approved_fs_values: &std::collections::BTreeSet<(String, &'static str)>,
+    approved_net_values: &std::collections::BTreeSet<String>,
     provisioned_domains: &std::collections::BTreeSet<String>,
 ) -> TransitionFacts {
     let input = policy.transition_graph_input(Some(workspace_root), writable_outside_policy);
@@ -78,7 +80,13 @@ pub(super) fn facts_from_policy(
                 .filter(|(path, access)| approved_fs_values.contains(&(path.clone(), *access)))
                 .map(|(path, access)| (path, access.to_string()))
                 .collect(),
-            rights_net: row.rights.net,
+            // [決定69(1)] 通信の宛先も**このマシンで承認済みのものだけ**（未承認の宛先は出口に入らない）。
+            rights_net: row
+                .rights
+                .net
+                .into_iter()
+                .filter(|host| approved_net_values.contains(&host.to_ascii_lowercase()))
+                .collect(),
             runnable_now: row.runnable_now,
         })
         .collect();
@@ -155,7 +163,14 @@ mod tests {
         let policy: harness_policy::policy_file::PolicyFile =
             serde_json::from_value(json).expect("parse");
 
-        let facts = facts_from_policy(&policy, "C:/ws", &[], &Default::default(), &Default::default());
+        let facts = facts_from_policy(
+            &policy,
+            "C:/ws",
+            &[],
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(facts.from_domain, harness_policy::policy_file::ENTRY_DOMAIN);
         assert_eq!(facts.programs.len(), 1);
@@ -170,7 +185,14 @@ mod tests {
     #[test]
     fn a_policy_without_transitions_yields_an_empty_list_not_a_missing_one() {
         let policy = harness_policy::policy_file::PolicyFile::default();
-        let facts = facts_from_policy(&policy, "C:/ws", &[], &Default::default(), &Default::default());
+        let facts = facts_from_policy(
+            &policy,
+            "C:/ws",
+            &[],
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
         assert!(facts.programs.is_empty());
     }
 
@@ -201,6 +223,7 @@ mod tests {
             "C:/ws",
             &[],
             &Default::default(),
+            &Default::default(),
             &provisioned,
         );
         assert!(
@@ -217,6 +240,7 @@ mod tests {
             &entry_with_an_edge_to("iso"),
             "C:/ws",
             &[],
+            &Default::default(),
             &Default::default(),
             &Default::default(),
         );
@@ -243,7 +267,14 @@ mod tests {
         let approved: std::collections::BTreeSet<(String, &'static str)> =
             [("C:/approved/**".to_string(), "read")].into_iter().collect();
 
-        let facts = facts_from_policy(&policy, "C:/ws", &[], &approved, &Default::default());
+        let facts = facts_from_policy(
+            &policy,
+            "C:/ws",
+            &[],
+            &approved,
+            &Default::default(),
+            &Default::default(),
+        );
 
         assert_eq!(facts.programs.len(), 1, "the edge itself does not depend on approval");
         let rights: Vec<&str> = facts.programs[0]

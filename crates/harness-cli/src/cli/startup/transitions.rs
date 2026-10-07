@@ -41,6 +41,7 @@ pub(super) fn provision(
     domain_fs_grants: &harness_sandbox::tier2a::policy_fs::DomainFsGrants,
     writable_outside_policy: Vec<String>,
     approved_fs_values: &std::collections::BTreeSet<(String, &'static str)>,
+    approved_net_values: &std::collections::BTreeSet<String>,
 ) -> Result<ProvisionedTransitions, ExitCode> {
     // [段階⑤] **製品の既定は「生成禁止を積まない」。** 積むと、遷移ポリシーの評価
     // （段階E）が無い今はDaemonの答えが常に「未実装なので断る」になり、
@@ -108,6 +109,7 @@ pub(super) fn provision(
         &workspace_root.to_string_lossy(),
         &writable_outside_policy,
         approved_fs_values,
+        approved_net_values,
         &provisioned_domains,
     ));
     Ok(ProvisionedTransitions {
@@ -117,6 +119,88 @@ pub(super) fn provision(
         domains: provisioned.domains,
         facts,
     })
+}
+
+/// 2a. [決定69] 用意できた遷移先のうち、**承認済みの通信の宛先を持つドメイン**に専用の中継プロキシを立てる。
+///
+/// 組み立ては`harness_tools::domain_egress`が持つ（ポリシーエディタのパス2も同じこれを呼ぶ。`B-05`）。
+/// ここがやるのは**用意できた表と宛先の突き合わせ**だけである——表に無いドメイン（用意できなかった）へ
+/// 出口を作っても使う子が居ないので、プロキシを立てない。
+///
+/// `record_all`は取らない（`harness.exe`は常に宣言どおり）。記録モードはポリシーエディタのパス2だけが使う。
+pub(super) async fn start_domain_egress(
+    provisioned: Option<&ProvisionedTransitions>,
+    domains_net: &[(String, harness_sandbox::tier2a::policy_fs::DomainNet)],
+    audit_log_path: Option<PathBuf>,
+) -> harness_tools::domain_egress::EgressPlan {
+    let mut wanted = Vec::new();
+    if let Some(provisioned) = provisioned {
+        for (domain, net) in domains_net {
+            // **使えなかった宣言を黙って落とさない**（`B-10`）。承認していない宛先は出口に入らない。
+            for skipped in &net.skipped {
+                eprintln!(
+                    "warning: the domain {domain:?} declares the destination {} but it is not used \
+                     this session: {}",
+                    skipped.value,
+                    skipped.reason.describe()
+                );
+            }
+            if !net.wants_egress() {
+                continue;
+            }
+            // 用意できた表に在るドメインだけ（`DomainSpec::name`がWFPの項目の条件になる）。
+            let Some(spec) = provisioned
+                .domains
+                .iter()
+                .find(|d| &d.policy_domain == domain)
+            else {
+                eprintln!(
+                    "warning: the domain {domain:?} declares network destinations, but the domain \
+                     itself could not be prepared this session, so it gets no egress"
+                );
+                continue;
+            };
+            wanted.push(harness_tools::domain_egress::DomainEgressRequest {
+                domain: domain.clone(),
+                profile: spec.name.clone(),
+                allow_domains: net.allow_domains.clone(),
+            });
+        }
+    }
+    let plan =
+        harness_tools::domain_egress::start_domain_egress(&wanted, audit_log_path, false).await;
+    for (domain, reason) in plan.failed() {
+        eprintln!("warning: the domain {domain:?} gets no network egress this session: {reason}");
+    }
+    plan
+}
+
+/// 4. [決定69] **WFPが立った回だけ**、出口を遷移先の表へ積む（`internetClient`とプロキシの宛先）。
+///
+/// 立たなかった回は**何も積まずにプロキシを畳む**（fail-closed）。`internetClient`を持ったまま既定拒否を
+/// 失うと素通しになる——`tier2a::wfp`のdocが既知の欠陥として書いている形である。
+pub(super) fn attach_domain_egress(
+    egress: &mut harness_tools::domain_egress::EgressPlan,
+    provisioned: &mut ProvisionedTransitions,
+    wfp_is_live: bool,
+) {
+    if !wfp_is_live {
+        for (domain, reason) in egress.drop_all(
+            "the WFP egress enforcement is not active this session, so this domain gets no network \
+             capability (refusing to hand out internetClient without the default-deny)",
+        ) {
+            eprintln!("warning: the domain {domain:?} gets no network egress: {reason}");
+        }
+        return;
+    }
+    let attached = egress.attach(&mut provisioned.domains);
+    if !attached.is_empty() {
+        eprintln!(
+            "note: dedicated egress proxies are live for the domain(s) {} (each one only reaches \
+             the destinations approved for that domain)",
+            attached.join(", ")
+        );
+    }
 }
 
 /// 3. Spawn Daemonを起こし、ツールを登録する。**呼び出し側がWFPの適用を終えてから呼ぶ**（モジュールdoc）。
@@ -221,5 +305,95 @@ fn end_session_after_failure() {
     );
     if let Some(summary) = outcome.summary() {
         eprintln!("note: {summary}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn domain_spec(policy_domain: &str) -> harness_sandbox::tier2a::spawnd::DomainSpec {
+        harness_sandbox::tier2a::spawnd::DomainSpec {
+            name: format!("harness.domain.1-2.{policy_domain}"),
+            policy_domain: policy_domain.to_string(),
+            container_sid: "S-1-15-2-1".to_string(),
+            capability_sids: vec!["S-1-15-3-1024-1".to_string()],
+            identity: harness_sandbox::tier2a::spawnd::DomainIdentitySpec::OwnPackage,
+            proxy_env: Vec::new(),
+        }
+    }
+
+    fn provisioned_with(domain: &str) -> ProvisionedTransitions {
+        ProvisionedTransitions {
+            policy: harness_policy::policy_file::PolicyFile::default(),
+            workspace_root: "C:/ws".to_string(),
+            writable_outside_policy: Vec::new(),
+            domains: vec![domain_spec(domain)],
+            facts: std::sync::Arc::new(harness_core::TransitionFacts {
+                from_domain: harness_policy::policy_file::ENTRY_DOMAIN.to_string(),
+                programs: Vec::new(),
+            }),
+        }
+    }
+
+    async fn egress_for(domain: &str) -> harness_tools::domain_egress::EgressPlan {
+        harness_tools::domain_egress::start_domain_egress(
+            &[harness_tools::domain_egress::DomainEgressRequest {
+                domain: domain.to_string(),
+                profile: format!("harness.domain.1-2.{domain}"),
+                allow_domains: vec!["example.com".to_string()],
+            }],
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// **禁止側（fail-closed）**: WFPが立たなかった回は、どのドメインも`internetClient`を持たない。
+    ///
+    /// # 壊れた状態を一文で
+    ///
+    /// **通信が素通しになる。** `internetClient`を持った子が、宛先を絞るWFPの既定拒否なしで走る
+    /// （`tier2a::wfp`のdocが既知の欠陥として書いている形）。順序を逆にすると同じことが一瞬だけ起きる。
+    #[tokio::test]
+    async fn when_wfp_does_not_come_up_no_domain_keeps_internet_client() {
+        let mut egress = egress_for("ssh").await;
+        let mut provisioned = provisioned_with("ssh");
+
+        attach_domain_egress(&mut egress, &mut provisioned, /* wfp_is_live */ false);
+
+        assert!(
+            !provisioned.domains[0]
+                .capability_sids
+                .iter()
+                .any(|sid| sid == harness_sandbox::tier2a::INTERNET_CLIENT_SID),
+            "WFPが立っていないのに internetClient を積んだ: {:?}",
+            provisioned.domains[0].capability_sids
+        );
+        assert!(
+            provisioned.domains[0].proxy_env.is_empty(),
+            "出口が無いのにプロキシの宛先を渡した（子が宛先を知る）"
+        );
+        assert!(egress.is_empty(), "プロキシを畳んでいない");
+    }
+
+    /// **許可側の対**: WFPが立った回は`internetClient`とプロキシの宛先が表へ載る。
+    ///
+    /// 対にしないと「常に積まない」実装でも禁止側が緑になり、**通信が1つも通らない**まま気づかない（`B-35`）。
+    #[tokio::test]
+    async fn when_wfp_is_live_the_domain_gets_its_capability_and_proxy() {
+        let mut egress = egress_for("ssh").await;
+        let mut provisioned = provisioned_with("ssh");
+
+        attach_domain_egress(&mut egress, &mut provisioned, /* wfp_is_live */ true);
+
+        assert!(provisioned.domains[0]
+            .capability_sids
+            .iter()
+            .any(|sid| sid == harness_sandbox::tier2a::INTERNET_CLIENT_SID));
+        assert!(provisioned.domains[0]
+            .proxy_env
+            .iter()
+            .any(|(name, _)| name == "HTTP_PROXY"));
     }
 }

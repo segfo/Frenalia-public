@@ -50,8 +50,13 @@ pub(super) struct SandboxPrepared {
     pub(super) writable_outside_policy: Vec<String>,
     /// [#30] 遷移先ドメインごとの、このセッションで付いた許可（ドメインの用意が読む）。
     pub(super) domain_fs_grants: harness_sandbox::tier2a::policy_fs::DomainFsGrants,
+    /// [決定69(1)] 用意する遷移先ドメインの**承認済みの通信の宛先**（ドメインごとの中継プロキシの材料）。
+    /// `harness_tools::domain_egress`へ渡す（出口を作るのは`stage_run_agent`——WFPの適用と順序が結び付くため）。
+    pub(super) domains_net: Vec<(String, harness_sandbox::tier2a::policy_fs::DomainNet)>,
     /// [#30] モデルへ見せる遷移の一覧の権限欄に載せてよい`(値, 級)`（このマシンで承認済みのもの）。
     pub(super) approved_fs_values: std::collections::BTreeSet<(String, &'static str)>,
+    /// [決定69(1)] 同じく権限欄に載せてよい通信の宛先（このマシンで承認済みのもの。小文字へ畳んだ綴り）。
+    pub(super) approved_net_values: std::collections::BTreeSet<String>,
     /// M15.7: セッション中のOS監査収集を有効にするか（`--policy-learn`→`settings.policy.learn`→false）。
     /// **`ToolCtx`には載せない**——収集器は受動的で`run_shell`の挙動を変えないため。
     pub(super) policy_learn: bool,
@@ -227,6 +232,10 @@ pub(super) fn stage_prepare_sandbox(
 
     // 協調プロキシ設定（M12補遺、D-15）。CLI `--net-allow-domain`（繰り返し）と
     // `.harness/settings.json`の`net.allow_domains`を和集合でマージする（重複除去）。
+    //
+    // [決定69(1)] **Tier2a ではこの宛先を下で捨てて、`policy.json`の承認済みの宣言＋`--net-allow-domain`へ
+    // 入れ替える**（`net_sources::entry_destinations`）。ここで一度組むのは、Tier2a 以外（Tier0/Tier1/Tier3）が
+    // 今までどおり`settings.json`を読むからである（P8 で決め直す）。
     let mut net_proxy = settings
         .net
         .clone()
@@ -477,6 +486,10 @@ pub(super) fn stage_prepare_sandbox(
         .as_ref()
         .map(|policy| harness_sandbox::tier2a::policy_fs::approved_fs_values(policy, &approved))
         .unwrap_or_default();
+    let approved_net_values = policy
+        .as_ref()
+        .map(|policy| harness_sandbox::tier2a::policy_fs::approved_net_values(policy, &approved))
+        .unwrap_or_default();
     // **付けない宣言を黙って落とさない**（B-10）。黙ると「承認したのに読めない」の原因が出ない。
     for skipped in &policy_plan.entry_skipped {
         eprintln!(
@@ -487,6 +500,34 @@ pub(super) fn stage_prepare_sandbox(
             harness_policy::policy_file::ENTRY_DOMAIN,
             skipped.reason.describe()
         );
+    }
+    // [決定69(1)] **Tier2a の通信の宛先は`policy.json`の承認済みの宣言＋`--net-allow-domain`だけ**にする
+    // （`settings.json`の`net.allow_domains`は Tier2a には効かない）。組み立ては`net_sources`の1か所で、
+    // `harness prompt`の下見も同じ関数を通る（`B-06`）。
+    if tier2a_requested {
+        match super::net_sources::entry_destinations(&policy_plan.entry_net, &cli.net_allow_domain) {
+            Ok(destinations) => {
+                // **使えなかった宣言を黙って落とさない**（`B-10`）。承認したのに通信できない理由はここにしか出ない。
+                for warning in &destinations.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                net_proxy.allow_domains = destinations.allow_domains;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+        // confidential（外部持出し経路を作らない）と`policy.json`の通信の宣言の矛盾も見る（文面と判定は
+        // `net_sources::confidential_conflict`の1か所。遷移先のドメインの宣言も数える）。
+        if let Some(reason) = super::net_sources::confidential_conflict(
+            require_sandbox,
+            &policy_plan.entry_net,
+            &policy_plan.domains_net,
+        ) {
+            eprintln!("error: {reason}");
+            return Err(ExitCode::FAILURE);
+        }
     }
     // 入口ドメインの宣言は、手書きの一覧と同じく入口の子のトークンへ載る（同じルートは1本に畳む）。
     harness_sandbox::tier2a::policy_fs::merge_into(&mut fs_passthrough, &policy_plan.entry);
@@ -678,7 +719,9 @@ pub(super) fn stage_prepare_sandbox(
         policy,
         writable_outside_policy,
         domain_fs_grants,
+        domains_net: policy_plan.domains_net,
         approved_fs_values,
+        approved_net_values,
         policy_learn,
         wfp_prelude,
         write_mode,

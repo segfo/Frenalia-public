@@ -12,6 +12,9 @@ mod configure;
 /// `.env`の読み込み。**リポジトリ同梱の`.env`は読まない**（BUG-115）。
 mod dotenv;
 mod mcp;
+/// [決定69(1)(4)] Tier2a の入口のシェルが使える通信の宛先をどこから取るか（`policy.json`の承認済みの宣言＋
+/// `--net-allow-domain`）。起動（`sandbox`）と`harness prompt`（`workspace_cmd`）が同じこれを通る。
+mod net_sources;
 mod parse_args;
 /// [#30] `policy.json`のファイル宣言から付ける許可を決め、付いた結果を宣言の一覧ごとに振り分ける。
 /// **windows専用にしない**——決める部分も振り分ける部分も純粋で、単体テストできることが要である。
@@ -33,6 +36,8 @@ mod transitions;
 mod wfp_outcome;
 
 use configure::stage_configure;
+/// [決定69(1)] `harness prompt`（下見）が、起動と**同じ関数**で入口の通信の宛先を組むための口。
+pub(crate) use net_sources::entry_destinations_from_workspace;
 use parse_args::stage_parse_args;
 use run_agent::stage_run_agent;
 use sandbox::stage_prepare_sandbox;
