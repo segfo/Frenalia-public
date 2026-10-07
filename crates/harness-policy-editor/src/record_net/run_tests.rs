@@ -12,7 +12,7 @@ use harness_policy::normalize::GrantScope;
 use harness_sandbox::tier2a::policy_fs::PolicyFsPlan;
 use harness_sandbox::FsPassthrough;
 
-use super::{pass2_lists, split_granted};
+use super::{domain_egress_requests, pass2_lists, split_granted};
 
 fn fp(path: &str, access: harness_sandbox::FsAccess) -> FsPassthrough {
     FsPassthrough {
@@ -109,4 +109,64 @@ fn only_the_entry_list_reaches_the_entry_child() {
         .expect("npm の分");
     let npm_sids: Vec<&str> = npm.iter().map(|g| g.subject_sid.as_str()).collect();
     assert_eq!(npm_sids, vec!["S-NPM-A", "S-NPM-B"]);
+}
+
+// --- [決定69] ドメインごとの出口を立てる要求の組み立て ---
+
+fn spec(policy_domain: &str) -> harness_sandbox::tier2a::spawnd::DomainSpec {
+    harness_sandbox::tier2a::spawnd::DomainSpec {
+        name: format!("harness.domain.1-2.{policy_domain}"),
+        policy_domain: policy_domain.to_string(),
+        container_sid: "S-1-15-2-1".to_string(),
+        capability_sids: Vec::new(),
+        identity: harness_sandbox::tier2a::spawnd::DomainIdentitySpec::OwnPackage,
+        proxy_env: Vec::new(),
+    }
+}
+
+fn declared(domain: &str, values: &[&str]) -> (String, harness_sandbox::tier2a::policy_fs::DomainNet) {
+    (
+        domain.to_string(),
+        harness_sandbox::tier2a::policy_fs::DomainNet {
+            allow_domains: values.iter().map(|v| v.to_string()).collect(),
+            skipped: Vec::new(),
+        },
+    )
+}
+
+/// **強制モード**（決定64）: 承認済みの宣言を持つドメインだけに出口を立てる。
+///
+/// 宣言していないドメインへ出口を作ると、「宣言の外は断られる」を確かめる実行にならない。
+#[test]
+fn enforcing_pass2_gives_egress_only_to_domains_that_declared_destinations() {
+    let domains = vec![spec("ssh"), spec("quiet")];
+    let nets = vec![declared("ssh", &["example.com"])];
+
+    let requests = domain_egress_requests(&domains, &nets, crate::session_dir::NetMode::Declared);
+
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert_eq!(requests[0].domain, "ssh");
+    assert_eq!(requests[0].profile, "harness.domain.1-2.ssh");
+    assert_eq!(requests[0].allow_domains, vec!["example.com".to_string()]);
+}
+
+/// **記録モード**（決定64）: 用意できた遷移先の**全部**に出口を立てる（候補をドメインごとに集めるため）。
+///
+/// 宛先の判定は中継プロキシ側の`record_all`が持つので、宣言していないドメインにも立てる必要がある
+/// ——立てないと、そのドメインの子が触った宛先が1件も記録に出ない（候補が永久に作れない）。
+#[test]
+fn recording_pass2_gives_egress_to_every_prepared_domain() {
+    let domains = vec![spec("ssh"), spec("quiet")];
+    let nets = vec![declared("ssh", &["example.com"])];
+
+    let requests = domain_egress_requests(&domains, &nets, crate::session_dir::NetMode::RecordAll);
+
+    let names: Vec<&str> = requests.iter().map(|r| r.domain.as_str()).collect();
+    assert_eq!(names, vec!["ssh", "quiet"], "{requests:?}");
+    assert!(
+        requests
+            .iter()
+            .all(|r| !r.allow_domains.is_empty()),
+        "宛先が空の要求は出口を作らない（`start_domain_egress`が飛ばす）: {requests:?}"
+    );
 }

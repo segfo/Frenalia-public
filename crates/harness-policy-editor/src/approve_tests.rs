@@ -357,14 +357,25 @@ fn approving_one_candidate_does_not_approve_a_shipped_declaration_in_the_same_do
     );
 }
 
-/// ネットワークの宣言は承認台帳の対象外（台帳はファイル宣言だけを持つ）。
+/// [決定69(2)] **通信の候補を承認すると、台帳にも記録される**（ファイルの宣言と同じ）。
+///
+/// 記録しないと、`policy.json`に書いた宛先が中継プロキシの許可に入らない——「承認したのに通信できない」
+/// という形で出る。2026-10-07 までは台帳がファイルの宣言だけを持っていたので、ここは「記録しない」を固定していた。
 #[test]
-fn approving_a_network_candidate_records_nothing_in_the_file_approval_ledger() {
+fn approving_a_network_candidate_records_it_in_the_approval_ledger() {
     let ws = workspace();
     let proposals = vec![proposal("net-1", SettingsKey::NetAllowDomains, "crates.io")];
     let accept = ids(&["net-1"]);
     let plan = plan(&request(ws.path(), &proposals, &accept)).expect("plan");
     commit(ws.path(), &plan).expect("commit");
 
-    assert!(crate::approval_store::approval_store().load().approvals.is_empty());
+    let approvals = crate::approval_store::approval_store().load();
+    assert!(approvals.is_approved(
+        ws.path(),
+        harness_sandbox::tier2a::policy_approval::DeclarationRef {
+            domain: "cargo",
+            value: "crates.io",
+            key: SettingsKey::NetAllowDomains,
+        }
+    ));
 }

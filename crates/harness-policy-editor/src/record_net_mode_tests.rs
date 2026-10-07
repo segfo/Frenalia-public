@@ -11,8 +11,9 @@ fn domain_allowing(name: &str, hosts: &[&str]) -> crate::policy_file::PolicyDoma
     domain
 }
 
-/// [決定68(2)] **通信の宣言は入口のドメインのものだけを使う**（パス2は常に入口から始める。ドメインごとの出口は P7）。
-/// 別のドメインが宣言した宛先は、強制で走らせても通さない（禁止側）。入口が宣言した宛先は通す（許可側）。
+/// [決定68(2)・決定69(1)] **入口の中継プロキシへ渡す宣言は入口のドメインのものだけ**である
+/// （遷移先のドメインの宛先は、そのドメインの専用プロキシが持つ＝`domain_egress`）。
+/// 別のドメインが宣言した宛先は入口のプロキシでは通さない（禁止側）。入口の宣言は通す（許可側）。
 #[test]
 fn the_network_declarations_come_from_the_entry_domain() {
     let policy = crate::policy_file::PolicyFile {
@@ -23,10 +24,14 @@ fn the_network_declarations_come_from_the_entry_domain() {
         ..crate::policy_file::PolicyFile::default()
     };
 
-    let declared = entry_net_declarations(&policy);
-    assert_eq!(declared, ["crates.io".to_string()]);
+    // [決定69(2)] 承認の照合は`policy_fs::domain_net`が持つ（ここでは全部承認済みとして見る）。
+    let declared = harness_sandbox::tier2a::policy_fs::domain_net(
+        policy.domain(crate::policy_file::ENTRY_DOMAIN).expect("入口"),
+        &|_| true,
+    );
+    assert_eq!(declared.allow_domains, ["crates.io".to_string()]);
 
-    let plan = net_policy_plan(NetMode::Declared, declared).expect("plan");
+    let plan = net_policy_plan(NetMode::Declared, &declared.allow_domains).expect("plan");
     assert!(plan.policy.evaluate_host("crates.io").allowed, "入口の宣言は通す");
     assert!(
         !plan.policy.evaluate_host("github.com").allowed,
@@ -43,14 +48,12 @@ fn a_policy_without_an_entry_domain_runs_with_no_declarations() {
         ..crate::policy_file::PolicyFile::default()
     };
 
-    let declared = entry_net_declarations(&policy);
-    assert!(declared.is_empty(), "{declared:?}");
-    let plan = net_policy_plan(NetMode::Declared, declared).expect("plan");
-    assert!(!plan.policy.evaluate_host("crates.io").allowed);
     assert!(
-        entry_net_declarations(&crate::policy_file::PolicyFile::default()).is_empty(),
-        "policy.json が空でも落ちない"
+        policy.domain(crate::policy_file::ENTRY_DOMAIN).is_none(),
+        "この policy.json には入口のドメインが無い"
     );
+    let plan = net_policy_plan(NetMode::Declared, &[]).expect("plan");
+    assert!(!plan.policy.evaluate_host("crates.io").allowed);
 }
 
 /// 遷移先のドメインを用意した結果の1行（CLI と画面が共有する）。用意したドメインの名前と、用意できなかった数を出す

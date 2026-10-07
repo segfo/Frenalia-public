@@ -278,22 +278,9 @@ pub(super) fn run_pass2<'a>(
             .collect(),
         skipped: provisioned.skipped.len(),
     });
-    // [決定68 の前例の(3)] **Daemon はパス2のたびに起こし直す**（Hello がその回の宣言・表・記録の名前を運ぶ）。
-    let transition_policy = harness_sandbox::tier2a::spawnd::TransitionPolicy {
-        policy: plan.policy.clone(),
-        workspace_root: request.workspace_root.to_string_lossy().into_owned(),
-        // [残課題 サンドボックス周辺 #65] **パス2は`policy.json`の外で書込を許さない**
-        // ——`--fs-allow`も`settings.json`も読まず、付けるのは`policy.json`の宣言だけで、
-        // それは宣言として既に検査の視野に入っている。したがって空が正しい。
-        writable_outside_policy: Vec::new(),
-        domains: provisioned.domains,
-        // [決定68 の前例の(2)] 許可した生成の記録の名前（Daemon は`workspace_root`から置き場を組み立てる）。
-        spawn_audit_record: plan.spawn_audit_record.clone(),
-    };
-    let spawn_daemon = request
-        .spawn_daemon
-        .restart(transition_policy)
-        .map_err(RecordNetError::SpawnDaemon)?;
+    // [決定69] **Daemon を起こすのはWFPの適用の後である**（`startup::transitions`と同じ順序）。表へ積む
+    // `internetClient`とプロキシの宛先は、WFPが立った回だけ付くので、ここでは表をまだ渡せない。
+    let mut provisioned_domains = provisioned.domains;
 
     // **実際にACEが付いた穴だけ**を台帳へ記録する（幻の台帳エントリを作らない、BUG-017）。
     // 記録しないと撤収経路の無い孤立ACEになるので、ここは飛ばせない。
@@ -450,6 +437,21 @@ pub(super) fn run_pass2<'a>(
             None
         }
     };
+    // [決定69] **ドメインごとの中継プロキシ**（入口の分と同じ監査の置き場へ、ドメインの印を付けて書く）。
+    // 記録モードでは各ドメインのプロキシも全部の宛先を通す（決定64。候補をドメインごとに集めるため）、
+    // 強制モードでは承認済みの宣言だけ。立たなければそのドメインは出口を持たない（閉じる側）。
+    let domain_egress = runtime.block_on(harness_tools::domain_egress::start_domain_egress(
+        &domain_egress_requests(&provisioned_domains, &fs_plan.domains_net, request.net_mode),
+        Some(net_audit_path.clone()),
+        request.net_mode == NetMode::RecordAll,
+    ));
+    for (domain, reason) in domain_egress.failed() {
+        warn(
+            format!("遷移先のドメイン `{domain}` は通信の出口を持ちません: {reason}"),
+            warnings,
+            on_event,
+        );
+    }
     state.runtime = Some(runtime);
 
     // --- WFPの出口強制 -----------------------------------------------------------
@@ -461,7 +463,8 @@ pub(super) fn run_pass2<'a>(
         allow_loopback_tcp_ports: loopback.tcp.clone(),
         allow_loopback_udp_ports: loopback.udp.clone(),
         audit_log_path: Some(net_audit_path.clone()),
-        mcp_profiles: Vec::new(),
+        // [決定69 の前例の(3)] ドメインごとの出口のWFPの項目（欄は MCP サーバと共有。古い昇格側でも読む欄）。
+        mcp_profiles: domain_egress.netfilter_entries(),
         // M15.7/D-44: 昇格側が`audit_log_path`を検証するための基準。渡さないと監査ログが
         // 無効化される（fail-safe側）。
         workspace_root: Some(request.workspace_root.to_path_buf()),
@@ -481,6 +484,33 @@ pub(super) fn run_pass2<'a>(
     on_event(NetRecordEvent::WfpEnforced {
         reused: applied.reused,
     });
+
+    // [決定69] **WFPが立ったのでドメインの出口を表へ付ける**（`internetClient`とプロキシの宛先）。
+    // ここへ来た＝`apply`が成功している（失敗は上の`?`で返っている）ので、立たなかった回は存在しない
+    // ——`harness.exe`側（`startup::transitions::attach_domain_egress`）は立たない回があるので分岐を持つ。
+    let attached = domain_egress.attach(&mut provisioned_domains);
+    if !attached.is_empty() {
+        on_event(NetRecordEvent::Warning(format!(
+            "ドメインごとの中継プロキシが立ちました: {}（それぞれ自分の宛先だけに届きます）",
+            attached.join("、")
+        )));
+    }
+    // [決定68 の前例の(3)] **Daemon はパス2のたびに起こし直す**（Hello がその回の宣言・表・記録の名前を運ぶ）。
+    let transition_policy = harness_sandbox::tier2a::spawnd::TransitionPolicy {
+        policy: plan.policy.clone(),
+        workspace_root: request.workspace_root.to_string_lossy().into_owned(),
+        // [残課題 サンドボックス周辺 #65] **パス2は`policy.json`の外で書込を許さない**
+        // ——`--fs-allow`も`settings.json`も読まず、付けるのは`policy.json`の宣言だけで、
+        // それは宣言として既に検査の視野に入っている。したがって空が正しい。
+        writable_outside_policy: Vec::new(),
+        domains: provisioned_domains,
+        // [決定68 の前例の(2)] 許可した生成の記録の名前（Daemon は`workspace_root`から置き場を組み立てる）。
+        spawn_audit_record: plan.spawn_audit_record.clone(),
+    };
+    let spawn_daemon = request
+        .spawn_daemon
+        .restart(transition_policy)
+        .map_err(RecordNetError::SpawnDaemon)?;
 
     // --- deny-only収集器（パス2で実際に起きたFS拒否を観測する）---------------------
     // **WFPを張ってから起こす**（順序に依存は無いが、出口強制の確立を遅らせない）。
@@ -792,6 +822,48 @@ fn drain_net_audit(
     }
     aggregate.add_unparsable(skipped);
 }
+
+/// [決定69] ドメインごとの出口を立てる要求を組む。
+///
+/// **記録モード**では用意できた遷移先の**全部**に立てる（決定64。候補をドメインごとに集めるので、
+/// 宣言していないドメインの通信も記録する必要がある。宛先の判定は`record_all`が全部通す）。
+/// **強制モード**では承認済みの宣言を持つドメインだけ（宣言の外は断られることを確かめるのが目的）。
+fn domain_egress_requests(
+    domains: &[harness_sandbox::tier2a::spawnd::DomainSpec],
+    domains_net: &[(String, harness_sandbox::tier2a::policy_fs::DomainNet)],
+    mode: NetMode,
+) -> Vec<harness_tools::domain_egress::DomainEgressRequest> {
+    domains
+        .iter()
+        .filter_map(|spec| {
+            let declared = domains_net
+                .iter()
+                .find(|(name, _)| name == &spec.policy_domain)
+                .map(|(_, net)| net.allow_domains.clone())
+                .unwrap_or_default();
+            // 記録モードは宛先の判定を`record_all`が持つので、ここは**空でない**ことだけが要る
+            // （`start_domain_egress`は宛先が空のドメインに出口を作らない）。印には宣言の綴りを渡す。
+            let allow_domains = match mode {
+                NetMode::RecordAll if declared.is_empty() => vec![RECORD_ALL_PLACEHOLDER.to_string()],
+                NetMode::RecordAll => declared,
+                NetMode::Declared => declared,
+            };
+            if allow_domains.is_empty() {
+                return None;
+            }
+            Some(harness_tools::domain_egress::DomainEgressRequest {
+                domain: spec.policy_domain.clone(),
+                profile: spec.name.clone(),
+                allow_domains,
+            })
+        })
+        .collect()
+}
+
+/// 記録モードで、宛先を1件も宣言していないドメインにも出口を立てるための置き（**判定には使われない**
+/// ——記録モードの中継プロキシは`DomainPolicy::record_all`で全部を通す）。綴りは解釈できる形でなければ
+/// ならない（`start_domain_egress`が正規化を通す）。
+const RECORD_ALL_PLACEHOLDER: &str = "record-all.invalid";
 
 /// [決定68(1)] 1回の付与処理（preflight）へ渡す一覧——**入口の一覧の後ろに、用意する遷移先の一覧を全部つなぐ**
 /// （UAC は今どおり最大1回）。戻り値の2つ目は入口の件数（振り分けで入口の分を切り出す）。`harness.exe`の

@@ -45,9 +45,9 @@ pub(super) fn print_overview() {
     println!("ACLは触りません。ACEが付くのは、承認済みのファイル宣言を record-net（パス2）か");
     println!("harness.exe の起動が読んだときです。");
     println!();
-    println!("宣言どおりに走らせて確かめるのは record-net --enforce-net です。強制で効くのは");
-    println!("この試験実行の中だけで、harness.exe本体はまだpolicy.jsonのnet.allow_domainsで");
-    println!("通信を許しません（本体ではsettings.jsonのnet.allow_domainsが効きます）。");
+    println!("宣言どおりに走らせて確かめるのは record-net --enforce-net です。");
+    println!("harness.exe の Tier2a も、この policy.json の承認済みの net.allow_domains で通信を許します");
+    println!("（決定69。承認していない宛先は中継プロキシの許可に入りません）。");
     println!();
     println!("宣言を直すには: 取り消しは unapprove か TUI の宣言画面の Space、ファイル宣言の");
     println!("種類と ** の付け替えは TUI の宣言画面の c・R です。");

@@ -312,3 +312,62 @@ fn the_rendered_text_names_the_mode() {
         "{record_all_text}"
     );
 }
+
+// --- [決定69 の前例の(7)] ドメインの印で候補を振り分ける ---
+
+fn proxy_event_of(domain: &str, host: &str) -> serde_json::Value {
+    let mut event = proxy_event(host, true, "record_all");
+    event["domain"] = serde_json::Value::String(domain.to_string());
+    event
+}
+
+/// **ドメインの印を持つ行は、そのドメインの候補になる**（印の無い行は入口）。
+///
+/// 1つの`net-audit.jsonl`へ入口とドメインのプロキシが追記するので、ファイル単位では分けられない
+/// ——行の印だけが「どのドメインが触った宛先か」を知っている。
+#[test]
+fn a_line_with_a_domain_tag_becomes_that_domains_candidate() {
+    let mut aggregate = NetAggregate::new();
+    aggregate.add_event(&proxy_event("entry.example.com", true, "record_all"));
+    aggregate.add_event(&proxy_event_of("ssh", "github.com"));
+
+    let by_domain = aggregate.proposals_by_domain();
+    let pairs: Vec<(&str, &str)> = by_domain
+        .iter()
+        .map(|(domain, proposal)| (domain.as_str(), proposal.value.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            (crate::policy_file::ENTRY_DOMAIN, "entry.example.com"),
+            ("ssh", "github.com"),
+        ],
+        "印で振り分けていない（または入口が先に来ていない）"
+    );
+    assert!(aggregate.has_domain_tags());
+}
+
+/// **禁止側の対**: 印の無い記録（古いパス2）は全部入口の候補で、ドメインの段を出さない。
+#[test]
+fn a_recording_without_tags_keeps_every_candidate_on_the_entry_domain() {
+    let mut aggregate = NetAggregate::new();
+    aggregate.add_event(&proxy_event("crates.io", true, "record_all"));
+
+    assert!(!aggregate.has_domain_tags());
+    let by_domain = aggregate.proposals_by_domain();
+    assert_eq!(by_domain.len(), 1);
+    assert_eq!(by_domain[0].0, crate::policy_file::ENTRY_DOMAIN);
+}
+
+/// 全体の候補（`proposals`）は**ドメインをまたいで**作る（注記と件数の見出しがこれまでと同じ計算のまま）。
+#[test]
+fn the_whole_recording_still_produces_one_combined_candidate_list() {
+    let mut aggregate = NetAggregate::new();
+    aggregate.add_event(&proxy_event("entry.example.com", true, "record_all"));
+    aggregate.add_event(&proxy_event_of("ssh", "github.com"));
+
+    let proposals = aggregate.proposals();
+    let values: Vec<&str> = proposals.iter().map(|p| p.value.as_str()).collect();
+    assert!(values.contains(&"entry.example.com") && values.contains(&"github.com"), "{values:?}");
+    assert_eq!(aggregate.events_seen, 2);
+}

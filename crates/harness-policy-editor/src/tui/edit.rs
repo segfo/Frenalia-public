@@ -19,7 +19,6 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
-use crate::policy_file;
 use crate::tui::proposal_tree::ProposalTree;
 use crate::tui::state::{edit_text, Action, App, EditField, Screen, SessionData, SessionView};
 
@@ -88,9 +87,7 @@ pub(super) fn pass2_view(
         workspace_root,
         &harness_policy::position_domains::SplitPositions::new(),
     );
-    let net_domain = candidates
-        .by_position()
-        .then(|| policy_file::ENTRY_DOMAIN.to_string());
+    let by_position = candidates.by_position();
     let fs = candidates.fs;
 
     // **FS欄は収集器が起きなかったときこそ出す。** 「観測していません（収集器を起動できませんでした）」と「拒否は0件でした」は
@@ -115,10 +112,13 @@ pub(super) fn pass2_view(
     notes.push_str(&crate::net_aggregate::render_notes(&net));
 
     let tree = crate::aggregate::render_process_tree(&fs);
+    // [決定69 の前例の(7)] 通信の候補も**ドメインごと**（監査の行の印で振り分け。印の無い行は入口）。
+    // ファイルの候補が1つの一覧のとき（古い記録）はドメインの段を出さないので、通信も`None`にする。
+    let by_domain = by_position || net.has_domain_tags();
     let (mut proposals, mut domains) = (candidates.proposals, candidates.domains);
-    for proposal in net.proposals() {
+    for (domain, proposal) in net.proposals_by_domain() {
         proposals.push(proposal);
-        domains.push(net_domain.clone());
+        domains.push(by_domain.then_some(domain));
     }
     // **両方を保持する**（`SessionData`のdoc）。
     let data = SessionData {

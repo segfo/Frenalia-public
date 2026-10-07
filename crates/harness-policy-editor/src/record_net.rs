@@ -377,7 +377,8 @@ pub fn record_net(
     // [決定68] 宣言はここで1回だけ読み、付与・遷移先の用意・Daemon の判定が同じ値を使う（`B-13`）。
     let policy =
         crate::policy_file::load(request.workspace_root).map_err(|e| RecordNetError::Policy(e.to_string()))?;
-    let net_plan = net_policy_plan(request.net_mode, entry_net_declarations(&policy))
+    let entry_net = entry_net(request.workspace_root, &policy);
+    let net_plan = net_policy_plan(request.net_mode, &entry_net.allow_domains)
         .map_err(RecordNetError::InvalidNetDeclaration)?;
     let (lock, lock_outcome) = RecordingLock::try_acquire().map_err(RecordNetError::Lock)?;
     if !lock_outcome.can_proceed() {
@@ -450,6 +451,19 @@ pub fn record_net(
             None
         }
     };
+    // [決定69(2)] **使えなかった入口の通信の宣言を黙って落とさない**（`B-10`）。承認していない宛先は
+    // 中継プロキシの許可に入らないので、そこへ出ようとするコマンドは断られる。
+    for skipped in &entry_net.skipped {
+        warn(
+            format!(
+                "入口のドメインの通信の宣言 {} は使いません: {}",
+                skipped.value,
+                skipped.reason.describe()
+            ),
+            &mut warnings,
+            on_event,
+        );
+    }
     // 強制で通信先を1件も宣言していなければ、名前解決も接続も全部断られる。止めはしない
     // （「このコマンドは通信しない」を確かめる使い方は正当）が、黙って走らせない（B-10）。
     if request.net_mode == NetMode::Declared && net_plan.allow_domains.is_empty() {
@@ -613,12 +627,21 @@ fn teardown(state: &mut TeardownState<'_>, on_event: &mut dyn FnMut(NetRecordEve
     // ものだけなので、付け直す対象にならない。
 }
 
-/// [決定68(2)] 通信の宣言は**入口のドメインのものだけ**（ドメインごとの出口は P7）。入口が無ければ空——強制では全部断る。
-fn entry_net_declarations(policy: &crate::PolicyFile) -> &[String] {
+/// [決定68(2)・決定69(2)] 入口のドメインの通信の宣言のうち、**このマシンで承認済み**のもの。
+///
+/// 承認の照合は`harness.exe`と同じ関数（`policy_fs::domain_net`）を通す（`B-05`）。未承認・解釈できない宣言は
+/// 宛先に入らず、理由を返す（呼び出し側が警告に出す。`B-10`）。入口が無ければ空——強制では全部断る。
+fn entry_net(workspace_root: &std::path::Path, policy: &crate::PolicyFile) -> harness_sandbox::tier2a::policy_fs::DomainNet {
+    let approvals = crate::approval_store::approval_store().load();
+    let key = harness_sandbox::tier2a::policy_approval::approval_workspace_key(workspace_root);
     policy
         .domain(ENTRY_DOMAIN)
-        .map(|entry| entry.net.allow_domains.as_slice())
-        .unwrap_or(&[])
+        .map(|entry| {
+            harness_sandbox::tier2a::policy_fs::domain_net(entry, &|d| {
+                approvals.is_approved_for_key(&key, d)
+            })
+        })
+        .unwrap_or_default()
 }
 
 /// 伝える価値のある事実を、**その場で見せる**と同時に**マニフェストへも残す**。
@@ -731,8 +754,8 @@ mod fs_denial_panel_tests {
     ///
     /// 記録で走らせた実行はFSだけを宣言どおりに強制した中間状態で、書かないと「宣言どおりに
     /// 確かめた」と読まれる。強制で走らせた実行は、それが**この試験実行の中だけ**であること
-    /// （`harness.exe`本体はまだ`policy.json`の通信の宣言を使わない）を書かないと、
-    /// 「本体でもこの宣言で動く」と読まれる。
+    /// [決定69] 2026-10-07 までは「この宣言が効くのは試験実行の中だけ」と書いていた（決定64の暫定）。
+    /// `harness.exe`が同じ宣言を読むようになったので、**その一文を消したこと**をここで固定する。
     #[test]
     fn the_panel_says_how_the_network_was_handled_in_each_mode() {
         let empty =
@@ -748,8 +771,8 @@ mod fs_denial_panel_tests {
         assert!(record_all.contains("FSの拒否だけ"), "{record_all}");
         assert!(declared.contains("宣言どおりに強制"), "{declared}");
         assert!(
-            declared.contains("harness.exe本体はまだ"),
-            "強制が試験実行の中だけであることを書く: {declared}"
+            !declared.contains("本体はまだ"),
+            "決定64の暫定の文言が残っている（決定69で`harness.exe`も同じ宣言を読む）: {declared}"
         );
         assert!(
             !declared.contains("全許可"),

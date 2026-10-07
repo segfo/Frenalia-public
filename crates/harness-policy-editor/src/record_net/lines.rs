@@ -39,7 +39,6 @@ pub fn wfp_enforced_line(reused: bool) -> String {
 /// （[`NetMode`]）。記録で走らせた実行は**FSは強制・通信は全許可**という中間状態にあり、
 /// これを書かないと「宣言どおりに動くことを確かめた」と誤読される。強制で走らせた実行は
 /// 通信も宣言どおりだが、その宣言が効くのは**この試験実行の中だけ**である——`harness.exe`
-/// 本体はまだ`policy.json`の`net.allow_domains`で通信を許さない（決定6の移設が残っている）。
 ///
 /// `collector_started`が偽なら**観測していない**。「拒否が0件だった」と区別できないと、
 /// fail-openは単なる隠蔽になる（D-43）。
@@ -88,9 +87,8 @@ pub fn net_mode_note(mode: NetMode) -> &'static str {
         NetMode::Declared => {
             "\n注意: **この実行で通信は宣言どおりに強制しました**（policy.jsonのnet.allow_domains\n\
              に一致する宛先だけを中継プロキシと名前解決が通し、ほかは断りました）。\n\
-             断られた宛先は通信の候補一覧に出ます。ただしこの宣言が効くのはこの試験実行の中だけで、\n\
-             harness.exe本体はまだpolicy.jsonのnet.allow_domainsで通信を許しません\n\
-             （本体で効くのは.harness/settings.jsonのnet.allow_domainsです）。\n"
+             断られた宛先は通信の候補一覧に出ます。同じ宣言は harness.exe の Tier2a でも効きます\n\
+             （決定69。このマシンで承認した宛先だけ）。\n"
         }
     }
 }

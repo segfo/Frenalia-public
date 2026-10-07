@@ -217,7 +217,7 @@ fn two_parallel_edges_do_not_justify_each_other() {
 
     assert_eq!(newly(&after, "a", "b"), handed);
     assert_eq!(
-        delta(&before, &after, provisional_net_capable).edges,
+        delta(&before, &after, net_capable).edges,
         vec![
             EdgeExposure {
                 from: "a".to_string(),
@@ -260,7 +260,7 @@ fn an_edge_that_existed_before_reports_only_what_the_edit_added() {
     ]);
 
     assert_eq!(
-        delta(&before, &after, provisional_net_capable).edges,
+        delta(&before, &after, net_capable).edges,
         vec![
             EdgeExposure {
                 from: "a".to_string(),
@@ -288,7 +288,7 @@ fn an_edge_entering_a_strict_domain_hands_nothing_to_the_caller() {
 
     let strict_after = after(logs().strict());
     assert_eq!(newly(&strict_after, "a", "logs"), Rights::default());
-    assert!(delta(&before(logs().strict()), &strict_after, provisional_net_capable)
+    assert!(delta(&before(logs().strict()), &strict_after, net_capable)
         .edges
         .is_empty());
 
@@ -296,7 +296,7 @@ fn an_edge_entering_a_strict_domain_hands_nothing_to_the_caller() {
     let handed = rights(&[("C:/logs/**", "read")], &[]);
     assert_eq!(newly(&plain_after, "a", "logs"), handed);
     assert_eq!(
-        delta(&before(logs()), &plain_after, provisional_net_capable).edges,
+        delta(&before(logs()), &plain_after, net_capable).edges,
         vec![EdgeExposure {
             from: "a".to_string(),
             edge_index: 0,
@@ -339,7 +339,7 @@ fn a_writer_and_a_net_capable_reader_of_one_place_form_a_pair() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        delta(&file(vec![]), &after, net_capable).pairs,
         vec![pair(
             "w",
             "C:/shared/**",
@@ -366,7 +366,7 @@ fn an_exec_overlap_is_a_pair() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        delta(&file(vec![]), &after, net_capable).pairs,
         vec![
             pair("w", "C:/drop/run.ps1", "r", "C:/drop/**", PairUse::Execute),
             pair(
@@ -393,11 +393,11 @@ fn a_pair_without_a_net_capable_reader_is_not_reported() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &offline, provisional_net_capable).pairs,
+        delta(&file(vec![]), &offline, net_capable).pairs,
         vec![]
     );
     assert_eq!(
-        delta(&file(vec![]), &online, provisional_net_capable)
+        delta(&file(vec![]), &online, net_capable)
             .pairs
             .len(),
         1
@@ -413,7 +413,7 @@ fn the_entry_domain_counts_as_net_capable_until_p7() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        delta(&file(vec![]), &after, net_capable).pairs,
         vec![pair(
             "w",
             "C:/shared/**",
@@ -440,7 +440,7 @@ fn places_writable_outside_the_declarations_are_written_by_the_entry_domain() {
     let with_roots = exposure_delta(
         &file(vec![]).transition_graph_input(Some("C:/ws"), &roots),
         &after.transition_graph_input(Some("C:/ws"), &roots),
-        provisional_net_capable,
+        net_capable,
     )
     .expect("同じ名前のドメインは無い");
 
@@ -464,7 +464,7 @@ fn places_writable_outside_the_declarations_are_written_by_the_entry_domain() {
         ],
     );
     assert_eq!(
-        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        delta(&file(vec![]), &after, net_capable).pairs,
         vec![],
         "根を渡さなければ、宣言に書込が無いので対は無い"
     );
@@ -506,7 +506,7 @@ fn neighbouring_places_and_a_domain_alone_are_not_pairs() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        delta(&file(vec![]), &after, net_capable).pairs,
         vec![]
     );
 }
@@ -527,7 +527,7 @@ fn pairs_that_existed_before_are_not_new() {
     ]);
 
     assert_eq!(
-        delta(&before, &after, provisional_net_capable).pairs,
+        delta(&before, &after, net_capable).pairs,
         vec![pair(
             "w",
             "C:/shared/**",
@@ -550,7 +550,7 @@ fn a_value_the_grant_layer_refuses_opens_no_place() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        delta(&file(vec![]), &after, net_capable).pairs,
         vec![]
     );
 }
@@ -573,7 +573,7 @@ fn edges_that_newly_enter_a_strict_domain_are_reported_but_old_ones_are_not() {
         Decl::new(ENTRY_DOMAIN).fixed_edge("C:/t/report.exe", "logs"),
         Decl::new("logs").read("C:/logs/**").strict(),
     ]);
-    let d = delta(&plain, &marked, provisional_net_capable);
+    let d = delta(&plain, &marked, net_capable);
     assert_eq!(
         d.strict_edges,
         vec![StrictEdge {
@@ -585,12 +585,12 @@ fn edges_that_newly_enter_a_strict_domain_are_reported_but_old_ones_are_not() {
     assert!(d.edges.is_empty(), "Strict の辺は何も渡さない: {:?}", d.edges);
 
     // 前から Strict だった辺は新しくない。
-    assert!(delta(&marked, &marked, provisional_net_capable).strict_edges.is_empty());
+    assert!(delta(&marked, &marked, net_capable).strict_edges.is_empty());
     // 印の無いドメインへ入る辺・Strict のドメインの中の自己ループは Strict の辺ではない。
     let self_loop = file(vec![
         Decl::new(ENTRY_DOMAIN),
         Decl::new("logs").fixed_edge("C:/t/report.exe", "logs").strict(),
     ]);
-    assert!(delta(&plain, &plain, provisional_net_capable).strict_edges.is_empty());
-    assert!(delta(&file(vec![]), &self_loop, provisional_net_capable).strict_edges.is_empty());
+    assert!(delta(&plain, &plain, net_capable).strict_edges.is_empty());
+    assert!(delta(&file(vec![]), &self_loop, net_capable).strict_edges.is_empty());
 }

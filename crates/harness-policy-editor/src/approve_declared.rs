@@ -106,17 +106,7 @@ pub fn plan(
 
     let mut out = DeclaredApprovalPlan::default();
     for target in targets {
-        // [P7.7] 通信の宣言は**台帳の鍵を持つようになった**（決定69(2)・P7.2）が、この入口（`approve-declared`・
-        // 宣言画面の`y`）が通す検査はまだファイルの値のものだけである（`grant_root`が通信の値を相対パスとして断る）。
-        // P7.7 で通信の検査を足して、この断りを外す。
-        if target.key == SettingsKey::NetAllowDomains {
-            out.refused.push((
-                target.clone(),
-                "ネットワークの宣言の承認は P7.7 で入ります（承認台帳の鍵は決定69(2)で持つようになった）"
-                    .to_string(),
-            ));
-            continue;
-        }
+        // [決定69(2)] 通信の宣言も承認の対象である（検査は[`refusal`]が種類で分ける）。
         let Some(target) = stored_spelling(&file, target) else {
             out.not_found.push(target.clone());
             continue;
@@ -141,12 +131,34 @@ pub fn plan(
 
 /// 承認しない理由（承認してよいなら`None`）。順序は「候補にしない規則 → 許可を付けない値 →
 /// `--require-sandbox`との矛盾 → 広すぎる値」。
+///
+/// [決定69(2)] **通信の宣言はファイルの検査を通さない**（値はパスではなく宛先の綴りなので、
+/// 候補にしない規則も付与ルートの検査も当たらない）。代わりに**宛先として解釈できるか**を見て、
+/// `--require-sandbox`との矛盾と広すぎる値の検査（`gate`・`breadth`）は同じものを通す。
 fn refusal(
     target: &UnapproveTarget,
     require_sandbox: RequireSandbox,
     exclusion: &crate::exclusion::ExclusionRules,
     grants: &harness_sandbox::tier2a::policy_grants::GrantContext,
 ) -> Option<String> {
+    if target.key == SettingsKey::NetAllowDomains {
+        if let Err(detail) = harness_core::normalize_domain_pattern(&target.value) {
+            return Some(format!(
+                "宛先として解釈できません（{detail}）。承認しても中継プロキシの許可に入りません"
+            ));
+        }
+        let proposal = RuleProposal {
+            id: String::new(),
+            key: target.key,
+            value: target.value.clone(),
+            evidence: Vec::new(),
+            warnings: Vec::new(),
+        };
+        if let GateVerdict::Rejected(message) = gate::check_proposal(&proposal, require_sandbox) {
+            return Some(message);
+        }
+        return breadth::check(&proposal).message().map(str::to_string);
+    }
     if let Some(reason) = exclusion.excluded(&target.value) {
         return Some(format!(
             "いまの規則なら候補にしない値です（{reason:?}）。`unapprove --excluded`で宣言ごと消せます"

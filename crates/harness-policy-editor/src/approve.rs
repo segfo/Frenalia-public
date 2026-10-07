@@ -319,7 +319,7 @@ pub fn commit(workspace_root: &Path, plan: &ApprovePlan<'_>) -> Result<(), Appro
     Ok(())
 }
 
-/// 今回受け入れた提案のうち、ファイル宣言のもの（承認台帳の鍵の形）。
+/// 今回受け入れた提案（承認台帳の鍵の形）。**通信の宣言も含む**（決定69(2)）。
 ///
 /// 値は提案の値そのまま——`merge_approved`は値を書き換えずに`policy.json`へ書くので、
 /// ここで記録する値と`policy.json`に書かれる値は同じ文字列になる（`R`で付けた`/**`も、
@@ -329,11 +329,8 @@ fn accepted_declarations<'p>(
 ) -> Vec<harness_sandbox::tier2a::policy_approval::DeclarationRef<'p>> {
     plan.accepted
         .iter()
-        .filter(|proposal| {
-            // [P7.7] 通信の候補の承認はまだ台帳へ記録しない（鍵は決定69(2)で持つようになったが、
-            // 画面と CLI の配線は P7.7）。
-            proposal.key != harness_policy::generalize::SettingsKey::NetAllowDomains
-        })
+        // [決定69(2)] **通信の候補も台帳へ記録する**（ファイルの宣言と同じ。承認していない宛先は
+        // 中継プロキシの許可に入らない）。種類は候補の`key`そのままで、値は`policy.json`へ書く綴りと同じ。
         .map(|proposal| harness_sandbox::tier2a::policy_approval::DeclarationRef {
             domain: plan.domain,
             value: &proposal.value,

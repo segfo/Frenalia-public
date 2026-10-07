@@ -181,15 +181,14 @@ impl PositionPlan {
             && self.strict_marked.is_empty()
     }
 
-    /// 保存の後に承認台帳へ記録するファイルの宣言（受理した値をドメインごとに。通信の宣言は台帳の対象外）。
+    /// 保存の後に承認台帳へ記録する宣言（受理した値をドメインごとに。**通信も対象**＝決定69(2)）。
     pub fn declarations(&self) -> Vec<DeclarationRef<'_>> {
         self.fs
             .iter()
             .flat_map(|d| {
                 d.accepted
                     .iter()
-                    // [P7.7] 通信の候補の承認はまだ台帳へ記録しない（`approve::accepted_declarations`と同じ）。
-                    .filter(|a| a.key != SettingsKey::NetAllowDomains)
+                    // [決定69(2)] 通信の宣言も台帳へ記録する（`approve::accepted_declarations`と同じ）。
                     .map(move |a| DeclarationRef {
                         domain: &d.domain,
                         value: &a.value,

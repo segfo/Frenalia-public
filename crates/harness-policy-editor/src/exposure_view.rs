@@ -27,7 +27,7 @@
 //! # 限界
 //!
 //! - **組み合わせの対**（Limit 1。あるドメインが書ける場所を、外部と通信できる別のドメインが読む／実行する）は
-//!   **断らずに並べるだけ**（P5.6、決定66(9)）。「外部と通信できるか」は暫定の見立て（`provisional_net_capable`。P7 で
+//!   **断らずに並べるだけ**（P5.6、決定66(9)）。「外部と通信できるか」は宣言の有無で決まる（`net_capable`。決定69 で
 //!   差し替え）で、変更の前から在った対は出さない。CLI の`--auto-approve`は対が1組でもあれば書かない（`cli_consent`）
 //! - **子の出力の行は、広がる辺にだけ出す**（P5.4b。Daemon が出力を返すようになった段で足した——P5.3 は返して
 //!   いなかったので、入る前に言うと嘘になった、`B-32`）。広がらない辺の出力の設定は、辺の綴りに添える
@@ -117,7 +117,7 @@ pub fn widening(before: &PolicyFile, after: &PolicyFile, workspace_root: &Path) 
     let delta = transition::exposure_delta(
         &before.transition_graph_input(Some(workspace.as_ref()), &[]),
         &after.transition_graph_input(Some(workspace.as_ref()), &[]),
-        transition::provisional_net_capable,
+        transition::net_capable,
     );
     // 辺は変更後の宣言での位置で指される。見つからないことは無い（見つからなければ空の綴り・既定の出力）。
     let written = |from: &str, index: usize| -> Option<&TransitionEdge> {

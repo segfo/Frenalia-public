@@ -958,7 +958,7 @@ pub use transition_shape::{self_loops, shape, LongestChain, SelfLoop, Transition
 #[path = "transition_exposure.rs"]
 mod transition_exposure;
 pub use transition_exposure::{
-    exposure_delta, newly_usable, provisional_net_capable, CombinationPair, EdgeExposure,
+    exposure_delta, newly_usable, net_capable, CombinationPair, EdgeExposure,
     ExposureDelta, PairUse, StrictEdge,
 };
 
