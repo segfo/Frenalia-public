@@ -225,6 +225,9 @@ pub fn provision_target_domains(
             // **このドメインは自分専用のpackage SIDを持つ**ので、身分はpackage SIDそのものである
             // （§22.1.1の`OwnPackage`）。呼び出し元のcapabilityを身分に流用しない。
             identity: DomainIdentitySpec::OwnPackage,
+            // [決定69] 中継プロキシの宛先は**ここでは空**。WFPが立った後に呼び出し側が積む
+            // （`harness_tools::domain_egress::EgressPlan::attach`）——立たなかった回に出口を持たせないため。
+            proxy_env: Vec::new(),
         });
     }
 

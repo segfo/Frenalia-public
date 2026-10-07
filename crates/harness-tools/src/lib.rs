@@ -33,6 +33,9 @@ mod shell_line;
 /// 字面による判定。承認画面の危険度の機械判定（Ollaya を使えないときにも働く）。境界ではない。
 pub mod system_damage;
 mod fs_tools;
+/// [決定69] ドメインごとの出口（専用の中継プロキシ・`internetClient`・WFPの項目）を組み立てる。
+/// `harness.exe`の起動とポリシーエディタのパス2が**同じこれ**を呼ぶ（`B-05`）。
+pub mod domain_egress;
 pub mod net_proxy;
 mod search;
 mod shell;

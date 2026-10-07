@@ -1408,9 +1408,10 @@ pub fn spawn_with_workspace<'a>(
     }
 }
 
-/// `internetClient` capability（D-10）。**直接生成とDaemon経由で同じ綴りを使う**
-/// ——2箇所に文字列を散らすと、片方だけ直った状態が黙って成立する（`B-05`）。
-pub(crate) const INTERNET_CLIENT_SID: &str = "S-1-15-3-1";
+/// `internetClient` capability（D-10）。綴りの正本は[`crate::tier2a::INTERNET_CLIENT_SID`]で、
+/// ここはこのモジュールから短く書くための再公開である（2026-10-07に移した——ドメインごとの出口を組む
+/// `harness_tools::domain_egress`が同じ綴りを積むので、windows専用でない場所へ置いた）。
+pub(crate) use crate::tier2a::INTERNET_CLIENT_SID;
 
 /// Daemon経由で起こす子に、**spawn要求受付パイプへ到達するcapabilityを積むか**（§10.1）。
 ///
@@ -1819,6 +1820,8 @@ pub fn spawn_with_workspace_via_daemon<'a>(
             container_sid: container_sid_string,
             capability_sids,
             identity,
+            // [決定69] トップレベルの子の環境は harness が組む（`env`がそれ）ので、差し替えの宛先は持たない。
+            proxy_env: Vec::new(),
         },
         job: handles.job.expect("job was created"),
         stdout_write,

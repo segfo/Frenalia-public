@@ -495,6 +495,7 @@ fn a_cross_domain_child_gets_no_ext_roots_but_a_self_loop_child_gets_exactly_one
         container_sid: "S-1-15-2-1-2-3".to_string(),
         capability_sids: vec!["S-1-15-3-1024-102".to_string()],
         identity: DomainIdentitySpec::OwnPackage,
+        proxy_env: Vec::new(),
     };
     let target = DomainSpec {
         name: "d0-profile".to_string(),
@@ -596,5 +597,91 @@ fn a_discarding_edge_cuts_stdout_and_stderr_but_not_stdin() {
     assert_eq!(
         caller_handles_for(ChildOutput::Discard, true, requested()),
         CallerHandles::default()
+    );
+}
+
+// --- [決定69 の前例の(6)] 遷移先のドメインの中継プロキシの宛先への差し替え ---
+
+/// そのドメインの出口（`DomainSpec::proxy_env`が持つ宛先）。
+///
+/// **組み立てはここで書く**——製品で組むのは`harness_tools::net_proxy::proxy_env_vars`だが、
+/// `harness-sandbox`は`harness-tools`に依存しない（逆向きの依存）。名前の一覧だけは
+/// `harness_core`の正本を読む（綴りを写さない。`B-05`）。
+fn domain_proxy(port: u16) -> Vec<(String, String)> {
+    let addr = format!("127.0.0.1:{port}");
+    let mut env: Vec<(String, String)> = harness_core::SOCKS_PROXY_ENV_NAMES
+        .iter()
+        .map(|name| (name.to_string(), format!("socks5h://{addr}")))
+        .collect();
+    env.extend(
+        harness_core::HTTP_PROXY_ENV_NAMES
+            .iter()
+            .map(|name| (name.to_string(), format!("http://{addr}"))),
+    );
+    env
+}
+
+/// **許可側**: 出口を持つドメインへ入る子は、**そのドメインの宛先**を受け取る（呼び出し元の値は消える）。
+#[test]
+fn a_child_entering_a_domain_with_a_proxy_gets_that_domains_proxy() {
+    let mut env = vec![
+        ("HTTP_PROXY".to_string(), "http://127.0.0.1:1111".to_string()),
+        ("ALL_PROXY".to_string(), "socks5h://127.0.0.1:1111".to_string()),
+        ("PATH".to_string(), r"C:\Windows".to_string()),
+    ];
+    force_domain_proxy(&mut env, &domain_proxy(2222));
+
+    assert_eq!(
+        value_of(&env, "HTTP_PROXY"),
+        Some("http://127.0.0.1:2222"),
+        "呼び出し元の宛先が残った（別のドメインの出口を使える）: {env:?}"
+    );
+    assert_eq!(value_of(&env, "ALL_PROXY"), Some("socks5h://127.0.0.1:2222"));
+    assert_eq!(
+        env.iter().filter(|(name, _)| name == "HTTP_PROXY").count(),
+        1,
+        "同じ名前が2つ並んでいる（環境ブロックでは先の方が効くので、消し忘れは黙って効く）: {env:?}"
+    );
+    assert_eq!(value_of(&env, "PATH"), Some(r"C:\Windows"), "関係の無い名前を消した");
+}
+
+/// **禁止側の対**: 出口を持たないドメインへ入る子からは、中継プロキシの名前を**全部消す**。
+///
+/// 消さないと、その子は呼び出し元（入口）のプロキシの宛先を知ったまま走る——WFPの既定拒否で繋げないが、
+/// 「宛先を知らない」と「繋げない」が混ざって、拒否の理由が読めなくなる。
+#[test]
+fn a_child_entering_a_domain_without_a_proxy_loses_the_callers_proxy() {
+    let mut env = vec![
+        ("HTTP_PROXY".to_string(), "http://127.0.0.1:1111".to_string()),
+        ("http_proxy".to_string(), "http://127.0.0.1:1111".to_string()),
+        ("HTTPS_PROXY".to_string(), "http://127.0.0.1:1111".to_string()),
+        ("https_proxy".to_string(), "http://127.0.0.1:1111".to_string()),
+        ("ALL_PROXY".to_string(), "socks5h://127.0.0.1:1111".to_string()),
+        ("all_proxy".to_string(), "socks5h://127.0.0.1:1111".to_string()),
+        ("PATH".to_string(), r"C:\Windows".to_string()),
+    ];
+    force_domain_proxy(&mut env, &[]);
+
+    assert!(
+        !env.iter()
+            .any(|(name, _)| harness_core::is_proxy_env_name(name)),
+        "出口を持たないドメインの子に中継プロキシの宛先が残った: {env:?}"
+    );
+    assert_eq!(value_of(&env, "PATH"), Some(r"C:\Windows"));
+}
+
+/// 呼び出し元が**大文字小文字を変えて**名乗っても差し替えが効く（環境変数の名前は大文字小文字を区別しない）。
+#[test]
+fn the_caller_cannot_keep_its_own_proxy_by_respelling_the_name() {
+    let mut env = vec![(
+        "Http_Proxy".to_string(),
+        "http://127.0.0.1:1111".to_string(),
+    )];
+    force_domain_proxy(&mut env, &domain_proxy(2222));
+
+    assert!(
+        !env.iter()
+            .any(|(_, value)| value.contains("1111")),
+        "綴りを変えた宛先が生き残った: {env:?}"
     );
 }

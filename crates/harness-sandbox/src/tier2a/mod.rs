@@ -133,6 +133,17 @@ pub(crate) mod wfp;
 #[cfg(windows)]
 pub(crate) mod loopback_exemption;
 
+/// `internetClient` capability（D-10）のSID。**直接生成・Daemon経由・ドメインごとの出口の3つが同じ綴りを使う**
+/// ——文字列を散らすと、片方だけ直った状態が黙って成立する（`B-05`）。
+///
+/// **これを積んでよいのは、WFPの既定拒否が立っている回だけである**（`internetClient`を持ったまま既定拒否を
+/// 失うと素通しになる。`tier2a::wfp`のdoc）。判定は`harness_tools::should_grant_tier2a_network_capability`（入口）と
+/// `harness_tools::domain_egress::EgressPlan::attach`（遷移先のドメイン。決定69）が持つ。
+///
+/// **2026-10-07に`win_appcontainer::spawn`から移した**（windows専用モジュールの外へ——
+/// ドメインごとの出口を組む`harness-tools`が同じ綴りを積むため）。
+pub const INTERNET_CLIENT_SID: &str = "S-1-15-3-1";
+
 /// **測定専用スパイク**（BUG-111の残り: シナリオ(A)のE2Eが成立するかの前提を測る）。
 /// 昇格した`dev-elevated-runner`配下から非昇格の子を起こせるか。
 /// **判定が出たら削除する**（`docs/CODE-STRUCTURE-RULES.md`規則2）。

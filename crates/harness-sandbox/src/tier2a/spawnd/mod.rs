@@ -159,7 +159,11 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// **`harness-spawnd.exe`はテストのビルドで作り直されない**ので、版9の個体は実在し得る。
 /// **11へ上げたのは P5.4d である**（電文の形は不変）。Strict の辺の作業ディレクトリも起こす直前に検査するようになり、版10の Daemon は黙って通す。
 /// **12へ上げたのは P6.4（決定68）である。** `Hello`に記録の名前（`spawn_audit_record`）が載った。版11の Daemon は欄を捨て、許可した生成の記録を黙って書かない。
-pub const PROTOCOL_VERSION: u32 = 12;
+/// **13へ上げたのは P7.5（決定69）である。** `Hello`の表（[`DomainSpec`]）に**遷移先のドメインの中継プロキシの宛先**
+/// （[`DomainSpec::proxy_env`]）が載った。版12の Daemon はこの欄を読まないので、**入れ子の子へ呼び出し元の
+/// プロキシの宛先をそのまま渡す**——別のドメインの出口を使える形（宛先を絞ったつもりで絞れていない）になり、
+/// 出口を持たないドメインの子も呼び出し元のプロキシへ出られる。黙って緩くなる向きなので版の一致で止める。
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// 相手が名乗った制御プロトコルの版を判定する。合わなければ理由の文面を返す。
 ///
@@ -240,6 +244,20 @@ pub struct DomainSpec {
     pub capability_sids: Vec<String>,
     /// 子のDACLに載せる宛先（上記）。
     pub identity: DomainIdentitySpec,
+    /// [決定69 の前例の(6)] **このドメインの中継プロキシの宛先**（`HTTP_PROXY`等の名前と値）。
+    ///
+    /// 空＝このドメインは出口を持たない。**そのときは入れ子の子から中継プロキシの名前を消す**
+    /// （呼び出し元の宛先を引き継がせない。`nested_inputs::force_domain_proxy`）。
+    ///
+    /// # なぜ表で運ぶのか
+    ///
+    /// 宛先はセッションごとに変わる（loopbackの空きポート）ので`policy.json`には書けない。
+    /// capability SIDと同じく**harnessが起動時に決めてHelloで渡す**ものである。名前の一覧は
+    /// `harness_core::is_proxy_env_name`が持つ（組む側＝`harness_tools::net_proxy::proxy_env_vars`と同じ）。
+    ///
+    /// **トップレベルの子には使わない**——あちらの環境はharnessが自分で組む（`win_appcontainer::spawn`）。
+    #[serde(default)]
+    pub proxy_env: Vec<(String, String)>,
 }
 
 /// Spawn Daemonがsuspended状態の子へ行うRedirector注入。

@@ -37,6 +37,7 @@ fn domain(name: &str) -> DomainSpec {
         container_sid: "S-1-15-2-1111111111-2222222222".to_string(),
         capability_sids: vec!["S-1-15-3-1024-1".to_string()],
         identity: DomainIdentitySpec::OwnPackage,
+        proxy_env: Vec::new(),
     }
 }
 

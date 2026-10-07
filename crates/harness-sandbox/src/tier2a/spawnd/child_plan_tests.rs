@@ -50,6 +50,7 @@ fn entry_domain() -> DomainSpec {
             REDIRECTOR_DLL,
         ]),
         identity: DomainIdentitySpec::OwnPackage,
+        proxy_env: Vec::new(),
     }
 }
 
@@ -62,6 +63,7 @@ fn target_domain() -> DomainSpec {
         container_sid: "S-1-15-2-4-5-6".to_string(),
         capability_sids: sids(&[TRAVERSE, SPAWN_REQUEST, WORKSPACE, REDIRECTOR_DLL]),
         identity: DomainIdentitySpec::OwnPackage,
+        proxy_env: Vec::new(),
     }
 }
 

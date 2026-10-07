@@ -39,7 +39,7 @@ fn control_request_hello_keeps_its_wire_shape() {
     // （P5.3、Strict の印）に 2 → 3。Daemon はこの値を見ずにグラフを組むので、欄の形は変わっていない。
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":12,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"],"spawn_audit_record":"policy-editor-1-1"}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":13,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"],"spawn_audit_record":"policy-editor-1-1"}"#
     );
 }
 
@@ -107,7 +107,7 @@ fn a_hello_without_a_spawn_audit_record_asks_for_no_record() {
     })
     .expect("serialize");
     assert!(json.ends_with(r#""spawn_audit_record":null}"#), "{json}");
-    let missing = r#"{"kind":"hello","harness_process":1,"protocol_version":12,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":[]}"#;
+    let missing = r#"{"kind":"hello","harness_process":1,"protocol_version":13,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":[]}"#;
     let ControlRequest::Hello {
         spawn_audit_record, ..
     } = serde_json::from_str::<ControlRequest>(missing).expect("parses")
@@ -132,6 +132,8 @@ fn control_request_spawn_top_level_keeps_its_wire_shape() {
             identity: DomainIdentitySpec::Capability {
                 sid: "S-1-15-3-1024-9".to_string(),
             },
+            // [決定69] トップレベルの子の環境は harness が組むので、差し替えの宛先は空である。
+            proxy_env: Vec::new(),
         },
         handles: ChildHandles {
             job: 16,
@@ -149,7 +151,7 @@ fn control_request_spawn_top_level_keeps_its_wire_shape() {
     let json = serde_json::to_string(&request).expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","policy_domain":"workspace-shell","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"],"identity":{"kind":"capability","sid":"S-1-15-3-1024-9"}},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"redirector":{"kind":"lazy","workspace_root":"C:/w","broker_pipe":"\\\\.\\pipe\\lazy"},"console":"required"}"#
+        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","policy_domain":"workspace-shell","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"],"identity":{"kind":"capability","sid":"S-1-15-3-1024-9"},"proxy_env":[]},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"redirector":{"kind":"lazy","workspace_root":"C:/w","broker_pipe":"\\\\.\\pipe\\lazy"},"console":"required"}"#
     );
     let back: ControlRequest = serde_json::from_str(&json).expect("round trip");
     assert_eq!(back, request);
@@ -201,7 +203,7 @@ fn control_responses_keep_their_wire_shape() {
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":12}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":13}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {

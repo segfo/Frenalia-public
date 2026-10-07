@@ -359,6 +359,7 @@ pub(super) fn domain_spec(
             .expect("container sid to string"),
         capability_sids,
         identity: DomainIdentitySpec::OwnPackage,
+        proxy_env: Vec::new(),
     }
 }
 
@@ -957,6 +958,7 @@ fn a_spawn_request_after_the_daemon_died_fails_loudly() {
             container_sid: "S-1-15-2-1-2-3".to_string(),
             capability_sids: Vec::new(),
             identity: DomainIdentitySpec::OwnPackage,
+            proxy_env: Vec::new(),
         },
         job,
         stdout_write,
@@ -1007,6 +1009,7 @@ fn a_spawn_request_after_the_daemon_died_fails_loudly() {
             container_sid: "S-1-15-2-1-2-3".to_string(),
             capability_sids: Vec::new(),
             identity: DomainIdentitySpec::OwnPackage,
+            proxy_env: Vec::new(),
         },
         job: second_job,
         stdout_write: second_stdout_write,

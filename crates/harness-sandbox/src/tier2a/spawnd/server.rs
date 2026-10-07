@@ -82,7 +82,7 @@ use super::child_plan::ChildPlan;
 use super::console_holder::ConsoleHolders;
 use super::spawn_audit::SpawnAudit;
 use super::nested_inputs::{
-    caller_handles_for, close_all, env_for_nested, force_request_pipe, pull_caller_stdio, OpenedStdio,
+    caller_handles_for, close_all, env_for_nested_child, force_request_pipe, pull_caller_stdio, OpenedStdio,
 };
 use super::table::ProcessTable;
 use super::transitions::TransitionQueue;
@@ -834,8 +834,8 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
     // §8.3: 辺が`cwd`を宣言していれば**その値を渡す**（検査するだけでは足りない）。
     // 宣言が無い辺は呼び出し元の実cwdをそのまま渡す（決定66(6)。広げる辺でも同じ——守る線は子のドメインの権限）。
     let effective_cwd = declared_cwd.unwrap_or(request.cwd);
-    // [段階6f-1] 呼び出し元の申告を使うが、**harnessが所有する名前だけは系統の値で強制する**。
-    let env = env_for_nested(&caller.base_env, request.env.as_deref(), env_policy);
+    // [段階6f-1・決定69 の前例の(6)] 申告＋harness所有の名前の強制＋遷移先のドメインのプロキシの宛先（3段の表は`env_for_nested_child`）。
+    let env = env_for_nested_child(&caller, request.env.as_deref(), env_policy, target_domain);
 
     // [P5.4b] **呼び出し元の標準入出力は、判定器の2つの指示で絞ってから渡す**（[`caller_handles_for`]の表）。
     //

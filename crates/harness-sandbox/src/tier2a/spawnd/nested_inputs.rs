@@ -166,6 +166,51 @@ pub(super) fn env_for_nested(
     env
 }
 
+/// 入れ子の子へ渡す環境変数を**1か所で**組む（`server::serve_spawn_request`はこれだけを呼ぶ）。
+///
+/// 3段を順に当てる——(1) 辺のenv方針（[`env_for_nested`]。呼び出し元の申告か harness の基準＋差分）、
+/// (2) harness が所有する名前とOSが書き換える名前の強制（同関数の中）、(3) **遷移先のドメインの
+/// 中継プロキシの宛先への差し替え**（[`force_domain_proxy`]。決定69 の前例の(6)。自己ループでは当てない）。
+///
+/// **3段を呼び出し側で並べない。** 並べると、順番を入れ替えた経路（プロキシの宛先を先に入れてから
+/// harness 所有の名前を戻す）が書けてしまい、どちらが勝つかが経路ごとに変わる（`B-05`）。
+pub(super) fn env_for_nested_child(
+    caller: &super::table::Caller,
+    caller_env: Option<&[(String, String)]>,
+    policy: &harness_policy::transition::EnvPolicy,
+    target_domain: &super::DomainSpec,
+) -> Vec<(String, String)> {
+    let mut env = env_for_nested(&caller.base_env, caller_env, policy);
+    if target_domain != &caller.domain {
+        force_domain_proxy(&mut env, &target_domain.proxy_env);
+    }
+    env
+}
+
+/// [決定69 の前例の(6)] **遷移先のドメインの中継プロキシの宛先へ強制で差し替える。**
+///
+/// | 遷移先のドメイン | 子の環境 |
+/// |---|---|
+/// | 出口を持つ（`proxy_env`が空でない） | **そのドメインの宛先**（呼び出し元の値は捨てる） |
+/// | 出口を持たない（`proxy_env`が空） | 中継プロキシの名前を**全部消す** |
+///
+/// # なぜ消す側が要るのか
+///
+/// 消さないと、**出口を持たないドメインの子が呼び出し元（入口）のプロキシの宛先を知っている**ことになる。
+/// その子はWFPの既定拒否でそのポートへ繋げないので通信はできないが、「宛先を知らない」と「繋げない」が
+/// 混ざると、E2Eで子の失敗の理由が読めなくなる（P5.7 の⑥がまさにこの形で、入口と同じ宛先を知っていた）。
+/// それ以上に、**付与と撤収を対にしない形**（`B-01`）そのものである——差し替える側だけ書くと、空のドメインで
+/// 呼び出し元の値が生き残る。
+///
+/// 名前の一覧は[`harness_core::is_proxy_env_name`]が持つ（組む側の`proxy_env_vars`と同じ正本。`B-05`）。
+/// **自己ループ（呼び出し元と同じドメイン）では呼ばない**——呼び出し元の環境がそのまま正しい。
+pub(super) fn force_domain_proxy(env: &mut Vec<(String, String)>, proxy_env: &[(String, String)]) {
+    env.retain(|(name, _)| !harness_core::is_proxy_env_name(name));
+    for (name, value) in proxy_env {
+        env.push((name.clone(), value.clone()));
+    }
+}
+
 /// [段階6b] 辺のenv方針を当てる規則。**Win32を1行も通らないので昇格が要らない。**
 /// [段階6f-1] 申告が無かった欄の代わりに何を開くか。
 ///

@@ -65,7 +65,8 @@ pub use risk_check::{RiskCheckError, RiskLevel, RiskVerdict};
 pub use schema::{apply_schema_strategy, unwrap_forced_tool_stream, SchemaStrategy};
 pub use text::truncate_head_tail;
 pub use tool::{
-    parse_tool_input, EgressEnforcement, GrantedPassthrough, McpServerFact, NetAppPolicy,
+    is_proxy_env_name, parse_tool_input, EgressEnforcement, GrantedPassthrough, McpServerFact,
+    NetAppPolicy, FAKE_DNS_ENV_NAME, HTTP_PROXY_ENV_NAMES, SOCKS_PROXY_ENV_NAMES,
     NetEgress, NetProxyConfig, ReadMode, ReadScopeConfig, RequireSandbox, RiskClass,
     RunnableProgramFact, SandboxChoice, ShellTier, ShellTierSelection, StagingConfig, StagingMode,
     TlsInspection, Tool, ToolCtx, ToolError, ToolOutput, ToolResult, ToolSpec, ToolUse,
