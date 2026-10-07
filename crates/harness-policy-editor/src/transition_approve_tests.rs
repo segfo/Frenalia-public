@@ -213,7 +213,8 @@ fn a_widening_destination_can_be_written_and_what_it_hands_over_is_listed() {
 }
 
 /// **禁止側（対）**: 遷移先に Strict の印があれば、入る辺は引数と作業ディレクトリを固定しなければ書けない（決定66の
-/// 追記）。このエディタは作業ディレクトリを宣言しない（[`edge_for`]）ので書けず、検査の理由をそのまま出して何も書かない。
+/// 追記）。拒否のタブの辺は引数も作業ディレクトリも固定しない（[`edge_for`]）ので書けず、検査の理由をそのまま出して
+/// 何も書かない。直し方は位置の木の`u`→`s`（決定67）か、宣言画面で Strict を外すこと。
 #[test]
 fn a_strict_destination_is_refused_because_this_editor_does_not_fix_inputs() {
     let tmp = tempfile::tempdir().unwrap();
@@ -230,6 +231,11 @@ fn a_strict_destination_is_refused_because_this_editor_does_not_fix_inputs() {
             assert!(
                 detail.contains("遷移先「wide」は Strict です") && detail.contains("Strict を外す"),
                 "直し方を言っていない: {detail}"
+            );
+            // [P5.10.4] 位置の木で書ける直し方（決定67）も言う。「手で書く」しか言わない古い文面へ戻さない。
+            assert!(
+                detail.contains("位置の木") && detail.contains("Space→u") && detail.contains("→s"),
+                "位置の木の u→s を案内していない: {detail}"
             );
         }
         other => panic!("Strict のドメインへの辺が別の形で返った: {other:?}"),

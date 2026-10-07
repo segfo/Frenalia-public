@@ -40,8 +40,9 @@
 //! 遷移先が呼び出し元より広い権限に届く辺も、入力（引数・作業ディレクトリ）を固定せずに書ける——守る線は子の
 //! ドメインの権限（OSが強制する）である。決定65(6) の暫定（「P5 まで書けない」・`WidensWithoutFixing`）は外した。
 //! 書くと呼び出し元が子を通して何を使えるようになるかは、確認の画面が[`crate::exposure_view`]で見せる。
-//! 書けないのは Strict の印が付いたドメインへ入る辺（入力の固定が要り、このエディタは作業ディレクトリを宣言しない。
-//! 決定66の追記）で、検査の理由をそのまま[`TransitionApproveError::Rejected`]で返す。
+//! 書けないのは Strict の印が付いたドメインへ入る辺（入力の固定が要る。決定66の追記）で、検査の理由をそのまま
+//! [`TransitionApproveError::Rejected`]で返す。ここ（拒否のタブの辺）は引数を固定しない——Strict の辺を書けるのは
+//! 位置の木の`u`→`s`だけである（決定67。`tui::position_split`・`tui::position_strict`）。
 
 use std::path::Path;
 
@@ -413,7 +414,8 @@ pub fn apply_edge_changes(file: &mut PolicyFile, changes: &EdgeChanges<'_>) -> E
 /// 足した辺がそれで落ちることは無い（試験`an_edge_this_editor_writes_survives_the_writable_places_harness_adds`）。
 ///
 /// [P5.5] 落ちた辺の遷移先が Strict なら、検査の理由の前に**このエディタで取れる直し方**を1行置く（検査の英文は
-/// 「引数をリテラルに・cwd を宣言せよ」で、このエディタでは取れない）。印を見るだけで判定はしない（`B-13`）。
+/// 「引数をリテラルに・cwd を宣言せよ」）。直し方は位置の木の`u`→`s`（決定67。P5.10.2 から）か、宣言画面で Strict を
+/// 外すか。拒否のタブの辺（[`edge_for`]）は引数を固定できない。印を見るだけで判定はしない（`B-13`）。
 pub fn check_added(file: &PolicyFile, workspace_root: &Path) -> Result<(), TransitionApproveError> {
     let workspace = workspace_root.to_string_lossy();
     let input = file.transition_graph_input(Some(workspace.as_ref()), &[]);
@@ -428,8 +430,10 @@ pub fn check_added(file: &PolicyFile, workspace_root: &Path) -> Result<(), Trans
                 match into_strict {
                     Some(edge) => format!(
                         "遷移先「{}」は Strict です——入る辺は入力（引数・作業ディレクトリ）を固定する必要があり、\
-                         このエディタが書く辺は固定しないので書けません。宣言画面（F3）の遷移タブで Strict を外すか、\
-                         policy.json に固定した辺を手で書いてください。\n{r}",
+                         この辺は固定していないので書けません。記録の位置の木（承認待ちの観測のタブ）でその行を\
+                         Space→u（引数を記録どおりに固定）→s（作業ディレクトリを宣言して Strict に）にすると書けます\
+                         （拒否のタブの辺は固定できません）。もう1つの直し方は、宣言画面（F3）の遷移タブで Strict を外す\
+                         ことです（入る辺は普通のモードになります）。\n{r}",
                         edge.to
                     ),
                     None => r.to_string(),
