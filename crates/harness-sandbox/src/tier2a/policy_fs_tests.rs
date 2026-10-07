@@ -368,3 +368,54 @@ fn a_ready_domain_carries_its_passthrough() {
         other => panic!("expected Ready, got {other:?}"),
     }
 }
+
+// --- [P6.2・決定68 の前例の(11)] 付与台帳の記録の組み立て（`grant_records`） ---
+
+fn granted_with(path: &str, writable: bool, used_restore_privilege: bool) -> GrantedPassthrough {
+    GrantedPassthrough {
+        used_restore_privilege,
+        ..granted(path, writable, "S-1-15-3-1", "read")
+    }
+}
+
+/// **同じパスは綴りが違っても1行に畳む**（台帳はパスごとに1行で、後の行が前の行を上書きする）。書込と特権の使用は和。
+#[test]
+fn grant_records_fold_one_path_from_several_lists() {
+    let entry = granted_with(r"C:\x", false, false);
+    let domain = granted_with("c:/X", true, true);
+    let records = grant_records([&entry, &domain], &[], &[], Path::new(r"C:\ws"));
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert!(records[0].writable);
+    assert!(records[0].forced, "the privilege used by one list must survive the fold (BUG-119)");
+}
+
+/// 承認済みの宣言のルート（自動撤収の宣言集合）なら、自分のワークスペースを参照に載せる。綴りの違いで外れない。
+/// **対の側**: 宣言集合に無いパスは載せない（`--fs-allow`と同じく自動撤収の対象にしない）。
+#[test]
+fn a_file_declared_root_carries_the_workspace_across_spellings() {
+    let declared_root = granted_with(r"C:\declared", false, false);
+    let other = granted_with(r"C:\manual", false, false);
+    let records = grant_records(
+        [&declared_root, &other],
+        &[],
+        &["c:/Declared".to_string()],
+        Path::new(r"C:\ws"),
+    );
+    assert_eq!(records[0].settings_workspace.as_deref(), Some(r"C:\ws"));
+    assert_eq!(records[1].settings_workspace, None);
+}
+
+/// [BUG-119] `forced`は宣言（`--force-system-acl`）ではなく、そのパスで特権を**使ったか**から決める。範囲は宣言から引き、
+/// 同じパスに素の宣言と`**`があれば再帰が勝つ。
+#[test]
+fn forced_follows_the_privilege_actually_used_not_the_declaration() {
+    let mut forced_decl = fp(r"C:\x", FsAccess::Read);
+    forced_decl.forced = true;
+    forced_decl.scope = GrantScope::Object;
+    let mut recursive_decl = fp("c:/X", FsAccess::Read);
+    recursive_decl.scope = GrantScope::Recursive;
+    let g = granted_with(r"C:\x", false, false);
+    let records = grant_records([&g], &[forced_decl, recursive_decl], &[], Path::new(r"C:\ws"));
+    assert!(!records[0].forced);
+    assert_eq!(records[0].scope, GrantScope::Recursive);
+}

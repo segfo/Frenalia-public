@@ -473,56 +473,25 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         // ある構成では数百MBのI/Oになる。**人へ見せる行は1件ずつのまま**——まとめるのは
         // 台帳の書込だけで、どの穴が開いたかの説明は落とさない。
         //
-        // [#30] 記録するのは入口の子の分と、遷移先ドメインの子の分。**同じパスは記録の前に1行へ畳む**
-        // ——付与台帳はパスごとに1行で、後から書いた行が`forced`/`writable`/`scope`を上書きする
-        // （`upsert_grant`）。ドメインの分（`forced=false`）が後に来ると、撤収が`SeRestorePrivilege`を
-        // 使わなくなる（BUG-119の逆行）。`forced`・`writable`はOR、範囲は再帰が勝つ。
-        // 比べる綴りは宛先SIDの鍵と同じ畳み方（`declaration_key`）。
-        use harness_sandbox::tier2a::workspace_capability::declaration_key;
-        let mut by_path: Vec<harness_core::GrantedPassthrough> = Vec::new();
-        for granted in shell_tier.granted_passthrough.iter().chain(
-            domain_fs_grants
-                .values()
-                .filter_map(|result| result.as_ref().ok())
-                .flatten(),
-        ) {
-            let key = declaration_key(&granted.path);
-            match by_path
-                .iter_mut()
-                .find(|seen| declaration_key(&seen.path) == key)
-            {
-                Some(seen) => {
-                    seen.writable |= granted.writable;
-                    seen.used_restore_privilege |= granted.used_restore_privilege;
-                }
-                None => by_path.push(granted.clone()),
-            }
-        }
-        let records: Vec<crate::fs_grants::FsPassthroughGrantRecord> = by_path
+        // [#30] 記録するのは入口の子の分と、遷移先ドメインの子の分。組み立て（同じパスを1行に畳む・`forced`は使った
+        // 特権から〔BUG-119〕・範囲は宣言から・承認済みの宣言のルートならワークスペースを参照に載せる）は
+        // `policy_fs::grant_records`が持つ（ポリシーエディタのパス2も同じこれを通る。決定68の前例の(11)）。
+        let granted: Vec<&harness_core::GrantedPassthrough> = shell_tier
+            .granted_passthrough
             .iter()
-            .map(|granted| {
-                let key = declaration_key(&granted.path);
-                // [D-63] 宣言側から引くのは**範囲だけ**である（同じパスの宣言が複数あれば再帰が勝つ）。
-                // [BUG-119] `forced`は宣言側から引かない——`--force-system-acl`は
-                // セッション全域のスイッチで、**そのパスで特権を使ったかという事実ではない**。
-                // 組み立ては`FsPassthroughGrantRecord::from_granted`が唯一の定義を持つ。
-                let declared = fs_passthrough
-                    .iter()
-                    .filter(|fp| declaration_key(&fp.path) == key)
-                    .max_by_key(|fp| fp.scope.is_recursive());
-                let path_str = granted.path.to_string_lossy();
-                // [#30] 「ファイルで宣言された」（＝自動撤収の対象）かは、台帳と同じ比べ方で決める。
-                // 文字列の完全一致では`C:\x`と`C:/x`が別物になり、毎起動で印が外れて撤収される。
-                let file_declared = file_declared_fs_paths
-                    .iter()
-                    .any(|declared| harness_grant_ledger::same_ledger_path(declared, &path_str));
-                crate::fs_grants::FsPassthroughGrantRecord::from_granted(
-                    granted,
-                    declared,
-                    file_declared.then(|| workspace_root.to_string_lossy().into_owned()),
-                )
-            })
+            .chain(
+                domain_fs_grants
+                    .values()
+                    .filter_map(|result| result.as_ref().ok())
+                    .flatten(),
+            )
             .collect();
+        let records = harness_sandbox::tier2a::policy_fs::grant_records(
+            granted,
+            &fs_passthrough,
+            &file_declared_fs_paths.iter().cloned().collect::<Vec<_>>(),
+            &workspace_root,
+        );
         crate::fs_grants::record_fs_passthrough_grants(&records);
         // [#30] 遷移先ドメインの分は**ドメインごとに1行**で知らせる（入口の分は下で1件ずつ出す）。
         for (domain, result) in &domain_fs_grants {

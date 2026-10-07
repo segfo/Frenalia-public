@@ -317,6 +317,66 @@ pub fn writable_outside_policy(
         .collect()
 }
 
+/// 付与の結果から、付与台帳（`fs-passthrough-ledger.json`）へ書く記録を組む（`harness-cli`の`run_agent.rs`から
+/// そのまま移した。P6.2。`harness.exe`とポリシーエディタのパス2が同じこれを通る——決定68の前例の(11)）。
+///
+/// # 同じパスは記録の前に1行へ畳む
+///
+/// 付与台帳はパスごとに1行で、後から書いた行が`forced`/`writable`/`scope`を上書きする（`upsert_grant`）。
+/// 一覧ごと（入口・遷移先ドメイン）に同じパスがあると、後の行（`forced=false`）が前の行の特権の使用を消し、
+/// 撤収が`SeRestorePrivilege`を使わなくなる（BUG-119の逆行）。`forced`・`writable`は和、範囲は再帰が勝つ。
+/// 比べる綴りは宛先SIDの鍵と同じ畳み方（`declaration_key`）。
+///
+/// # `forced`は宣言からではなく、そのパスで特権を使ったかから
+///
+/// [BUG-119] `--force-system-acl`はセッション全域のスイッチで、そのパスで特権を使ったかという事実ではない。
+/// 宣言（`declared`）から引くのは**範囲だけ**である。組み立ては`FsPassthroughGrantRecord::from_granted`が唯一の定義を持つ。
+///
+/// # 承認済みの宣言のルートなら、ワークスペースを参照に載せる
+///
+/// 「ファイルで宣言された」（＝自動撤収の対象。D-27）かは、台帳と同じ比べ方（`same_ledger_path`）で
+/// `file_declared_roots`と比べる。文字列の完全一致では`C:\x`と`C:/x`が別物になり、毎起動で印が外れて撤収される。
+pub fn grant_records<'a>(
+    granted: impl IntoIterator<Item = &'a GrantedPassthrough>,
+    declared: &[FsPassthrough],
+    file_declared_roots: &[String],
+    workspace_root: &std::path::Path,
+) -> Vec<crate::tier2a::fs_passthrough_ledger::FsPassthroughGrantRecord> {
+    let mut by_path: Vec<GrantedPassthrough> = Vec::new();
+    for granted in granted {
+        let key = declaration_key(&granted.path);
+        match by_path
+            .iter_mut()
+            .find(|seen| declaration_key(&seen.path) == key)
+        {
+            Some(seen) => {
+                seen.writable |= granted.writable;
+                seen.used_restore_privilege |= granted.used_restore_privilege;
+            }
+            None => by_path.push(granted.clone()),
+        }
+    }
+    by_path
+        .iter()
+        .map(|granted| {
+            let key = declaration_key(&granted.path);
+            let declared = declared
+                .iter()
+                .filter(|fp| declaration_key(&fp.path) == key)
+                .max_by_key(|fp| fp.scope.is_recursive());
+            let path_str = granted.path.to_string_lossy();
+            let file_declared = file_declared_roots
+                .iter()
+                .any(|root| harness_grant_ledger::same_ledger_path(root, &path_str));
+            crate::tier2a::fs_passthrough_ledger::FsPassthroughGrantRecord::from_granted(
+                granted,
+                declared,
+                file_declared.then(|| workspace_root.to_string_lossy().into_owned()),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[path = "policy_fs_tests.rs"]
 mod policy_fs_tests;
