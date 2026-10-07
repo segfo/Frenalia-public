@@ -809,6 +809,28 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "a_widening_edge_written_by_the_editor_lets_the_child_use_its_own_domain_and_no_more",
         ],
     ),
+    // 決定69（P7.8）: **ドメインごとの通信**の実機E2E。`policy.json`の承認済みの`net`宣言が、そのドメインの子だけに
+    // 効くことを`harness.exe --enforce-transitions`（e2e-mock のビルド）で測る
+    // （`crates/harness-policy-editor/tests/domain_net_e2e.rs`）。7本の腕——外の対照・子が自分の宛先へ届く・
+    // 他のドメインの宛先は断られる・入口の対照・他のドメインのプロキシのポートへは繋げない・通信を宣言しない
+    // ドメインは宛先を知らない・ssh が`ProxyCommand`で22番へ届く・監査の行のドメインの印。
+    // **外部への到達性が要る**（`example.com`の HTTP と`github.com`の22番）。届かなければ判定不能で落ちる。
+    // フィルタはテスト関数名と一致させる（0件マッチは`check_tests_actually_ran`が非0で落とす、BUG-056同型）。
+    (
+        "e2e-policy-editor-domain-net",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "domain_net_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "each_domain_reaches_only_its_own_destinations_through_its_own_proxy",
+        ],
+    ),
     // 引数を固定した位置の分割と Strict の辺（決定67）の実機E2E。パス1で同じ親から同じ`powershell.exe`で
     // 3つのスクリプトを記録し、エディタの画面の`u`でコマンドラインごとのドメインに分け、1行を`s`で Strict にして
     // 承認し、`harness.exe --enforce-transitions`（e2e-mock のビルド）で、分けたドメインが別のスクリプトの目印を
