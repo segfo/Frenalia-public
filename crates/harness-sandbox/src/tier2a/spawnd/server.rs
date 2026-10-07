@@ -80,7 +80,9 @@ use crate::win_pipe_ipc::{
 
 use super::child_plan::ChildPlan;
 use super::console_holder::ConsoleHolders;
-use super::nested_inputs::{caller_handles_for, env_for_nested, force_request_pipe};
+use super::nested_inputs::{
+    caller_handles_for, close_all, env_for_nested, force_request_pipe, pull_caller_stdio, OpenedStdio,
+};
 use super::table::ProcessTable;
 use super::transitions::TransitionQueue;
 use super::{
@@ -114,7 +116,7 @@ impl std::fmt::Display for SpawnDaemonError {
 
 impl std::error::Error for SpawnDaemonError {}
 
-fn err(message: impl Into<String>) -> SpawnDaemonError {
+pub(super) fn err(message: impl Into<String>) -> SpawnDaemonError {
     SpawnDaemonError {
         kind: SpawnFailureKind::Spawn,
         message: message.into(),
@@ -1758,141 +1760,6 @@ fn duplicate_to_caller(
             }
             Err(e)
         }
-    }
-}
-
-/// [段階6f-1] 申告が無かった欄の代わりに何を開くか。
-///
-/// **`Read`の側を作っていないのは意図である**——標準入力の申告が無い子は
-/// 「標準入力を持たない」（`None`）であって、「空を読む」ではない。`NUL`を読ませると
-/// **即EOF**になり、`None`とほぼ同じに見えるが、`isatty`相当の問い合わせの答えが変わる。
-enum Nul {
-    Write,
-}
-
-/// [段階6f-1] nestedの子へ渡すstdio一式を**集める**入れ物。
-///
-/// # なぜ入れ物が要るのか
-///
-/// 3本のうち2本目で失敗したとき、**1本目を閉じなければ漏れる**。返り道ごとに閉じる形にすると、
-/// 4本目が生えた日に必ずどれかが漏れる（`B-01`・`B-06`）。集めておいて、
-/// 失敗したら[`close_all`]へ渡す。
-///
-/// 成功した場合は`create_suspended_in_job`が**成否によらず全部閉じる**契約を持っているので、
-/// こちら側で閉じるのは「あそこへ渡す前に落ちたとき」だけである。
-#[derive(Default)]
-struct OpenedStdio {
-    opened: Vec<HANDLE>,
-}
-
-impl OpenedStdio {
-    /// 呼び出し元のハンドルを引き抜く。申告が無ければ`fallback`（`None`ならハンドル無し）。
-    ///
-    /// **`DUPLICATE_SAME_ACCESS`で引き抜く。** アクセスを広げない——広げても得る物は無いが、
-    /// 「Daemonを通すと権限が増える」形を1つも作らないためである（`P-01`）。
-    fn pull(
-        &mut self,
-        caller_process: HANDLE,
-        claimed: Option<u64>,
-        fallback: Option<Nul>,
-    ) -> Result<Option<HANDLE>, SpawnDaemonError> {
-        let handle = match claimed {
-            Some(value) => {
-                let mut mine = HANDLE::default();
-                unsafe {
-                    DuplicateHandle(
-                        caller_process,
-                        HANDLE(value as *mut _),
-                        GetCurrentProcess(),
-                        &mut mine,
-                        0,
-                        // 子へ継承させる値なので、複製の時点で継承可にしておく。
-                        true,
-                        DUPLICATE_SAME_ACCESS,
-                    )
-                }
-                .map_err(|e| {
-                    // **嘘の値を送られただけのことがある。** 理由を具体的に残しておかないと、
-                    // 「起こせなかった」としか分からない（`B-10`）。
-                    err(format!("DuplicateHandle(caller stdio {value:#x}): {e}"))
-                })?;
-                Some(mine)
-            }
-            None => match fallback {
-                Some(Nul::Write) => Some(open_nul_for_write()?),
-                None => None,
-            },
-        };
-        if let Some(handle) = handle {
-            self.opened.push(handle);
-        }
-        Ok(handle)
-    }
-
-    /// 集めたハンドルを`inherit_handles`として取り出す。
-    fn take_for_inherit(self) -> Vec<HANDLE> {
-        self.opened
-    }
-}
-
-/// 3本まとめて引き抜く。**途中で落ちたら、開いたぶんは呼び出し側が[`close_all`]で閉じる。**
-///
-/// 標準出力・標準エラーは`NUL`の逃げ道があるので必ず値が返る。標準入力だけは
-/// 「持たない」があり得る（[`Nul`]のdoc）。
-fn pull_caller_stdio(
-    opened: &mut OpenedStdio,
-    caller_process: HANDLE,
-    handles: &super::CallerHandles,
-) -> Result<(Option<HANDLE>, HANDLE, HANDLE), SpawnDaemonError> {
-    let stdin_read = opened.pull(caller_process, handles.stdin, None)?;
-    let stdout_write = opened
-        .pull(caller_process, handles.stdout, Some(Nul::Write))?
-        .expect("the NUL fallback always yields a handle");
-    let stderr_write = opened
-        .pull(caller_process, handles.stderr, Some(Nul::Write))?
-        .expect("the NUL fallback always yields a handle");
-    Ok((stdin_read, stdout_write, stderr_write))
-}
-
-/// 集めたハンドルを全部閉じる。**`create_suspended_in_job`へ渡す前に落ちたときだけ呼ぶ。**
-fn close_all(handles: &[HANDLE]) {
-    unsafe {
-        for handle in handles {
-            let _ = CloseHandle(*handle);
-        }
-    }
-}
-
-/// 継承させられる`NUL`（書き込み用）を1本開く。
-///
-/// # なぜ`NUL`なのか
-///
-/// [`create_suspended_in_job`]は`stdout_write`・`stderr_write`を**必ず**要求する
-/// （`Option`ではない）。nestedの子の出力を運ぶ先が6bには無いので、捨てる先を渡す。
-/// **パイプを作って読み捨てるスレッドを立てるより、OSに捨てさせるほうが部品が少ない。**
-///
-/// **継承させるハンドルなので`bInheritHandle`を立てる。** サンドボックスの子は`NUL`を
-/// 自分で開くこともできるが、それは別の話である——ここで渡すのは
-/// `STARTUPINFO`の`hStdOutput`に入れる値で、無効ハンドルを入れると子の起動自体が不安定になる。
-fn open_nul_for_write() -> Result<HANDLE, SpawnDaemonError> {
-    let sa = windows::Win32::Security::SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: true.into(),
-    };
-    unsafe {
-        let name = wide("NUL");
-        CreateFileW(
-            PCWSTR(name.as_ptr()),
-            FILE_GENERIC_WRITE.0,
-            windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE
-                | windows::Win32::Storage::FileSystem::FILE_SHARE_READ,
-            Some(&sa as *const _),
-            OPEN_EXISTING,
-            Default::default(),
-            None,
-        )
-        .map_err(|e| err(format!("CreateFileW(NUL): {e}")))
     }
 }
 
