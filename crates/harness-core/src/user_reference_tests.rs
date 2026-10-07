@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use super::*;
-use crate::ContentBlock;
+use crate::{ContentBlock, Role};
 
 /// 実測で写し損じが起きた値（308文字の base64。`plans/risk-judge-spike/RESULTS.md`）と同じ長さの塊。
 ///
@@ -42,25 +42,73 @@ fn only_long_values_get_a_number_and_they_keep_their_order() {
     assert_eq!(values_in(&[user(&format!("{short} {just}"))]), vec![just]);
 }
 
-/// **長い値を含む直近のユーザーの文1つだけ**を見る（モデルの文は見ない。前の文まで通して数えない）。
+/// **`{{val:N}}`で指せるのは、人が書いた直近の文の値だけ**（D-127。モデルの文は見ない。前の文へ遡らない）。
+///
+/// BUG-234: 以前は「長い値を含む文のうち直近」を探していたので、新しい文に値が無いと前の文まで遡り、
+/// モデルは前に貼られた値を今の番号で指して走らせようとした。
 #[test]
-fn the_newest_user_message_that_has_long_values_wins() {
+fn only_the_newest_human_message_is_reachable_by_val() {
     // hex 文字で作らないと形フィルタに弾かれて候補にならない。
     let (old, new) = (blob('c'), blob('d'));
     let messages = vec![
         user(&format!("これを使って {old}")),
         // モデルの文にも長い値があるが、**参照元にしない**（モデルが書いた値を差し込むと、写し損じを拾う）。
         assistant(&format!("こう書きます {new}")),
-        user("さっきのを実行して"), // 長い値が無いので、1つ前のユーザーの文まで遡る
+        user("ありがとう、次はこれ"), // 長い値が無い。**前の文へは遡らない**
     ];
-    assert_eq!(values_in(&messages), vec![old.clone()]);
+    assert_eq!(values_in(&messages), Vec::<String>::new());
 
+    // 対: 直近の文に値があれば、それが番号を取る（前の文の値は混ざらない）。
     let messages = vec![
         user(&format!("これを使って {old}")),
         assistant(&format!("こう書きます {new}")),
         user(&format!("今度はこれ {new}")),
     ];
     assert_eq!(values_in(&messages), vec![new]);
+}
+
+/// **ツールの結果を運ぶ文と、会話を畳んだ要約の文は「直近」にならない**（どちらも長い値を含んでいても）。
+///
+/// どちらも`Role::User`で積まれるので、役割だけで探すとこれらが「直近のユーザーの文」になり、
+/// ツールの出力や要約に書き写された値が`{{val:1}}`で指せてしまう（D-113「ツールの出力は参照元にしない」）。
+#[test]
+fn tool_results_and_fold_summaries_are_never_the_newest() {
+    let (in_summary, human, in_tool_result) = (blob('a'), blob('b'), blob('e'));
+    let fold_summary = user(&format!(
+        "{}3 earlier messages]\n前に使った値は {in_summary}",
+        crate::human_turns::FOLD_SUMMARY_PREFIX
+    ));
+    let tool_call = Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "1".into(),
+            name: "run_shell".into(),
+            input: json!({ "command": "type out.txt" }),
+        }],
+    };
+    let tool_result = Message {
+        role: Role::User,
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: "1".into(),
+            content: format!("出力 {in_tool_result}"),
+            is_error: false,
+        }],
+    };
+
+    // 新しい側にツールの結果が積まれていても、直近の人の文は`human`を含む文のまま。
+    let messages = vec![
+        fold_summary.clone(),
+        user(&format!("これを使って {human}")),
+        tool_call,
+        tool_result,
+    ];
+    assert_eq!(values_in(&messages), vec![human]);
+
+    // 要約の後ろの人の文に値が無ければ空（要約の中の値は指せない）。
+    let messages = vec![fold_summary.clone(), user("続けて")];
+    assert_eq!(values_in(&messages), Vec::<String>::new());
+    // 要約しか無い会話でも空。
+    assert_eq!(values_in(&[fold_summary]), Vec::<String>::new());
 }
 
 /// **散文・識別子・URL は候補にしない**（2026-10-06の無限ループ事故の再発防止）。
@@ -366,4 +414,39 @@ fn the_old_spelling_still_substitutes() {
         ),
         json!({ "command": format!("cmp {b} {a}") })
     );
+}
+
+/// **前の文の値の写しも審査する**（D-127 の4）。どの文の何番目か（`{{back:K:N}}`）で報告する。
+#[test]
+fn a_transcription_of_an_older_value_names_its_back_number() {
+    use crate::reference_syntax::ValueRef;
+    let (current, older) = (blob('a'), blob('b'));
+    let mut slipped: Vec<char> = older.chars().collect();
+    slipped[100] = 'Z';
+    let slipped: String = slipped.into_iter().collect();
+
+    let candidates = [
+        (ValueRef::current(1), current.as_str()),
+        (ValueRef { back: 1, number: 1 }, older.as_str()),
+    ];
+    let found = review_against(&json!({ "command": slipped }), &candidates);
+    assert_eq!(found.len(), 1);
+    assert_eq!((found[0].back, found[0].number), (1, 1));
+    assert_eq!(found[0].differences, 1);
+    assert_eq!(found[0].reference(), "{{back:1:1}}");
+
+    // 対: 前の文の値を相手にしない審査（`review`は直近の文だけ）では見つからない。
+    assert!(review(
+        &json!({ "command": slipped }),
+        std::slice::from_ref(&current)
+    )
+    .is_empty());
+
+    // 同じ値が今の文にも前の文にもあれば、今の番号で報告する（並びの先が勝つ）。
+    let same = [
+        (ValueRef::current(1), older.as_str()),
+        (ValueRef { back: 1, number: 1 }, older.as_str()),
+    ];
+    let found = review_against(&json!({ "command": slipped }), &same);
+    assert_eq!(found[0].reference(), "{{val:1}}");
 }

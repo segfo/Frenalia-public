@@ -235,7 +235,8 @@ fn home_end_operate_on_current_line_in_multiline_input() {
 }
 
 /// Up/Downで行をまたいでカーソルが移動し、列(行頭からの文字数)を可能な限り維持する
-/// （短い行へ移動するときはその行の長さでクランプする）。
+/// （短い行へ移動するときはその行の長さでクランプする）。入力履歴が空なので、1行目のUp・最終行のDownは
+/// 今までどおり何もしない（履歴があるときは`app::input_history`の試験）。
 #[test]
 fn up_down_arrows_move_between_lines_preserving_column() {
     let mut app = AppState::new("mock".into(), "mock-model".into());
@@ -260,9 +261,10 @@ fn up_down_arrows_move_between_lines_preserving_column() {
     app.on_key(code(KeyCode::Up));
     assert_eq!(app.input_cursor, 1);
 
-    // 先頭行でのUpは何もしない。
+    // 先頭行でのUpは何もしない（履歴が空）。
     app.on_key(code(KeyCode::Up));
     assert_eq!(app.input_cursor, 1);
+    assert_eq!(app.input, "abcde\nxy\nz");
 
     // Endで1行目の末尾(列5)へ行ってからDownすると、2行目("xy"、長さ2)の列はクランプされ2になる。
     app.on_key(code(KeyCode::End));
@@ -274,10 +276,11 @@ fn up_down_arrows_move_between_lines_preserving_column() {
     app.on_key(code(KeyCode::Down));
     assert_eq!(app.input_cursor, app.input.chars().count());
 
-    // 最終行でのDownは何もしない。
+    // 最終行でのDownは何もしない（履歴を見ていない）。
     let cursor_at_last_line = app.input_cursor;
     app.on_key(code(KeyCode::Down));
     assert_eq!(app.input_cursor, cursor_at_last_line);
+    assert_eq!(app.input, "abcde\nxy\nz");
 }
 
 /// 左矢印は先頭で、Backspace/Deleteは範囲外では何もせずパニックしない
@@ -1885,6 +1888,7 @@ fn a_transcribed_user_value_leaves_a_line_in_the_transcript() {
     // 損じていたので断った。
     let mut app = AppState::new("p".into(), "m".into());
     app.apply(AgentEvent::UserValueTranscribed {
+        back: 0,
         value_chars: 308,
         differences: 64,
         refused: true,
@@ -1899,6 +1903,7 @@ fn a_transcribed_user_value_leaves_a_line_in_the_transcript() {
     // 一字一句同じだったので走らせた。**こちらも黙らせない。**
     let mut app = AppState::new("p".into(), "m".into());
     app.apply(AgentEvent::UserValueTranscribed {
+        back: 0,
         value_chars: 308,
         differences: 0,
         refused: false,
@@ -1906,6 +1911,39 @@ fn a_transcribed_user_value_leaves_a_line_in_the_transcript() {
     assert!(
         matches!(&app.transcript[0], TranscriptItem::Info(l)
             if l.contains("308") && l.contains("書き写した") && !l.contains("実行しなかった")),
+        "{:?}",
+        app.transcript[0]
+    );
+}
+
+/// **前の文の値を差し込んだら、会話の記録に1行残る**（D-127 の5）。記録済みの規則で自動で通る呼び出しには
+/// 承認画面が出ないので、これが唯一の知らせになる。何個前の文の何番目かと長さを出し、中身は出さない。
+#[test]
+fn a_back_reference_leaves_a_line_in_the_transcript() {
+    let mut app = AppState::new("p".into(), "m".into());
+    app.apply(AgentEvent::BackReferenceUsed {
+        back: 2,
+        number: 1,
+        value_chars: 308,
+    });
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Info(l)
+            if l == "[参照] モデルが2つ前のあなたの文の値（{{back:2:1}}、308文字）を差し込んだ"),
+        "{:?}",
+        app.transcript[0]
+    );
+
+    // 前の文の値を書き写したときは、何個前の文かも言う。対: 直近の文なら言わない（上の試験）。
+    let mut app = AppState::new("p".into(), "m".into());
+    app.apply(AgentEvent::UserValueTranscribed {
+        back: 1,
+        value_chars: 308,
+        differences: 1,
+        refused: true,
+    });
+    assert!(
+        matches!(&app.transcript[0], TranscriptItem::Info(l)
+            if l.contains("1つ前のあなたの文の308文字の値") && l.contains("実行しなかった")),
         "{:?}",
         app.transcript[0]
     );

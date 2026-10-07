@@ -773,13 +773,13 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         compaction.context_window,
     )));
 
-    // `recall`ツール（`plans/PLAN-RECALL-MEMORY.md`段階3）。`census`と異なり内部で新しい
-    // `TurnExecutor`を組まない（`search`は決定的検索のみ、`remember`はファイル書込みのみ）
-    // ため、再帰対策（レジストリのスナップショット）は不要。`CognitionLevel`に関わらず常時
-    // 登録する（未使用時のコストはゼロ、`Off`の等価性を壊さない）。
+    // `recall`（`plans/PLAN-RECALL-MEMORY.md`段階3。`search`は決定的検索、`remember`はファイル書込みのみ）と
+    // `past_requests`（D-127。会話を読むだけ）は内部で`TurnExecutor`を組まないので再帰対策は不要。`inner_tools`より後
+    // なので`census`の内側には見えない。`CognitionLevel`に関わらず常時登録する（未使用時のコストはゼロ）。
     tools.register(Arc::new(RecallTool::new(
         cognition.recall_allow_unversioned(),
     )));
+    tools.register(Arc::new(harness_engine::PastRequestsTool));
 
     // `/workspace`で選ばれた移動先。ここでは**まだ起動しない**——teardownを全部通した後で
     // 起こす（`startup::relaunch`のモジュールdoc「置き場所が末尾でなければならない」）。

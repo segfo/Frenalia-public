@@ -30,13 +30,40 @@
 //! 危ないかどうかを決めるのは**判定モデルと、承認画面を見る人**である（D-100「要約は補助であって境界ではない」）。
 //! 人には承認画面でハーネスが解読した各段が見えている。
 //!
+//! # 置き場は人の文ごとに1つ（D-127）
+//!
+//! [`ReferenceBook`]が、人が書いた直近の文の置き場（`{{val:N}}`）と、それより前の文ごとの置き場
+//! （`{{back:K:N}}`。K が何個前か）を束ねる。**システムプロンプトの一覧に並べるのは直近の文の値だけ**で、
+//! 前の文の値は「`{{back:K:N}}`で指せる」と1行で伝える（[`ReferenceBook::render_menu`]）——遠くまで遡っても
+//! 一覧が伸びず、選び間違える余地も増えない。
+//!
 //! # ここが守らないもの
 //!
 //! - **番号はこのターン限り。** 毎ターン作り直すので、前のターンの番号は当てにならない
-//!   （文脈の圧縮で古い文が畳まれると、同じ番号が別の値を指してしまうため）
+//!   （文脈の圧縮で古い文が畳まれると、同じ番号が別の値を指してしまうため）。K は新しい方から数えるので、
+//!   畳まれずに残った文の K は変わらない。**畳まれた文の値は指せない**（元の文が会話から消えている）
 //! - **ユーザーの文に無い値は置けない。** ツールの出力・ファイルの中身は、モデルが書き写すしかない
+//! - **前の文の置き場は、会話に残っている人の文の数だけ作る（上限なし）。** その費用は測っていない
 
+use crate::reference_syntax::ValueRef;
 use crate::Message;
+
+/// 一覧の見出し（[`ValueStore::render`]と[`ReferenceBook::render_for`]が共有する）。
+const MENU_HEADER: &str = "ハーネスが次の値を持っています。コマンドの中にこれらの値を書き写さず、\
+     番号で指してください（ハーネスが中身へ置き換えます）。中身は渡していません——\
+     符号化された中身は承認画面で人が見ます。\n";
+
+/// 前の文にも値があることを伝える1行（[`ReferenceBook::render_menu`]）。**値も番号も並べない**——
+/// どの文の何番かは、モデルが道具（[`crate::human_turns::PAST_REQUESTS_TOOL`]）で見てから選ぶ（D-127 の3）。
+pub const BACK_REFERENCE_LINE: &str = concat!(
+    "ユーザーのもっと前の文にも長い値があります（この一覧には載せていません）。\
+     それらも書き写さず {{back:K:N}} と書いて指してください——K はユーザーの文を新しい方から数えて\
+     何個前か（1 が1つ前の文）、N はその文の中での番号です（数え方は {{val:N}} と同じ）。\
+     どの文の何番かは、道具 ",
+    crate::human_turns::past_requests_tool!(),
+    " で前の文とその返事で走らせたコマンドを見てから選んでください\
+     （読むだけで承認は要りません。値は番号だけで出ます）。\n"
+);
 
 /// 値の中身を文面へ載せるかの上限（文字）。**0である**——[モジュールdoc](self)のとおり、
 /// 中身は一切載せない。定数として置いてあるのは、将来ここを動かすときに1か所で済ませるため。
@@ -126,18 +153,24 @@ impl ValueStore {
         self.values.get(number.checked_sub(1)?)
     }
 
-    /// モデルへ見せる文面。置き場が空なら`None`。
+    /// モデルへ見せる文面（直近の文の置き場として。番号は`{{val:N}}`）。置き場が空なら`None`。
     ///
     /// **中身は1文字も載せない**（[モジュールdoc](self)）。載せるのは番号・長さ・出どころだけである。
     pub fn render(&self) -> Option<String> {
         if self.values.is_empty() {
             return None;
         }
-        let mut out = String::from(
-            "ハーネスが次の値を持っています。コマンドの中にこれらの値を書き写さず、\
-             番号で指してください（ハーネスが中身へ置き換えます）。中身は渡していません——\
-             符号化された中身は承認画面で人が見ます。\n",
-        );
+        Some(format!("{MENU_HEADER}{}", self.entry_lines(0)))
+    }
+
+    /// 1つずつの行。`back`個前の文の置き場として番号を綴る（0 なら`{{val:N}}`、それ以外は`{{back:K:N}}`。
+    /// 解読した段の親も同じ綴りで書く）。**中身は1文字も載せない**（番号・長さ・出どころだけ）。
+    ///
+    /// システムプロンプトの一覧（[`ValueStore::render`]）と、前の文を読む道具（`harness_engine::past_requests`）が
+    /// 同じ行を出す——見せ方を2つ持たない。
+    pub fn entry_lines(&self, back: usize) -> String {
+        let spelling = |number| ValueRef { back, number }.spelling();
+        let mut out = String::new();
         for (index, value) in self.values.iter().enumerate() {
             let chars = value.text.chars().count();
             let origin = match &value.origin {
@@ -148,15 +181,91 @@ impl ValueStore {
                     } else {
                         ""
                     };
-                    format!("{{{{val:{from}}}}} を {encoding} として解読したもの{shape}")
+                    format!(
+                        "{} を {encoding} として解読したもの{shape}",
+                        spelling(*from)
+                    )
                 }
             };
             out.push_str(&format!(
-                "  {{{{val:{}}}}} {chars}文字・{origin}\n",
-                index + 1
+                "  {} {chars}文字・{origin}\n",
+                spelling(index + 1)
             ));
         }
-        Some(out)
+        out
+    }
+}
+
+/// 人が書いた文ごとの置き場の束（D-127）。**毎ターン会話から作り直す**（組み立ては
+/// `harness_engine::references`の1か所）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReferenceBook {
+    /// 人が書いた直近の文の置き場（`{{val:N}}`）。
+    pub current: ValueStore,
+    /// それより前の文の置き場。**`back[0]`が1つ前の文**（`{{back:1:N}}`）で、古い方へ続く。
+    pub back: Vec<ValueStore>,
+}
+
+impl ReferenceBook {
+    /// `back`個前の文の置き場（0 が直近の文）。その文が無ければ`None`。
+    pub fn store(&self, back: usize) -> Option<&ValueStore> {
+        match back {
+            0 => Some(&self.current),
+            k => self.back.get(k - 1),
+        }
+    }
+
+    /// 参照1つを引く。文も番号も無ければ`None`（呼び出し側は綴りを残す）。
+    pub fn resolve(&self, reference: ValueRef) -> Option<&StoredValue> {
+        self.store(reference.back)?.get(reference.number)
+    }
+
+    /// 指せる値の全部（書き写しの審査の相手。D-127 の4）。**直近の文を先に**、前の文を新しい順に並べる
+    /// （審査は違いが同じなら先のものを採るので、同じ値が今の文にもあれば今の番号で報告する）。
+    pub fn all_values(&self) -> Vec<(ValueRef, &str)> {
+        std::iter::once(&self.current)
+            .chain(&self.back)
+            .enumerate()
+            .flat_map(|(back, store)| {
+                store.values.iter().enumerate().map(move |(index, v)| {
+                    let number = index + 1;
+                    (ValueRef { back, number }, v.text.as_str())
+                })
+            })
+            .collect()
+    }
+
+    /// 前の文のどれかに値があるか。
+    pub fn has_back_values(&self) -> bool {
+        self.back.iter().any(|store| !store.is_empty())
+    }
+
+    /// システムプロンプトへ載せる一覧。**並べるのは直近の文の値だけ**で（[`ValueStore::render`]と同じ文面）、
+    /// 前の文に値があるときだけ[`BACK_REFERENCE_LINE`]を1行足す。どちらも無ければ`None`。
+    pub fn render_menu(&self) -> Option<String> {
+        let mut out = self.current.render().unwrap_or_default();
+        if self.has_back_values() {
+            out.push_str(BACK_REFERENCE_LINE);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// 書き写しを断る文に添える一覧: 直近の文の値と、`backs`に挙げた前の文（審査で写しと分かった値の文）の値。
+    /// 前の文の値は`{{back:K:N}}`で綴るので、モデルはそのまま指し直せる。**中身は1文字も載せない。**
+    pub fn render_for(&self, backs: &[usize]) -> Option<String> {
+        let mut backs: Vec<usize> = backs.iter().copied().filter(|k| *k > 0).collect();
+        backs.sort_unstable();
+        backs.dedup();
+        let mut body = self.current.entry_lines(0);
+        for k in backs {
+            if let Some(store) = self.store(k).filter(|s| !s.is_empty()) {
+                body.push_str(&format!(
+                    "  （ここからユーザーの{k}つ前の文の値）\n{}",
+                    store.entry_lines(k)
+                ));
+            }
+        }
+        (!body.is_empty()).then(|| format!("{MENU_HEADER}{body}"))
     }
 }
 

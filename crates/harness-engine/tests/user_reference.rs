@@ -7,7 +7,10 @@
 //! 実測の背景（2026-10-04、ローカルの`qwen3.6-35b`・4回）: 308文字の base64 を4回とも写し損じ、1文字違った値は
 //! `systeminfo`ではなく`sDsteminfo`を走らせる命令になっていた。
 
-use harness_core::{AgentEvent, BlockKind, ContentBlock, StopReason, StreamEvent, ToolCtx, Usage};
+use harness_core::ProviderError;
+use harness_core::{
+    AgentEvent, BlockKind, ContentBlock, Message, Role, StopReason, StreamEvent, ToolCtx, Usage,
+};
 use harness_engine::{
     run_agent_loop, AgentLoopConfig, ConversationState, PermissionArbiter, PermissionMode,
 };
@@ -65,11 +68,30 @@ async fn run_write(
     user_text: &str,
     input: serde_json::Value,
 ) -> (Option<String>, String, Vec<AgentEvent>) {
+    let run = run_write_after(vec![user(user_text)], input).await;
+    (run.file, run.result, run.events)
+}
+
+/// [`run_write_after`]の結果。
+struct WriteRun {
+    /// 書かれたファイルの中身（書けなければ`None`）。
+    file: Option<String>,
+    /// この回の`write_file`の結果（履歴の中の**最も新しい**ツールの結果）。
+    result: String,
+    events: Vec<AgentEvent>,
+    /// 1回目のリクエストのシステムプロンプト（全部の塊をつないだもの）。
+    first_system: String,
+}
+
+/// 会話`history`の後ろでモデルが`write_file`を1回撃つ。`history`の最後は人の文であること。
+async fn run_write_after(history: Vec<Message>, input: serde_json::Value) -> WriteRun {
     let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("requests.jsonl");
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let provider = MockProvider::new(vec![tool_use_turn(input), end_turn()]);
+    let provider = MockProvider::new(vec![tool_use_turn(input), end_turn()])
+        .with_request_record_path(record.clone());
     let mut state = ConversationState::new(Vec::new());
-    state.push_user_text(user_text);
+    state.messages = history;
 
     let tools = ToolRegistry::with_builtin_tools();
     let ctx = ToolCtx::new(dir.path().to_path_buf());
@@ -98,24 +120,78 @@ async fn run_write(
     let result = state
         .messages
         .iter()
+        .rev()
         .flat_map(|m| m.content.iter())
         .find_map(|b| match b {
             ContentBlock::ToolResult { content, .. } => Some(content.clone()),
             _ => None,
         })
         .expect("the write_file call must produce a tool_result");
-    (
-        std::fs::read_to_string(dir.path().join("out.txt")).ok(),
+    let sent = std::fs::read_to_string(&record).expect("リクエストが記録されていない");
+    let request: serde_json::Value = serde_json::from_str(sent.lines().next().unwrap()).unwrap();
+    drop(tx);
+    let mut events = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        events.push(e);
+    }
+    WriteRun {
+        file: std::fs::read_to_string(dir.path().join("out.txt")).ok(),
         result,
-        {
-            drop(tx);
-            let mut events = Vec::new();
-            while let Ok(e) = rx.try_recv() {
-                events.push(e);
-            }
-            events
+        events,
+        first_system: request["system"].to_string(),
+    }
+}
+
+fn user(text: &str) -> Message {
+    Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text(text.to_string())],
+    }
+}
+
+/// 前の文で値`value`を貼って走らせ、今の文には値が無い会話（2026-10-06 にユーザーが実機で踏んだ形）。
+///
+/// モデルの前の呼び出しは書いたまま（`{{val:1}}`）履歴に残っている（D-113）。
+fn history_with_an_older_value(value: &str) -> Vec<Message> {
+    vec![
+        user(&format!("これを実行して pwsh --enc {value}")),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "old".into(),
+                name: "run_shell".into(),
+                input: serde_json::json!({ "command": "pwsh --enc {{val:1}}" }),
+            }],
         },
-    )
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "old".into(),
+                content: "ok".into(),
+                is_error: false,
+            }],
+        },
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("実行しました".into())],
+        },
+        user("ありがとう、次はこれ"),
+    ]
+}
+
+/// 前の文の値を差し込んだと知らせた回数（`AgentEvent::BackReferenceUsed`）。`(K, N, 長さ)`。
+fn back_reference_notices(events: &[AgentEvent]) -> Vec<(usize, usize, usize)> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::BackReferenceUsed {
+                back,
+                number,
+                value_chars,
+            } => Some((*back, *number, *value_chars)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// 書き写しを見つけたと知らせた回数（`AgentEvent::UserValueTranscribed`）。
@@ -415,4 +491,223 @@ fn decoded_layers_get_their_own_numbers() {
         store.get(last).map(|v| v.origin.clone()),
         Some(harness_core::value_store::Origin::Decoded { from, .. }) if from > 1
     ));
+}
+
+// --- 前の文の値（D-127。`{{back:K:N}}`） ---
+
+/// **前の文の値は`{{val:N}}`では指せない**（BUG-234 の再発防止）。
+///
+/// 2026-10-06 にユーザーが実機で踏んだ形: 前の文で値を貼って走らせ、今の文（「ありがとう、次はこれ」）には
+/// 値が無い。以前は番号の置き場が前の文まで遡って作られ、モデルが書いた`{{val:1}}`が前の値に置き換わった。
+#[tokio::test]
+async fn an_old_value_is_not_reachable_by_val() {
+    let value = long_value();
+    let run = run_write_after(
+        history_with_an_older_value(&value),
+        serde_json::json!({ "path": "out.txt", "content": "pwsh --enc {{val:1}}" }),
+    )
+    .await;
+    assert_eq!(run.file.as_deref(), Some("pwsh --enc {{val:1}}"));
+    assert_eq!(back_reference_notices(&run.events), Vec::new());
+}
+
+/// **前の文の値は`{{back:K:N}}`で指す。** 差し込んだことは会話の記録に1行残る（D-127 の5）。
+#[tokio::test]
+async fn back_reference_reaches_the_previous_message() {
+    let value = long_value();
+    let run = run_write_after(
+        history_with_an_older_value(&value),
+        serde_json::json!({ "path": "out.txt", "content": "pwsh --enc {{back:1:1}}" }),
+    )
+    .await;
+    assert_eq!(
+        run.file.as_deref(),
+        Some(format!("pwsh --enc {value}").as_str())
+    );
+    assert_eq!(
+        back_reference_notices(&run.events),
+        vec![(1, 1, value.chars().count())]
+    );
+    // モデルは番号で指したので、書き写しの知らせは出ない。
+    assert_eq!(transcription_notices(&run.events), Vec::new());
+
+    // 対: 無い文（2つ前）を指した綴りは置き換わらずに残り、知らせも出ない。
+    let run = run_write_after(
+        history_with_an_older_value(&value),
+        serde_json::json!({ "path": "out.txt", "content": "pwsh --enc {{back:2:1}}" }),
+    )
+    .await;
+    assert_eq!(run.file.as_deref(), Some("pwsh --enc {{back:2:1}}"));
+    assert_eq!(back_reference_notices(&run.events), Vec::new());
+}
+
+/// **前の文の値の壊れた写しも断る**（D-127 の4）。断る文は`{{back:1:1}}`の形で番号を出し、中身は出さない。
+#[tokio::test]
+async fn a_damaged_copy_of_an_older_value_is_refused() {
+    let value = long_value();
+    let mut damaged: Vec<char> = value.chars().collect();
+    damaged[7] = 'Z';
+    let damaged: String = damaged.into_iter().collect();
+    assert_ne!(damaged, value);
+
+    let run = run_write_after(
+        history_with_an_older_value(&value),
+        serde_json::json!({ "path": "out.txt", "content": damaged }),
+    )
+    .await;
+    assert_eq!(run.file, None, "壊れた写しでファイルが書かれてはいけない");
+    assert!(
+        run.result.contains("書き写した値は実行しませんでした"),
+        "{}",
+        run.result
+    );
+    assert!(run.result.contains("{{back:1:1}}"), "{}", run.result);
+    assert!(!run.result.contains(&value), "{}", run.result);
+    // 記録には「何個前の文の値か」も載る。
+    let notices: Vec<(usize, usize, bool)> = run
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::UserValueTranscribed {
+                back,
+                differences,
+                refused,
+                ..
+            } => Some((*back, *differences, *refused)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices, vec![(1, 1, true)]);
+}
+
+/// **モデルへ送る一覧には、前の文の値を並べず「`{{back:K:N}}`で指せる」と1行だけ載る**（配線の確認。B-06）。
+/// 今の文に値が無いので`{{val:1}}`の行は無く、中身もどこにも載らない。
+#[tokio::test]
+async fn the_request_mentions_back_references_without_listing_them() {
+    let value = long_value();
+    let run = run_write_after(
+        history_with_an_older_value(&value),
+        serde_json::json!({ "path": "out.txt", "content": "plain" }),
+    )
+    .await;
+    let back_line = harness_core::value_store::BACK_REFERENCE_LINE.trim_end();
+    assert!(run.first_system.contains(back_line), "{}", run.first_system);
+    assert!(
+        !run.first_system.contains("{{val:1}} "),
+        "{}",
+        run.first_system
+    );
+    assert!(!run.first_system.contains(&value), "{}", run.first_system);
+}
+
+/// 呼び出しごとに決めた結果を返し、送られたシステムプロンプトを控えるプロバイダ。
+/// `ContextTooLong`のリアクティブ圧縮は「本題（失敗）→要約→再試行」と同じプロバイダを3役で呼ぶので、
+/// `MockProvider`のターン列では表せない（`golden_transcript.rs`の`ScriptedProvider`と同じ理由）。
+struct RecordingScripted {
+    calls: std::sync::Mutex<std::collections::VecDeque<Result<Vec<StreamEvent>, ProviderError>>>,
+    systems: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl harness_core::LlmProvider for RecordingScripted {
+    fn id(&self) -> &str {
+        "recording-scripted"
+    }
+
+    async fn stream(
+        &self,
+        req: harness_core::CompletionRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<StreamEvent, ProviderError>>,
+        ProviderError,
+    > {
+        let system: Vec<&str> = req.system.iter().map(|b| b.text.as_str()).collect();
+        self.systems.lock().unwrap().push(system.join("\n"));
+        match self.calls.lock().unwrap().pop_front() {
+            Some(Ok(events)) => Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok)))),
+            Some(Err(e)) => Err(e),
+            None => Err(ProviderError::InvalidRequest {
+                msg: "recording-scripted provider ran out of calls".to_string(),
+            }),
+        }
+    }
+}
+
+/// **会話を畳んで撃ち直すときは、値の一覧も畳んだ後の会話から作り直す**（D-127 の検問2「差し込みの経路は3つ」）。
+///
+/// 以前の撃ち直しは送る文だけを差し替え、システムプロンプトの一覧は畳む前の会話のまま送っていた
+/// （差し込む段は畳んだ後の会話から組むので、見せた一覧と食い違う）。ここでは値を持つ唯一の文が畳まれるので、
+/// 畳む前の一覧にあった「前の文にも値がある」の1行が、撃ち直しでは消えていなければならない。
+/// あわせて、**畳まれた文を指す`{{back:K:N}}`は置き換わらずに残る**（K は新しい方から数える）。
+#[tokio::test]
+async fn the_compaction_retry_rebuilds_the_value_list_from_the_folded_conversation() {
+    let value = long_value();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = RecordingScripted {
+        calls: std::sync::Mutex::new(
+            vec![
+                Err(ProviderError::ContextTooLong),
+                Ok(end_turn()), // 要約のコール
+                Ok(tool_use_turn(
+                    serde_json::json!({ "path": "out.txt", "content": "payload={{back:2:1}}" }),
+                )),
+                Ok(end_turn()),
+            ]
+            .into(),
+        ),
+        systems: std::sync::Mutex::new(Vec::new()),
+    };
+    // 人の文が3つ。既定の`keep_recent_turns`=2 で、値を持つ最初の文が要約へ畳まれる。
+    let mut state = ConversationState::new(Vec::new());
+    state.messages = vec![
+        user(&format!("これを覚えて {value}")),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("覚えました".into())],
+        },
+        user("別の話"),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("はい".into())],
+        },
+        user("さっきのを書いて"),
+    ];
+    let tools = ToolRegistry::with_builtin_tools();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    let arbiter = PermissionArbiter::new(PermissionMode::AcceptAll, vec![], dir.path());
+
+    run_agent_loop(
+        &provider,
+        &mut state,
+        &tools,
+        &ctx,
+        &arbiter,
+        AgentLoopConfig {
+            model: "mock".into(),
+            max_tokens: 100,
+            max_turns: 5,
+            compaction: Default::default(),
+            degeneracy: None,
+        },
+        None,
+        None,
+        |_| {},
+    )
+    .await
+    .expect("the loop itself must not fail");
+
+    let systems = provider.systems.lock().unwrap().clone();
+    assert_eq!(systems.len(), 4, "本題・要約・撃ち直し・最後の返事");
+    let back_line = harness_core::value_store::BACK_REFERENCE_LINE.trim_end();
+    // 対照: 畳む前に送った一覧には、前の文に値がある旨の1行があった。
+    assert!(systems[0].contains(back_line), "{}", systems[0]);
+    // 撃ち直しの一覧は畳んだ後の会話から作り直されている（値を持つ文はもう無い）。
+    assert!(!systems[2].contains(back_line), "{}", systems[2]);
+    // 畳まれた文を指した綴りは置き換わらずに残る（承認画面で人に見える）。
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out.txt"))
+            .ok()
+            .as_deref(),
+        Some("payload={{back:2:1}}")
+    );
 }

@@ -40,6 +40,8 @@
 //! 目印が行の中に無ければ何も取り出さない。だから**取り出した文字列は必ず行の一部そのもの**になり、
 //! 写し間違いが入る余地が無い。あわせて目印の長さ（[`MAX_MARKER_CHARS`]）・目印の数（[`MAX_MARKERS`]）・
 //! 取り出す数（[`MAX_SPANS`]）・1つの長さ（[`MIN_SPAN_CHARS`]〜[`MAX_SPAN_CHARS`]）に上限を置く。
+//! 目印の数と取り出す数は、**上限より1つ多くまで**見る——超えて示されたことを、解読の側
+//! （`harness_tools::encoded_payload::decode_located`）が止めた印の段（`CountLimit`）として残せるようにするため。
 
 use std::sync::Arc;
 
@@ -52,9 +54,9 @@ use harness_core::{
 use crate::approval_summary::nonce;
 use crate::side_call;
 
-/// 取り出す箇所の数の上限（`harness_tools::encoded_payload::MAX_LOCATED_SPANS`と同じ）。
+/// 解読する箇所の数の上限（`harness_tools::encoded_payload::MAX_LOCATED_SPANS`と同じ）。取り出すのは1つ多くまで。
 const MAX_SPANS: usize = harness_tools::encoded_payload::MAX_LOCATED_SPANS;
-/// 受け取る目印の数の上限。
+/// 当てる目印の数の上限。受け取るのは1つ多くまで。
 const MAX_MARKERS: usize = 4;
 /// 目印1つの長さの上限（文字）。**短く保つ**——目印はモデルが書き写すものなので、
 /// 目で照合できる長さを超えると、ここでも写し損じが起きる。
@@ -84,6 +86,9 @@ gzip_base64 (gzip-compressed data written as base64), deflate_base64 (raw deflat
 pub trait SpanLocator: Send + Sync {
     /// `line`から取り出した文字列と、その符号化。**取り出すのは正規表現エンジン**なので、返る文字列は
     /// 必ず`line`の一部そのものである。
+    ///
+    /// 数は`MAX_LOCATED_SPANS`を超えてよい。ハーネスが解読するのは先頭からその数までで、超えた分は
+    /// 止めた印の段として残る（`decode_located`）。**上限で切って返すと、切ったことが伝わらない。**
     async fn locate(&self, line: &str) -> Result<Vec<LocatedSpan>, String>;
 }
 
@@ -193,7 +198,8 @@ pub fn parse_markers(body: &str) -> Vec<SpanMarker> {
             after: after.to_string(),
             encoding,
         });
-        if out.len() >= MAX_MARKERS {
+        // 1つ多くまで受ける（超えて示されたことを止めた印の段として残すため。モジュールdoc）。
+        if out.len() > MAX_MARKERS {
             break;
         }
     }
@@ -216,7 +222,7 @@ fn is_payload_char(c: char, encoding: PayloadEncoding) -> bool {
 /// その符号化で使われる文字が続くかぎりを取る。
 ///
 /// **行の中に実在しない目印は黙って捨てる**（モデルが思いついただけの文字列で切り出さない）。
-/// 短すぎる塊・同じ文字列も捨てる。
+/// 短すぎる塊・同じ文字列も捨てる。取り出すのは[`MAX_SPANS`]より1つ多くまで（モジュールdoc）。
 fn apply_markers(markers: &[SpanMarker], line: &str) -> Vec<LocatedSpan> {
     let mut out: Vec<LocatedSpan> = Vec::new();
     for marker in markers {
@@ -238,7 +244,7 @@ fn apply_markers(markers: &[SpanMarker], line: &str) -> Vec<LocatedSpan> {
                 text,
                 encoding: marker.encoding,
             });
-            if out.len() >= MAX_SPANS {
+            if out.len() > MAX_SPANS {
                 return out;
             }
         }

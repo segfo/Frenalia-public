@@ -28,11 +28,11 @@ the work. Output only the summary text.";
 pub const MIN_CHUNK_TOKENS: u64 = 1_024;
 
 /// 畳んだ要約メッセージの先頭。**書く側と「これは過去の要約か」を見る側が共有する唯一のマーカー**
-/// （[`compact`]の空振り判定と、その回帰テスト）。
+/// （[`compact`]の空振り判定と、その回帰テスト。値の参照が「人が書いた文」から要約を外すのにも使う）。
 ///
-/// 状態フラグではなく本文のマーカーにしてあるのは、`--resume`で復元した履歴でも効かせるため
-/// （チェックポイントから復元した`ConversationState`は`folds`が0で、フラグでは判定できない）。
-pub const FOLD_SUMMARY_PREFIX: &str = "[compacted summary of ";
+/// 正本は`harness_core::human_turns`にある（値の参照は`harness-core`で人の文を数えるので、
+/// 印をこちらに置くと`harness-core`から見えない）。ここは同じ定数の再公開で、コピーではない。
+pub use harness_core::human_turns::FOLD_SUMMARY_PREFIX;
 
 /// 要約コールの分割予算を`context_window`から決める。
 ///

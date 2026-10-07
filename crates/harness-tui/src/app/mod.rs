@@ -71,6 +71,8 @@ mod approval;
 mod commands;
 mod events;
 mod input;
+/// 入力欄の↑↓で前に送った文を呼び戻す（2026-10-06。`plans/DESIGN.md` §リッチTUI「入力ボックスの履歴」）。
+mod input_history;
 mod pointer;
 /// `Esc`の二度押しで閉じる（2026-10-03。判定は`harness_term::double_esc`）。`Ctrl+C`は終了に使わない。
 mod quit;
@@ -84,7 +86,7 @@ mod stderr;
 pub use approval::MODAL_INPUT_GRACE;
 pub use approval::{
     ApprovalCommand, ApprovalLine, ApprovalStage, LineStyle, PermissionView, PreviousCopy,
-    RiskView, SummaryState, SummaryWait, WaitClock,
+    RiskView, SummaryState, SummaryWait, TitleTone, WaitClock,
 };
 use commands::parse_slash_command;
 pub use commands::{Action, FsStageCommand, MemoryCommand, SlashCommand};
@@ -183,6 +185,9 @@ pub struct AppState {
     /// 直前の変更が「選択なしの単純な1文字挿入」だったか。連続するタイピングを1つの
     /// Undo単位にまとめる（1文字ずつUndoすると使いづらいため）ためのフラグ。
     input_last_edit_was_insert: bool,
+    /// 入力欄の履歴（送った文と、↑↓で見ている間に退避した書きかけ。`app::input_history`）。
+    /// **`command_history`（実際に走ったコマンドの流れ）とは別物**——こちらは人が自分の文を直して送り直すための道具。
+    input_history: input_history::InputHistory,
     pub pending_permission: Option<PermissionView>,
     /// 判定モデルまで使って判定済みの危険度（判定に使った材料の鍵→結果。`harness_engine::approval_risk::cache_key`。
     /// セッション中だけ覚える）。同じ材料を2回判定しない。**判定モデルが答えなかった回は覚えない**——覚えると、
@@ -324,6 +329,7 @@ impl AppState {
             input_undo_stack: Vec::new(),
             input_redo_stack: Vec::new(),
             input_last_edit_was_insert: false,
+            input_history: Default::default(),
             pending_permission: None,
             risk_seen: std::collections::HashMap::new(),
             risk_unavailable_noted: false,
@@ -590,6 +596,16 @@ impl AppState {
         for item in restored_transcript_items(messages) {
             self.transcript.push(item);
         }
+    }
+
+    /// 起動時に再開した会話（`--resume`・`--continue`・起動時のピッカー）を画面へ積み（[`Self::restore_transcript`]）、
+    /// 入力欄の履歴をその会話の人が書いた文から作る（`app::input_history`）。
+    ///
+    /// **起動時の1か所からだけ呼ぶ。** `/sessions`・`/fork`での切り替えは[`Self::restore_transcript`]だけを呼ぶ——
+    /// `/fork`は同じ会話の続きなので、ここを通すと同じ文が履歴に2回並ぶ。
+    pub(crate) fn restore_resumed_conversation(&mut self, messages: &[harness_core::Message]) {
+        self.restore_transcript(messages);
+        self.seed_input_history(messages);
     }
 
     /// 画面のトランスクリプトを空にする（[BUG-072](../../../docs/bugs/BUG-072.md)）。

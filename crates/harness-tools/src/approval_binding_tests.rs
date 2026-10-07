@@ -458,3 +458,38 @@ fn a_memo_is_not_decoded_for_run_shell() {
     // コードを走らせる呼び出し（`run_program`）では、拡張子で絞らず解読する。
     assert!(!decode_in_files(&b.previews, false).is_empty());
 }
+
+/// ファイルの中の段は全部合わせて上限まで。**超えたら、止めたファイルの中に止めた印の段を残す**
+/// （黙って落とすと、全部解けた段と区別がつかない）。対照: 上限に届かなければ印は無い。
+#[test]
+fn the_file_layer_cap_leaves_a_marker_in_the_file_it_stopped_in() {
+    let previews = |per_file: usize| -> Vec<FilePreview> {
+        ["a.py", "b.py"]
+            .iter()
+            .map(|path| FilePreview {
+                rel_path: path.to_string(),
+                text: "pwsh -enc cwB5AHMAdABlAG0AaQBuAGYAbwA=\n".repeat(per_file),
+                truncated: false,
+            })
+            .collect()
+    };
+    let is_marker = |l: &harness_core::DecodedLayer| {
+        matches!(l.outcome, harness_core::DecodeOutcome::CountLimit { .. })
+    };
+
+    let layers = decode_in_files(&previews(MAX_FILE_LAYERS / 2 + 2), true);
+    assert_eq!(layers.len(), MAX_FILE_LAYERS + 1, "{layers:?}");
+    let last = layers.last().unwrap();
+    assert_eq!(
+        last.outcome,
+        harness_core::DecodeOutcome::CountLimit {
+            max_layers: MAX_FILE_LAYERS
+        }
+    );
+    assert_eq!(last.in_file.as_deref(), Some("b.py"));
+    assert_eq!(layers.iter().filter(|l| is_marker(l)).count(), 1);
+
+    let layers = decode_in_files(&previews(3), true);
+    assert_eq!(layers.len(), 6, "{layers:?}");
+    assert!(!layers.iter().any(is_marker));
+}

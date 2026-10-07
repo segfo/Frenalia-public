@@ -48,7 +48,7 @@ pub mod summarize;
 #[cfg(test)]
 pub(crate) mod test_support;
 
-use harness_core::{ContentBlock, Message, Role};
+use harness_core::Message;
 
 pub use budget::{assess, CompactionOverrides, CompactionPolicy, ContextPressure, PolicyError};
 pub use digest::{digest_tool_results, DigestOutcome};
@@ -70,7 +70,9 @@ pub const DEFAULT_KEEP_RECENT_TURNS: usize = 2;
 ///
 /// ツール結果を運ぶ`Role::User`メッセージは`ContentBlock::ToolResult`を含み、
 /// `push_user_text`が積む純粋なテキスト1ブロックのメッセージとは形が異なるため区別できる
-/// （`ConversationState`にターン境界メタデータを別途持たせる必要がない）。
+/// （`ConversationState`にターン境界メタデータを別途持たせる必要がない）。形の判定は
+/// [`harness_core::human_turns::is_single_text_user`]の1か所が持つ（値の参照が「人が書いた文」を
+/// 数えるのと同じ判定。**畳んだ要約もここでは境界の1つに数える**——外すのは値の参照の側だけ）。
 ///
 /// [`shrink`]（保護範囲の決定）と[`summarize`]（カット位置・チャンク分割）の両方が使う。
 /// **カット・チャンク分割は必ずこの境界で行う**——ターン内部で切ると`tool_use`と`tool_result`の
@@ -79,12 +81,7 @@ pub fn turn_boundaries(messages: &[Message]) -> Vec<usize> {
     messages
         .iter()
         .enumerate()
-        .filter_map(|(i, m)| {
-            let is_external_prompt = m.role == Role::User
-                && m.content.len() == 1
-                && matches!(m.content[0], ContentBlock::Text(_));
-            is_external_prompt.then_some(i)
-        })
+        .filter_map(|(i, m)| harness_core::human_turns::is_single_text_user(m).then_some(i))
         .collect()
 }
 
@@ -102,6 +99,7 @@ pub(crate) fn protect_boundary(messages: &[Message], keep_recent_turns: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harness_core::{ContentBlock, Role};
 
     fn user_turn(text: &str) -> Message {
         Message {

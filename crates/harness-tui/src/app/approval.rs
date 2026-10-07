@@ -23,16 +23,15 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent};
 use harness_core::{
     escape_for_display, hole_accepts, DecodeOutcome, DecodedLayer, EncodedSource,
-    PermissionSubject, RiskClass, RiskLevel,
+    PermissionSubject, RiskClass,
 };
 use harness_sandbox::textdiff::{diff_hunks, DiffKind};
 
 use super::pointer::KeyHint;
-use harness_engine::approval_risk::Severity;
 
 #[path = "approval_risk.rs"]
 mod risk;
-pub use risk::RiskView;
+pub use risk::{RiskView, TitleTone};
 
 /// モーダルを出してからこの時間の入力は捨てる（D-106）。
 pub const MODAL_INPUT_GRACE: Duration = Duration::from_millis(300);
@@ -139,7 +138,7 @@ pub enum LineStyle {
     Dim,
     /// 注意（確かめられない・恒久承認できない・写しが壊れている）。
     Warn,
-    /// 外の判定モデルが危険と見たコマンド（`harness_core::RiskLevel::Danger`）。画面は赤の太字で描く。
+    /// 危険度「高」の行（`harness_engine::approval_risk::Severity::High`。機械の判定でも判定モデルでも）。赤の太字で描く。
     Danger,
     /// 差分の追加行・削除行。
     Added,
@@ -320,15 +319,6 @@ impl PermissionView {
             summary: SummaryState::Off,
             summary_source: None,
             assessment: None,
-        }
-    }
-
-    /// 枠の見出しと、危険度が高いときの段階（枠の色に使う）。**要確認・判定しない材料は今までと同じ
-    /// 「承認が必要です」**で、安全だとも書かない。
-    pub fn title(&self) -> (&'static str, Option<RiskLevel>) {
-        match self.assessment.as_ref().map(RiskView::severity) {
-            Some(Severity::High) => ("危険なコマンド — 承認が必要です", Some(RiskLevel::Danger)),
-            _ => ("承認が必要です", None),
         }
     }
 

@@ -849,6 +849,23 @@ pub trait Tool: Send + Sync {
         ctx: &ToolCtx,
     ) -> Result<crate::PermissionSubject, ToolError>;
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
+    /// 会話を読む道具のための口。**エンジン（`harness_engine::turn`）はツールを常にこちらで呼ぶ**。
+    /// 既定は[`Tool::call`]へそのまま渡すので、会話を読まないツールは何も書かなくてよい。
+    ///
+    /// `conversation`は、そのターンの値の置き場が**本物の会話**から組まれたときだけ`Some`
+    /// （判定するのは`harness_engine::References`の組み立ての1か所）。認知レイヤーのように組み直した文を
+    /// 送る経路では`None`——送る文は会話ではないので、それを会話として読ませない（D-127「認知レイヤーの経路は未決」）。
+    ///
+    /// **判定（`PermissionGate`）はこれを呼ぶ前に済んでいる。** ここは判定を変えない。
+    async fn call_in_conversation(
+        &self,
+        input: serde_json::Value,
+        ctx: &ToolCtx,
+        conversation: Option<&[crate::Message]>,
+    ) -> Result<ToolOutput, ToolError> {
+        let _ = conversation;
+        self.call(input, ctx).await
+    }
 }
 
 /// ツールの入力を型付き構造体へ読む。`permission_subject`と`call`が**同じ関数で**読むための共通の口
