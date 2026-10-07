@@ -792,3 +792,51 @@ pub fn harness_profiles() -> BTreeSet<String> {
         .filter(|name| harness_sandbox::tier2a::session_profile::token_of_profile(name).is_some())
         .collect()
 }
+
+/// 通信の宣言（`net.allow_domains`）をこのマシンの承認台帳へ記録する／消す（決定69(2)）。
+///
+/// **`harness.exe`とパス2はどちらも承認済みの宣言しか通さない**ので、強制を測る試験は先に
+/// ここを通す。製品の経路（エディタの`approve`・`approve-declared`・宣言画面の`y`）と同じ
+/// 台帳へ直接書く——測りたいのは強制の振る舞いで、承認の操作そのものは単体試験が見ている。
+///
+/// **付与と撤収を1つの関数にまとめてよいのは、どちらを行うかが引数で決まるからである**
+/// （環境変数で切り替えると「撤収したつもりで付与していた」が無言で起きる＝`CLAUDE.md`）。
+/// 残った分（台帳へ書けなかった宣言）を返すので、**呼ぶ側が空を確かめること**。
+pub fn net_approval_in_ledger(
+    workspace_root: &Path,
+    declarations: &[(&str, &str)],
+    approve: bool,
+) -> Vec<String> {
+    use harness_sandbox::tier2a::policy_approval::{DeclarationRef, PolicyApprovalStore};
+    if declarations.is_empty() {
+        return Vec::new();
+    }
+    let refs: Vec<DeclarationRef<'_>> = declarations
+        .iter()
+        .map(|(domain, value)| DeclarationRef {
+            domain,
+            value,
+            key: harness_policy::generalize::SettingsKey::NetAllowDomains,
+        })
+        .collect();
+    let store = PolicyApprovalStore::in_config_dir();
+    let left = if approve {
+        store.approve(workspace_root, &refs)
+    } else {
+        store.revoke(workspace_root, &refs)
+    };
+    left.iter().map(|d| format!("{d:?}")).collect()
+}
+
+/// 通信の宣言を承認する。**書けなければ落ちる**（承認が無いと強制の試験は何も測れない）。
+pub fn approve_net_in_ledger(workspace_root: &Path, declarations: &[(&str, &str)]) {
+    let left = net_approval_in_ledger(workspace_root, declarations, true);
+    assert!(left.is_empty(), "通信の宣言を台帳へ記録できない: {left:?}");
+}
+
+/// 承認を台帳から消す（**付与と撤収の対**。`B-01`）。一時ワークスペースの承認を残すと、
+/// 実在しない置き場の行が台帳に積もる。
+pub fn revoke_net_in_ledger(workspace_root: &Path, declarations: &[(&str, &str)]) {
+    let left = net_approval_in_ledger(workspace_root, declarations, false);
+    assert!(left.is_empty(), "通信の宣言の承認を台帳から消せない: {left:?}");
+}

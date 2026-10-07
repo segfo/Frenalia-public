@@ -99,44 +99,12 @@ fn write_policy_declaring(
     // 製品の経路（エディタの`approve`／`approve-declared`）と同じ台帳へ、この試験が直接書く
     // ——測りたいのは強制の振る舞いで、承認の操作そのものは単体試験が見ている。後始末は
     // 試験の末尾の`unapprove`（`policy.json`から消すと承認も消える）が担う。
-    approve_net_declarations(workspace_root, allow_domains);
+    common::approve_net_in_ledger(workspace_root, &entry_net_pairs(allow_domains));
 }
 
-/// 通信の宣言をこのマシンで承認する（[`write_policy_declaring`]の一部）。
-fn approve_net_declarations(workspace_root: &Path, allow_domains: &[&str]) {
-    net_approvals(workspace_root, allow_domains, /* approve */ true);
-}
-
-/// 承認を台帳から消す（**付与と撤収の対**。`B-01`）。一時ワークスペースの承認を残すと、実在しない
-/// 置き場の行が台帳に積もる（撤収の索引ではないので害は小さいが、残すと数えられなくなる）。
-fn revoke_net_declarations(workspace_root: &Path, allow_domains: &[&str]) {
-    net_approvals(workspace_root, allow_domains, /* approve */ false);
-}
-
-fn net_approvals(workspace_root: &Path, allow_domains: &[&str], approve: bool) {
-    use harness_sandbox::tier2a::policy_approval::{DeclarationRef, PolicyApprovalStore};
-    if allow_domains.is_empty() {
-        return;
-    }
-    let declarations: Vec<DeclarationRef<'_>> = allow_domains
-        .iter()
-        .map(|value| DeclarationRef {
-            domain: ENTRY,
-            value,
-            key: harness_policy::generalize::SettingsKey::NetAllowDomains,
-        })
-        .collect();
-    let store = PolicyApprovalStore::in_config_dir();
-    let left = if approve {
-        store.approve(workspace_root, &declarations)
-    } else {
-        store.revoke(workspace_root, &declarations)
-    };
-    assert!(
-        left.is_empty(),
-        "通信の宣言の承認を台帳へ{}できない（この試験は強制を測れない）: {left:?}",
-        if approve { "記録" } else { "消すことが" }
-    );
+/// 入口のドメインの通信の宣言として台帳の鍵の形へ直す（鍵はドメインを持つ＝決定69(2)）。
+fn entry_net_pairs<'a>(allow_domains: &[&'a str]) -> Vec<(&'static str, &'a str)> {
+    allow_domains.iter().map(|v| (ENTRY, *v)).collect()
 }
 
 fn run_record_net(workspace_root: &Path, command: &str) -> std::process::Output {
@@ -360,7 +328,7 @@ fn enforcing_pass2_allows_only_the_declared_domain_and_proposes_the_refused_one(
 
     let output = run_record_net_with(workspace_root, &command, &["--enforce-net"]);
     // **判定より前に後始末**（承認は走らせている間だけ要る。`B-01`の対）。
-    revoke_net_declarations(workspace_root, &[TARGET_DOMAIN]);
+    common::revoke_net_in_ledger(workspace_root, &entry_net_pairs(&[TARGET_DOMAIN]));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");

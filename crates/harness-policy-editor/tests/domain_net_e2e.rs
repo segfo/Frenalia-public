@@ -53,7 +53,6 @@ use std::process::Command;
 
 use harness_policy::policy_file::{self, PolicyDomain, PolicyFile, ENTRY_DOMAIN};
 use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
-use harness_sandbox::tier2a::policy_approval::{DeclarationRef, PolicyApprovalStore};
 
 use common::{
     case_dir, file_name, harness_exe, middle_shell, run_arm_with, scratch_dir, system32,
@@ -426,35 +425,25 @@ fn net_declarations(shell_domain: &str) -> Vec<(String, &'static str)> {
     ]
 }
 
+/// 台帳への記録そのものは[`common::net_approval_in_ledger`]が持つ（`record_net_e2e`と同じ1か所）。
 fn approve_net(ws: &Path) -> bool {
-    let shell = middle_shell();
-    let declarations = net_declarations(&shell.domain);
-    let refs: Vec<DeclarationRef<'_>> = declarations
-        .iter()
-        .map(|(domain, value)| DeclarationRef {
-            domain,
-            value,
-            key: harness_policy::generalize::SettingsKey::NetAllowDomains,
-        })
-        .collect();
-    PolicyApprovalStore::in_config_dir()
-        .approve(ws, &refs)
-        .is_empty()
+    net_approval(ws, /* approve */ true).is_empty()
 }
 
+/// 承認を台帳から消す（**付与と撤収の対**。`B-01`）。
 fn revoke_net(ws: &Path) {
+    let left = net_approval(ws, /* approve */ false);
+    assert!(left.is_empty(), "承認を台帳から消せない: {left:?}");
+}
+
+fn net_approval(ws: &Path, approve: bool) -> Vec<String> {
     let shell = middle_shell();
     let declarations = net_declarations(&shell.domain);
-    let refs: Vec<DeclarationRef<'_>> = declarations
+    let pairs: Vec<(&str, &str)> = declarations
         .iter()
-        .map(|(domain, value)| DeclarationRef {
-            domain,
-            value,
-            key: harness_policy::generalize::SettingsKey::NetAllowDomains,
-        })
+        .map(|(domain, value)| (domain.as_str(), *value))
         .collect();
-    let left = PolicyApprovalStore::in_config_dir().revoke(ws, &refs);
-    assert!(left.is_empty(), "承認を台帳から消せない: {left:?}");
+    common::net_approval_in_ledger(ws, &pairs, approve)
 }
 
 /// `<tag>:PROXY=…`と`<tag>:NET_OK <状態>`／`<tag>:NET_FAIL <理由>`を印字する PowerShell の1行。
