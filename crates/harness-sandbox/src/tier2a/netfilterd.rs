@@ -149,7 +149,7 @@ pub struct McpNetfilterPolicy {
     #[serde(default)]
     pub profile: String,
     /// このサーバが到達してよいloopbackのTCPポート（＝このサーバ専用プロキシの待受ポート）。
-    /// **空なら外向き通信は一切できない**（capability自体も付かないので二重にdenyされる）。
+    /// **TCP・UDPとも空の項目は積まない**——何も許さない項目ではなく失敗になり、1件で全部の項目が畳まれる（BUG-239）。
     #[serde(default)]
     pub allow_loopback_tcp_ports: Vec<u16>,
     #[serde(default)]
