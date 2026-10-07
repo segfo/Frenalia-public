@@ -809,6 +809,27 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "a_widening_edge_written_by_the_editor_lets_the_child_use_its_own_domain_and_no_more",
         ],
     ),
+    // 引数を固定した位置の分割と Strict の辺（決定67）の実機E2E。パス1で同じ親から同じ`powershell.exe`で
+    // 3つのスクリプトを記録し、エディタの画面の`u`でコマンドラインごとのドメインに分け、1行を`s`で Strict にして
+    // 承認し、`harness.exe --enforce-transitions`（e2e-mock のビルド）で、分けたドメインが別のスクリプトの目印を
+    // 読めないこと・記録に無いスクリプトを断ること・Strict の辺は宣言した作業ディレクトリからだけ通り標準入力が
+    // 届かないことを測る（`crates/harness-policy-editor/tests/split_strict_e2e.rs`）。Strict の置き場を`C:\`直下に作る。
+    // フィルタはテスト関数名と一致させる（0件マッチは`check_tests_actually_ran`が非0で落とす、BUG-056同型）。
+    (
+        "e2e-policy-editor-split-strict",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "split_strict_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "split_rows_give_each_script_its_own_domain_and_a_strict_row_runs_only_from_its_declared_cwd",
+        ],
+    ),
     // ポリシーエディタのパス2（Tier2aでのドメイン記録）の実機E2E。WFPの出口強制daemonを
     // 起こすため管理者権限と外部への到達性が要る（`crates/harness-policy-editor/tests/
     // record_net_e2e.rs`）。**2本目は対のテスト**で、生ソケットがWFPに落とされることを
