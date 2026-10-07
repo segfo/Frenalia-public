@@ -29,6 +29,9 @@ mod policy_declarations;
 /// M16: 妥当性の経路を本物のMCPサーバで通す（`e2e-mcp-corroboration`）。2026-10-07に上と同じ理由で移した。
 #[path = "tier2a_e2e/mcp_corroboration.rs"]
 mod mcp_corroboration;
+/// 段5の測定の git に与える完全一致の規則（D-123）。
+#[path = "tier2a_e2e/census_rules.rs"]
+mod census_rules;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -2803,9 +2806,9 @@ const CENSUS_STEPS: &[CensusStep] = &[
         path: "src/new.txt",
         content: "new file committed by the agent\n",
     },
-    // 4: .git（index）。`add -A`は使わない——ハーネスは起動のたびに本物のワークスペースへ
-    // `.harness/`を作り、サンドボックスからの読み書きを剥がすので、全体を拾うと当たる。
-    CensusStep::Git(&["add", "--", "src/lib.txt", "src/new.txt"]),
+    // 4: .git（index）。`add -A`は使わない（起動のたびに作られる`.harness/`に当たる）。ファイルを名指しすると
+    // D-123 で中身が縛られ、2・3段で書き換えた後なので起動時の規則とも一致しない（`census_rules`のdoc）。
+    CensusStep::Git(&["add", "--", "src"]),
     // 5: .git（ゆるいオブジェクト・ref）。種付けで全部packへ畳んであるので、gitがpackの
     // 時刻だけを更新しに来れば「中身の変わらないコピー」が.gitの中に出る（出るかは観測）。
     CensusStep::Git(&[
@@ -3425,7 +3428,9 @@ fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, St
     let ws = case_dir(&case_name);
     census_seed_repo(&ws)?;
 
-    let extra: &[&str] = &[
+    // D-123: 実在ファイルを名指しする git は accept-all でも規則が要る（`census_rules`のdoc）。
+    let rules = census_rules::program_rule_args();
+    let mut extra = vec![
         "--sandbox",
         "tier2a-cow",
         "--max-turns",
@@ -3433,6 +3438,7 @@ fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, St
         "--cognition",
         "off",
     ];
+    extra.extend(rules.iter().map(String::as_str));
     let mock_turns = census_mock_turns();
     let live_prompt = census_live_prompt();
     let before = ex.list_cow_sessions();
@@ -3451,7 +3457,7 @@ fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, St
         &ws.to_string_lossy(),
         None,
         driver,
-        extra,
+        &extra,
         &case_name,
         &[],
     );
@@ -7673,10 +7679,10 @@ const EXEC_PROBES: &[ExecProbe] = &[
 /// **T-09の危険構文マーカーを踏まないように書いてある**（`harness-engine/src/permission.rs`の
 /// `looks_like_allowlist_bypass`）。`Invoke-Expression`と`cmd.exe /c`は`accept-all`下でも
 /// 強制Promptへ落ち、ヘッドレスでは自動拒否になる——最初の実測はこれで`run_shell`ごと
-/// 拒否された。ここで測りたいのは**ACLの層**なので、同じ意味の別の綴り
-/// （`[scriptblock]::Create`・`.cmd`の直接起動）へ置き換えてある。
-/// **この置き換えが成立すること自体が、T-09が境界ではないこと**（`DESIGN.md`が
-/// 「明白物の追加ブロックであり安全の根拠にしない」と書いているとおり）**の実例**である。
+/// 拒否された。ここで測りたいのは**ACLの層**なので、同じ意味の別の綴り（`function:`ドライブへ文字列を
+/// 置く＝プロセス内で文字列をスクリプトブロックへ変える・`.cmd`の直接起動）へ置き換えてある。2026-10-07まで
+/// 前者は`[scriptblock]::Create`だったが、BUG-226（2026-10-04）でT-09が`scriptblock]`を拾うようになり拒否された。
+/// **この置き換えが成立すること自体が、T-09が境界ではないこと**（`DESIGN.md`）**の実例**である。
 const EXEC_PROBE_SCRIPT: &str = "\
 $ErrorActionPreference='SilentlyContinue'; \
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force } catch { }; \
@@ -7685,7 +7691,7 @@ try { & '.\\evil.exe' /c echo HP_A_EXE } catch { }; \
 try { Copy-Item -LiteralPath '.\\evil.exe' -Destination '.\\copied.exe' -Force -ErrorAction Stop; \
       & '.\\copied.exe' /c echo HP_B_EXECOPY } catch { }; \
 try { & '.\\evil.ps1' } catch { }; \
-try { & ([scriptblock]::Create((Get-Content -LiteralPath '.\\evil_iex.ps1' -Raw))) } catch { }; \
+try { New-Item -Path 'function:hp_probe_d' -Value (Get-Content -LiteralPath '.\\evil_iex.ps1' -Raw) -Force | Out-Null; hp_probe_d } catch { }; \
 try { & '.\\evil.cmd' } catch { }; \
 try { & $env:ComSpec '/c' '.\\evil2.cmd' } catch { }; \
 try { & '.\\evil_readdeny.ps1' } catch { }; \
