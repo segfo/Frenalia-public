@@ -43,7 +43,7 @@ pub(super) fn should_expose(
 /// **ここへ写さない**——段階⑦のポリシーエディタの画面も同じものを使う。
 ///
 /// [#30] **権限欄（`rights_fs`）には、このマシンで承認済みの宣言だけを載せる**（`approved_fs_values`、
-/// `startup::policy_fs::approved_fs_values`が作る）。未承認の宣言には許可が付かないので、載せると
+/// `harness_sandbox::tier2a::policy_fs::approved_fs_values`が作る）。未承認の宣言には許可が付かないので、載せると
 /// 付いていない許可をモデルへ伝えることになる。辺と判定の入力は変えない（Daemonと同じグラフのまま）。
 ///
 /// **`provisioned_domains`はDaemonへ渡すのと同じ表から作ること**（`domain_provision`が実際に用意できた
@@ -86,35 +86,6 @@ pub(super) fn facts_from_policy(
         from_domain: from_domain.to_string(),
         programs,
     }
-}
-
-/// [残課題 サンドボックス周辺 #65] **`policy.json`の外で書込を許した場所**の一覧。
-/// 遷移の編集時検査が「呼び出し元から書ける場所」として数える
-/// （`harness_policy::policy_file::load_for_session`のdoc）。
-///
-/// 入力は`settings.json`の`fs.*`と`--fs-allow`を合成済みの一覧で、書込を含むもの
-/// （`FsAccess::is_read_write`＝`ReadWrite`/`ReadWriteExec`）の付与ルートを返す。
-///
-/// # 付与した結果ではなく、宣言から取る
-///
-/// 付与に失敗した穴も数える——検査は厳しい側に倒す。**CoWモードでも数える**:
-/// CoWでは`:rw`の実ACEが読取へ降格され書込は差分層へ向かうが、既存の検査は
-/// ワークスペースもCoWに関係なく「書ける」と数えているので、それに揃える。
-///
-/// # `policy.json`の宣言は入れない（#30）
-///
-/// この一覧に入るのは`settings.json`と`--fs-allow`由来だけである。`harness.exe`は#30から
-/// `policy.json`の`fs`も付与の一覧へ流し込むが、**この関数は合流させる前の手書きの一覧で呼ぶ**
-/// （`stage_prepare_sandbox`）——宣言は宣言として既に検査の視野にあり、ここへ入れると遷移先ドメインの
-/// 書込宣言まで「入口から書ける」と数えられ、正当な辺が拒否される。
-pub(super) fn writable_outside_policy(
-    fs_passthrough: &[harness_sandbox::FsPassthrough],
-) -> Vec<String> {
-    fs_passthrough
-        .iter()
-        .filter(|fp| fp.access.is_read_write())
-        .map(|fp| fp.path.to_string_lossy().into_owned())
-        .collect()
 }
 
 #[cfg(test)]
@@ -283,35 +254,4 @@ mod tests {
         assert_eq!(rights, vec!["C:/approved/**"]);
     }
 
-    fn passthrough(path: &str, access: harness_sandbox::FsAccess) -> harness_sandbox::FsPassthrough {
-        harness_sandbox::FsPassthrough {
-            path: std::path::PathBuf::from(path),
-            access,
-            forced: false,
-            scope: harness_policy::GrantScope::Recursive,
-        }
-    }
-
-    /// [残課題 サンドボックス周辺 #65] **許可側**: 書込を含む穴は、遷移の検査へ
-    /// 「呼び出し元から書ける場所」として渡る。`ReadWriteExec`も書込を含む
-    /// ——ここが落ちると、`:rw`と実行の宣言を同じルートへ畳んだ瞬間に検査から消える。
-    #[test]
-    fn places_opened_for_writing_are_handed_to_the_transition_check() {
-        let list = writable_outside_policy(&[
-            passthrough(r"C:\tools", harness_sandbox::FsAccess::ReadWrite),
-            passthrough(r"C:\cache", harness_sandbox::FsAccess::ReadWriteExec),
-        ]);
-        assert_eq!(list, vec![r"C:\tools".to_string(), r"C:\cache".to_string()]);
-    }
-
-    /// **禁止側（対）**: 読むだけ・読んで実行するだけの穴は入れない。入れると、
-    /// 読取専用で開けた場所にある固定したプログラムまで「書き換えられる」として拒否される。
-    #[test]
-    fn places_opened_only_for_reading_or_running_are_not_counted_as_writable() {
-        let list = writable_outside_policy(&[
-            passthrough(r"C:\sdk", harness_sandbox::FsAccess::Read),
-            passthrough(r"C:\bin", harness_sandbox::FsAccess::ReadExec),
-        ]);
-        assert!(list.is_empty(), "read-only places leaked in: {list:?}");
-    }
 }

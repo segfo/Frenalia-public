@@ -77,6 +77,11 @@ pub mod workspace_capability;
 /// `harness.exe`が同じ関数を通る）。純粋関数なのでwindows専用にしない。
 pub mod policy_grants;
 
+/// [#30・決定68] `policy.json`から**どの許可をどの一覧で付け、付いた結果をどの子へ渡すか**を決める手順。
+/// `harness.exe`の起動とポリシーエディタのパス2が同じこれを通る（`harness-cli`の`startup/policy_fs.rs`から
+/// そのまま移した。P6.2）。純粋関数なのでwindows専用にしない。
+pub mod policy_fs;
+
 /// [#30・D-112] `policy.json`のファイル宣言の、このマシンでの承認の台帳。リポジトリに同梱された
 /// 宣言は、承認するまで許可を付けない。台帳と照合は純粋なのでwindows専用にしない。
 pub mod policy_approval;

@@ -29,7 +29,7 @@
 //! # この関数が守らないもの
 //!
 //! - **承認の判定はしない**——渡された`approved`をそのまま使う（承認台帳はD-112、
-//!   `harness_sandbox::tier2a::policy_approval`）。
+//!   `crate::tier2a::policy_approval`）。
 //! - **同じパス・同じ級を別のドメインが素のパスと`**`で宣言すると、宛先SIDが1つなので両方が
 //!   配下すべてを得る**（宛先の鍵に範囲が入っていない既存の設計。STATUSの残課題）。
 
@@ -37,33 +37,33 @@ use std::collections::BTreeMap;
 
 use harness_core::GrantedPassthrough;
 use harness_policy::policy_file::{PolicyFile, ENTRY_DOMAIN};
-use harness_sandbox::tier2a::policy_approval::DeclarationRef;
-use harness_sandbox::tier2a::policy_grants::{GrantContext, SkippedDeclaration};
-use harness_sandbox::tier2a::workspace_capability::declaration_key;
-use harness_sandbox::{FsPassthrough, WorkspaceWriteMode};
+use crate::tier2a::policy_approval::DeclarationRef;
+use crate::tier2a::policy_grants::{GrantContext, SkippedDeclaration};
+use crate::tier2a::workspace_capability::declaration_key;
+use crate::{FsPassthrough, WorkspaceWriteMode};
 
 /// 遷移先ドメインごとの、このセッションで付いた許可（`Ok`）か、付けなかった理由（`Err`）。
 /// ドメインの用意（`domain_provision::provision_target_domains`）がこれを読む——台帳を引き直さない
 /// （BUG-185）。
-pub(crate) type DomainFsGrants = BTreeMap<String, Result<Vec<GrantedPassthrough>, String>>;
+pub type DomainFsGrants = BTreeMap<String, Result<Vec<GrantedPassthrough>, String>>;
 
 /// `policy.json`から決めた、付与処理へ渡すもの。
 #[derive(Debug, Default)]
-pub(super) struct PolicyFsPlan {
+pub struct PolicyFsPlan {
     /// 入口ドメイン`workspace-shell`の承認済み宣言（手書きの一覧へ[`merge_into`]で合流させる）。
-    pub(super) entry: Vec<FsPassthrough>,
+    pub entry: Vec<FsPassthrough>,
     /// 付与する範囲に入った遷移先ドメインの承認済み宣言。
-    pub(super) domains: Vec<(String, Vec<FsPassthrough>)>,
+    pub domains: Vec<(String, Vec<FsPassthrough>)>,
     /// 付与する範囲に入らなかった遷移先ドメインと、その理由。
-    pub(super) not_granted_domains: Vec<(String, String)>,
+    pub not_granted_domains: Vec<(String, String)>,
     /// 全ドメインの承認済み宣言のルート（自動撤収の宣言集合へ足す）。
-    pub(super) declared_roots: Vec<String>,
+    pub declared_roots: Vec<String>,
     /// 入口ドメインで付けなかった宣言（人へ見せる）。
-    pub(super) entry_skipped: Vec<SkippedDeclaration>,
+    pub entry_skipped: Vec<SkippedDeclaration>,
 }
 
 /// 宣言から、付ける一覧を決める（**何も書かない**。純粋関数）。
-pub(super) fn plan(
+pub fn plan(
     policy: &PolicyFile,
     ctx: &GrantContext,
     approved: &dyn Fn(DeclarationRef<'_>) -> bool,
@@ -139,7 +139,7 @@ pub(super) fn plan(
 /// 入口ドメインの宣言を手書きの一覧へ合流させる。**同じルートは1本に畳む**（和を取り、範囲は再帰が勝つ）
 /// ——手書きの一覧の作り方（`sandbox.rs`の畳み込み）と同じ規則である。比較は宛先SIDの鍵と同じ畳み方
 /// （`declaration_key`）で行う（`C:\x`と`c:/X`を別のルートとして2本にしない）。
-pub(super) fn merge_into(manual: &mut Vec<FsPassthrough>, entry: &[FsPassthrough]) {
+pub fn merge_into(manual: &mut Vec<FsPassthrough>, entry: &[FsPassthrough]) {
     for fp in entry {
         let key = declaration_key(&fp.path);
         match manual.iter_mut().find(|m| declaration_key(&m.path) == key) {
@@ -166,7 +166,7 @@ pub(super) fn merge_into(manual: &mut Vec<FsPassthrough>, entry: &[FsPassthrough
 ///
 /// 戻り値は（見つかった分, 見つからなかった宣言のパス）。見つからないのは、付与処理が付けられなかった
 /// （パスが無い・昇格を断られた等。理由は付与処理の警告が持つ）ときである。
-pub(super) fn granted_for(
+pub fn granted_for(
     requested: &[FsPassthrough],
     granted: &[GrantedPassthrough],
     write_mode: &WorkspaceWriteMode,
@@ -175,7 +175,7 @@ pub(super) fn granted_for(
     let mut missing = Vec::new();
     for fp in requested {
         let key = declaration_key(&fp.path);
-        let access = harness_sandbox::shell_tier::effective_access(fp.access, write_mode);
+        let access = crate::shell_tier::effective_access(fp.access, write_mode);
         match granted
             .iter()
             .find(|g| g.granted_access == access.label() && declaration_key(&g.path) == key)
@@ -191,7 +191,7 @@ pub(super) fn granted_for(
 }
 
 /// 遷移先ドメインごとの付与の結果（[`DomainFsGrants`]）を組み立てる。
-pub(super) fn domain_fs_grants(
+pub fn domain_fs_grants(
     plan: &PolicyFsPlan,
     granted: &[GrantedPassthrough],
     write_mode: &WorkspaceWriteMode,
@@ -226,7 +226,7 @@ pub(super) fn domain_fs_grants(
 /// 権限欄は到達できる全ドメインの和で、どのドメインの宣言かを持たない
 /// （`harness_policy::transition::rights_summary`）。だから「どれかのドメインで承認済み」で絞る。
 /// 未承認の宣言を載せると、付いていない許可をモデルへ伝えることになる。
-pub(super) fn approved_fs_values(
+pub fn approved_fs_values(
     policy: &PolicyFile,
     approved: &dyn Fn(DeclarationRef<'_>) -> bool,
 ) -> std::collections::BTreeSet<(String, &'static str)> {
@@ -243,6 +243,35 @@ pub(super) fn approved_fs_values(
         }
     }
     out
+}
+
+/// [残課題 サンドボックス周辺 #65] **`policy.json`の外で書込を許した場所**の一覧。
+/// 遷移の編集時検査が「呼び出し元から書ける場所」として数える
+/// （`harness_policy::policy_file::load_for_session`のdoc）。
+///
+/// 入力は`settings.json`の`fs.*`と`--fs-allow`を合成済みの一覧で、書込を含むもの
+/// （`FsAccess::is_read_write`＝`ReadWrite`/`ReadWriteExec`）の付与ルートを返す。
+///
+/// # 付与した結果ではなく、宣言から取る
+///
+/// 付与に失敗した穴も数える——検査は厳しい側に倒す。**CoWモードでも数える**:
+/// CoWでは`:rw`の実ACEが読取へ降格され書込は差分層へ向かうが、既存の検査は
+/// ワークスペースもCoWに関係なく「書ける」と数えているので、それに揃える。
+///
+/// # `policy.json`の宣言は入れない（#30）
+///
+/// この一覧に入るのは`settings.json`と`--fs-allow`由来だけである。`harness.exe`は#30から
+/// `policy.json`の`fs`も付与の一覧へ流し込むが、**この関数は合流させる前の手書きの一覧で呼ぶ**
+/// （`stage_prepare_sandbox`）——宣言は宣言として既に検査の視野にあり、ここへ入れると遷移先ドメインの
+/// 書込宣言まで「入口から書ける」と数えられ、正当な辺が拒否される。
+pub fn writable_outside_policy(
+    fs_passthrough: &[crate::FsPassthrough],
+) -> Vec<String> {
+    fs_passthrough
+        .iter()
+        .filter(|fp| fp.access.is_read_write())
+        .map(|fp| fp.path.to_string_lossy().into_owned())
+        .collect()
 }
 
 #[cfg(test)]

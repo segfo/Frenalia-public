@@ -46,10 +46,10 @@ pub(super) struct SandboxPrepared {
     /// （起動を止める）。**読み直さない**（判定と表示と付与の入力を1つにする、`B-13`）。
     pub(super) policy: Option<harness_policy::policy_file::PolicyFile>,
     /// [残課題#65] `policy.json`の外で書込を許した場所。**手書きの一覧だけから作る**
-    /// （`transition_tool::writable_outside_policy`のdoc）。
+    /// （`harness_sandbox::tier2a::policy_fs::writable_outside_policy`のdoc）。
     pub(super) writable_outside_policy: Vec<String>,
     /// [#30] 遷移先ドメインごとの、このセッションで付いた許可（ドメインの用意が読む）。
-    pub(super) domain_fs_grants: super::policy_fs::DomainFsGrants,
+    pub(super) domain_fs_grants: harness_sandbox::tier2a::policy_fs::DomainFsGrants,
     /// [#30] モデルへ見せる遷移の一覧の権限欄に載せてよい`(値, 級)`（このマシンで承認済みのもの）。
     pub(super) approved_fs_values: std::collections::BTreeSet<(String, &'static str)>,
     /// M15.7: セッション中のOS監査収集を有効にするか（`--policy-learn`→`settings.policy.learn`→false）。
@@ -405,8 +405,9 @@ pub(super) fn stage_prepare_sandbox(
     // [残課題#65] **`policy.json`の外で書込を許した場所は、手書きの一覧だけから作る**
     // ——下で入口ドメインの宣言を合流させる**前**に作ること。宣言は宣言として遷移の検査の視野に
     // 既にあり、合流させた後で作ると遷移先ドメインの書込宣言まで「入口から書ける」と数え、
-    // 正当な辺を拒否する（`transition_tool::writable_outside_policy`のdoc）。
-    let writable_outside_policy = super::transition_tool::writable_outside_policy(&fs_passthrough);
+    // 正当な辺を拒否する（`harness_sandbox::tier2a::policy_fs::writable_outside_policy`のdoc）。
+    let writable_outside_policy =
+        harness_sandbox::tier2a::policy_fs::writable_outside_policy(&fs_passthrough);
 
     // [#30] **`policy.json`とこのマシンでの承認（D-112）を、ここで1回だけ読む。**
     //
@@ -464,7 +465,7 @@ pub(super) fn stage_prepare_sandbox(
         approvals.is_approved_for_key(&approval_key, d)
     };
     let policy_plan = match &policy {
-        Some(policy) => super::policy_fs::plan(
+        Some(policy) => harness_sandbox::tier2a::policy_fs::plan(
             policy,
             &harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(&workspace_root),
             &approved,
@@ -474,7 +475,7 @@ pub(super) fn stage_prepare_sandbox(
     };
     let approved_fs_values = policy
         .as_ref()
-        .map(|policy| super::policy_fs::approved_fs_values(policy, &approved))
+        .map(|policy| harness_sandbox::tier2a::policy_fs::approved_fs_values(policy, &approved))
         .unwrap_or_default();
     // **付けない宣言を黙って落とさない**（B-10）。黙ると「承認したのに読めない」の原因が出ない。
     for skipped in &policy_plan.entry_skipped {
@@ -488,7 +489,7 @@ pub(super) fn stage_prepare_sandbox(
         );
     }
     // 入口ドメインの宣言は、手書きの一覧と同じく入口の子のトークンへ載る（同じルートは1本に畳む）。
-    super::policy_fs::merge_into(&mut fs_passthrough, &policy_plan.entry);
+    harness_sandbox::tier2a::policy_fs::merge_into(&mut fs_passthrough, &policy_plan.entry);
     let mut file_declared_fs_paths = settings_fs_paths;
     file_declared_fs_paths.extend(policy_plan.declared_roots.iter().cloned());
 
@@ -623,13 +624,13 @@ pub(super) fn stage_prepare_sandbox(
     // ここで振り分けを誤らなければ、ドメインの宣言にACEを書いても入口は広がらない。
     // 書込の印は**一覧ごとに自分の要求で組み直す**（`policy_fs::granted_for`のdoc）。
     let mut shell_tier = shell_tier;
-    let domain_fs_grants = super::policy_fs::domain_fs_grants(
+    let domain_fs_grants = harness_sandbox::tier2a::policy_fs::domain_fs_grants(
         &policy_plan,
         &shell_tier.granted_passthrough,
         &write_mode,
     );
     let entry_requested = &fs_passthrough[..entry_requested_len];
-    let (entry_granted, _not_granted) = super::policy_fs::granted_for(
+    let (entry_granted, _not_granted) = harness_sandbox::tier2a::policy_fs::granted_for(
         entry_requested,
         &shell_tier.granted_passthrough,
         &write_mode,

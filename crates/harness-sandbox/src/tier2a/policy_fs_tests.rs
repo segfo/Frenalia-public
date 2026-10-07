@@ -10,9 +10,9 @@ use harness_core::GrantedPassthrough;
 use harness_policy::normalize::GrantScope;
 use harness_policy::policy_file::{PolicyDomain, PolicyFile, ENTRY_DOMAIN};
 use harness_policy::transition::{AnyMarker, ArgvMatcher, ExeMatcher, TransitionEdge};
-use harness_sandbox::tier2a::policy_approval::DeclarationRef;
-use harness_sandbox::tier2a::policy_grants::GrantContext;
-use harness_sandbox::{FsAccess, FsPassthrough, WorkspaceWriteMode};
+use crate::tier2a::policy_approval::DeclarationRef;
+use crate::tier2a::policy_grants::GrantContext;
+use crate::{FsAccess, FsPassthrough, WorkspaceWriteMode};
 
 use super::*;
 
@@ -276,4 +276,36 @@ fn only_approved_values_are_shown_to_the_model() {
     let shown = approved_fs_values(&three_domains(), &only_cargo);
     assert!(shown.contains(&("C:/cargo/db".to_string(), "read_write")));
     assert!(!shown.contains(&("C:/entry/**".to_string(), "read")));
+}
+
+fn passthrough(path: &str, access: crate::FsAccess) -> crate::FsPassthrough {
+    crate::FsPassthrough {
+        path: std::path::PathBuf::from(path),
+        access,
+        forced: false,
+        scope: harness_policy::GrantScope::Recursive,
+    }
+}
+
+/// [残課題 サンドボックス周辺 #65] **許可側**: 書込を含む穴は、遷移の検査へ
+/// 「呼び出し元から書ける場所」として渡る。`ReadWriteExec`も書込を含む
+/// ——ここが落ちると、`:rw`と実行の宣言を同じルートへ畳んだ瞬間に検査から消える。
+#[test]
+fn places_opened_for_writing_are_handed_to_the_transition_check() {
+    let list = writable_outside_policy(&[
+        passthrough(r"C:\tools", crate::FsAccess::ReadWrite),
+        passthrough(r"C:\cache", crate::FsAccess::ReadWriteExec),
+    ]);
+    assert_eq!(list, vec![r"C:\tools".to_string(), r"C:\cache".to_string()]);
+}
+
+/// **禁止側（対）**: 読むだけ・読んで実行するだけの穴は入れない。入れると、
+/// 読取専用で開けた場所にある固定したプログラムまで「書き換えられる」として拒否される。
+#[test]
+fn places_opened_only_for_reading_or_running_are_not_counted_as_writable() {
+    let list = writable_outside_policy(&[
+        passthrough(r"C:\sdk", crate::FsAccess::Read),
+        passthrough(r"C:\bin", crate::FsAccess::ReadExec),
+    ]);
+    assert!(list.is_empty(), "read-only places leaked in: {list:?}");
 }
