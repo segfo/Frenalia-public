@@ -285,9 +285,18 @@ fn pass2_records_the_domain_a_command_reached_without_declaring_any_allowlist() 
 
     // 撤収まで通っている（ここが抜けるとプロファイルとACEがマシンに残る）。
     assert!(
-        stderr.contains("撤収: AppContainerプロファイルとACE"),
+        tore_down(&stderr),
         "the session profile teardown must run: {stderr}"
     );
+}
+
+/// 撤収の1行（`session_grants.rs`の`drop_report`。`撤収: AppContainerプロファイル N個とACE（d/t件）`）が出たか。
+/// P6.3 で個数が入る形になり、それまでの`撤収: AppContainerプロファイルとACE`という部分一致は当たらなくなった
+/// （この試験は昇格が要るので P6.3 の時点では撃っておらず、P6.8 で直した）。行頭と「とACE（」の2点で見る。
+fn tore_down(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.starts_with("撤収: AppContainerプロファイル") && line.contains("とACE（"))
 }
 
 /// 8番（決定64）: **強制モードは宣言した通信先だけを通し、宣言の外を断る。断った宛先だけが候補になる。**
@@ -379,7 +388,7 @@ fn enforcing_pass2_allows_only_the_declared_domain_and_proposes_the_refused_one(
     );
 
     assert!(
-        stderr.contains("撤収: AppContainerプロファイルとACE"),
+        tore_down(&stderr),
         "the session profile teardown must run: {stderr}"
     );
 }
