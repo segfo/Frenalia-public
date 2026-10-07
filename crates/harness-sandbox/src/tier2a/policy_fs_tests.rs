@@ -309,3 +309,62 @@ fn places_opened_only_for_reading_or_running_are_not_counted_as_writable() {
     ]);
     assert!(list.is_empty(), "read-only places leaked in: {list:?}");
 }
+
+// --- [P6.2・決定68 の前例の(9)] ドメインごとの判定（`domain_readiness`・`network_blocker`） ---
+
+fn cargo_domain(policy: &PolicyFile) -> &PolicyDomain {
+    policy.domain("cargo").expect("cargo")
+}
+
+/// **通信を宣言しているドメインは、付与の一覧を作る前に断る**（`grants`を呼ばない）。判定順を入れ替えると、
+/// 使われない一覧のために台帳を読み、付かない宣言の理由で通信の理由が隠れる。
+#[test]
+fn a_domain_that_declares_network_is_refused_before_its_grants_are_computed() {
+    let mut policy = three_domains();
+    policy
+        .domains
+        .iter_mut()
+        .find(|d| d.name == "cargo")
+        .unwrap()
+        .net
+        .allow_domains
+        .push("crates.io".to_string());
+    let called = std::cell::Cell::new(false);
+    let readiness = domain_readiness(cargo_domain(&policy), |_| {
+        called.set(true);
+        crate::tier2a::policy_grants::DomainGrants::default()
+    });
+    assert!(
+        matches!(readiness, DomainReadiness::DeclaresNetwork { count: 1 }),
+        "{readiness:?}"
+    );
+    assert!(!called.get(), "the grant list was computed for a domain that is refused anyway");
+    assert_eq!(network_blocker(cargo_domain(&policy)), Some(1));
+}
+
+/// 許可が付かない宣言が1件でもあれば用意できない（付いた分だけで用意すると、確かめたより狭い権限で黙って動く）。
+#[test]
+fn a_domain_with_a_skipped_declaration_is_not_ready() {
+    let policy = three_domains();
+    let nothing = |_: DeclarationRef<'_>| false;
+    let readiness = domain_readiness(cargo_domain(&policy), |d| ctx().domain_grants(d, &nothing));
+    match readiness {
+        DomainReadiness::NotGranted { skipped } => {
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(skipped[0].value, "C:/cargo/db");
+        }
+        other => panic!("expected NotGranted, got {other:?}"),
+    }
+}
+
+/// **対の側**: 通信を宣言せず、全部の宣言に許可が付くなら、付ける一覧ごと「用意できる」。
+#[test]
+fn a_ready_domain_carries_its_passthrough() {
+    let policy = three_domains();
+    assert_eq!(network_blocker(cargo_domain(&policy)), None);
+    let readiness = domain_readiness(cargo_domain(&policy), |d| ctx().domain_grants(d, &all_approved));
+    match readiness {
+        DomainReadiness::Ready { passthrough } => assert_eq!(paths(&passthrough), vec!["C:/cargo/db"]),
+        other => panic!("expected Ready, got {other:?}"),
+    }
+}

@@ -36,7 +36,7 @@
 use std::collections::BTreeMap;
 
 use harness_core::GrantedPassthrough;
-use harness_policy::policy_file::{PolicyFile, ENTRY_DOMAIN};
+use harness_policy::policy_file::{PolicyDomain, PolicyFile, ENTRY_DOMAIN};
 use crate::tier2a::policy_approval::DeclarationRef;
 use crate::tier2a::policy_grants::{GrantContext, SkippedDeclaration};
 use crate::tier2a::workspace_capability::declaration_key;
@@ -60,6 +60,48 @@ pub struct PolicyFsPlan {
     pub declared_roots: Vec<String>,
     /// 入口ドメインで付けなかった宣言（人へ見せる）。
     pub entry_skipped: Vec<SkippedDeclaration>,
+}
+
+/// 通信を宣言しているドメインなら、その宣言の件数。
+///
+/// **【暫定】決定65の暫定(b)**——ドメインごとの通信の出口制御（専用プロキシ＋WFPの欄。作業の一覧の P7）がまだ無いので、
+/// 通信を宣言するドメインは用意しない（capabilityだけ与えると既定拒否が効かず素通しになる。`domain_provision`のdoc）。
+/// **判定はこの1か所だけが持つ**（決定68の前例の(9)。以前は`harness-cli`の`startup/policy_fs::plan`・
+/// `win_appcontainer::domain_provision::capability_sids_for`・エディタの`transition_destination::outlook`の3か所に写しがあった）。
+/// P7 でこの関数ごと消すと、呼び出し元（[`domain_readiness`]と`capability_sids_for`）がコンパイルできなくなる——それが撤去の合図である。
+pub fn network_blocker(domain: &PolicyDomain) -> Option<usize> {
+    (!domain.net.allow_domains.is_empty()).then_some(domain.net.allow_domains.len())
+}
+
+/// 遷移先のドメイン1つを、`harness.exe`が用意できるか。
+#[derive(Debug, Clone)]
+pub enum DomainReadiness {
+    /// 通信を宣言している（[`network_blocker`]。暫定）。
+    DeclaresNetwork { count: usize },
+    /// 許可が付かない宣言がある。**1件でもあればドメインごと用意しない**（fail-closed）。
+    NotGranted { skipped: Vec<SkippedDeclaration> },
+    /// 用意できる。付ける一覧（空なら共通の土台だけで用意される）。
+    Ready { passthrough: Vec<FsPassthrough> },
+}
+
+/// 遷移先のドメイン1つを用意できるかを決める。`harness.exe`の付与の一覧（[`plan`]）とポリシーエディタの見込み
+/// （`transition_destination::outlook`）が**同じこれを通る**（決定68の前例の(9)）。
+///
+/// 判定順は「通信の宣言 → 付かない宣言 → 用意できる」。**通信を宣言していれば`grants`を呼ばない**——付与の一覧を
+/// 作る前に断る（使われない一覧のために台帳を読まない。付かない宣言の理由で通信の理由を隠さない）。
+/// `grants`は宣言から付ける一覧を作る関数で、製品では`GrantContext::domain_grants`に承認台帳を渡したもの。
+pub fn domain_readiness(
+    domain: &PolicyDomain,
+    grants: impl FnOnce(&PolicyDomain) -> crate::tier2a::policy_grants::DomainGrants,
+) -> DomainReadiness {
+    if let Some(count) = network_blocker(domain) {
+        return DomainReadiness::DeclaresNetwork { count };
+    }
+    let granted = grants(domain);
+    if !granted.skipped.is_empty() {
+        return DomainReadiness::NotGranted { skipped: granted.skipped };
+    }
+    DomainReadiness::Ready { passthrough: granted.passthrough }
 }
 
 /// 宣言から、付ける一覧を決める（**何も書かない**。純粋関数）。
@@ -88,37 +130,38 @@ pub fn plan(
             // 定義が無いことはドメインの用意が理由ごと報告する（ここで二重に出さない）。
             continue;
         };
-        if !domain.net.allow_domains.is_empty() {
-            out.not_granted_domains.push((
-                name,
-                "it declares network access, and per-domain egress control does not exist yet, \
-                 so the domain is not prepared and its file declarations are not granted"
-                    .to_string(),
-            ));
-            continue;
-        }
-        let grants = ctx.domain_grants(domain, approved);
-        // **1件でも付けない宣言があるドメインは用意しない**（fail-closed。§22.9の骨格と同じ判断）。
-        // 付けられる分だけで用意すると、エディタで確かめたより狭い権限で黙って動く。
-        if !grants.skipped.is_empty() {
-            out.not_granted_domains.push((
-                name,
-                format!(
-                    "{} of its file declarations cannot be granted: {}",
-                    grants.skipped.len(),
-                    grants
-                        .skipped
-                        .iter()
-                        .map(|s| format!("{} ({}): {}", s.value, s.access.settings_key(), s.reason.describe()))
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                ),
-            ));
-            continue;
-        }
+        // 判定は[`domain_readiness`]の1つ（エディタの見込みと`domain_provision`も同じ判定を通る。決定68の前例の(9)）。
+        let passthrough = match domain_readiness(domain, |d| ctx.domain_grants(d, approved)) {
+            DomainReadiness::DeclaresNetwork { .. } => {
+                out.not_granted_domains.push((
+                    name,
+                    "it declares network access, and per-domain egress control does not exist yet,                      so the domain is not prepared and its file declarations are not granted"
+                        .to_string(),
+                ));
+                continue;
+            }
+            // **1件でも付けない宣言があるドメインは用意しない**（fail-closed。§22.9の骨格と同じ判断）。
+            // 付けられる分だけで用意すると、エディタで確かめたより狭い権限で黙って動く。
+            DomainReadiness::NotGranted { skipped } => {
+                out.not_granted_domains.push((
+                    name,
+                    format!(
+                        "{} of its file declarations cannot be granted: {}",
+                        skipped.len(),
+                        skipped
+                            .iter()
+                            .map(|s| format!("{} ({}): {}", s.value, s.access.settings_key(), s.reason.describe()))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                ));
+                continue;
+            }
+            DomainReadiness::Ready { passthrough } => passthrough,
+        };
         // **付ける宣言が無いドメインは、強制の有無に関係なく今までどおり用意できる**（土台だけで動く）。
         // 下の「強制が無効なら付けない」は、払う費用（付与とUAC）があるときだけの判断である。
-        if grants.passthrough.is_empty() {
+        if passthrough.is_empty() {
             out.domains.push((name, Vec::new()));
             continue;
         }
@@ -131,7 +174,7 @@ pub fn plan(
             ));
             continue;
         }
-        out.domains.push((name, grants.passthrough));
+        out.domains.push((name, passthrough));
     }
     out
 }

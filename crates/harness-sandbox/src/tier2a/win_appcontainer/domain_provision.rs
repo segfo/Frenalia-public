@@ -107,11 +107,11 @@ fn capability_sids_for(
     // 片方だけ用意すると**素通しになる**（`internetClient`を持ったまま既定拒否だけを失う形は
     // 既知の欠陥として`tier2a::wfp`のdocが書いている）。WFPの欄とドメイン専用プロキシは
     // この回の範囲外なので、**断る側へ倒す**。
-    if !domain.net.allow_domains.is_empty() {
+    // 判定は`policy_fs::network_blocker`の1か所（決定68の前例の(9)。P7 で消す暫定）。
+    if let Some(count) = crate::tier2a::policy_fs::network_blocker(domain) {
         return Err(format!(
-            "`{name}`は通信を宣言している（{}件）。ドメインごとの出口制御はまだ無いので用意しない\
-             ——capabilityだけ与えると既定拒否が効かず素通しになる",
-            domain.net.allow_domains.len()
+            "`{name}`は通信を宣言している（{count}件）。ドメインごとの出口制御はまだ無いので用意しない\
+             ——capabilityだけ与えると既定拒否が効かず素通しになる"
         ));
     }
 

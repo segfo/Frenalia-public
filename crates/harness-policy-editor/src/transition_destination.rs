@@ -12,15 +12,14 @@
 //! 用意できるかは`policy.json`と承認台帳から決まる（D-112、#30）ので、エディタも書く前に
 //! 「宣言の上では用意されない」ことを言える。ここがその見込みを作る。
 //!
-//! # 判定の材料は`harness.exe`と同じ関数を通す。写しているのは組み立て順だけ
+//! # 判定は`harness.exe`と同じ関数を通す
 //!
 //! - **宣言ごとに許可が付くか**: `policy_grants::GrantContext::domain_grants`——`harness.exe`の
-//!   付与の一覧（`harness-cli`の`startup::policy_fs::plan`）が呼ぶのと**同じ関数・同じ承認台帳**。
-//! - **組み立て順**（通信を宣言している→付かない宣言が1件でもある→宣言が無い）は、`policy_fs::plan`と
-//!   `harness-sandbox`の`domain_provision::capability_sids_for`の**写し**である。`harness-cli`は
-//!   バイナリのクレートでここから呼べない。**ずれたときに外れるのはこの画面の見込みだけ**で、
-//!   実際に起こせるかは`harness.exe`が決め、モデルへ見せる一覧も`harness.exe`が実際に用意した表から
-//!   作る（`transition_tool::facts_from_policy`）。
+//!   付与の一覧（`harness_sandbox::tier2a::policy_fs::plan`）が呼ぶのと**同じ関数・同じ承認台帳**。
+//! - **用意できるか**（通信を宣言している→付かない宣言が1件でもある→用意できる）は
+//!   `harness_sandbox::tier2a::policy_fs::domain_readiness`の1つ（2026-10-07、決定68の前例の(9)。それまではここに
+//!   判定順の写しがあった）。実際に起こせるかは`harness.exe`が決め、モデルへ見せる一覧も`harness.exe`が実際に
+//!   用意した表から作る（`transition_tool::facts_from_policy`）。
 //!
 //! # 見込みが言わないもの（限界）
 //!
@@ -35,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use harness_policy::policy_file::{PolicyDomain, PolicyFile};
+use harness_sandbox::tier2a::policy_fs::DomainReadiness;
 use harness_sandbox::tier2a::policy_grants::{DomainGrants, SkipReason, SkippedDeclaration};
 
 /// 遷移先ドメインを`harness.exe`が用意する見込み。
@@ -200,20 +200,17 @@ pub fn outlook(
     let Some(domain) = file.domain(to_domain) else {
         return Outlook::Provisioned { declarations: 0 };
     };
-    // 順序は`policy_fs::plan`と同じ（モジュールdoc）。通信の宣言が先——付与の一覧を作る前に断る。
-    if !domain.net.allow_domains.is_empty() {
-        return Outlook::NotProvisioned(Blocker::DeclaresNetwork {
-            count: domain.net.allow_domains.len(),
-        });
-    }
-    let granted = grants(domain);
-    if !granted.skipped.is_empty() {
-        return Outlook::NotProvisioned(Blocker::DeclarationsNotGranted {
-            skipped: granted.skipped,
-        });
-    }
-    Outlook::Provisioned {
-        declarations: domain.fs.entries().len(),
+    // 判定は`harness.exe`の付与の一覧と同じ関数（`policy_fs::domain_readiness`。決定68の前例の(9)）。ここは写すだけ。
+    match harness_sandbox::tier2a::policy_fs::domain_readiness(domain, grants) {
+        DomainReadiness::DeclaresNetwork { count } => {
+            Outlook::NotProvisioned(Blocker::DeclaresNetwork { count })
+        }
+        DomainReadiness::NotGranted { skipped } => {
+            Outlook::NotProvisioned(Blocker::DeclarationsNotGranted { skipped })
+        }
+        DomainReadiness::Ready { .. } => Outlook::Provisioned {
+            declarations: domain.fs.entries().len(),
+        },
     }
 }
 
