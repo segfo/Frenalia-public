@@ -35,7 +35,8 @@ use harness_core::{parse_tool_input, PermissionSubject, ProgramSubject};
 use super::net_decision::classify_net_program;
 use super::runner::Launch;
 use super::{
-    join_output, prepare_run, push_run_footer, resolve_cwd, run_in_tier, DEFAULT_TIMEOUT_MS,
+    join_output, prepare_run, push_run_footer, resolve_cwd, run_in_tier, JoinedOutput,
+    DEFAULT_TIMEOUT_MS,
 };
 #[cfg(windows)]
 use super::{transition_denial_note, transition_queue_cursor};
@@ -214,7 +215,10 @@ impl Tool for RunProgramTool {
         .await?;
 
         let code = code.unwrap_or(-1);
-        let mut content = join_output(out, err);
+        let JoinedOutput {
+            mut content,
+            clixml_note,
+        } = join_output(out, err);
         content.push_str(&format!(
             "\n[exit code: {code}]\n[program: {}]",
             exe.display()
@@ -233,6 +237,7 @@ impl Tool for RunProgramTool {
             net_decision,
             setup_warning,
             transition_note,
+            clixml_note,
             &prepared,
         );
 

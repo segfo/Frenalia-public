@@ -34,6 +34,8 @@
 //! | [`platform`] | シェル実行ファイルそのもの（起動・stdinブートストラップ・コンソール符号化） |
 //! | [`program`] | `run_program`（シェルを通さずプログラムを直接起こす、D-96）。隔離・環境・フッタはここと共有する |
 
+/// [BUG-238] 子の PowerShell が CLIXML（XML）で書いた出力を、文字へ戻す。
+mod clixml;
 mod env;
 mod net_decision;
 mod platform;
@@ -306,17 +308,32 @@ async fn run_in_tier(
     .await
 }
 
+/// [`join_output`]の結果。`clixml_note`は[`push_run_footer`]へ渡す。
+struct JoinedOutput {
+    content: String,
+    clixml_note: Option<String>,
+}
+
 /// 標準出力と標準エラーを、上限で切ってから1つにつなぐ。
-fn join_output(out: String, err: String) -> String {
-    let mut content = truncate_to_limit(out);
-    let err = truncate_to_limit(err);
+///
+/// [BUG-238] その前に、子のPowerShellがCLIXML（XML）で書いた区画を文字へ戻す（[`clixml`]）。
+/// **戻すのは切る前**——XMLを途中で切ると、読めない残りが元のまま本文に出る。
+fn join_output(out: String, err: String) -> JoinedOutput {
+    let out = clixml::restore(out);
+    let err = clixml::restore(err);
+    let clixml_note = clixml::footer_note(&[&out, &err]);
+    let mut content = truncate_to_limit(out.text);
+    let err = truncate_to_limit(err.text);
     if !err.is_empty() {
         if !content.is_empty() {
             content.push('\n');
         }
         content.push_str(&err);
     }
-    content
+    JoinedOutput {
+        content,
+        clixml_note,
+    }
 }
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const RUN_SHELL_DEFAULT_DESCRIPTION: &str =
@@ -465,7 +482,10 @@ impl Tool for RunShellTool {
         // 「シェルの起動時警告」が唯一の出力になり、失敗と見分けが付かない。
         let (out_noise, out) = split_shell_startup_noise(&out);
         let (err_noise, err) = split_shell_startup_noise(&err);
-        let mut content = join_output(out, err);
+        let JoinedOutput {
+            mut content,
+            clixml_note,
+        } = join_output(out, err);
         content.push_str(&format!("\n[exit code: {code}]\n[shell: {shell_label}]"));
         if let Some(noise) = merge_startup_noise(&out_noise, &err_noise) {
             content.push_str(&format!(
@@ -489,6 +509,7 @@ impl Tool for RunShellTool {
             net_decision,
             setup_warning,
             transition_note,
+            clixml_note,
             &prepared,
         );
 
@@ -506,13 +527,18 @@ impl Tool for RunShellTool {
 /// `setup_warning`は[`runner::IsolatedRun::setup_warning`]（[BUG-208]: Tier1が作業フォルダへ
 /// 低ILラベルを付けられなかった）。文そのものは利用者へ出すstderrの行と同じものである。
 ///
+/// `clixml_note`は[`JoinedOutput::clixml_note`]（[BUG-238]: 子のPowerShellがXMLで書いた分を
+/// 本文で文字へ戻したこと）。本文の書式を変えたことの断りなので、出力の直後に置く。
+///
 /// [BUG-208]: ../../../../docs/bugs/BUG-208.md
+/// [BUG-238]: ../../../../docs/bugs/BUG-238.md
 fn push_run_footer(
     content: &mut String,
     ctx: &ToolCtx,
     net_decision: NetDecision,
     setup_warning: Option<String>,
     transition_note: Option<String>,
+    clixml_note: Option<String>,
     prepared: &PreparedRun,
 ) {
     let net_domain_policy_requested = ctx.net_proxy.domain_policy_enabled;
@@ -523,6 +549,10 @@ fn push_run_footer(
         proxy_addr,
         ..
     } = prepared;
+    if let Some(note) = clixml_note {
+        content.push('\n');
+        content.push_str(&note);
+    }
     // 着地したTierだけを出す。**「(downgraded from ...)」はもう付かない**——D-75で
     // 降格が消え、`select_tier`が返した時点で要求どおりのTierに居るためである。
     content.push_str(&format!("\n[tier: {}]", ctx.shell_tier.tier.label()));
