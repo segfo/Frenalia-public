@@ -1,6 +1,7 @@
 //! 位置ごとのドメインの E2E（`position_domains_e2e.rs`）・広げる遷移の E2E（`widening_transitions_e2e.rs`）・
-//! 引数を固定した位置と Strict の辺の E2E（`split_strict_e2e.rs`）が共有する部品。どのテストバイナリからも
-//! `mod common;`で取り込む（`plans/position-domains/P5.md`の P5.7・P5.10.3）。
+//! 引数を固定した位置と Strict の辺の E2E（`split_strict_e2e.rs`）・パス2の E2E（`record_net_e2e.rs`・
+//! `pass2_domains_e2e.rs`）が共有する部品。どのテストバイナリからも`mod common;`で取り込む
+//! （`plans/position-domains/P5.md`の P5.7・P5.10.3、`P6.md`の P6.8）。
 //!
 //! # 置き場の注意
 //!
@@ -26,9 +27,14 @@
 //! - 中の段のシェルを探す場所（[`middle_shell`]の`which::which("pwsh")`と`SystemRoot`）:
 //!   `harness-sandbox`の`win_appcontainer/spawn.rs`の`shell_candidates`。**どれを外し、どれを最後に積むかの
 //!   判断は写さず**、公開した`shell_candidates_from`を呼ぶ
-//! - DACL の読み方（[`acl_sddl`]・[`count_sid_prefix`]）と宣言の取り消し（[`unapprove_all`]）: `tests/record_net_e2e.rs`の
-//!   同名の関数と後片付け。広げる遷移の E2E が写したものを、引数を固定した位置の E2E（`split_strict_e2e.rs`）も
-//!   使うのでここへ移した（P5.10.3）
+//! - 宣言の取り消し（[`unapprove_all`]）: `tests/record_net_e2e.rs`の後片付け。広げる遷移の E2E が写したものを、
+//!   引数を固定した位置の E2E（`split_strict_e2e.rs`）も使うのでここへ移した（P5.10.3）
+//!
+//! # 移してきた部品（写しではなく、ここが正本）
+//!
+//! - DACL の読み方（[`acl_sddl`]・[`count_sid_prefix`]）・パス2の CLI の撃ち方（[`record_net_cli`]）・
+//!   `harness-netfilterd.exe`の置き方（[`place_netfilterd_next_to_the_test_binary`]）: `tests/record_net_e2e.rs`に
+//!   あったものを、位置ごとのパス2の E2E（`pass2_domains_e2e.rs`）も使うのでそのまま移した（P6.8。3つ目の写しを作らない）
 
 #![allow(dead_code)]
 
@@ -433,11 +439,22 @@ pub fn run_arm_with(
         .unwrap_or_else(|| panic!("no tool_calls[0].result in outcome: {outcome}"))
         .to_string();
 
-    let tail = read_from(&queue, 0);
+    Arm {
+        result,
+        denials: daemon_denials(ws, script.name),
+        daemon_stderr: std::fs::read_to_string(&daemon_log).unwrap_or_default(),
+        harness_stderr: stderr,
+    }
+}
+
+/// 待ち行列（`pending.jsonl`）の Daemon の拒否を（遷移元, 実行ファイル名, 理由）で。同じ種類の更新行は畳む。
+/// **読めない行・あふれ・カーネルの拒否は落とす**——断った一覧が欠けたまま「拒否は無い」と読まない（`B-09`）。
+/// `name`は落としたときの文面に出す腕の名前。[`run_arm`]とパス2の E2E（`record_net_e2e.rs`・`pass2_domains_e2e.rs`）が使う。
+pub fn daemon_denials(ws: &Path, name: &str) -> Vec<(Option<String>, String, DenyReason)> {
+    let tail = read_from(&pending_path(ws), 0);
     assert_eq!(
         tail.skipped, 0,
-        "{}: 待ち行列の行が読めなかった（断った一覧が欠けている）",
-        script.name
+        "{name}: 待ち行列の行が読めなかった（断った一覧が欠けている）"
     );
     let mut denials: Vec<(Option<String>, String, DenyReason)> = Vec::new();
     for record in &tail.records {
@@ -445,27 +462,18 @@ pub fn run_arm_with(
             PendingRecord::DeniedByDaemon(d) => {
                 (d.from_domain.clone(), file_name(&d.exe), d.reason.clone())
             }
-            PendingRecord::DeniedByKernel(d) => panic!(
-                "{}: カーネルの拒否が積まれた（今日これを書く者は居ないはず）: {d:?}",
-                script.name
-            ),
+            PendingRecord::DeniedByKernel(d) => {
+                panic!("{name}: カーネルの拒否が積まれた（今日これを書く者は居ないはず）: {d:?}")
+            }
             PendingRecord::Overflowed { dropped, .. } => {
-                panic!(
-                    "{}: 待ち行列が{dropped}件あふれた（断った一覧が欠けている）",
-                    script.name
-                )
+                panic!("{name}: 待ち行列が{dropped}件あふれた（断った一覧が欠けている）")
             }
         };
         if !denials.contains(&key) {
             denials.push(key);
         }
     }
-    Arm {
-        result,
-        denials,
-        daemon_stderr: std::fs::read_to_string(&daemon_log).unwrap_or_default(),
-        harness_stderr: stderr,
-    }
+    denials
 }
 
 /// 強制が効いている回にだけモデルへ見える`can_run_program`が、送ったシステムプロンプトにあるか
@@ -585,7 +593,18 @@ pub fn unapprove_all(ws: &Path, domain: &str) {
     assert!(output.status.success(), "unapprove {domain} が失敗した");
 }
 
-/// ファイルの DACL を SDDL で（`record_net_e2e.rs`の`acl_sddl`の写し）。
+/// 対象パスのDACLをSDDL（セキュリティ記述子の文字列表現）で読む（`record_net_e2e.rs`からそのまま移した。P6.8）。
+///
+/// # なぜharnessの関数で数えないのか
+///
+/// ACEを**付ける**のも**数える**のも同じ関数だと、その関数が同じ向きに間違えていても
+/// 緑になる。ここは「実マシンに何が残ったか」を測るところなので、**別の道具**（`Get-Acl`）で
+/// 読み直す。同じ形の裏取りをD-84の実装でも行っている。
+///
+/// **限界**: SDDLは継承ACEと明示ACEを1つの文字列に並べる。ここで測る対象は
+/// **新しく作ったファイル**で、capability SID（`S-1-15-3-`）や
+/// AppContainerのpackage SID（`S-1-15-2-`）が最初から載っていることは無いため、
+/// **測定前後の差**を見れば継承分と混ざらない。だから基準線を必ず先に取る。
 pub fn acl_sddl(path: &Path) -> String {
     let script = format!(
         "(Get-Acl -LiteralPath '{}').Sddl",
@@ -604,10 +623,141 @@ pub fn acl_sddl(path: &Path) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// SDDLの中に現れる、指定した接頭辞を持つSIDの件数（`S-1-15-3-`＝capability SID、`S-1-15-2-`＝package SID）。
-/// `record_net_e2e.rs`の`count_sid_prefix`の写し。
+/// SDDLの中に現れる、指定した接頭辞を持つSIDの件数。
+///
+/// `S-1-15-3-`＝capability SID（宣言ごとの宛先SID、残課題#20の移行先）、
+/// `S-1-15-2-`＝AppContainerのpackage SID（移行元。**移行後は0本でなければならない**）。
 pub fn count_sid_prefix(sddl: &str, prefix: &str) -> usize {
     sddl.match_indices(prefix).count()
+}
+
+// --- パス2（`record-net`） -------------------------------------------------------------
+
+/// パス2を CLI（`record-net`）で1回撃つ（`record_net_e2e.rs`の`run_record_net_with`をそのまま移した。P6.8）。
+/// [決定68(2)] `--domain`は無い（パス2は常に入口から始める）。`flags`は`--enforce-net`等、`envs`は足す環境変数
+/// （Spawn Daemon の標準エラーの受け皿`DAEMON_STDERR_ENV`など）。
+///
+/// 戻り値の2つ目は**撃ったエディタのプロセスID**——その回のセッションと遷移先ドメインの AppContainer
+/// プロファイルの名前のトークンに入る（[`profiles_added_since`]が「自分が作った分」を見分けるのに使う）。
+pub fn record_net_cli(
+    workspace_root: &Path,
+    command: &str,
+    flags: &[&str],
+    envs: &[(&str, &Path)],
+) -> (std::process::Output, u32) {
+    let child = Command::new(editor_exe())
+        .arg("record-net")
+        .args(flags)
+        .args([
+            "--workspace",
+            &workspace_root.to_string_lossy(),
+            "--cwd",
+            &workspace_root.to_string_lossy(),
+            "--limit",
+            "0",
+            "--timeout",
+            "120",
+            "--",
+            command,
+        ])
+        // 開発ビルド（`target/debug`）は必ずユーザー書込可なので、D-44の逃がし弁が要る。
+        .env("HARNESS_ALLOW_USER_WRITABLE_ELEVATED_HELPERS", "1")
+        .envs(envs.iter().map(|(name, value)| (*name, *value)))
+        // `output()`と同じ持ち方（標準入力は渡さない・出力は全部受ける）。プロセスIDを取るために`spawn`で起こす。
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the policy editor binary should run");
+    let pid = child.id();
+    (
+        child
+            .wait_with_output()
+            .expect("the policy editor binary should finish"),
+        pid,
+    )
+}
+
+/// `NetfilterHandle::start`は`current_exe().parent()`の隣から`harness-netfilterd.exe`を探すが、
+/// **統合テストのバイナリが置かれる`target/debug/deps/`にそれは無い**（cargoが実行ファイルを
+/// 置くのは`target/debug/`）。ビルド済みCLIをサブプロセスとして起こす試験は影響を
+/// 受けないが、ライブラリ（`record_net`）を直接呼ぶ試験は自分で置く必要がある
+/// （`record_net_e2e.rs`からそのまま移した。P6.8）。
+///
+/// 実装は`harness-sandbox`側の`ensure_daemon_next_to_test_binary`と同型だが、あちらは
+/// `#[cfg(test)]`のクレート内部関数なので参照できない（テスト専用の関数を製品APIとして
+/// 公開する方が悪い）。**同じ理由で同じことをしている**ことをここに書いておく。
+pub fn place_netfilterd_next_to_the_test_binary() {
+    const NAME: &str = "harness-netfilterd.exe";
+    let current = std::env::current_exe().expect("current_exe");
+    let deps = current.parent().expect("deps dir");
+    let target = deps.join(NAME);
+    let source = deps.parent().expect("target/debug").join(NAME);
+    assert!(
+        source.exists(),
+        "{} is missing; run `cargo build --workspace` first",
+        source.display()
+    );
+    let same = (|| -> Option<bool> {
+        let (a, b) = (
+            std::fs::metadata(&source).ok()?,
+            std::fs::metadata(&target).ok()?,
+        );
+        Some(a.len() == b.len() && a.modified().ok()? == b.modified().ok()?)
+    })()
+    .unwrap_or(false);
+    if !same {
+        std::fs::copy(&source, &target).unwrap_or_else(|e| {
+            panic!(
+                "failed to place a fresh {NAME} next to the test binary ({e}). If a previous \
+                 harness-netfilterd.exe is still running, stop it and re-run."
+            )
+        });
+    }
+}
+
+/// **このプロセスが起こした`harness-spawnd.exe`のプロセスID**（`Get-CimInstance Win32_Process`で読む）。
+///
+/// パス2は Spawn Daemon をパス2のたびに起こし直す（決定68 の前例の(3)）。エディタの持ち主（`SharedSpawnDaemon`）の中身は
+/// 非公開なので、**製品の公開面を試験のために広げず、別の道具で数える**（[`acl_sddl`]と同じ考え方）。Daemon は
+/// ホストが`CreateProcessW`で直接起こすので、親のプロセスIDはこの試験のプロセスになる（`spawnd/client.rs`の`launch_daemon`）。
+/// **一覧を取れなかったことを「1つも無い」と読まない**（`B-09`）——`powershell.exe`が失敗したら落とす。
+pub fn spawn_daemons_started_by_this_process() -> BTreeSet<u32> {
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name='harness-spawnd.exe' AND ParentProcessId={}\" | \
+         ForEach-Object {{ $_.ProcessId }}",
+        std::process::id()
+    );
+    let output = Command::new(system32(r"WindowsPowerShell\v1.0\powershell.exe"))
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("powershell.exe should run");
+    assert!(
+        output.status.success(),
+        "harness-spawnd.exe の一覧を取れない: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// `before`の後に増えた harness の族の AppContainer プロファイルを、**名前のトークンのプロセスIDが`pid`のもの**
+/// （その回のパス2が作った分。トークンは`<pid>-<起動秒>`＝`session_profile::session_token`）と、**それ以外**に分ける。
+///
+/// それ以外は、同じ機で動いている別の作業ツリーの`harness.exe`などが作ったもので、この試験の後始末の判定に入れない
+/// ——入れると、隣の実行が作った入れ物でこの試験が赤くなる（`plans/position-domains/P6.md`の P6.8 の注意）。
+/// 呼び出し側は2つ目も記録に残すために出す。
+pub fn profiles_added_since(before: &BTreeSet<String>, pid: u32) -> (Vec<String>, Vec<String>) {
+    let ours = format!("{pid}-");
+    harness_profiles()
+        .difference(before)
+        .cloned()
+        .partition(|name| {
+            harness_sandbox::tier2a::session_profile::token_of_profile(name)
+                .is_some_and(|token| token.starts_with(&ours))
+        })
 }
 
 /// このユーザーの AppContainer プロファイルのうち、harness の族（セッション・MCP・遷移先ドメイン）の名前。

@@ -12,8 +12,8 @@
 //! 4. **対のテスト**: 環境変数を読まない生ソケットは**WFPに落とされる**
 //!    ——2番が「単に何も強制していない」から通ったのではないことを示す（B-35）
 //! 5. マニフェストが`pass=2`・`finished`で閉じ、撤収まで通っている
-//! 6. **1プロセスで2回走らせると、2回目はdaemonを再利用する**（D-56）——かつ
-//!    **再利用したdaemonでも強制は本物のまま**（生ソケットは落ちる）。
+//! 6. **1プロセスで2回走らせると、2回目はWFPのdaemonを再利用し**（D-56）、**Spawn Daemonは起こし直す**
+//!    （決定68 の前例の(3)）——かつ**再利用したdaemonでも強制は本物のまま**（生ソケットは落ちる）。
 //!    「2回目が速かったのは強制が消えたからではない」ことを区別する対（B-35）
 //! 7. **承認したFS宣言が実DACLへ届き、その宛先SIDがcapability SIDである**（残課題#20の
 //!    移行の不変条件＝package SID宛が0本）。**取り消したあとに何が残るか**も同じ実行で測る
@@ -22,6 +22,13 @@
 //!    ——同じ実行で許可側と禁止側を両方測り、候補が断られた宛先だけになることを確かめる
 //!    （[`enforcing_pass2_allows_only_the_declared_domain_and_proposes_the_refused_one`]）
 //! 9. **同じワークスペースの`harness.exe`の許可がパス2で消えない**（BUG-184）——子モジュール[`harness_grants`]
+//!
+//! # [決定68] パス2は入口から・生成禁止つきで走る
+//!
+//! パス2は入口のドメイン`workspace-shell`から始め、Spawn Daemon を生成禁止（`Restricted`）つきで起こす。
+//! シェルが起こす子（`curl.exe`・`e2e-exec-probe.exe`）は**入口の辺に当たらないと Daemon が断る**ので、
+//! 子を起こす試験は`policy.json`にその実行ファイルの辺を**入口から入口へ**（自己ループ。Daemon は表を引かず
+//! 呼び出し元の実体で起こす）書く（[`write_policy`]）。宣言も入口のドメインに置き、`--domain`は渡さない。
 //!
 //! # このテストが触らないもの（正直に書く）
 //!
@@ -36,76 +43,68 @@
 #[path = "record_net_e2e/harness_grants.rs"] // 1,000行に近いので子モジュールへ置く（規則1）
 mod harness_grants;
 
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 
-fn editor_exe() -> &'static str {
-    env!("CARGO_BIN_EXE_harness-policy-editor")
-}
+// 子モジュール（`harness_grants`）も`super::`越しに使う。
+use common::{acl_sddl, count_sid_prefix, editor_exe, place_netfilterd_next_to_the_test_binary};
 
 /// 記録対象にするドメイン。外部への到達性が要るので、安定していて用途上問題の無いものを使う。
 const TARGET_DOMAIN: &str = "example.com";
 
-/// [決定68(2)] 宣言は**入口のドメイン**（`workspace-shell`）に置く——パス2は常に入口から始め、通信の宣言も入口のものを使う。
-/// **P6.8 で撃ち直すときの注意**: パス2は生成禁止を積むので、シェルが起こす子（`curl.exe`等）は入口の辺に当たらないと
-/// 断られる（このファイルの`policy.json`はまだ辺を持たない）。意味の書き換えは P6.8。
-fn write_policy(workspace_root: &Path, command: &str) {
-    // **1つも宣言しない。** それでも到達できることがrecord_allの効き目の証明になる。
-    write_policy_declaring(workspace_root, command, &[]);
-}
-
 /// 入口のドメインの名前（`harness_policy::policy_file::ENTRY_DOMAIN`）。
 const ENTRY: &str = harness_policy_editor::policy_file::ENTRY_DOMAIN;
 
-/// [`write_policy`]の、通信先を宣言する版（強制モードの試験が使う）。
-fn write_policy_declaring(workspace_root: &Path, command: &str, allow_domains: &[&str]) {
-    let policy = serde_json::json!({
-        "schema_version": 1,
-        "domains": [{
-            "name": ENTRY,
-            "commands": [command],
-            "cwd": workspace_root,
-            // 意図的に空（モジュールdocの「触らないもの」参照）。
-            "fs": { "read": [], "read_write": [], "read_exec": [] },
-            "net": { "allow_domains": allow_domains },
-            "provenance": { "record_sessions": [], "updated_unix_ms": 0 }
-        }]
-    });
-    let dir = workspace_root.join(".harness");
-    std::fs::create_dir_all(dir.join("sandbox")).unwrap();
-    std::fs::write(
-        dir.join("policy.json"),
-        serde_json::to_string_pretty(&policy).unwrap(),
-    )
-    .unwrap();
+/// Windows 標準の`curl.exe`（PowerShell が`curl.exe`を引いて起こす実行ファイル。入口の辺に書く綴り）。
+fn curl_exe() -> String {
+    common::system32("curl.exe")
+}
+
+/// [決定68(2)] 宣言は**入口のドメイン**（`workspace-shell`）に置く——パス2は常に入口から始め、通信の宣言も入口のものを使う。
+/// `children`はコマンドが起こす子の実行ファイル（絶対パス）で、**入口から入口への辺**（引数は任意）として書く
+/// ——パス2は生成禁止を積むので、辺の無い子は Daemon が`no_matching_edge`で断る（決定68(1)）。
+fn write_policy(workspace_root: &Path, command: &str, children: &[&str]) {
+    // **1つも宣言しない。** それでも到達できることがrecord_allの効き目の証明になる。
+    write_policy_declaring(workspace_root, command, &[], children);
+}
+
+/// [`write_policy`]の、通信先を宣言する版（強制モードの試験が使う）。手書きの JSON にせず製品の型で組み、
+/// 製品の`save`で書く（型が変わった日に試験だけが古い綴りで残らない。`save`は読み込みと同じ遷移の検査を掛ける）。
+fn write_policy_declaring(
+    workspace_root: &Path,
+    command: &str,
+    allow_domains: &[&str],
+    children: &[&str],
+) {
+    use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher};
+    let mut entry = harness_policy::policy_file::PolicyDomain::new(ENTRY);
+    entry.commands.push(command.to_string());
+    entry.cwd = Some(workspace_root.to_path_buf());
+    // `fs`は意図的に空（モジュールdocの「触らないもの」参照）。
+    entry.net.allow_domains = allow_domains.iter().map(|d| d.to_string()).collect();
+    for exe in children {
+        entry
+            .process
+            .transitions
+            .push(editor_edge(exe, ArgvMatcher::Any(AnyMarker), ENTRY));
+    }
+    let mut file = harness_policy::policy_file::PolicyFile::default();
+    file.domains.push(entry);
+    std::fs::create_dir_all(workspace_root.join(".harness").join("sandbox")).unwrap();
+    harness_policy::policy_file::save(workspace_root, &file)
+        .unwrap_or_else(|e| panic!("policy.jsonを書けない: {e}"));
 }
 
 fn run_record_net(workspace_root: &Path, command: &str) -> std::process::Output {
     run_record_net_with(workspace_root, command, &[])
 }
 
-/// [`run_record_net`]に`record-net`のフラグ（`--enforce-net`等）を足して走らせる版。
-/// [決定68(2)] `--domain`は無い（パス2は常に入口から始める）。
+/// [`run_record_net`]に`record-net`のフラグ（`--enforce-net`等）を足して走らせる版（撃ち方の正本は
+/// [`common::record_net_cli`]）。[決定68(2)] `--domain`は無い（パス2は常に入口から始める）。
 fn run_record_net_with(workspace_root: &Path, command: &str, flags: &[&str]) -> std::process::Output {
-    Command::new(editor_exe())
-        .arg("record-net")
-        .args(flags)
-        .args([
-            "--workspace",
-            &workspace_root.to_string_lossy(),
-            "--cwd",
-            &workspace_root.to_string_lossy(),
-            "--limit",
-            "0",
-            "--timeout",
-            "120",
-            "--",
-            command,
-        ])
-        // 開発ビルド（`target/debug`）は必ずユーザー書込可なので、D-44の逃がし弁が要る。
-        .env("HARNESS_ALLOW_USER_WRITABLE_ELEVATED_HELPERS", "1")
-        .output()
-        .expect("the policy editor binary should run")
+    common::record_net_cli(workspace_root, command, flags, &[]).0
 }
 
 fn manifest_of_latest_session(workspace_root: &Path) -> serde_json::Value {
@@ -166,44 +165,6 @@ fn run_show(workspace_root: &Path) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).to_string()
-}
-
-/// 対象パスのDACLをSDDL（セキュリティ記述子の文字列表現）で読む。
-///
-/// # なぜharnessの関数で数えないのか
-///
-/// ACEを**付ける**のも**数える**のも同じ関数だと、その関数が同じ向きに間違えていても
-/// 緑になる。ここは「実マシンに何が残ったか」を測るところなので、**別の道具**（`Get-Acl`）で
-/// 読み直す。同じ形の裏取りをD-84の実装でも行っている。
-///
-/// **限界**: SDDLは継承ACEと明示ACEを1つの文字列に並べる。ここで測る対象は
-/// **新しく作った一時ディレクトリの中のファイル**で、capability SID（`S-1-15-3-`）や
-/// AppContainerのpackage SID（`S-1-15-2-`）が最初から載っていることは無いため、
-/// **測定前後の差**を見れば継承分と混ざらない。だから基準線を必ず先に取る。
-fn acl_sddl(path: &Path) -> String {
-    let script = format!(
-        "(Get-Acl -LiteralPath '{}').Sddl",
-        path.display().to_string().replace('\'', "''")
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .expect("powershell.exe should run");
-    assert!(
-        output.status.success(),
-        "Get-Acl failed for {}: {}",
-        path.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// SDDLの中に現れる、指定した接頭辞を持つSIDの件数。
-///
-/// `S-1-15-3-`＝capability SID（宣言ごとの宛先SID、残課題#20の移行先）、
-/// `S-1-15-2-`＝AppContainerのpackage SID（移行元。**移行後は0本でなければならない**）。
-fn count_sid_prefix(sddl: &str, prefix: &str) -> usize {
-    sddl.match_indices(prefix).count()
 }
 
 /// 実行像の診断に使うexeの置き場（**`%TEMP%`の外**）。
@@ -271,8 +232,9 @@ fn pass2_records_the_domain_a_command_reached_without_declaring_any_allowlist() 
     let workspace = tempfile::tempdir().expect("tempdir");
     let workspace_root = workspace.path();
     // Windows標準の`curl.exe`はプロキシ環境変数を読む（AppContainerからも起動できる）。
+    // [決定68(1)] 入口から入口への`curl.exe`の辺が無いと、Daemon が生成を断る（モジュールdoc）。
     let command = format!("curl.exe -sS -o NUL -w '%{{http_code}}' https://{TARGET_DOMAIN}/");
-    write_policy(workspace_root, &command);
+    write_policy(workspace_root, &command, &[&curl_exe()]);
 
     let output = run_record_net(workspace_root, &command);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -343,7 +305,7 @@ fn enforcing_pass2_allows_only_the_declared_domain_and_proposes_the_refused_one(
         "curl.exe -sS -o NUL -w '%{{http_code}}' https://{TARGET_DOMAIN}/; \
          curl.exe -sS -o NUL -w '%{{http_code}}' https://{UNDECLARED}/"
     );
-    write_policy_declaring(workspace_root, &command, &[TARGET_DOMAIN]);
+    write_policy_declaring(workspace_root, &command, &[TARGET_DOMAIN], &[&curl_exe()]);
 
     let output = run_record_net_with(workspace_root, &command, &["--enforce-net"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -438,7 +400,8 @@ fn a_raw_socket_that_bypasses_the_proxy_is_dropped_by_wfp() {
                    $c.Connect('93.184.215.14', 443); \
                    Write-Output 'RAW-SOCKET-CONNECTED'; exit 9 } \
                    catch { Write-Output 'RAW-SOCKET-BLOCKED'; exit 0 }";
-    write_policy(workspace_root, command);
+    // 子を起こさない（PowerShell の中だけで完結する）ので辺は要らない。
+    write_policy(workspace_root, command, &[]);
 
     let output = run_record_net(workspace_root, command);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -462,8 +425,18 @@ fn a_raw_socket_that_bypasses_the_proxy_is_dropped_by_wfp() {
     );
 }
 
-/// 6番（D-56）: **1プロセスで`record_net`を2回呼び、2回目がdaemonを再利用すること**と、
-/// **再利用したdaemンでも強制が本物のままであること**を同時に固定する。
+/// 6番（D-56）: **1プロセスで`record_net`を2回呼び、2回目がWFPのdaemonを再利用すること**と、
+/// **再利用したdaemonでも強制が本物のままであること**を同時に固定する。あわせて
+/// **Spawn Daemon は使い回さず、2回目に起こし直す**ことを見る（決定68 の前例の(3)）。
+///
+/// # 2つの daemon は逆の持ち方をする
+///
+/// WFPのdaemon（`harness-netfilterd`）は昇格して起きるので、使い回すことで2回目のUACを消す（D-56）。
+/// Spawn Daemon は昇格しないので UAC は増えず、宣言と遷移先の表を Hello の後で差し替える口が無いので、
+/// 使い回すと承認した辺がその回に効かない（決定68の困りごと2）——だから毎回起こし直す。どちらかだけを見ると、
+/// 「全部使い回す」「全部起こし直す」の取り違えがもう片方で緑になるので、同じ2回で両方を見る。
+/// Spawn Daemon の取り替えは**プロセスIDが変わったこと**を、エディタの持ち主（非公開）ではなく
+/// `Get-CimInstance`（[`common::spawn_daemons_started_by_this_process`]）で数える。
 ///
 /// # なぜ上の2本と違って`record_net`を直接呼ぶのか
 ///
@@ -487,7 +460,8 @@ fn a_raw_socket_that_bypasses_the_proxy_is_dropped_by_wfp() {
 /// 「プロキシ経由なら到達できる」ことも併せて確かめる。
 #[test]
 #[ignore = "requires administrator rights (WFP netfilterd) and outbound network access"]
-fn a_second_pass2_in_the_same_process_reuses_the_daemon_and_still_enforces() {
+fn a_second_pass2_in_the_same_process_reuses_the_wfp_daemon_restarts_the_spawn_daemon_and_still_enforces()
+{
     use harness_policy_editor::record_net::{
         record_net, NetRecordEvent, RecordNetRequest, SessionGrants, SharedNetfilter,
     };
@@ -504,7 +478,12 @@ fn a_second_pass2_in_the_same_process_reuses_the_daemon_and_still_enforces() {
                  $c.Connect('93.184.215.14', 443); \
                  Write-Output 'RAW-SOCKET-CONNECTED'; exit 9 } \
                  catch { Write-Output 'RAW-SOCKET-BLOCKED'; exit 0 }";
-    write_policy(workspace_root, &reach);
+    write_policy(workspace_root, &reach, &[&curl_exe()]);
+    let daemons_before = common::spawn_daemons_started_by_this_process();
+    assert!(
+        daemons_before.is_empty(),
+        "前提: この試験のプロセスがまだ Spawn Daemon を起こしていない（前の試験の残りが居ると、下の取り替えの判定が読めない）: {daemons_before:?}"
+    );
 
     // **宣言順が撤収順を決める**（D-56）。`SessionGrants`より後に`SharedNetfilter`を作ることで、
     // netfilterdの`Teardown`がAppContainerプロファイルの削除より先に走る。
@@ -561,8 +540,16 @@ fn a_second_pass2_in_the_same_process_reuses_the_daemon_and_still_enforces() {
          'still enforcing' assertion below cannot be told apart from 'nothing works at all': \
          {stdout_first:?}"
     );
+    // 1回目の Spawn Daemon は、次のパス2が畳むまで生きている（持ち主がプロセスの寿命で持つ）。
+    let daemons_first = common::spawn_daemons_started_by_this_process();
+    eprintln!("[e2e] 1回目の後の Spawn Daemon: {daemons_first:?}");
+    assert_eq!(
+        daemons_first.len(),
+        1,
+        "1回目のパス2の後に、この試験が起こした Spawn Daemon がちょうど1つ居ない: {daemons_first:?}"
+    );
 
-    // 2回目: **daemonを再利用する＝UACが出ない**。しかも強制は本物のまま。
+    // 2回目: **WFPのdaemonを再利用する＝UACが出ない**。しかも強制は本物のまま。
     let (reused_second, stdout_second) = run(guard);
     assert_eq!(
         reused_second,
@@ -575,6 +562,15 @@ fn a_second_pass2_in_the_same_process_reuses_the_daemon_and_still_enforces() {
         "a raw socket must still be dropped by the reused daemon's filters. If this says \
          CONNECTED, the reuse silently dropped the enforcement and pass 2's records can no \
          longer be read as 'only these domains': {stdout_second:?}"
+    );
+    // **Spawn Daemon は起こし直す**（決定68 の前例の(3)）——1回目の個体は畳まれ、別のプロセスIDの1つだけが居る。
+    let daemons_second = common::spawn_daemons_started_by_this_process();
+    eprintln!("[e2e] 2回目の後の Spawn Daemon: {daemons_second:?}");
+    assert!(
+        daemons_second.len() == 1 && daemons_second.is_disjoint(&daemons_first),
+        "2回目のパス2は Spawn Daemon を起こし直す（1回目 {daemons_first:?} を畳み、別の1つを起こす）はずが、\
+         2回目の後は {daemons_second:?}。同じプロセスIDなら使い回している（承認した辺がその回に効かない、決定68の困りごと2）、\
+         2つ以上なら前の個体を畳んでいない"
     );
 }
 
@@ -643,7 +639,10 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
         "precondition: a freshly copied probe must not carry any package SID ACE: {baseline}"
     );
 
-    write_policy(workspace_root, &command);
+    // [決定68(1)] 入口から入口への辺（Daemon が呼び出し元の実体で起こす）。辺はファイルの許可ではないので、1回目に
+    // 起動できないことは変わらない——起動できない理由が「辺が無い」ではなく「実行権が無い」であることを、辺を書いて
+    // 揃える。綴りは`\`の形（下の`policy.json`の`/`の値の照合に、辺の綴りが当たらないようにする）。
+    write_policy(workspace_root, &command, &[&probe.display().to_string()]);
 
     // --- 1回目: 宣言が無いので起動できない。診断が名指しし、候補として出る -----------
     let first = run_record_net(workspace_root, &command);
@@ -674,26 +673,34 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
     // 診断の説明行（`候補に足した: …`）が先に当たり、その行頭の語をidとして`approve`へ
     // 渡してしまう（実機で `知らない提案id: 候補に足した:` として出た）。
     // 候補表の行は必ず`fs-<番号>`で始まるので、そこまで含めて絞る。
-    let id = show
+    let line = show
         .lines()
         .map(str::trim_start)
         .find(|line| {
             line.starts_with("fs-") && line.contains("fs.read_exec") && line.contains(&declared)
         })
-        .and_then(|line| line.split_whitespace().next())
         .unwrap_or_else(|| {
             panic!("the diagnosed executable must appear as an fs.read_exec candidate:\n{show}")
-        })
+        });
+    // [決定68] 実行前診断は入口で起こすコマンドを診るので、候補は入口のドメインの見出しに出る（P6.6）。
+    assert!(
+        line.contains(&format!("[{ENTRY}]")),
+        "the diagnosed executable must be offered to the entry domain: {line}"
+    );
+    let id = line
+        .split_whitespace()
+        .next()
+        .expect("a candidate line starts with its id")
         .to_string();
 
     // --- 承認して2回目: 今度は実際に起動する -----------------------------------------
+    // [決定68 の前例の(1)(7)] パス2の記録は許可した生成の記録を持つので候補がドメインごとに分かれ、`approve`は
+    // `--domain`を断る（実行前診断の候補は入口の候補に出るので、書く先は入口）。
     let approve = Command::new(editor_exe())
         .args([
             "approve",
             "--workspace",
             &workspace_root.to_string_lossy(),
-            "--domain",
-            ENTRY,
             "--accept",
             &id,
             "--yes",
@@ -884,6 +891,8 @@ fn the_hand_written_spawn_request_still_parses() {
 /// `unknown_source_domain`ではなく`no_matching_edge`が返ることは、
 /// **Daemonがこの子の遷移元を入口のドメイン（`workspace-shell`）として引けている**ことを意味する
 /// （決定68(2)。以前は「記録中のドメイン」だった。宣言を入口へ置いたので、入口の名前が`policy.json`に在る）。
+/// 子が受け取った理由の文字列だけでなく、Daemon の待ち行列（`pending.jsonl`）の行の遷移元・実行ファイル・理由も見る
+/// ——子の印字は子が組み立てた文字列で、遷移元の名前までは載らない。
 ///
 /// # 対の相手
 ///
@@ -906,7 +915,8 @@ fn the_hand_written_spawn_request_still_parses() {
 fn pass2_reaches_the_request_pipe_and_is_denied_by_policy_not_by_the_table() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let workspace_root = workspace.path();
-    write_policy(workspace_root, SPAWN_REQUEST_ROUNDTRIP);
+    // 辺は書かない——`cmd.exe`を起こす辺が無いことが、この試験の断られる理由そのものである。
+    write_policy(workspace_root, SPAWN_REQUEST_ROUNDTRIP, &[]);
 
     let output = run_record_net(workspace_root, SPAWN_REQUEST_ROUNDTRIP);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -944,46 +954,24 @@ fn pass2_reaches_the_request_pipe_and_is_denied_by_policy_not_by_the_table() {
         !stdout.contains("not_registered"),
         "Daemonが起こした子なのに「台帳に無い」で断られている（§12・BUG-116）: {stdout}"
     );
+    // [決定68(2)] Daemon が断った記録の遷移元は入口のドメイン（ちょうど1種類。要求は1往復だけ送る）。
+    let denials = common::daemon_denials(workspace_root, "pass2-spawn-reach");
+    eprintln!("[e2e] 待ち行列の拒否: {denials:?}");
+    let expected = (
+        Some(ENTRY.to_string()),
+        "cmd.exe".to_string(),
+        harness_sandbox::tier2a::spawnd::DenyReason::Transition {
+            denial: harness_policy::transition::TransitionDenial::NoMatchingEdge,
+        },
+    );
+    assert_eq!(
+        denials,
+        vec![expected],
+        "Daemon の待ち行列に（入口 {ENTRY}, cmd.exe, no_matching_edge）がちょうど1件ない"
+    );
 
     // 撤収まで通っている（ここが抜けるとプロファイルとACEがマシンに残る）。
     let manifest = manifest_of_latest_session(workspace_root);
     assert_eq!(manifest["pass"], 2, "manifest: {manifest}");
     assert_eq!(manifest["status"], "finished", "manifest: {manifest}");
-}
-
-/// `NetfilterHandle::start`は`current_exe().parent()`の隣から`harness-netfilterd.exe`を探すが、
-/// **統合テストのバイナリが置かれる`target/debug/deps/`にそれは無い**（cargoが実行ファイルを
-/// 置くのは`target/debug/`）。上の2本はビルド済みCLIをサブプロセスとして起こすので影響を
-/// 受けないが、ライブラリを直接呼ぶこのテストは自分で置く必要がある。
-///
-/// 実装は`harness-sandbox`側の`ensure_daemon_next_to_test_binary`と同型だが、あちらは
-/// `#[cfg(test)]`のクレート内部関数なので参照できない（テスト専用の関数を製品APIとして
-/// 公開する方が悪い）。**同じ理由で同じことをしている**ことをここに書いておく。
-fn place_netfilterd_next_to_the_test_binary() {
-    const NAME: &str = "harness-netfilterd.exe";
-    let current = std::env::current_exe().expect("current_exe");
-    let deps = current.parent().expect("deps dir");
-    let target = deps.join(NAME);
-    let source = deps.parent().expect("target/debug").join(NAME);
-    assert!(
-        source.exists(),
-        "{} is missing; run `cargo build --workspace` first",
-        source.display()
-    );
-    let same = (|| -> Option<bool> {
-        let (a, b) = (
-            std::fs::metadata(&source).ok()?,
-            std::fs::metadata(&target).ok()?,
-        );
-        Some(a.len() == b.len() && a.modified().ok()? == b.modified().ok()?)
-    })()
-    .unwrap_or(false);
-    if !same {
-        std::fs::copy(&source, &target).unwrap_or_else(|e| {
-            panic!(
-                "failed to place a fresh {NAME} next to the test binary ({e}). If a previous \
-                 harness-netfilterd.exe is still running, stop it and re-run."
-            )
-        });
-    }
 }

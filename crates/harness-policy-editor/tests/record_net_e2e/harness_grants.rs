@@ -23,6 +23,16 @@
 //! 取り消し処理は生きていて、残す集合も効いている。実行中の回は、見送った件数（SとFの2件）が
 //! 警告に出ることで、取り消し処理がSとFを候補として見たうえで見送ったことを確かめる。
 //!
+//! # [決定68(2)] パス2も入口の宣言（A）を付ける
+//!
+//! パス2は入口のドメイン（`workspace-shell`）から始め、`harness.exe --enforce-transitions`と同じ手順で
+//! 入口の承認済みの宣言に許可を付ける（以前は宣言の無い別のドメインで記録していたので、Aには触れなかった）。
+//! 宛先SIDは（ワークスペース, 宣言のパス, 級）で決まるので、パス2が付けるAの宛先は`harness.exe`が付けたものと
+//! 同じで、ACEは1本のまま（付与は「既に足りている」で飛ぶ）。**そのため「Aが1本のまま」だけでは、
+//! 開始時の取り消しがAを剥がして付与が付け直した場合と区別できない**——両方の回で、パス2の撤収の行に
+//! Aが出ないことも見る（取り消しは付与より前に走り、剥がしたものは1件ずつ撤収の行に出る）。
+//! コマンドは`Write-Output`だけで子を起こさないので、遷移の辺は要らない。
+//!
 //! # 2つのキーに分けてある（撃つ順序が要る）
 //!
 //! - `e2e-policy-editor-keeps-harness-grants`（`keep_`）: `harness.exe`を動かしたまま
@@ -69,6 +79,7 @@ const WORKSPACE: &str = r"C:\harness-e2e\editor-keeps-harness";
 /// スクラッチ（台本・`harness.exe`の出力）。ワークスペースの外に置く。
 const SCRATCH: &str = r"C:\harness-e2e\_scratch";
 /// パス2で撃つコマンド。走ったことを標準出力の印で見る。[決定68(2)] パス2は入口のドメインから始める（`--domain`は無い）。
+/// 子を起こさないので、生成禁止の下でも辺は要らない。
 const PASS2_MARKER: &str = "EDITOR_PASS2_RAN";
 
 /// 3つの置き場。**付与の試験と撤収の試験が同じ値を読む**（綴りを2箇所に書かない、`B-05`）。
@@ -428,8 +439,7 @@ fn reset_leftovers(ws: &Path) {
 }
 
 /// `policy.json`を書く: 入口ドメインにAとSの宣言と、パス2のコマンド（[決定68(2)] パス2は常に入口から始め、記録したコマンドを
-/// 書くのも入口だけ。以前はファイル宣言の無い別のドメインで記録していた——**P6.8 の注意**: パス2は入口の宣言（A・S）も付けるので、
-/// 「パス2が付けた分」と「harness.exe が付けた分」の区別はこの試験の意味の書き換えで扱う）。
+/// 書くのも入口だけ）。パス2も入口の承認済みの宣言に許可を付けるので、Aの扱いはモジュールdocの「パス2も入口の宣言（A）を付ける」。
 fn write_policy(ws: &Path) {
     let mut file = PolicyFile::default();
     let mut entry = PolicyDomain::new(ENTRY_DOMAIN);
@@ -558,6 +568,12 @@ fn keep_harness_grants_while_harness_runs_in_the_same_workspace() {
         if n != 1 {
             failures.push(format!(
                 "**harness.exeが動いている間のパス2で、{dir}のACEが{n}本になった**（1本のまま残るはず。BUG-184）"
+            ));
+        }
+        // [決定68(2)] パス2はAも付けるので、本数だけでは「剥がして付け直した」と区別できない（モジュールdoc）。
+        if pass2_revoked(&stderr, dir) {
+            failures.push(format!(
+                "harness.exeが動いている間のパス2の撤収の行に{dir}が出た（使用中なので何も取り消さないはず）"
             ));
         }
     }
