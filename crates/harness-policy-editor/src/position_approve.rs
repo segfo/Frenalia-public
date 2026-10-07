@@ -112,7 +112,7 @@ pub struct EdgeWrite {
 pub struct PositionRequest<'a> {
     pub workspace_root: &'a Path,
     pub require_sandbox: RequireSandbox,
-    /// 記録したコマンド・作業ディレクトリ・記録セッション（ファイルの宣言を書く各ドメインの由来に残す）。
+    /// 記録したコマンド・作業ディレクトリ（入口のドメインにだけ残す。決定68 の前例の(12)）・記録セッション（書く各ドメインの由来）。
     pub command: Option<&'a str>,
     pub cwd: Option<&'a Path>,
     pub record_session: Option<&'a str>,
@@ -413,12 +413,13 @@ pub fn plan(req: &PositionRequest<'_>) -> Result<PositionPlan, PositionApproveEr
                 domain: domain.to_string(),
             });
         }
+        // [決定68 の前例の(12)] `commands`・`cwd`はここでは書かない（入口のドメインへだけ、下の(7b)で書く）。
         let report = file.merge_approved(
             &checked.accepted,
             &ApprovalContext {
                 domain,
-                command: req.command,
-                cwd: req.cwd,
+                command: None,
+                cwd: None,
                 record_session: req.record_session,
                 now_unix_ms: req.now_unix_ms,
             },
@@ -447,6 +448,22 @@ pub fn plan(req: &PositionRequest<'_>) -> Result<PositionPlan, PositionApproveEr
                 })
                 .collect(),
         });
+    }
+
+    // (7b) [決定68 の前例の(12)] 記録したコマンドと作業ディレクトリは**入口のドメインにだけ**由来として書く（パス2は常に
+    // 入口から始め、`record-net`はコマンドを省くと入口の`commands`を使う）。入口が確定の後に在るとき（宣言か辺で）だけで、
+    // **入口を`commands`のためだけに作らない**。提案は渡さないので、増えるのは`commands`・`cwd`・由来の記録だけ。
+    if file.domain(ENTRY_DOMAIN).is_some() {
+        file.merge_approved(
+            &[],
+            &ApprovalContext {
+                domain: ENTRY_DOMAIN,
+                command: req.command,
+                cwd: req.cwd,
+                record_session: req.record_session,
+                now_unix_ms: req.now_unix_ms,
+            },
+        );
     }
 
     // (8) 宣言の取り消し（承認の後——逆順だと、今回外したものを承認が書き戻しうる。`tui::edit_commit`と同じ順）。

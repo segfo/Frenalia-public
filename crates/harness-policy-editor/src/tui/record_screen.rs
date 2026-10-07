@@ -230,15 +230,16 @@ fn draw_form(frame: &mut Frame, area: Rect, app: &App, targets: &mut Targets) {
         app.record_focus == RecordField::Cwd,
     );
     targets.click(rows[2], Click::Field(Field::Record(RecordField::Cwd)));
+    // [決定68(2)] パス2はドメインを選ばない——始める場所（入口のドメイン）を**編集できない1行**で見せる（押せる場所にしない）。
+    // 文言は CLI と同じ関数が持つ（規則5）。
     if app.pass == Pass::Two {
-        draw_input(
-            frame,
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                crate::record_net::pass2_start_line(),
+                Style::default().fg(Color::Gray),
+            ))),
             rows[3],
-            "ドメイン",
-            &app.run_domain,
-            app.record_focus == RecordField::Domain,
         );
-        targets.click(rows[3], Click::Field(Field::Record(RecordField::Domain)));
     }
 
     if let Some(run) = app.run.as_ref() {

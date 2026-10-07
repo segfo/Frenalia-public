@@ -1,11 +1,13 @@
 //! **パス2**（Tier2aでのドメイン記録）のオーケストレーション。
 //!
 //! ```text
-//!   排他を取る ── 記録セッションのdirを作る ── policy.jsonの穴を FsPassthrough へ
+//!   policy.jsonを読む ─ 排他を取る ─ 記録のdir＋空のspawn-audit.jsonl ─ 入口＋遷移先の穴を FsPassthrough へ
 //!        │                                                  │
-//!        │                              WFPパイプを用意 → select_tier（＝preflightがACE付与）
+//!        │        生成禁止を宣言 → WFPパイプを用意 → select_tier（＝preflightがACE付与）
 //!        │                                                  │
 //!        │                        付与できた穴を台帳へ／付与できなかった穴を表示
+//!        │                                                  │
+//!        │   遷移先のドメインを用意 → Spawn Daemonを生成禁止つきで起こし直す（決定68）
 //!        │                                                  │
 //!        │    Proxy＋Fake DNSを起こす（記録: record_all／強制: 宣言したallow_domainsだけ）
 //!        │                                                  │
@@ -66,7 +68,7 @@ use crate::child_run::{pump_child, ChildRunSink};
 pub use crate::child_run::AbortReason;
 use crate::net_aggregate::NetAggregate;
 
-use crate::policy_file::PolicyDomain;
+use crate::policy_file::ENTRY_DOMAIN;
 pub use crate::session_dir::NetMode;
 use crate::session_dir::{now_unix_ms, RecordManifest, RecordSessionDir, RecordStatus};
 use crate::session_lock::{LockOutcome, RecordingLock};
@@ -84,9 +86,10 @@ mod lines;
 pub use hosts::{SharedNetfilter, SharedSpawnDaemon};
 pub use session_grants::SessionGrants;
 pub use lines::{
-    elevation_notice, net_mode_note, proxy_started_line, render_fs_denials, wfp_enforced_line,
+    domains_provisioned_line, elevation_notice, net_mode_note, pass2_start_line, proxy_started_line,
+    render_fs_denials, wfp_enforced_line,
 };
-use run::{run_pass2, Pass2Facts};
+use run::{run_pass2, Pass2Facts, Pass2Plan};
 
 /// パス2の中継プロキシと名前解決（Fake DNS）へ渡す、通信の扱い（決定64）。
 ///
@@ -137,9 +140,9 @@ pub const NET_DRAIN: Duration = Duration::from_millis(500);
 /// 撤収待ちの間、監査ログを読み続ける間隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// パス2の要求。[決定68(2)] **ドメインを持たない**——パス2は常に入口のドメイン（[`ENTRY_DOMAIN`]）から始め、
+/// 宣言は[`record_net`]が`policy.json`から1回だけ読む（付与・遷移先の用意・Daemon の判定が同じ値を使う、`B-13`）。
 pub struct RecordNetRequest<'a> {
-    /// 承認済みのドメイン（`policy.json`から読んだもの）。
-    pub domain: &'a PolicyDomain,
     /// Tier2aで走らせるコマンド。
     pub command: &'a str,
     pub cwd: &'a Path,
@@ -158,7 +161,8 @@ pub struct RecordNetRequest<'a> {
     /// Tier2aなのでpackage SIDが効く——`record_all=true`のときにprobeを使えなかった制約
     /// （`LearnPolicy.record_all`のdoc）はここでは当てはまらない。
     pub collector: &'a crate::record::SharedCollector,
-    /// このpolicy editor processが共有するSpawn Daemon。最初のパス2でだけ遅延起動する。
+    /// このpolicy editor processが共有するSpawn Daemonの持ち主。[決定68 の前例の(3)] **パス2のたびに起こし直す**
+    /// （その回の宣言・遷移先の表・記録の名前を Hello で渡す）。
     pub spawn_daemon: &'a SharedSpawnDaemon,
     /// [決定64] 通信をどう扱うか（記録＝全部許して記録／強制＝宣言どおり）。
     pub net_mode: NetMode,
@@ -200,6 +204,12 @@ pub enum NetRecordEvent {
     },
     /// Tier2aへ着地した。
     Tier2aReady,
+    /// [決定68(1)] 遷移先のドメインを用意した（`harness.exe --enforce-transitions`と同じ手順）。`provisioned`は用意できた
+    /// ドメインの名前、`skipped`は用意できなかった数（理由は1件ずつ`Warning`で出る）。文言は[`domains_provisioned_line`]。
+    DomainsProvisioned {
+        provisioned: Vec<String>,
+        skipped: usize,
+    },
     /// **子を起こす前に測った**「コマンドの実行ファイルへ届くか」（[`crate::exec_reach`]）。
     ///
     /// 届かないと分かっていても**止めない**（判定は`which`の解決に依存し外れ得る）。
@@ -285,6 +295,16 @@ pub struct RecordNetOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RecordNetError {
+    /// [決定68] 宣言を読めない（排他も記録の置き場も取る前に断る＝マシンに何も残さない）。
+    #[error("policy.jsonを読めないのでパス2を始めません: {0}")]
+    Policy(String),
+    /// [決定68(1)] 生成禁止を宣言しても、このプロセスの姿勢が生成禁止にならなかった（先に別の姿勢が宣言されていた）。
+    /// 強制しないまま走らせると本番の`--enforce-transitions`と違う形の確認になるので、黙って走らせない（`B-10`）。
+    #[error(
+        "このプロセスでは生成禁止を積めませんでした（先に別の姿勢が宣言されています）。パス2は本番\
+         （harness.exe で遷移を強制したとき）と同じ形でしか走らせません（決定68）"
+    )]
+    NotRestricted,
     #[error("{0}")]
     AlreadyRecording(String),
     #[error("記録セッションの排他を確認できませんでした: {0}")]
@@ -330,6 +350,8 @@ impl RecordNetError {
     /// （タグの付け忘れを実行時ではなくコンパイル時に捕まえる）。
     pub fn kind(&self) -> &'static str {
         match self {
+            RecordNetError::Policy(_) => "policy",
+            RecordNetError::NotRestricted => "not_restricted",
             RecordNetError::AlreadyRecording(_) => "already_recording",
             RecordNetError::Lock(_) => "lock",
             RecordNetError::SessionDir { .. } => "session_dir",
@@ -351,8 +373,11 @@ pub fn record_net(
     request: &RecordNetRequest<'_>,
     on_event: &mut dyn FnMut(NetRecordEvent),
 ) -> Result<RecordNetOutcome, RecordNetError> {
-    // **排他も記録の置き場も取る前に**組み立てる。宣言を解釈できなければ、マシンに何も残さずに断る。
-    let net_plan = net_policy_plan(request.net_mode, &request.domain.net.allow_domains)
+    // **排他も記録の置き場も取る前に**読んで組み立てる。宣言を読めない・解釈できなければ、マシンに何も残さずに断る。
+    // [決定68] 宣言はここで1回だけ読み、付与・遷移先の用意・Daemon の判定が同じ値を使う（`B-13`）。
+    let policy =
+        crate::policy_file::load(request.workspace_root).map_err(|e| RecordNetError::Policy(e.to_string()))?;
+    let net_plan = net_policy_plan(request.net_mode, entry_net_declarations(&policy))
         .map_err(RecordNetError::InvalidNetDeclaration)?;
     let (lock, lock_outcome) = RecordingLock::try_acquire().map_err(RecordNetError::Lock)?;
     if !lock_outcome.can_proceed() {
@@ -384,15 +409,16 @@ pub fn record_net(
         now_unix_ms(),
     );
     manifest.pass = 2;
-    manifest.domain = Some(request.domain.name.clone());
+    // [決定68(2)] パス2は常に入口から始める（マニフェストにもそう書く）。
+    manifest.domain = Some(ENTRY_DOMAIN.to_string());
     manifest.net_mode = Some(request.net_mode);
     // **この記録を走らせた時点の宣言**を残す（`RecordManifest::declared_fs`のdoc）。
     // 後から`policy.json`を読み直す形にすると、承認して1周した後に古い記録を開いたときに
-    // 当時は成立していなかった診断が出る。
-    manifest.declared_fs = request
-        .domain
-        .fs
-        .entries()
+    // 当時は成立していなかった診断が出る。**限界**: 載るのは入口の宣言だけで、遷移先の宣言は載らない。
+    manifest.declared_fs = policy
+        .domain(ENTRY_DOMAIN)
+        .map(|entry| entry.fs.entries())
+        .unwrap_or_default()
         .into_iter()
         .map(|(value, access)| crate::session_dir::DeclaredFsRule {
             value: value.to_string(),
@@ -407,14 +433,30 @@ pub fn record_net(
     }
 
     let mut warnings: Vec<String> = Vec::new();
+    // [決定68 の前例の(2)] 許可した生成の記録を**Daemon より先に空で作る**（Daemon は在るファイルにしか追記しない）。
+    // 作れなければ名前を渡さない——拒否はどのドメインにも引けない側へ倒れる（候補は件数だけになる）。
+    let spawn_audit_record = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.spawn_audit_path())
+    {
+        Ok(_) => Some(dir.name()),
+        Err(e) => {
+            let message = format!(
+                "許可した生成の記録（{}）を作れませんでした: {e}。この記録の拒否はどのドメインにも振り分けられません",
+                dir.spawn_audit_path().display()
+            );
+            warn(message, &mut warnings, on_event);
+            None
+        }
+    };
     // 強制で通信先を1件も宣言していなければ、名前解決も接続も全部断られる。止めはしない
     // （「このコマンドは通信しない」を確かめる使い方は正当）が、黙って走らせない（B-10）。
     if request.net_mode == NetMode::Declared && net_plan.allow_domains.is_empty() {
         warn(
             format!(
-                "強制モードですが、ドメイン `{}` は通信先を1件も宣言していません。\
-                 この実行では名前解決と接続がすべて断られます（断られた宛先は候補に出ます）。",
-                request.domain.name
+                "強制モードですが、入口のドメイン `{ENTRY_DOMAIN}` は通信先を1件も宣言していません。\
+                 この実行では名前解決と接続がすべて断られます（断られた宛先は候補に出ます）。"
             ),
             &mut warnings,
             on_event,
@@ -426,9 +468,14 @@ pub fn record_net(
     // `finish_failed`を通すのはそのため（`?`で素通しにしない）。
     let mut state = TeardownState::default();
 
+    let plan = Pass2Plan {
+        policy: &policy,
+        net: &net_plan,
+        spawn_audit_record,
+    };
     let result = run_pass2(
         request,
-        &net_plan,
+        &plan,
         &dir,
         &mut warnings,
         &mut facts,
@@ -566,6 +613,14 @@ fn teardown(state: &mut TeardownState<'_>, on_event: &mut dyn FnMut(NetRecordEve
     // ものだけなので、付け直す対象にならない。
 }
 
+/// [決定68(2)] 通信の宣言は**入口のドメインのものだけ**（ドメインごとの出口は P7）。入口が無ければ空——強制では全部断る。
+fn entry_net_declarations(policy: &crate::PolicyFile) -> &[String] {
+    policy
+        .domain(ENTRY_DOMAIN)
+        .map(|entry| entry.net.allow_domains.as_slice())
+        .unwrap_or(&[])
+}
+
 /// 伝える価値のある事実を、**その場で見せる**と同時に**マニフェストへも残す**。
 fn warn(message: String, warnings: &mut Vec<String>, on_event: &mut dyn FnMut(NetRecordEvent)) {
     on_event(NetRecordEvent::Warning(message.clone()));
@@ -584,6 +639,10 @@ mod error_kind_tests {
     #[test]
     fn every_failure_gets_its_own_label() {
         let all = [
+            RecordNetError::Policy("x".into()),
+            RecordNetError::NotRestricted,
+            RecordNetError::SpawnDaemon("x".into()),
+            RecordNetError::InvalidNetDeclaration("x".into()),
             RecordNetError::AlreadyRecording("x".into()),
             RecordNetError::Lock("x".into()),
             RecordNetError::SessionDir {

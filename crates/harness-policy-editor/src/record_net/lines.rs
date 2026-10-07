@@ -104,3 +104,31 @@ pub fn proxy_started_line(addr: std::net::SocketAddr, mode: NetMode, allowed: us
         ),
     }
 }
+
+/// [決定68(2)] パス2が子を起こす場所の1行（CLIの「始める場所:」と記録画面の編集できない行が共有する）。
+/// パス2は常に入口のドメインから始める——`harness.exe`の子が必ず入口で始まるので、それ以外の始め方は確認にならない。
+pub fn pass2_start_line() -> String {
+    format!(
+        "始める場所: {}（入口のドメイン）",
+        crate::policy_file::ENTRY_DOMAIN
+    )
+}
+
+/// [決定68(1)] 遷移先のドメインを用意した結果の1行（[`NetRecordEvent::DomainsProvisioned`]。CLIと画面が共有する）。
+/// 用意できなかったものは**数を必ず出す**（`B-10`）——理由はドメインごとの警告が持ち、そこへの遷移は Daemon が断る。
+pub fn domains_provisioned_line(provisioned: &[String], skipped: usize) -> String {
+    let made = if provisioned.is_empty() {
+        "用意した遷移先のドメインはありません".to_string()
+    } else {
+        format!(
+            "遷移先のドメインを{}つ用意しました: {}",
+            provisioned.len(),
+            provisioned.join(", ")
+        )
+    };
+    if skipped == 0 {
+        made
+    } else {
+        format!("{made}（ほかに{skipped}つは用意できなかった——理由は警告を見てください。そこへの遷移は断られます）")
+    }
+}

@@ -331,9 +331,10 @@ pub(super) fn run_approve(
         "書きました: {}",
         harness_policy_editor::policy_file::path(&workspace_root).display()
     );
+    // [決定68(2)] パス2は`--domain`を取らない（常に入口のドメインから始め、遷移を強制する）。
     println!(
-        "次: harness-policy-editor record-net --domain {domain}\n\
-         （Tier2aで実行し、接続したドメインを記録します。ここで初めてACEが付きます）"
+        "次: harness-policy-editor record-net -- <コマンド>\n\
+         （入口のドメインから遷移を強制してTier2aで実行し、接続したドメインを記録します。ここで初めてACEが付きます）"
     );
     ExitCode::SUCCESS
 }

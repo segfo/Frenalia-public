@@ -134,6 +134,88 @@ fn three_domains(ws: &Path) -> PositionRequest<'_> {
     )
 }
 
+/// [決定68 の前例の(12)] **記録したコマンドと作業ディレクトリ（`commands`・`cwd`）は入口のドメインにだけ書く**
+/// （パス2は常に入口から始め、`record-net`はコマンドを省くと入口の`commands`を使う）。ファイルの宣言を書く他の
+/// ドメインには書かない（禁止側）。入口には書く（許可側）——入口のファイルの宣言を選んでいない回でも、入口が確定の後に
+/// 在れば由来として足す。P4 #44（「ファイルの宣言を書く全部のドメインへ」）を改めた。
+#[test]
+fn commands_and_cwd_are_written_only_to_the_entry_domain() {
+    // 入口のファイルの宣言を選んだ回（3つのドメインに書く）。
+    let ws = workspace();
+    let ok = plan(&three_domains(ws.path())).expect("書ける");
+    let entry = ok.file.domain(ENTRY_DOMAIN).expect("入口");
+    assert_eq!(entry.commands, vec!["cmd /c pwsh".to_string()]);
+    assert_eq!(entry.cwd.as_deref(), Some(ws.path()));
+    for name in ["pwsh", "calc"] {
+        let domain = ok.file.domain(name).expect("遷移先");
+        assert!(
+            domain.commands.is_empty(),
+            "{name} にコマンドを書いた: {:?}",
+            domain.commands
+        );
+        assert!(domain.cwd.is_none(), "{name} に作業ディレクトリを書いた");
+    }
+
+    // 入口のファイルの宣言を選んでいない回: 入口は辺の遷移元として確定の後に在るので、由来として足す。
+    let ws = workspace();
+    let ok = plan(&request(
+        ws.path(),
+        vec![select(
+            "calc",
+            vec![proposal("fs-3", SettingsKey::FsRead, "C:/Users/x/c.txt")],
+        )],
+        vec![edge(ENTRY_DOMAIN, CALC, "calc")],
+    ))
+    .expect("書ける");
+    let entry = ok.file.domain(ENTRY_DOMAIN).expect("入口は辺の遷移元として在る");
+    assert_eq!(entry.commands, vec!["cmd /c pwsh".to_string()]);
+    assert!(ok.file.domain("calc").expect("calc").commands.is_empty());
+}
+
+/// [決定68 の前例の(12)] **入口を`commands`のためだけに作らない。** 確定の後の`policy.json`に入口が無ければ（入口の
+/// ファイルの宣言も入口からの辺も無い回）、コマンドはどこにも書かない（入口へ書くと、権限の無い入口のドメインが
+/// 由来だけのために生まれる）。対の側: 入口が元から在れば足す（上の試験の2つ目の回と同じ向き）。
+#[test]
+fn the_entry_is_not_created_just_to_hold_the_command() {
+    let fs = || {
+        vec![select(
+            "pwsh",
+            vec![proposal("fs-2", SettingsKey::FsRead, "C:/Users/x/p.txt")],
+        )]
+    };
+
+    // 禁止側: 入口が無い。`pwsh`は元から在る（届く辺が無くても元から在るドメインには書ける）。
+    let ws = workspace();
+    seed(ws.path(), vec![domain_reading("pwsh", "C:/Users/x/old.txt")]);
+    let ok = plan(&request(ws.path(), fs(), Vec::new())).expect("書ける");
+    assert!(
+        ok.file.domain(ENTRY_DOMAIN).is_none(),
+        "コマンドのためだけに入口を作った: {:?}",
+        ok.file.domain(ENTRY_DOMAIN)
+    );
+    assert!(ok.file.domain("pwsh").expect("pwsh").commands.is_empty());
+    assert!(
+        !ok.created_domains.iter().any(|d| d == ENTRY_DOMAIN),
+        "{:?}",
+        ok.created_domains
+    );
+
+    // 許可側: 入口が元から在れば、そのファイルの宣言を選んでいなくても由来として足す。
+    let ws = workspace();
+    seed(
+        ws.path(),
+        vec![
+            domain_reading("pwsh", "C:/Users/x/old.txt"),
+            PolicyDomain::new(ENTRY_DOMAIN),
+        ],
+    );
+    let ok = plan(&request(ws.path(), fs(), Vec::new())).expect("書ける");
+    assert_eq!(
+        ok.file.domain(ENTRY_DOMAIN).expect("入口").commands,
+        vec!["cmd /c pwsh".to_string()]
+    );
+}
+
 /// **広がる辺も書ける**（決定66。守る線は子のドメインの権限）。書ける辺・ファイルの宣言と一緒に1回で書き、確認の明細に
 /// 「広がる遷移N本」と、その辺で呼び出し元が子を通して使えるようになる権限が出る（狭める辺は出ない）。
 ///

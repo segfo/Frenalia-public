@@ -422,7 +422,7 @@ impl App {
     fn focus_field(&mut self, field: Field) {
         match field {
             Field::Record(target) => {
-                // 記録画面の`Tab`は欄を巡回するだけ。描いた欄はどれも巡回に入っている（ドメイン欄はパス2でだけ描く）。
+                // 記録画面の`Tab`は欄を巡回するだけ。描いた欄はどれも巡回に入っている（パス2の始める場所の行は押せない）。
                 for _ in 0..4 {
                     if self.record_focus == target {
                         return;

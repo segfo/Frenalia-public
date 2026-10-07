@@ -333,18 +333,18 @@ impl App {
         };
         self.pass = Pass::Two;
         self.net_mode = next_mode;
-        self.run_domain.set_text(domain.clone());
+        // [決定68(2)] 書いたドメインを記録画面へ引き継がない——パス2は常に入口から始める。
         self.command.set_text(command);
         self.cwd.set_text(cwd.display().to_string());
         self.screen = Screen::Record;
         self.record_focus = RecordField::Command;
         self.status = match next_mode {
             NetMode::RecordAll => format!(
-                "書きました: {written}{unapproved_note}。次はパス2（ドメイン {domain}）——\
+                "書きました: {written}{unapproved_note}。次はパス2——\
                  **ここで初めてACEが付きます**。Enterで開始"
             ),
             NetMode::Declared => format!(
-                "書きました: {written}{unapproved_note}。次はパス2の強制（ドメイン {domain}）——\
+                "書きました: {written}{unapproved_note}。次はパス2の強制——\
                  宣言した通信先だけを許して走らせ、断られる宛先が無いかを確かめます。Enterで開始"
             ),
         };

@@ -46,22 +46,23 @@ fn editor_exe() -> &'static str {
 /// 記録対象にするドメイン。外部への到達性が要るので、安定していて用途上問題の無いものを使う。
 const TARGET_DOMAIN: &str = "example.com";
 
-fn write_policy(workspace_root: &Path, domain: &str, command: &str) {
+/// [決定68(2)] 宣言は**入口のドメイン**（`workspace-shell`）に置く——パス2は常に入口から始め、通信の宣言も入口のものを使う。
+/// **P6.8 で撃ち直すときの注意**: パス2は生成禁止を積むので、シェルが起こす子（`curl.exe`等）は入口の辺に当たらないと
+/// 断られる（このファイルの`policy.json`はまだ辺を持たない）。意味の書き換えは P6.8。
+fn write_policy(workspace_root: &Path, command: &str) {
     // **1つも宣言しない。** それでも到達できることがrecord_allの効き目の証明になる。
-    write_policy_declaring(workspace_root, domain, command, &[]);
+    write_policy_declaring(workspace_root, command, &[]);
 }
 
+/// 入口のドメインの名前（`harness_policy::policy_file::ENTRY_DOMAIN`）。
+const ENTRY: &str = harness_policy_editor::policy_file::ENTRY_DOMAIN;
+
 /// [`write_policy`]の、通信先を宣言する版（強制モードの試験が使う）。
-fn write_policy_declaring(
-    workspace_root: &Path,
-    domain: &str,
-    command: &str,
-    allow_domains: &[&str],
-) {
+fn write_policy_declaring(workspace_root: &Path, command: &str, allow_domains: &[&str]) {
     let policy = serde_json::json!({
         "schema_version": 1,
         "domains": [{
-            "name": domain,
+            "name": ENTRY,
             "commands": [command],
             "cwd": workspace_root,
             // 意図的に空（モジュールdocの「触らないもの」参照）。
@@ -79,23 +80,17 @@ fn write_policy_declaring(
     .unwrap();
 }
 
-fn run_record_net(workspace_root: &Path, domain: &str, command: &str) -> std::process::Output {
-    run_record_net_with(workspace_root, domain, command, &[])
+fn run_record_net(workspace_root: &Path, command: &str) -> std::process::Output {
+    run_record_net_with(workspace_root, command, &[])
 }
 
 /// [`run_record_net`]に`record-net`のフラグ（`--enforce-net`等）を足して走らせる版。
-fn run_record_net_with(
-    workspace_root: &Path,
-    domain: &str,
-    command: &str,
-    flags: &[&str],
-) -> std::process::Output {
+/// [決定68(2)] `--domain`は無い（パス2は常に入口から始める）。
+fn run_record_net_with(workspace_root: &Path, command: &str, flags: &[&str]) -> std::process::Output {
     Command::new(editor_exe())
         .arg("record-net")
         .args(flags)
         .args([
-            "--domain",
-            domain,
             "--workspace",
             &workspace_root.to_string_lossy(),
             "--cwd",
@@ -277,9 +272,9 @@ fn pass2_records_the_domain_a_command_reached_without_declaring_any_allowlist() 
     let workspace_root = workspace.path();
     // Windows標準の`curl.exe`はプロキシ環境変数を読む（AppContainerからも起動できる）。
     let command = format!("curl.exe -sS -o NUL -w '%{{http_code}}' https://{TARGET_DOMAIN}/");
-    write_policy(workspace_root, "e2e", &command);
+    write_policy(workspace_root, &command);
 
-    let output = run_record_net(workspace_root, "e2e", &command);
+    let output = run_record_net(workspace_root, &command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
@@ -319,7 +314,8 @@ fn pass2_records_the_domain_a_command_reached_without_declaring_any_allowlist() 
     let manifest = manifest_of_latest_session(workspace_root);
     assert_eq!(manifest["pass"], 2, "manifest: {manifest}");
     assert_eq!(manifest["status"], "finished", "manifest: {manifest}");
-    assert_eq!(manifest["domain"], "e2e", "manifest: {manifest}");
+    // [決定68(2)] パス2は入口から始めたとマニフェストに書く。
+    assert_eq!(manifest["domain"], ENTRY, "manifest: {manifest}");
     assert_eq!(
         manifest["exit_code"], 0,
         "the command must have succeeded (a non-zero exit means the recording is incomplete): {manifest}"
@@ -347,9 +343,9 @@ fn enforcing_pass2_allows_only_the_declared_domain_and_proposes_the_refused_one(
         "curl.exe -sS -o NUL -w '%{{http_code}}' https://{TARGET_DOMAIN}/; \
          curl.exe -sS -o NUL -w '%{{http_code}}' https://{UNDECLARED}/"
     );
-    write_policy_declaring(workspace_root, "e2e-enforce", &command, &[TARGET_DOMAIN]);
+    write_policy_declaring(workspace_root, &command, &[TARGET_DOMAIN]);
 
-    let output = run_record_net_with(workspace_root, "e2e-enforce", &command, &["--enforce-net"]);
+    let output = run_record_net_with(workspace_root, &command, &["--enforce-net"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
@@ -442,9 +438,9 @@ fn a_raw_socket_that_bypasses_the_proxy_is_dropped_by_wfp() {
                    $c.Connect('93.184.215.14', 443); \
                    Write-Output 'RAW-SOCKET-CONNECTED'; exit 9 } \
                    catch { Write-Output 'RAW-SOCKET-BLOCKED'; exit 0 }";
-    write_policy(workspace_root, "e2e-raw", command);
+    write_policy(workspace_root, command);
 
-    let output = run_record_net(workspace_root, "e2e-raw", command);
+    let output = run_record_net(workspace_root, command);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprintln!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
@@ -508,7 +504,7 @@ fn a_second_pass2_in_the_same_process_reuses_the_daemon_and_still_enforces() {
                  $c.Connect('93.184.215.14', 443); \
                  Write-Output 'RAW-SOCKET-CONNECTED'; exit 9 } \
                  catch { Write-Output 'RAW-SOCKET-BLOCKED'; exit 0 }";
-    write_policy(workspace_root, "e2e-reuse", &reach);
+    write_policy(workspace_root, &reach);
 
     // **宣言順が撤収順を決める**（D-56）。`SessionGrants`より後に`SharedNetfilter`を作ることで、
     // netfilterdの`Teardown`がAppContainerプロファイルの削除より先に走る。
@@ -519,18 +515,12 @@ fn a_second_pass2_in_the_same_process_reuses_the_daemon_and_still_enforces() {
     let collector = harness_policy_editor::record::SharedCollector::hold();
     let spawn_daemon = harness_policy_editor::record_net::SharedSpawnDaemon::hold();
 
-    let policy =
-        harness_policy_editor::policy_file::load(workspace_root).expect("load policy.json");
-    let domain = policy
-        .domain("e2e-reuse")
-        .expect("domain e2e-reuse")
-        .clone();
     let never_cancel = || false;
 
     // 1回の実行を回して「WFPが立ったか・再利用だったか」と標準出力を集める小さなヘルパー。
     let run = |command: &str| -> (Option<bool>, String) {
+        // [決定68(2)] 要求はドメインを持たない（`record_net`が`policy.json`を読み、入口から始める）。
         let request = RecordNetRequest {
-            domain: &domain,
             command,
             cwd: workspace_root,
             workspace_root,
@@ -653,10 +643,10 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
         "precondition: a freshly copied probe must not carry any package SID ACE: {baseline}"
     );
 
-    write_policy(workspace_root, "e2e-exec", &command);
+    write_policy(workspace_root, &command);
 
     // --- 1回目: 宣言が無いので起動できない。診断が名指しし、候補として出る -----------
-    let first = run_record_net(workspace_root, "e2e-exec", &command);
+    let first = run_record_net(workspace_root, &command);
     let first_stdout = String::from_utf8_lossy(&first.stdout).to_string();
     let first_stderr = String::from_utf8_lossy(&first.stderr).to_string();
     eprintln!("--- 1st stdout ---\n{first_stdout}\n--- 1st stderr ---\n{first_stderr}");
@@ -703,7 +693,7 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
             "--workspace",
             &workspace_root.to_string_lossy(),
             "--domain",
-            "e2e-exec",
+            ENTRY,
             "--accept",
             &id,
             "--yes",
@@ -723,7 +713,7 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
         "the approved value must land in policy.json: {policy}"
     );
 
-    let second = run_record_net(workspace_root, "e2e-exec", &command);
+    let second = run_record_net(workspace_root, &command);
     let second_stdout = String::from_utf8_lossy(&second.stdout).to_string();
     let second_stderr = String::from_utf8_lossy(&second.stderr).to_string();
     eprintln!("--- 2nd stdout ---\n{second_stdout}\n--- 2nd stderr ---\n{second_stderr}");
@@ -759,7 +749,7 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
             "--workspace",
             &workspace_root.to_string_lossy(),
             "--domain",
-            "e2e-exec",
+            ENTRY,
             "--all",
             "--yes",
         ])
@@ -780,7 +770,7 @@ fn an_executable_that_cannot_be_started_becomes_a_read_exec_candidate_and_then_r
          policy.json, otherwise nothing is expected to be revoked: {policy_after_unapprove}"
     );
 
-    let third = run_record_net(workspace_root, "e2e-exec", &command);
+    let third = run_record_net(workspace_root, &command);
     eprintln!(
         "--- 3rd stderr ---\n{}",
         String::from_utf8_lossy(&third.stderr)
@@ -892,9 +882,8 @@ fn the_hand_written_spawn_request_still_parses() {
 /// # [段階6b] この1本が、遷移元ドメインの配線まで測っている
 ///
 /// `unknown_source_domain`ではなく`no_matching_edge`が返ることは、
-/// **Daemonがこの子の遷移元を「記録中のドメイン」として引けている**ことを意味する。
-/// パス2が`run_shell`と同じ入口ドメインの固定名を渡してしまうと、そのドメインは
-/// `policy.json`に無いので`unknown_source_domain`になり、ここが赤くなる。
+/// **Daemonがこの子の遷移元を入口のドメイン（`workspace-shell`）として引けている**ことを意味する
+/// （決定68(2)。以前は「記録中のドメイン」だった。宣言を入口へ置いたので、入口の名前が`policy.json`に在る）。
 ///
 /// # 対の相手
 ///
@@ -917,9 +906,9 @@ fn the_hand_written_spawn_request_still_parses() {
 fn pass2_reaches_the_request_pipe_and_is_denied_by_policy_not_by_the_table() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let workspace_root = workspace.path();
-    write_policy(workspace_root, "e2e-spawn-reach", SPAWN_REQUEST_ROUNDTRIP);
+    write_policy(workspace_root, SPAWN_REQUEST_ROUNDTRIP);
 
-    let output = run_record_net(workspace_root, "e2e-spawn-reach", SPAWN_REQUEST_ROUNDTRIP);
+    let output = run_record_net(workspace_root, SPAWN_REQUEST_ROUNDTRIP);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     eprintln!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
@@ -946,8 +935,8 @@ fn pass2_reaches_the_request_pipe_and_is_denied_by_policy_not_by_the_table() {
     assert!(
         stdout.contains("no_matching_edge"),
         "パス2の子が要求受付パイプで `no_matching_edge` を受け取れていない。\
-         `unknown_source_domain` なら遷移元ドメインの配線が違う（パス2は記録中のドメイン名を\
-         渡すはずで、入口ドメインの固定名を渡していると`policy.json`に無いのでこうなる）、\
+         `unknown_source_domain` なら遷移元ドメインの配線が違う（パス2は入口のドメインの固定名を\
+         渡すはずで、それ以外の名前を渡していると`policy.json`に無いのでこうなる。決定68）、\
          `not_registered` なら Process Table への登録が Resume より前に効いていない（BUG-116の形）、\
          `CONNECT_FAILED` なら spawn要求用capability を積んでいない: {stdout}"
     );

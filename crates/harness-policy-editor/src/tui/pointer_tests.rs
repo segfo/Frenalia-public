@@ -35,7 +35,7 @@ fn snapshot(app: &App) -> String {
     let text = format!(
         "screen={:?} tab={:?} help={} status={}\n\
          modal={:?}\n\
-         record: focus={:?} pass={:?} net={:?} command={} cwd={} domain={} running={}\n\
+         record: focus={:?} pass={:?} net={:?} command={} cwd={} running={}\n\
          edit: focus={:?} session={} row={} accepted={:?} expanded={} recursive={} hand={:?} \
          filter={:?} tree={} domain={} unapproved={:?}\n\
          pending: denied={} approve={:?} narrow={:?} remove={:?} dismiss={:?} \
@@ -52,7 +52,6 @@ fn snapshot(app: &App) -> String {
         app.net_mode,
         app.command.text(),
         app.cwd.text(),
-        app.run_domain.text(),
         app.run.is_some(),
         app.edit_focus,
         app.selected_session,

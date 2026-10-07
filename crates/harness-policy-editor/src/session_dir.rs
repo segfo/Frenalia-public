@@ -323,6 +323,18 @@ impl RecordSessionDir {
         &self.path
     }
 
+    /// ディレクトリ名そのもの（`policy-editor-<id>`）。[決定68 の前例の(2)] パス2はこれを Hello で Spawn Daemon へ渡し、
+    /// Daemon は`workspace_root`から置き場を組み立てる（パスは渡さない）。
+    pub fn name(&self) -> String {
+        format!("{RECORD_DIR_PREFIX}{}", self.id)
+    }
+
+    /// Spawn Daemon が書く**許可した生成の記録**（パス2。決定68）。**エディタが先に空で作る**——Daemon は在るファイルにしか
+    /// 追記しない（`harness_sandbox`の`spawnd::spawn_audit`のモジュールdoc）。
+    pub fn spawn_audit_path(&self) -> PathBuf {
+        self.path.join(harness_policy::spawn_audit::SPAWN_AUDIT_FILE)
+    }
+
     pub fn audit_log_path(&self) -> PathBuf {
         self.path.join(AUDIT_LOG_FILE_NAME)
     }
@@ -765,6 +777,38 @@ mod tests {
         // 空＝「合流するものが無い」であって、読めないことではない。
         assert!(manifest.unreachable_exec.is_none());
         assert!(manifest.declared_fs.is_empty());
+    }
+
+    /// [決定68 の前例の(2)] **Hello で Spawn Daemon へ渡す記録の名前は、記録のディレクトリ名そのもの**で、Daemon が
+    /// `workspace_root`から組み立てる置き場（`<workspace_root>\.harness\sandbox\<名前>\spawn-audit.jsonl`）が、
+    /// エディタが先に作るファイルと同じ場所を指す。名前はパスの1要素（区切り・`:`・先頭の`.`を含まない）——
+    /// Daemon はそうでない名前を断る（`spawnd::spawn_audit::record_dir_name_problem`）。
+    #[test]
+    fn the_record_name_is_the_directory_name_and_the_spawn_audit_lives_inside() {
+        let ws = workspace();
+        let dir = RecordSessionDir::create(ws.path(), "tok-3").expect("create");
+
+        assert_eq!(
+            dir.path().file_name().and_then(|n| n.to_str()),
+            Some(dir.name().as_str()),
+            "名前がディレクトリ名と違う"
+        );
+        assert_eq!(dir.name(), format!("{RECORD_DIR_PREFIX}tok-3"));
+        assert!(
+            !dir.name().starts_with('.')
+                && !dir.name().contains(['\\', '/', ':']),
+            "Daemon が断る綴り: {}",
+            dir.name()
+        );
+        // Daemon の組み立て方（`workspace_root`＋`.harness\sandbox`＋名前＋ファイル名）で同じ場所になる。
+        let daemon_side = ws
+            .path()
+            .join(".harness")
+            .join("sandbox")
+            .join(dir.name())
+            .join(harness_policy::spawn_audit::SPAWN_AUDIT_FILE);
+        assert_eq!(dir.spawn_audit_path(), daemon_side);
+        assert_eq!(dir.spawn_audit_path().parent(), Some(dir.path()));
     }
 
     /// `open`は作らない（`show`が存在しないidを指定したときに空のディレクトリを

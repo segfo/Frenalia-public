@@ -20,7 +20,7 @@ pub(super) fn print_overview() {
     println!("  approve [--domain <name>] --accept <id>...");
     println!("                              候補を承認して .harness/policy.json へ書く");
     println!(
-        "  record-net --domain <name>  Tier2aで実行し、接続したドメインを記録する（UAC 最大2回）"
+        "  record-net [-- <コマンド>]   入口のドメインから遷移を強制してTier2aで実行し、接続したドメインを記録する（UAC 最大2回）"
     );
     println!("             [--enforce-net]  通信をpolicy.jsonのnet.allow_domainsだけに絞り、ほかは断る");
     println!("  sessions                    記録セッションの一覧");

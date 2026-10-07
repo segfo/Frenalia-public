@@ -23,7 +23,10 @@ pub struct SharedNetfilter {
     inner: std::sync::Arc<std::sync::Mutex<harness_sandbox::tier2a::netfilterd::NetfilterSession>>,
 }
 
-/// policy editorの最初のパス2で遅延起動し、TUI終了まで使い回すSpawn Daemon。
+/// policy editorのパス2が使うSpawn Daemonの持ち主（TUI・CLI・プロセス内のE2Eが同じ1つを持つ）。
+///
+/// [決定68 の前例の(3)] **パス2のたびに起こし直す**（[`Self::restart`]）。宣言と遷移先の表を Hello の後で差し替える口は
+/// 無いので、使い回すと承認した辺がそのパス2に効かない（決定68の困りごと2）。
 #[derive(Clone, Default)]
 pub struct SharedSpawnDaemon {
     inner: std::sync::Arc<
@@ -36,13 +39,22 @@ impl SharedSpawnDaemon {
         Self::default()
     }
 
-    /// [段階6b] `policy`は**呼び出し側が必ず渡す**（`SharedSpawnDaemon::start`のdoc）。
+    /// このプロセスが選んだ生成の姿勢。**エディタで姿勢を読む場所はここ1つ**——Daemon へ渡す値（[`Self::restart`]）と、
+    /// パス2が宣言の直後に確かめる値（`run::run_pass2`の`NotRestricted`）が同じこれを通る（読み口を2つにすると、いつか
+    /// 片方だけ違う値になる、`B-06`。`launch.rs`の数え上げ試験が読む場所の合計を固定している）。
+    pub(super) fn chosen_child_process_policy() -> harness_sandbox::tier2a::spawnd::ChildProcessPolicy {
+        harness_sandbox::tier2a::spawnd::child_process_policy_for_this_process()
+    }
+
+    /// [決定68 の前例の(3)] **前の Daemon を畳んでから、その回の宣言で起こし直す。** `policy`は呼び出し側が必ず渡す
+    /// （`SharedSpawnDaemon::start`のdoc）。表と宣言が変わっていなくても起こし直す——比べて使い回す経路を作ると、
+    /// 通らない経路が1本増える（`B-08`）。Daemon は昇格しないので UAC は増えない。畳むのに最長5秒待つ
+    /// （`SpawnDaemonHandle::shutdown`）。
     ///
-    /// **2本目以降のパス2では使われない。** このホストはDaemonを1本だけ起こして使い回すので、
-    /// 宣言は**最初のパス2の時点のもの**で固定される。これは
-    /// [§19.2](../../../plans/DESIGN-MAC.md)「Policy Generationはセッション内で固定する」と
-    /// 同じ向きである——**途中で`policy.json`を編集しても、そのプロセスの間は効かない。**
-    pub(super) fn ensure_started(
+    /// 姿勢は**このプロセスが選んだもの**（[`Self::chosen_child_process_policy`]。パス2は`select_tier`より前で生成禁止を
+    /// 宣言する、決定68 の前例の(15)）。**製品の既定の姿勢を直接渡さない**——渡すと、宣言したのに生成禁止の
+    /// 無い Daemon が起きる。
+    pub(super) fn restart(
         &self,
         policy: harness_sandbox::tier2a::spawnd::TransitionPolicy,
     ) -> Result<harness_sandbox::tier2a::spawnd::SharedSpawnDaemon, String> {
@@ -50,16 +62,12 @@ impl SharedSpawnDaemon {
             .inner
             .lock()
             .map_err(|_| "Spawn Daemon holder mutex was poisoned".to_string())?;
-        if let Some(daemon) = slot.as_ref() {
-            return Ok(daemon.clone());
+        if let Some(previous) = slot.take() {
+            previous.shutdown();
         }
-        // [段階⑤] 製品の既定は「生成禁止を積まない」（harness本体側と同じ理由。
-        // `ChildProcessPolicy`のdoc）。**ホストが2つあるので両方に同じ姿勢を渡す**——
-        // 片方だけへ配線すると、もう片方だけが別の世界で動く（`B-06`）。
-        // [残課題#50] **値そのものはここに書かない**（`PRODUCT_DEFAULT`のdoc）。
         let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
             policy,
-            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::PRODUCT_DEFAULT,
+            Self::chosen_child_process_policy(),
         )
         .map_err(|error| error.to_string())?;
         *slot = Some(daemon.clone());

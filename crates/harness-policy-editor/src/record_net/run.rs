@@ -3,6 +3,7 @@
 
 use super::*;
 use super::session_grants::{file_declared_roots, reconcile_undeclared_roots};
+use harness_sandbox::tier2a::policy_fs::{DomainFsGrants, PolicyFsPlan};
 
 pub(super) struct Pass2Inner {
     pub(super) exit_code: Option<i32>,
@@ -37,25 +38,82 @@ pub(super) struct Pass2Facts {
     pub(super) shell_tier: Option<String>,
 }
 
+/// [`run_pass2`]へ渡す、排他を取る前に決めたもの。
+pub(super) struct Pass2Plan<'p> {
+    /// `policy.json`（[`record_net`]が1回だけ読んだもの）。付与の一覧・遷移先の用意・Daemon の判定が同じこれを使う
+    /// （`harness.exe`が`stage_prepare_sandbox`で1回読むのと同じ形、`B-13`）。
+    pub(super) policy: &'p crate::PolicyFile,
+    /// 中継プロキシと名前解決へ渡す通信の扱い（入口のドメインの宣言から作ったもの）。
+    pub(super) net: &'p NetPolicyPlan,
+    /// [決定68 の前例の(2)] 許可した生成の記録の名前（記録のディレクトリ名）。空のファイルを作れなかった回は`None`。
+    pub(super) spawn_audit_record: Option<String>,
+}
+
 pub(super) fn run_pass2<'a>(
     request: &RecordNetRequest<'a>,
-    net_plan: &NetPolicyPlan,
+    plan: &Pass2Plan<'_>,
     dir: &RecordSessionDir,
     warnings: &mut Vec<String>,
     facts: &mut Pass2Facts,
     state: &mut TeardownState<'a>,
     on_event: &mut dyn FnMut(NetRecordEvent),
 ) -> Result<Pass2Inner, RecordNetError> {
-    let passthrough = passthrough_for_domain(request.domain, request.workspace_root, warnings, on_event);
+    let net_plan = plan.net;
+    // [決定68(1)・前例の(15)] **生成禁止をここで1回宣言する——`select_tier`（＝preflight）より前でなければならない。**
+    // preflight はこの姿勢を見て Tier2a のシェルの候補を決める（生成禁止を積むなら、呼び出し元の中から起こせる綴りしか
+    // 選べない。残課題#50・§S62）。CLI・画面・プロセス内の E2E のどれもこの関数を通るので、宣言は1か所で足りる
+    // （`harness-cli`が旗を姿勢へ変える`startup/sandbox.rs`と同じ位置づけ。`launch.rs`の数え上げ試験が2か所を固定する）。
+    harness_sandbox::tier2a::spawnd::declare_child_process_policy(
+        harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Restricted,
+    );
+    // **宣言した後で読み直して確かめる。** `OnceLock`はプロセスで1回しか書けないので、先に別の姿勢が宣言されていれば
+    // 上の宣言は効かない（2回目以降のパス2は同じ`Restricted`なので通る）。強制しないまま走らせない（`B-10`）。
+    if !SharedSpawnDaemon::chosen_child_process_policy().is_restricted() {
+        return Err(RecordNetError::NotRestricted);
+    }
+    // [決定68(2)] 付ける一覧は`harness.exe --enforce-transitions`と同じ手順（`policy_fs::plan`。強制は常に有効）で作る
+    // ——入口のドメインの宣言と、用意する遷移先のドメインの宣言。[D-112] このマシンで承認した宣言だけに付ける。
+    let approvals = crate::approval_store::approval_store().load();
+    let workspace_key =
+        harness_sandbox::tier2a::policy_approval::approval_workspace_key(request.workspace_root);
+    let fs_plan = harness_sandbox::tier2a::policy_fs::plan(
+        plan.policy,
+        &harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(request.workspace_root),
+        &|d| approvals.is_approved_for_key(&workspace_key, d),
+        /* transitions_enforced */ true,
+    );
+    // **宣言にあるのに付けない値は、理由ごと見せる**（B-10）。黙って落とすと、「承認したのに読めない」の原因が
+    // 画面のどこにも出ない。遷移先のドメインは、付けない理由があればドメインごと用意しない（`policy_fs::plan`のdoc）。
+    for skipped in &fs_plan.entry_skipped {
+        warn(
+            format!(
+                "fs宣言 {} ({}) には許可を付けません: {}",
+                skipped.value,
+                skipped.access.settings_key(),
+                skipped.reason.describe()
+            ),
+            warnings,
+            on_event,
+        );
+    }
+    for (domain, reason) in &fs_plan.not_granted_domains {
+        warn(
+            format!("遷移先のドメイン `{domain}` の宣言には許可を付けません: {reason}"),
+            warnings,
+            on_event,
+        );
+    }
+    let (passthrough, entry_len) = pass2_lists(&fs_plan);
     // **付与より先に、もう宣言されていない穴を閉じる。** 宣言を取り消しただけでは
     // このプロセスが既に開けたACEは残っており、同じプロセスで次のパス2を走らせると
     // 「取り消したのにまだ通る」ことになる（付与は`preflight`が宣言から毎回計算するので
     // 付け直しはされないが、剥がす側の経路が無かった）。
     //
-    // [BUG-184] 残す集合は**このワークスペースのファイル宣言の全部**（記録中のドメインだけではない）。
+    // [BUG-184] 残す集合は**このワークスペースのファイル宣言の全部**（付ける一覧に入ったドメインだけではない）。
     // 宣言を読めなければ取り消し自体を飛ばす——空として扱うと全部を取り消す。
-    if let Some(wanted) = file_declared_roots(request.workspace_root, warnings, on_event) {
-        reconcile_undeclared_roots(&wanted, request.workspace_root, warnings, on_event);
+    let declared_roots = file_declared_roots(request.workspace_root, warnings, on_event);
+    if let Some(wanted) = declared_roots.as_deref() {
+        reconcile_undeclared_roots(wanted, request.workspace_root, warnings, on_event);
     }
     on_event(NetRecordEvent::ElevationExpected {
         // **出ない見込みのUACを予告しない**——出なかったことが「何か起きなかった」に見える。
@@ -181,38 +239,61 @@ pub(super) fn run_pass2<'a>(
     // ここへ来た＝**実際にTier2aへ着地した**（直前の分岐が他のTierを弾いている）。
     facts.shell_tier = Some(selection.tier.label().to_string());
     on_event(NetRecordEvent::Tier2aReady);
-    // パス1では起こさない。Tier2a preflightが成功したこの地点が、最初のパス2だけの起動点。
-    //
-    // [段階6b] **遷移の宣言はここで読んでDaemonへ渡す**（`plans/DESIGN-MAC-PROTOCOL.md` §12.1）。
-    // 読めなければパス2を失敗させる——宣言を持たないDaemonを起こすと、
-    // 宣言してある遷移まで拒否される（`SharedSpawnDaemon::start`のdoc）。
-    let transition_policy = harness_sandbox::tier2a::spawnd::TransitionPolicy {
-        policy: crate::policy_file::load(request.workspace_root)
-            .map_err(|e| RecordNetError::SpawnDaemon(e.to_string()))?,
-        workspace_root: request.workspace_root.to_string_lossy().into_owned(),
-        // [残課題 サンドボックス周辺 #65] **パス2は`policy.json`の外で書込を許さない**
-        // ——`--fs-allow`も`settings.json`も読まず、付けるのは記録中のドメインの宣言だけで、
-        // それは宣言として既に検査の視野に入っている。したがって空が正しい。
-        writable_outside_policy: Vec::new(),
-        // [#55] **パス2は遷移先ドメインを用意しない。**
-        //
-        // ここが記録しているのは「このコマンドが何へ触るか」であって、
-        // **遷移の強制ではない**——パス2のドメインは`--domain`で指定された記録中のもの1つで、
-        // `policy.json`の遷移先とは由来が違う（`plans/DESIGN-MAC-PROTOCOL.md` §12.1の表）。
-        // 用意すると、記録のために起こした入れ物が記録の対象へ混ざる。
-        //
-        // **空は「用意できなかった」と同じ扱い**で、別ドメインへの遷移は断られる（fail-closed）。
-        domains: Vec::new(),
-        // [決定68] 許可した生成の記録は P6.5 で頼む（入口から走らせる段で記録の名前を渡す）。
-        spawn_audit_record: None,
-    };
-    let spawn_daemon = request
-        .spawn_daemon
-        .ensure_started(transition_policy)
-        .map_err(RecordNetError::SpawnDaemon)?;
     for warning in &selection.passthrough_warnings {
         warn(warning.clone(), warnings, on_event);
     }
+    // [決定68(1)] **付与の結果を一覧ごとに振り分ける**（`harness.exe`の`startup/sandbox.rs`と同じ形）。入口の子のトークンへは
+    // 入口の一覧の分だけ、遷移先のドメインの子へはそのドメインの分だけ——宛先SIDは宣言ごとなので、ここを誤らなければ
+    // 遷移先の宣言に ACE を書いても入口の子は広がらない。
+    let (entry_granted, domain_fs_grants) =
+        split_granted(&fs_plan, &passthrough[..entry_len], &selection.granted_passthrough);
+    // [決定68(1)] **遷移先のドメインの入れ物を、Daemon を起こす前に用意する**（`harness.exe`の`run_agent.rs`と同じ関数）。
+    // 表を持たない Daemon が要求を捌く瞬間を作らないため、宣言と同じ Hello で渡す。入れ物は`end_session`
+    // （`SessionGrants`。付与が0件でも呼ぶ、決定68 の前例の(14)）が撤収する。
+    let canonical_ws = request
+        .workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| request.workspace_root.to_path_buf());
+    let provisioned =
+        harness_sandbox::tier2a::win_appcontainer::domain_provision::provision_target_domains(
+            plan.policy,
+            &canonical_ws,
+            // **preflight が付与したのと同じ語彙**でなければ別の宛先SIDを導出し、ワークスペースが見えない子ができる。
+            WorkspaceWriteMode::DirectRw.capability_mode(),
+            &domain_fs_grants,
+        );
+    // **用意できなかったものを黙って落とさない**（`B-10`）。そこへの遷移は Daemon が断る。
+    for (domain, reason) in &provisioned.skipped {
+        warn(
+            format!("遷移先のドメイン `{domain}` は用意できませんでした（そこへの遷移は断られます）: {reason}"),
+            warnings,
+            on_event,
+        );
+    }
+    on_event(NetRecordEvent::DomainsProvisioned {
+        provisioned: provisioned
+            .domains
+            .iter()
+            .map(|domain| domain.policy_domain.clone())
+            .collect(),
+        skipped: provisioned.skipped.len(),
+    });
+    // [決定68 の前例の(3)] **Daemon はパス2のたびに起こし直す**（Hello がその回の宣言・表・記録の名前を運ぶ）。
+    let transition_policy = harness_sandbox::tier2a::spawnd::TransitionPolicy {
+        policy: plan.policy.clone(),
+        workspace_root: request.workspace_root.to_string_lossy().into_owned(),
+        // [残課題 サンドボックス周辺 #65] **パス2は`policy.json`の外で書込を許さない**
+        // ——`--fs-allow`も`settings.json`も読まず、付けるのは`policy.json`の宣言だけで、
+        // それは宣言として既に検査の視野に入っている。したがって空が正しい。
+        writable_outside_policy: Vec::new(),
+        domains: provisioned.domains,
+        // [決定68 の前例の(2)] 許可した生成の記録の名前（Daemon は`workspace_root`から置き場を組み立てる）。
+        spawn_audit_record: plan.spawn_audit_record.clone(),
+    };
+    let spawn_daemon = request
+        .spawn_daemon
+        .restart(transition_policy)
+        .map_err(RecordNetError::SpawnDaemon)?;
 
     // **実際にACEが付いた穴だけ**を台帳へ記録する（幻の台帳エントリを作らない、BUG-017）。
     // 記録しないと撤収経路の無い孤立ACEになるので、ここは飛ばせない。
@@ -234,31 +315,26 @@ pub(super) fn run_pass2<'a>(
     // `workspace-capability-ledger.json`の`declaration`欄を索引にした名前の付いた扉が担う。
     //
     // **移行前の記録は消えない**——この欄は上書きではなく積み増しである。
-    let grants: Vec<_> = selection
-        .granted_passthrough
+    //
+    // [決定68 の前例の(11)] 組み立て（同じパスを1行に畳む・`forced`は使った特権から〔BUG-119〕・範囲は宣言から・
+    // 承認済みの宣言のルートならワークスペースを参照に載せる）は`harness.exe`と同じ`policy_fs::grant_records`が持つ。
+    // 渡すのは入口の子の分と遷移先のドメインの子の分（一覧ごとに書込の印を組み直した後の値）。宣言のルートを読めなかった回は
+    // 空（ワークスペースを参照に載せない＝自動撤収の対象にしない側）。
+    let granted: Vec<&harness_core::GrantedPassthrough> = entry_granted
         .iter()
-        .map(|granted| {
-            let path = &granted.path;
-            harness_sandbox::tier2a::fs_passthrough_ledger::FsPassthroughGrantRecord {
-                path: path.clone(),
-                writable: granted.writable,
-                forced: passthrough
-                    .iter()
-                    .find(|fp| &fp.path == path)
-                    .map(|fp| fp.forced)
-                    .unwrap_or(false),
-                // [D-63] 宣言された範囲を記録する（`forced`と同じ引き方）。
-                scope: passthrough
-                    .iter()
-                    .find(|fp| &fp.path == path)
-                    .map(|fp| fp.scope)
-                    .unwrap_or(harness_policy::GrantScope::Recursive),
-                // policy.json由来はsettings.jsonの参照カウントに載せない。
-                settings_workspace: None,
-                granted_sid: None,
-            }
-        })
+        .chain(
+            domain_fs_grants
+                .values()
+                .filter_map(|result| result.as_ref().ok())
+                .flatten(),
+        )
         .collect();
+    let grants = harness_sandbox::tier2a::policy_fs::grant_records(
+        granted,
+        &passthrough,
+        declared_roots.as_deref().unwrap_or(&[]),
+        request.workspace_root,
+    );
     harness_sandbox::tier2a::fs_passthrough_ledger::record_fs_passthrough_grants(&grants);
     // [BUG-142] **ここでプロセス内へ覚え直さない。** 「どのパスへ宛先SIDを発行したか」は
     // `preflight`が既にcapability台帳へ書いており（`declaration`欄）、撤収側は
@@ -290,7 +366,12 @@ pub(super) fn run_pass2<'a>(
     // envはここで組み立てて下の起動でも使い回す——`PATH`を測るときと渡すときで別々に
     // 読むと、片方だけ変わったときに判定が静かにずれる（B-05）。
     let mut env = harness_sandbox::secret_env::build_child_env();
-    let reach = diagnose_command_exe(request, &selection.denied_passthrough, &env);
+    let reach = diagnose_command_exe(
+        request,
+        plan.policy.domain(ENTRY_DOMAIN),
+        &selection.denied_passthrough,
+        &env,
+    );
     // **表示はイベント側だけが行う。** ここで`warn`も呼ぶと、同じ文言が2回出る
     // （`Warning`と`ExecReachability`の両方を表示側が描くため。実機E2Eで実際に二重に出た）。
     // マニフェストへは残したいので、`warnings`へは直接積む。
@@ -557,13 +638,12 @@ pub(super) fn run_pass2<'a>(
                 env,
                 workspace_root: request.workspace_root.to_path_buf(),
                 cow_diff_layer_dir: None,
-                granted_passthrough: selection.granted_passthrough.clone(),
+                // 入口の一覧の分だけ（上の振り分け）。遷移先の宣言の宛先は、そのドメインの子にだけ載る。
+                granted_passthrough: entry_granted.clone(),
                 net_capability,
-                // [段階6b] **パス2の遷移元は「いま記録しているドメイン」である**
-                // （`plans/DESIGN-MAC-PROTOCOL.md` §12.1の表）。`run_shell`と入口の関数を
-                // 共有しているが、遷移元の名前だけは共有しない——あちらは入口ドメインの固定名で、
-                // こちらは`--domain`で指定された名前である。
-                policy_domain: request.domain.name.clone(),
+                // [決定68(2)] **パス2の遷移元は入口のドメインの固定名**（`run_shell`と同じ）。`harness.exe`の子は必ず入口で
+                // 始まるので、それ以外から始める実行は本番に無く確認にならない（以前は`--domain`で選んだ名前だった）。
+                policy_domain: ENTRY_DOMAIN.to_string(),
             },
         )
         .map_err(|e| RecordNetError::Spawn(e.to_string()))?;
@@ -713,48 +793,43 @@ fn drain_net_audit(
     aggregate.add_unparsable(skipped);
 }
 
-/// ドメインのFSルールから`FsPassthrough`を作る。
-///
-/// 変換は`harness_sandbox::tier2a::policy_grants`が唯一の定義を持つ——**`harness.exe`が
-/// 起動時に付ける一覧も同じ関数で作る**ので、ここで確かめた挙動がそのまま再現される（#30）。
-/// workspace配下のパスは含めない（Tier2aのworkspace grantが既に覆っている）。
-///
-/// **宣言にあるのに付けない値は、理由ごと見せる**（B-10）。黙って落とすと、
-/// 「承認したのに読めない」の原因が画面のどこにも出ない。
-fn passthrough_for_domain(
-    domain: &PolicyDomain,
-    workspace_root: &Path,
-    warnings: &mut Vec<String>,
-    on_event: &mut dyn FnMut(NetRecordEvent),
-) -> Vec<FsPassthrough> {
-    // [D-112] このマシンで承認した宣言だけに付ける。`harness.exe`も同じ台帳・同じ関数で決める。
-    let approvals = crate::approval_store::approval_store().load();
-    let workspace_key =
-        harness_sandbox::tier2a::policy_approval::approval_workspace_key(workspace_root);
-    let grants = harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(workspace_root)
-        .domain_grants(domain, &|d| approvals.is_approved_for_key(&workspace_key, d));
-    for skipped in &grants.skipped {
-        warn(
-            format!(
-                "fs宣言 {} ({}) には許可を付けません: {}",
-                skipped.value,
-                skipped.access.settings_key(),
-                skipped.reason.describe()
-            ),
-            warnings,
-            on_event,
-        );
-    }
-    grants.passthrough
+/// [決定68(1)] 1回の付与処理（preflight）へ渡す一覧——**入口の一覧の後ろに、用意する遷移先の一覧を全部つなぐ**
+/// （UAC は今どおり最大1回）。戻り値の2つ目は入口の件数（振り分けで入口の分を切り出す）。`harness.exe`の
+/// `startup/sandbox.rs`が同じ形でつなぐ。workspace配下のパスは含めない（Tier2aのworkspace grantが既に覆っている。
+/// 変換は`policy_grants`が唯一の定義を持つ、#30）。
+pub(super) fn pass2_lists(fs_plan: &PolicyFsPlan) -> (Vec<FsPassthrough>, usize) {
+    let lists: Vec<FsPassthrough> = fs_plan
+        .entry
+        .iter()
+        .cloned()
+        .chain(fs_plan.domains.iter().flat_map(|(_, list)| list.iter().cloned()))
+        .collect();
+    (lists, fs_plan.entry.len())
 }
 
-/// このドメインの宣言と付与結果から、コマンドの実行ファイルへ届くかを測る。
+/// [決定68(1)] 付与の結果を、**入口の子へ渡す分**と**遷移先のドメインごとの分**（ドメインの用意が読む）へ振り分ける。
+/// 書込の印は一覧ごとに自分の要求で組み直す（`policy_fs::granted_for`のdoc）。入口で付かなかった宣言は付与処理の
+/// 拒否（`PassthroughDenied`）が既に名指ししているので、ここでは捨てる（`harness.exe`と同じ）。
+pub(super) fn split_granted(
+    fs_plan: &PolicyFsPlan,
+    entry_requested: &[FsPassthrough],
+    granted: &[harness_core::GrantedPassthrough],
+) -> (Vec<harness_core::GrantedPassthrough>, DomainFsGrants) {
+    let write_mode = WorkspaceWriteMode::DirectRw;
+    let domains = harness_sandbox::tier2a::policy_fs::domain_fs_grants(fs_plan, granted, &write_mode);
+    let (entry, _not_granted) =
+        harness_sandbox::tier2a::policy_fs::granted_for(entry_requested, granted, &write_mode);
+    (entry, domains)
+}
+
+/// 入口のドメインの宣言と付与結果から、コマンドの実行ファイルへ届くかを測る（コマンドを起こすのは入口の子である）。
 ///
 /// 判定そのものは[`crate::exec_reach`]の純粋関数が持つ（実機なしで全数テストできる）。
 /// ここがやるのは**入力の組み立てだけ**——`PATH`は子へ渡す`env`から取る（プロセスのenvを
 /// 別途読むと、渡す値と測る値が将来ずれる）。
 fn diagnose_command_exe(
     request: &RecordNetRequest<'_>,
+    entry: Option<&crate::policy_file::PolicyDomain>,
     denied_passthrough: &[(PathBuf, String, String)],
     env: &[(String, String)],
 ) -> crate::exec_reach::ExecReach {
@@ -774,6 +849,12 @@ fn diagnose_command_exe(
                 .to_string(),
         };
     };
-    let entries = request.domain.fs.entries();
+    let entries = entry.map(|domain| domain.fs.entries()).unwrap_or_default();
     crate::exec_reach::diagnose(&exe, &entries, request.workspace_root, denied_passthrough)
 }
+
+// **インラインの試験を置かない**——`launch.rs`の姿勢の数え上げ（`product_callers_of`）は、ファイルの中で最初の
+// `#[cfg(test)]`より後ろを全部試験として数える。このファイルは生成禁止を宣言する製品の場所なので、宣言より前に置かない。
+#[cfg(test)]
+#[path = "run_tests.rs"]
+mod run_tests;

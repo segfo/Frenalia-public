@@ -18,7 +18,6 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::policy_file::PolicyDomain;
 use crate::record::{RecordError, RecordEvent, RecordOutcome, RecordRequest};
 use crate::record_net::{NetRecordEvent, RecordNetError, RecordNetOutcome, RecordNetRequest};
 
@@ -84,9 +83,8 @@ pub struct Pass1Request {
     pub wfp: crate::record_net::SharedNetfilter,
 }
 
-/// パス2（Tier2aでのドメイン記録）の入力。
+/// パス2（Tier2aでのドメイン記録）の入力。[決定68(2)] ドメインは持たない（常に入口から始める）。
 pub struct Pass2Request {
-    pub domain: PolicyDomain,
     pub command: String,
     pub cwd: PathBuf,
     pub workspace_root: PathBuf,
@@ -143,7 +141,6 @@ pub fn spawn_pass2(request: Pass2Request) -> RunHandle {
     let join = std::thread::spawn(move || {
         let canceled = move || cancel_for_thread.load(Ordering::Relaxed);
         let req = RecordNetRequest {
-            domain: &request.domain,
             command: &request.command,
             cwd: &request.cwd,
             workspace_root: &request.workspace_root,

@@ -42,6 +42,44 @@ fn the_record_screen_renders() {
     render(&app, 80, 24);
 }
 
+/// [決定68(2)] **パス2の記録画面にドメイン欄は無い。** 欄の場所には編集できない1行（始める場所＝入口のドメイン）が
+/// 出る——文言は CLI と同じ関数（`record_net::pass2_start_line`）が持つ。パス1ではその行も出ない（対の側）。
+#[test]
+fn the_record_screen_has_no_domain_field_in_pass_two() {
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    app.command.set_text("cargo build");
+
+    app.pass = crate::tui::state::Pass::Two;
+    let grid = paint_grid(120, 30, |frame| {
+        draw(frame, &app);
+    });
+    let form: Vec<String> = box_inner(&grid, " 記録 ").iter().map(|row| squash(row)).collect();
+    assert_eq!(
+        form.get(3).map(String::as_str),
+        Some(squash(&crate::record_net::pass2_start_line()).as_str()),
+        "パス2の4行目が始める場所の1行ではない: {form:?}"
+    );
+    assert!(
+        form.iter().any(|row| row.contains(crate::policy_file::ENTRY_DOMAIN)),
+        "入口のドメインの名前が出ていない: {form:?}"
+    );
+    assert!(
+        !form.iter().any(|row| row.starts_with("ドメイン")),
+        "ドメインの入力欄が残っている: {form:?}"
+    );
+
+    app.pass = crate::tui::state::Pass::One;
+    let grid = paint_grid(120, 30, |frame| {
+        draw(frame, &app);
+    });
+    let form: Vec<String> = box_inner(&grid, " 記録 ").iter().map(|row| squash(row)).collect();
+    assert!(
+        !form.iter().any(|row| row.contains("始める場所")),
+        "パス1に始める場所の行が出た: {form:?}"
+    );
+}
+
 /// 記録中（進行ログ・出力・起動時ノイズの3枠が出る）。
 #[test]
 fn the_record_screen_renders_while_running() {

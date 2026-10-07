@@ -68,9 +68,7 @@ const REVOKE_KEY: &str = "e2e-policy-editor-revokes-stale-grants";
 const WORKSPACE: &str = r"C:\harness-e2e\editor-keeps-harness";
 /// スクラッチ（台本・`harness.exe`の出力）。ワークスペースの外に置く。
 const SCRATCH: &str = r"C:\harness-e2e\_scratch";
-/// パス2で記録するドメイン（ファイル宣言を持たない＝パス2自身は何も付けない）。
-const RECORDED_DOMAIN: &str = "e2e-keep";
-/// パス2で撃つコマンド。走ったことを標準出力の印で見る。
+/// パス2で撃つコマンド。走ったことを標準出力の印で見る。[決定68(2)] パス2は入口のドメインから始める（`--domain`は無い）。
 const PASS2_MARKER: &str = "EDITOR_PASS2_RAN";
 
 /// 3つの置き場。**付与の試験と撤収の試験が同じ値を読む**（綴りを2箇所に書かない、`B-05`）。
@@ -167,7 +165,7 @@ fn harness_fs_revoke(path: &str) -> String {
 /// パス2を1回撃つ（親の`run_record_net_with`）。標準出力と標準エラーをつないで返す。
 fn run_pass2() -> (bool, String, String) {
     let command = format!("Write-Output '{PASS2_MARKER}'");
-    let out = super::run_record_net_with(&workspace(), RECORDED_DOMAIN, &command, &[]);
+    let out = super::run_record_net_with(&workspace(), &command, &[]);
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     eprintln!("--- パス2 stdout ---\n{stdout}\n--- パス2 stderr ---\n{stderr}");
@@ -429,19 +427,17 @@ fn reset_leftovers(ws: &Path) {
     }
 }
 
-/// `policy.json`を書く: 入口ドメインにAとSの宣言、パス2で記録するドメイン（ファイル宣言なし）。
+/// `policy.json`を書く: 入口ドメインにAとSの宣言と、パス2のコマンド（[決定68(2)] パス2は常に入口から始め、記録したコマンドを
+/// 書くのも入口だけ。以前はファイル宣言の無い別のドメインで記録していた——**P6.8 の注意**: パス2は入口の宣言（A・S）も付けるので、
+/// 「パス2が付けた分」と「harness.exe が付けた分」の区別はこの試験の意味の書き換えで扱う）。
 fn write_policy(ws: &Path) {
     let mut file = PolicyFile::default();
     let mut entry = PolicyDomain::new(ENTRY_DOMAIN);
     entry.fs.read_exec.push(declared_value(DECLARED));
     entry.fs.read_exec.push(declared_value(STALE));
+    entry.commands.push(format!("Write-Output '{PASS2_MARKER}'"));
+    entry.cwd = Some(ws.to_path_buf());
     file.domains.push(entry);
-    let mut recorded = PolicyDomain::new(RECORDED_DOMAIN);
-    recorded
-        .commands
-        .push(format!("Write-Output '{PASS2_MARKER}'"));
-    recorded.cwd = Some(ws.to_path_buf());
-    file.domains.push(recorded);
     harness_policy::policy_file::save(ws, &file)
         .unwrap_or_else(|e| panic!("policy.jsonを書けない: {e}"));
     harness_policy::policy_file::load(ws)

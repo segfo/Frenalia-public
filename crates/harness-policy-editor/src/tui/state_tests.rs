@@ -469,53 +469,52 @@ fn ctrl_c_neither_quits_nor_stops_and_says_how_to_quit() {
     assert_eq!(app.status, harness_term::double_esc::CTRL_C_NOTICE);
 }
 
-/// パス2は**承認済みのドメインが無ければ始まらない**（開くべき穴が開いていない状態で
-/// 走らせても失敗するだけ）。禁止側。
+/// [決定68(2)] パス2が画面から要るのは**コマンドだけ**になった（ドメインは選ばない——常に入口から始める）。
+/// コマンドが無ければ始まらず、コマンド欄へ戻して理由を言う（禁止側。許可側は次の試験）。
+///
+/// 以前は「承認済みのドメインが無ければ始まらない」を測っていた（ドメイン欄の名前を`policy.json`で引いていた）。
 #[test]
-fn pass2_refuses_to_start_without_an_approved_domain() {
+fn pass2_refuses_to_start_without_a_command() {
     let ws = workspace();
     let mut app = app_with(&ws);
     app.pass = Pass::Two;
-    app.record_focus = RecordField::Command;
-    type_text(&mut app, "cargo build");
-    app.record_focus = RecordField::Domain;
-    type_text(&mut app, "cargo");
+    app.record_focus = RecordField::Cwd;
 
     let action = app.on_key(key(KeyCode::Enter));
 
     assert!(action.is_none());
     assert!(!app.is_running());
+    assert_eq!(app.record_focus, RecordField::Command, "コマンド欄へ戻す");
     assert!(
-        app.status.contains("cargo"),
-        "どのドメインが無いのかを言う: {}",
+        app.status.contains("コマンド"),
+        "何が足りないのかを言う: {}",
         app.status
     );
 }
 
-/// 承認済みならパス2は始まる（許可側。B-35の対）。
+/// [決定68(2)] **ドメインを選ばずにパス2が始まる**（許可側。B-35の対）。`policy.json`が無くても画面は止めない
+/// ——始める場所は入口で、宣言を読むのは記録の側（`record_net`。読めなければそこで理由ごと失敗する）。
+///
+/// 以前は「承認済みのドメインならパス2は始まる」（ドメイン欄に`cargo`を打ち、要求に載ることを見ていた）。
 #[test]
-fn pass2_starts_once_the_domain_exists_in_the_policy_file() {
+fn pass_two_starts_without_choosing_a_domain() {
     let ws = workspace();
-    let mut policy = crate::policy_file::PolicyFile::default();
-    let mut domain = crate::policy_file::PolicyDomain::new("cargo");
-    domain.fs.read.push(r"C:\Users\me\.cargo\**".to_string());
-    policy.domains.push(domain);
-    crate::policy_file::save(ws.path(), &policy).expect("policy.json");
+    assert!(
+        !crate::policy_file::path(ws.path()).exists(),
+        "前提: policy.json が無い"
+    );
 
     let mut app = app_with(&ws);
     app.pass = Pass::Two;
     app.record_focus = RecordField::Command;
     type_text(&mut app, "cargo build");
-    app.record_focus = RecordField::Domain;
-    type_text(&mut app, "cargo");
 
     match app.on_key(key(KeyCode::Enter)) {
         Some(Action::StartPass2(request)) => {
-            assert_eq!(request.domain.name, "cargo");
             assert_eq!(request.command, "cargo build");
             assert_eq!(request.net_mode, NetMode::RecordAll, "既定は記録");
         }
-        _ => panic!("承認済みのドメインならパス2は始まる"),
+        _ => panic!("コマンドがあればパス2は始まる"),
     }
     assert!(app.is_running());
 }
@@ -526,7 +525,8 @@ fn pass2_starts_once_the_domain_exists_in_the_policy_file() {
 fn pass2_carries_the_chosen_net_mode_into_the_request() {
     let ws = workspace();
     let mut policy = crate::policy_file::PolicyFile::default();
-    let mut domain = crate::policy_file::PolicyDomain::new("cargo");
+    // [決定68(2)] 通信の宣言は入口のドメインのもの。
+    let mut domain = crate::policy_file::PolicyDomain::new(crate::policy_file::ENTRY_DOMAIN);
     domain.net.allow_domains.push("crates.io".to_string());
     policy.domains.push(domain);
     crate::policy_file::save(ws.path(), &policy).expect("policy.json");
@@ -536,14 +536,12 @@ fn pass2_carries_the_chosen_net_mode_into_the_request() {
     app.net_mode = NetMode::Declared;
     app.record_focus = RecordField::Command;
     type_text(&mut app, "cargo fetch");
-    app.record_focus = RecordField::Domain;
-    type_text(&mut app, "cargo");
 
     match app.on_key(key(KeyCode::Enter)) {
         Some(Action::StartPass2(request)) => {
             assert_eq!(request.net_mode, NetMode::Declared);
         }
-        _ => panic!("承認済みのドメインならパス2は始まる"),
+        _ => panic!("コマンドがあればパス2は始まる"),
     }
 }
 
@@ -804,9 +802,12 @@ fn the_first_escape_says_a_second_one_quits_until_the_window_passes() {
     assert_eq!(app.status, "別の知らせ", "ほかの知らせを消した");
 }
 
-/// 記録画面の入力欄はTabで巡回し、パス1ではドメイン欄を飛ばす（パス1に無い項目なので）。
+/// 記録画面の入力欄はTabで巡回する。[決定68(2)] **パス2もパス1と同じ3つ**（パス・コマンド・作業ディレクトリ）——
+/// パス2のドメイン欄は無くなった（始める場所の行は編集できないので巡回に入らない）。
+///
+/// 以前は「パス1ではドメイン欄を飛ばし、パス2では作業ディレクトリの次がドメイン欄」を測っていた。
 #[test]
-fn tab_cycles_the_fields_and_skips_the_domain_on_pass1() {
+fn tab_cycles_the_same_three_fields_in_both_passes() {
     let ws = workspace();
     let mut app = app_with(&ws);
     app.record_focus = RecordField::Pass;
@@ -821,7 +822,13 @@ fn tab_cycles_the_fields_and_skips_the_domain_on_pass1() {
     app.pass = Pass::Two;
     app.record_focus = RecordField::Cwd;
     app.on_key(key(KeyCode::Tab));
-    assert_eq!(app.record_focus, RecordField::Domain);
+    assert_eq!(
+        app.record_focus,
+        RecordField::Pass,
+        "パス2でも作業ディレクトリの次はパス欄へ戻る"
+    );
+    app.on_key(key(KeyCode::BackTab));
+    assert_eq!(app.record_focus, RecordField::Cwd, "逆回りも同じ3つ");
 }
 
 /// 経過表示・スピナーは会話TUI（`harness-tui`）と同じ形にする。
@@ -985,7 +992,7 @@ fn granting_and_revoking_share_the_same_progress_ui() {
 
     let ws = workspace();
     let mut policy = crate::policy_file::PolicyFile::default();
-    let mut domain = crate::policy_file::PolicyDomain::new("cargo");
+    let mut domain = crate::policy_file::PolicyDomain::new(crate::policy_file::ENTRY_DOMAIN);
     domain.fs.read.push("C:/Users/me/.cargo/**".to_string());
     policy.domains.push(domain);
     crate::policy_file::save(ws.path(), &policy).expect("policy.json");
@@ -994,8 +1001,6 @@ fn granting_and_revoking_share_the_same_progress_ui() {
     app.pass = Pass::Two;
     app.record_focus = RecordField::Command;
     type_text(&mut app, "cargo test");
-    app.record_focus = RecordField::Domain;
-    type_text(&mut app, "cargo");
     app.on_key(key(KeyCode::Enter)).expect("パス2が始まる");
 
     // 付与: ゲージが立ち、内訳（新規／既存のまま）が出る。

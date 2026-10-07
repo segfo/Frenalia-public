@@ -305,9 +305,15 @@ fn confirming_the_diff_writes_the_policy_file_and_points_at_pass2() {
         NetMode::RecordAll,
         "FSを承認した直後は通信先をまだ宣言していないので、記録で集める"
     );
-    assert_eq!(app.run_domain.text(), "cargo");
+    // [決定68(2)] 書いたドメイン（cargo）は記録画面へ引き継がない——パス2は常に入口から始める（以前はドメイン欄に
+    // `cargo`が入ることを見ていた）。知らせもドメインを名指ししない。
     assert_eq!(app.command.text(), "cargo build");
     assert!(app.status.contains("パス2"), "{}", app.status);
+    assert!(
+        !app.status.contains("ドメイン cargo"),
+        "パス2を書いたドメインから始めるように読める: {}",
+        app.status
+    );
 }
 
 /// 差分は**access種別ごとにまとめる**。`+ fs.read = <パス>`を1行ずつ出すと、687件では
@@ -1013,9 +1019,14 @@ fn approving_domains_leads_to_the_enforcing_pass2() {
     assert_eq!(app.screen, Screen::Record, "次の実行を記録画面に用意する");
     assert_eq!(app.pass, Pass::Two);
     assert_eq!(app.net_mode, NetMode::Declared, "強制モードへ案内する");
-    assert_eq!(app.run_domain.text(), "cargo", "記録時のドメインを引き継ぐ");
+    // [決定68(2)] 記録時のドメインは引き継がない（パス2は常に入口から始める。以前はドメイン欄に`cargo`が入ることを見ていた）。
     assert_eq!(app.command.text(), "cargo build", "記録時のコマンドを引き継ぐ");
     assert!(app.status.contains("強制"), "{}", app.status);
+    assert!(
+        !app.status.contains("ドメイン cargo"),
+        "パス2を記録時のドメインから始めるように読める: {}",
+        app.status
+    );
 }
 
 /// セッションを移ったら中身も入れ替わる（選択だけ動いて表示が古いまま、にしない）。

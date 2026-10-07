@@ -228,8 +228,8 @@ pub struct DomainSpec {
     /// # 誰が何を入れるか
     ///
     /// 由来は経路ごとに違う（`plans/DESIGN-MAC-PROTOCOL.md` §12.1の表）。
-    /// `run_shell`は固定名（`harness_policy::policy_file::ENTRY_DOMAIN`）、
-    /// ポリシーエディタのパス2は記録中のドメイン名、MCPは宣言idである。
+    /// `run_shell`とポリシーエディタのパス2は入口の固定名（`harness_policy::policy_file::ENTRY_DOMAIN`。
+    /// パス2は決定68から常に入口で始める）、MCPは宣言idである。
     ///
     /// **`Option`にしない。** 既定を持たせると、4つ目の経路を足す人が選ばずに通れてしまい、
     /// **その経路だけが黙って別ドメイン扱いになる**（`DomainIdentitySpec`と同じ姿勢）。

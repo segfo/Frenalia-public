@@ -95,8 +95,8 @@ enum Command {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// 承認済みのドメインをTier2a（AppContainer＋WFP＋Proxy）で実行し、
-    /// 接続したドメインを記録する（パス2）。
+    /// 入口のドメイン（workspace-shell）から、遷移を強制してTier2a（AppContainer＋WFP＋Proxy）で
+    /// 実行し、接続したドメインを記録する（パス2。決定68——本番で遷移を強制したときと同じ形）。
     ///
     /// **ここで初めてACEが付く**（`preflight`経由）。Tier2aへ着地しない場合とWFPが立たない
     /// 場合は中止する——強制の無い観測を「記録できた」と言わないため。
@@ -105,16 +105,13 @@ enum Command {
     /// `net.allow_domains`に一致する通信先だけを許し、ほかは断る（決定64）。
     #[command(name = "record-net")]
     RecordNet {
-        /// 承認済みのドメイン名（`approve --domain`で使ったもの）。
-        #[arg(long)]
-        domain: String,
         /// 通信を宣言どおりに強制する（`policy.json`の`net.allow_domains`だけを許し、ほかは断る）。
         /// 候補には断られた宛先だけが出る。省略時は通信先を全部許して記録する。
         #[arg(long)]
         enforce_net: bool,
         #[arg(long)]
         workspace: Option<PathBuf>,
-        /// 作業ディレクトリ（既定: policy.jsonに記録されたcwd、無ければworkspace）。
+        /// 作業ディレクトリ（既定: 入口のドメインに記録されたcwd、無ければworkspace）。
         #[arg(long)]
         cwd: Option<PathBuf>,
         /// この秒数を過ぎたら対象コマンドを打ち切る。
@@ -122,7 +119,7 @@ enum Command {
         timeout: Option<u64>,
         #[arg(long)]
         limit: Option<usize>,
-        /// 実行するコマンド（`--`のあと）。省略時はドメインが1件だけ持つコマンドを使う。
+        /// 実行するコマンド（`--`のあと）。省略時は入口のドメインが1件だけ持つコマンドを使う。
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -258,14 +255,13 @@ fn main() -> ExitCode {
             command,
         }) => run_record(cwd, workspace, timeout, limit, &command),
         Some(Command::RecordNet {
-            domain,
             enforce_net,
             workspace,
             cwd,
             timeout,
             limit,
             command,
-        }) => run_record_net(&domain, enforce_net, workspace, cwd, timeout, limit, &command),
+        }) => run_record_net(enforce_net, workspace, cwd, timeout, limit, &command),
         Some(Command::Show {
             session,
             workspace,
@@ -497,9 +493,7 @@ fn run_record(
 }
 
 #[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
 fn run_record_net(
-    domain_name: &str,
     enforce_net: bool,
     workspace: Option<PathBuf>,
     cwd: Option<PathBuf>,
@@ -537,41 +531,26 @@ fn run_record_net(
             return ExitCode::FAILURE;
         }
     };
-    let Some(domain) = policy.domain(domain_name) else {
-        eprintln!(
-            "ドメイン `{domain_name}` は {} にありません。先に \
-             `harness-policy-editor approve --domain {domain_name} --accept <id>...` を実行してください。",
-            harness_policy_editor::policy_file::path(&workspace_root).display()
-        );
-        if !policy.domains.is_empty() {
-            eprintln!(
-                "定義済みのドメイン: {}",
-                policy
-                    .domains
-                    .iter()
-                    .map(|d| d.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        return ExitCode::FAILURE;
-    };
+    // [決定68(2)] パス2は常に入口のドメインから始める。コマンドと作業ディレクトリを省いたら入口のものを使う
+    // （記録したコマンドを書くのは入口だけ、決定68 の前例の(12)）。
+    let entry_name = harness_policy_editor::policy_file::ENTRY_DOMAIN;
+    let entry = policy.domain(entry_name);
 
     // コマンドは明示指定が優先。省略時は**1件だけ**のときに限りそれを使う
     // ——複数あるなら黙って1つ選ばず、どれかを言わせる。
     let command = if command.is_empty() {
-        match domain.commands.as_slice() {
+        match entry.map(|d| d.commands.as_slice()).unwrap_or_default() {
             [only] => only.clone(),
             [] => {
                 eprintln!(
-                    "ドメイン `{domain_name}` にはコマンドが記録されていません。\
+                    "入口のドメイン `{entry_name}` にはコマンドが記録されていません。\
                      `-- <コマンド>` で明示してください。"
                 );
                 return ExitCode::FAILURE;
             }
             many => {
                 eprintln!(
-                    "ドメイン `{domain_name}` には複数のコマンドがあります。`-- <コマンド>` で\
+                    "入口のドメイン `{entry_name}` には複数のコマンドがあります。`-- <コマンド>` で\
                      どれを走らせるか明示してください:"
                 );
                 for c in many {
@@ -586,12 +565,12 @@ fn run_record_net(
 
     let cwd = cwd
         .map(|p| harness_sandbox::session_scope::normalize_workspace_root(&p))
-        .or_else(|| domain.cwd.clone())
+        .or_else(|| entry.and_then(|d| d.cwd.clone()))
         .unwrap_or_else(|| workspace_root.clone());
 
     eprintln!("パス2（Tier2aでのドメイン記録）");
     eprintln!("通信の扱い: {}", net_mode.label());
-    eprintln!("ドメイン: {domain_name}");
+    eprintln!("{}", harness_policy_editor::record_net::pass2_start_line());
     eprintln!("コマンド: {command}");
     eprintln!("作業ディレクトリ: {}", cwd.display());
 
@@ -600,7 +579,6 @@ fn run_record_net(
     // 畳まれ、パイプ切断でnetfilterdも自発終了する（寿命がOSハンドルに紐付いている）。
     let never_cancel = || false;
     let request = RecordNetRequest {
-        domain,
         command: &command,
         cwd: &cwd,
         workspace_root: &workspace_root,
@@ -652,6 +630,10 @@ fn run_record_net(
             );
         }
         NetRecordEvent::Tier2aReady => eprintln!("Tier2aへ着地しました"),
+        NetRecordEvent::DomainsProvisioned { provisioned, skipped } => eprintln!(
+            "{}",
+            harness_policy_editor::record_net::domains_provisioned_line(&provisioned, skipped)
+        ),
         // 文言は`ExecReach`が持つ（表示側で書き写さない、規則5）。問題が無ければ黙る。
         NetRecordEvent::ExecReachability(reach) => {
             if let Some(message) = reach.message() {
@@ -773,16 +755,14 @@ fn run_record_net(
         outcome.session_id
     );
     println!(
-        "候補を承認する: harness-policy-editor approve {} --domain {domain_name} --accept <id>...",
+        "候補を承認する: harness-policy-editor approve {} --domain {entry_name} --accept <id>...",
         outcome.session_id
     );
     ExitCode::SUCCESS
 }
 
 #[cfg(not(windows))]
-#[allow(clippy::too_many_arguments)]
 fn run_record_net(
-    _domain_name: &str,
     _enforce_net: bool,
     _workspace: Option<PathBuf>,
     _cwd: Option<PathBuf>,
