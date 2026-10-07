@@ -60,31 +60,36 @@ fn each_target_domain_is_listed_once() {
     assert_eq!(policy.transition_target_domains(), vec!["cargo".to_string()]);
 }
 
-/// **通信を宣言するドメインは用意しない**（理由付きで断る）。
+/// [決定69] **通信を宣言するドメインも用意する。ただし`internetClient`はここでは積まない。**
 ///
 /// # 壊れた状態を一文で
 ///
 /// **通信が素通しになる。** 出口は`internetClient`（capability）とWFPの既定拒否の
 /// 両方で閉じており、**capabilityだけ与えて既定拒否を張らないと開いてしまう**
 /// ——`tier2a::wfp`のdocが「`internetClient`を持ったままdefault-denyだけ失う（fail-open）」
-/// という欠陥として書いている形そのものである。
+/// という欠陥として書いている形そのものである。だからここは用意するだけで、`internetClient`は
+/// **WFPが立った後に**呼び出し側が表へ足す（`harness_tools::domain_egress::EgressPlan::attach`）。
+/// 2026-10-07 までは、その機構が無かったのでここで用意ごと断っていた（決定65の暫定(b)）。
 #[test]
-fn a_domain_that_declares_network_is_not_provisioned() {
+fn a_domain_that_declares_network_keeps_the_network_capability_out_of_the_prepared_set() {
     let mut target = PolicyDomain::new("fetcher");
     target.net.allow_domains = vec!["crates.io".to_string()];
     let policy = policy_with_edge("fetcher", Some(target));
     let workspace = tempfile::tempdir().expect("temp workspace");
 
-    let outcome = provision_target_domains(&policy, workspace.path(), "rwx", &Default::default());
+    // **入れ物は作らない**（モジュールdocの「用意できない側の判断は入れ物を1つも作らない」を保つため、
+    // 実資源を作る`provision_target_domains`ではなく、組み立てだけを行う`capability_sids_for`を呼ぶ）。
+    let sids = capability_sids_for(
+        &policy,
+        workspace.path(),
+        "rwx",
+        "fetcher",
+        Some(&Ok(Vec::new())),
+    )
+    .expect("通信を宣言したドメインの組み立てが断られた（決定69で用意する側へ変えた）");
     assert!(
-        outcome.domains.is_empty(),
-        "通信を宣言したドメインを用意している"
-    );
-    assert_eq!(outcome.skipped.len(), 1);
-    assert!(
-        outcome.skipped[0].1.contains("通信"),
-        "断った理由が通信だと分からない: {}",
-        outcome.skipped[0].1
+        !sids.iter().any(|sid| sid == crate::tier2a::win_appcontainer::INTERNET_CLIENT_SID),
+        "用意の時点で internetClient が積まれている（WFPが立つ前に出口が開く）: {sids:?}"
     );
 }
 

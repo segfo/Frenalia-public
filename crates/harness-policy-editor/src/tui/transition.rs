@@ -368,9 +368,9 @@ impl App {
             }
         };
         // 遷移先ごとの用意の見込み（`harness.exe`と同じ付与の関数・同じ承認台帳。ここで1回だけ読む）。
-        let grants = crate::transition_destination::grants_on_this_machine(&workspace_root);
+        let checks = crate::transition_destination::MachineChecks::for_workspace(&workspace_root);
         self.pending.outlooks =
-            crate::transition_destination::outlooks(&file, ENTRY_DOMAIN, &grants);
+            crate::transition_destination::outlooks(&file, ENTRY_DOMAIN, &checks);
         let provisioned = crate::transition_destination::provisioned_names(&self.pending.outlooks);
         let workspace = workspace_root.to_string_lossy().into_owned();
         // 拒否の記録を先に読む——その行の遷移元ごとに宣言を組む（P4.6）。入口のドメインは宣言済みの

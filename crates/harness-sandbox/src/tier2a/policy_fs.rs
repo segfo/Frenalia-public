@@ -20,11 +20,18 @@
 //!
 //! # 付与する範囲（他のドメイン）
 //!
-//! 遷移先ドメインの宣言は、そのドメインの子が実際に起こされ得るときだけ付ける。条件は3つ——
-//! 遷移先になっている（ドメインの用意と同じ`PolicyFile::transition_target_domains`）、
-//! 通信を宣言していない（していれば用意を断るので付けても使われない）、遷移の強制が有効
+//! 遷移先ドメインの宣言は、そのドメインの子が実際に起こされ得るときだけ付ける。条件は2つ——
+//! 遷移先になっている（ドメインの用意と同じ`PolicyFile::transition_target_domains`）、遷移の強制が有効
 //! （`--enforce-transitions`。無効だと子は自分で生成でき、Daemon経由の遷移が起きない）。
 //! 使われないドメインまで毎回付けると、`.cargo`だけで実測142.6秒の付与とUACが起動に乗る。
+//! **「通信を宣言していない」という3つ目の条件は決定69（P7）で外した**——通信を宣言するドメインには
+//! 専用の中継プロキシ・`internetClient`・WFPの項目を与えるので、用意を断る理由ではなくなった。
+//!
+//! # 通信の宣言（決定69）
+//!
+//! ファイルと同じく**このマシンで承認した宣言だけ**を使う（[`domain_net`]）。承認済みの宛先は
+//! [`PolicyFsPlan::entry_net`]（入口）と[`PolicyFsPlan::domains_net`]（用意する遷移先）に載り、
+//! 呼び出し側（`harness.exe`の起動・ポリシーエディタのパス2）がそこから出口を組み立てる。
 //!
 //! # この関数が守らないもの
 //!
@@ -60,48 +67,135 @@ pub struct PolicyFsPlan {
     pub declared_roots: Vec<String>,
     /// 入口ドメインで付けなかった宣言（人へ見せる）。
     pub entry_skipped: Vec<SkippedDeclaration>,
+    /// [決定69(1)] 入口ドメインの通信（承認済みの宛先と、使えなかった宣言の理由）。
+    /// セッションの中継プロキシへ渡す宛先はこれと`--net-allow-domain`の和である。
+    pub entry_net: DomainNet,
+    /// [決定69(1)] 用意する範囲に入った遷移先ドメインの通信（ドメインごとの中継プロキシの材料）。
+    /// **用意しないドメインは入らない**——出口を作っても使う子が居ない。
+    pub domains_net: Vec<(String, DomainNet)>,
 }
 
-/// 通信を宣言しているドメインなら、その宣言の件数。
+/// [決定69(1)(2)] ドメインが使える通信の宛先と、使えなかった宣言の理由。
 ///
-/// **【暫定】決定65の暫定(b)**——ドメインごとの通信の出口制御（専用プロキシ＋WFPの欄。作業の一覧の P7）がまだ無いので、
-/// 通信を宣言するドメインは用意しない（capabilityだけ与えると既定拒否が効かず素通しになる。`domain_provision`のdoc）。
-/// **判定はこの1か所だけが持つ**（決定68の前例の(9)。以前は`harness-cli`の`startup/policy_fs::plan`・
-/// `win_appcontainer::domain_provision::capability_sids_for`・エディタの`transition_destination::outlook`の3か所に写しがあった）。
-/// P7 でこの関数ごと消すと、呼び出し元（[`domain_readiness`]と`capability_sids_for`）がコンパイルできなくなる——それが撤去の合図である。
-pub fn network_blocker(domain: &PolicyDomain) -> Option<usize> {
-    (!domain.net.allow_domains.is_empty()).then_some(domain.net.allow_domains.len())
+/// **値は`policy.json`の綴りのまま**で、正規化（`harness_core::normalize_domain_pattern`）は中継プロキシへ
+/// 渡す直前に1回だけ通す（`harness.exe`とパス2が同じ`net_policy_plan`を通る）。ここで正規化しないのは、
+/// 承認台帳の鍵が**書いてあるとおりの綴り**だからである（綴りを変えた値は未承認＝付けない側へ倒れる）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DomainNet {
+    /// このマシンで承認済みの宛先（宣言の順）。
+    pub allow_domains: Vec<String>,
+    /// 使えなかった宣言（**呼び出し側は必ず出すこと**。`B-10`）。
+    pub skipped: Vec<SkippedNetDeclaration>,
+}
+
+impl DomainNet {
+    /// 出口（専用の中継プロキシ・`internetClient`・WFPの項目）が要るか。
+    pub fn wants_egress(&self) -> bool {
+        !self.allow_domains.is_empty()
+    }
+}
+
+/// 使えなかった通信の宣言1件。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedNetDeclaration {
+    pub value: String,
+    pub reason: NetSkipReason,
+}
+
+/// 通信の宣言に許可を付けない理由。**`_`を書かない網羅`match`で文面を作る**（理由を足したらビルドが落ちる）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetSkipReason {
+    /// このマシンで承認されていない（D-112・決定69(2)）。
+    NotApprovedOnThisMachine,
+    /// 宛先の綴りを解釈できない（`harness_core::normalize_domain_pattern`が断った）。
+    Unparsable(String),
+}
+
+impl NetSkipReason {
+    /// 人へ見せる理由。
+    pub fn describe(&self) -> String {
+        match self {
+            NetSkipReason::NotApprovedOnThisMachine => {
+                "not approved on this machine (a policy.json shipped with a repository is not \
+                 trusted until you approve each declaration in harness-policy-editor)"
+                    .to_string()
+            }
+            NetSkipReason::Unparsable(detail) => {
+                format!("the destination cannot be interpreted: {detail}")
+            }
+        }
+    }
+}
+
+/// ドメインの`net`宣言から、**このマシンで承認済みで、綴りを解釈できる宛先だけ**を取る（決定69(1)(2)）。
+///
+/// 承認の照合は`harness.exe`・パス2・エディタの見込みが同じこれを通る（`B-05`: 判定を写さない）。
+/// 解釈の検査もここで掛ける——未承認と解釈できないは**別の理由**なので、まとめて「使えない」にしない（`B-10`）。
+pub fn domain_net(
+    domain: &PolicyDomain,
+    approved: &dyn Fn(DeclarationRef<'_>) -> bool,
+) -> DomainNet {
+    let mut out = DomainNet::default();
+    for value in &domain.net.allow_domains {
+        let declaration = DeclarationRef {
+            domain: &domain.name,
+            value,
+            key: harness_policy::generalize::SettingsKey::NetAllowDomains,
+        };
+        if !approved(declaration) {
+            out.skipped.push(SkippedNetDeclaration {
+                value: value.clone(),
+                reason: NetSkipReason::NotApprovedOnThisMachine,
+            });
+            continue;
+        }
+        if let Err(detail) = harness_core::normalize_domain_pattern(value) {
+            out.skipped.push(SkippedNetDeclaration {
+                value: value.clone(),
+                reason: NetSkipReason::Unparsable(detail),
+            });
+            continue;
+        }
+        if !out.allow_domains.contains(value) {
+            out.allow_domains.push(value.clone());
+        }
+    }
+    out
 }
 
 /// 遷移先のドメイン1つを、`harness.exe`が用意できるか。
 #[derive(Debug, Clone)]
 pub enum DomainReadiness {
-    /// 通信を宣言している（[`network_blocker`]。暫定）。
-    DeclaresNetwork { count: usize },
-    /// 許可が付かない宣言がある。**1件でもあればドメインごと用意しない**（fail-closed）。
+    /// 許可が付かないファイル宣言がある。**1件でもあればドメインごと用意しない**（fail-closed）。
     NotGranted { skipped: Vec<SkippedDeclaration> },
-    /// 用意できる。付ける一覧（空なら共通の土台だけで用意される）。
-    Ready { passthrough: Vec<FsPassthrough> },
+    /// 用意できる。付けるファイルの一覧（空なら共通の土台だけで用意される）と、使える通信の宛先。
+    Ready {
+        passthrough: Vec<FsPassthrough>,
+        /// [決定69] 承認済みの通信の宛先（出口はここから作る。`net.allow_domains`を宣言していても
+        /// **用意そのものは断らない**——決定65の暫定(b) は P7 で外した）。
+        net: DomainNet,
+    },
 }
 
 /// 遷移先のドメイン1つを用意できるかを決める。`harness.exe`の付与の一覧（[`plan`]）とポリシーエディタの見込み
 /// （`transition_destination::outlook`）が**同じこれを通る**（決定68の前例の(9)）。
 ///
-/// 判定順は「通信の宣言 → 付かない宣言 → 用意できる」。**通信を宣言していれば`grants`を呼ばない**——付与の一覧を
-/// 作る前に断る（使われない一覧のために台帳を読まない。付かない宣言の理由で通信の理由を隠さない）。
+/// 判定順は「付かないファイル宣言 → 用意できる」。**通信の宣言は用意を断る理由ではない**（決定69）——
+/// 承認済みの宛先は[`DomainReadiness::Ready`]に載り、呼び出し側がそこから専用の中継プロキシとWFPの項目を作る。
 /// `grants`は宣言から付ける一覧を作る関数で、製品では`GrantContext::domain_grants`に承認台帳を渡したもの。
 pub fn domain_readiness(
     domain: &PolicyDomain,
+    approved: &dyn Fn(DeclarationRef<'_>) -> bool,
     grants: impl FnOnce(&PolicyDomain) -> crate::tier2a::policy_grants::DomainGrants,
 ) -> DomainReadiness {
-    if let Some(count) = network_blocker(domain) {
-        return DomainReadiness::DeclaresNetwork { count };
-    }
     let granted = grants(domain);
     if !granted.skipped.is_empty() {
         return DomainReadiness::NotGranted { skipped: granted.skipped };
     }
-    DomainReadiness::Ready { passthrough: granted.passthrough }
+    DomainReadiness::Ready {
+        passthrough: granted.passthrough,
+        net: domain_net(domain, approved),
+    }
 }
 
 /// 宣言から、付ける一覧を決める（**何も書かない**。純粋関数）。
@@ -123,6 +217,9 @@ pub fn plan(
         let grants = ctx.domain_grants(entry, approved);
         out.entry = grants.passthrough;
         out.entry_skipped = grants.skipped;
+        // [決定69(1)] 入口の通信も同じ1回の`plan`で決める——`harness.exe`が`policy.json`を読むのは
+        // `stage_prepare_sandbox`の1回だけで、ここで取らないと読み直すことになる（`B-13`）。
+        out.entry_net = domain_net(entry, approved);
     }
 
     for name in policy.transition_target_domains() {
@@ -131,15 +228,9 @@ pub fn plan(
             continue;
         };
         // 判定は[`domain_readiness`]の1つ（エディタの見込みと`domain_provision`も同じ判定を通る。決定68の前例の(9)）。
-        let passthrough = match domain_readiness(domain, |d| ctx.domain_grants(d, approved)) {
-            DomainReadiness::DeclaresNetwork { .. } => {
-                out.not_granted_domains.push((
-                    name,
-                    "it declares network access, and per-domain egress control does not exist yet,                      so the domain is not prepared and its file declarations are not granted"
-                        .to_string(),
-                ));
-                continue;
-            }
+        let (passthrough, net) = match domain_readiness(domain, approved, |d| {
+            ctx.domain_grants(d, approved)
+        }) {
             // **1件でも付けない宣言があるドメインは用意しない**（fail-closed。§22.9の骨格と同じ判断）。
             // 付けられる分だけで用意すると、エディタで確かめたより狭い権限で黙って動く。
             DomainReadiness::NotGranted { skipped } => {
@@ -157,11 +248,12 @@ pub fn plan(
                 ));
                 continue;
             }
-            DomainReadiness::Ready { passthrough } => passthrough,
+            DomainReadiness::Ready { passthrough, net } => (passthrough, net),
         };
         // **付ける宣言が無いドメインは、強制の有無に関係なく今までどおり用意できる**（土台だけで動く）。
         // 下の「強制が無効なら付けない」は、払う費用（付与とUAC）があるときだけの判断である。
         if passthrough.is_empty() {
+            out.domains_net.push((name.clone(), net));
             out.domains.push((name, Vec::new()));
             continue;
         }
@@ -174,6 +266,7 @@ pub fn plan(
             ));
             continue;
         }
+        out.domains_net.push((name.clone(), net));
         out.domains.push((name, passthrough));
     }
     out

@@ -341,8 +341,8 @@ impl App {
         let workspace = workspace_root.to_string_lossy().into_owned();
         let input = file.transition_graph_input(Some(&workspace), &[]);
         // 用意の見込み（`harness.exe`と同じ付与の関数・同じ承認台帳。ここで1回だけ読む）。
-        let grants = crate::transition_destination::grants_on_this_machine(&workspace_root);
-        state.outlooks = crate::transition_destination::outlooks(&file, ENTRY_DOMAIN, &grants);
+        let checks = crate::transition_destination::MachineChecks::for_workspace(&workspace_root);
+        state.outlooks = crate::transition_destination::outlooks(&file, ENTRY_DOMAIN, &checks);
         let provisioned = crate::transition_destination::provisioned_names(&state.outlooks);
         state.domains = match listing(&input, &provisioned) {
             Ok(domains) => domains,

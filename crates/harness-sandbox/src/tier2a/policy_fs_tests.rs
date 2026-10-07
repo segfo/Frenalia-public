@@ -116,21 +116,31 @@ fn a_target_domain_without_file_declarations_stays_provisionable_without_enforce
     assert!(plan.domains[0].1.is_empty());
 }
 
-/// 通信を宣言している遷移先ドメインには付けない（用意を断るので付けても使われない）。
+/// [決定69] **通信を宣言している遷移先ドメインにもファイルの許可を付ける。**
+///
+/// 2026-10-07 までは「用意を断るので付けても使われない」として付けずに断っていた（決定65の暫定(b)）。
+/// P7 でそのドメインにも専用の中継プロキシ・`internetClient`・WFPの項目を与えるようになったので、
+/// ファイルの宣言も付ける側へ戻した（**用意されるのに読めない**という食い違いを作らない）。
 #[test]
-fn a_target_domain_that_declares_network_is_not_granted() {
-    let mut policy = three_domains();
-    policy
-        .domains
-        .iter_mut()
-        .find(|d| d.name == "cargo")
-        .unwrap()
-        .net
-        .allow_domains
-        .push("crates.io".to_string());
+fn a_target_domain_that_declares_network_is_granted_and_carries_its_destinations() {
+    let policy = three_domains_with_net(&["crates.io"]);
     let plan = plan(&policy, &ctx(), &all_approved, true);
-    assert!(plan.domains.is_empty());
-    assert!(plan.not_granted_domains[0].1.contains("network"));
+    assert!(
+        plan.not_granted_domains.is_empty(),
+        "{:?}",
+        plan.not_granted_domains
+    );
+    assert_eq!(paths(&plan.domains[0].1), vec!["C:/cargo/db"]);
+    assert_eq!(
+        plan.domains_net,
+        vec![(
+            "cargo".to_string(),
+            DomainNet {
+                allow_domains: vec!["crates.io".to_string()],
+                skipped: Vec::new(),
+            }
+        )]
+    );
 }
 
 /// [D-112] **未承認の宣言は付けない。** 入口の分は理由ごと返り、遷移先は**1件でも付けない宣言が
@@ -310,16 +320,14 @@ fn places_opened_only_for_reading_or_running_are_not_counted_as_writable() {
     assert!(list.is_empty(), "read-only places leaked in: {list:?}");
 }
 
-// --- [P6.2・決定68 の前例の(9)] ドメインごとの判定（`domain_readiness`・`network_blocker`） ---
+// --- [P6.2・決定68 の前例の(9)・決定69] ドメインごとの判定（`domain_readiness`・`domain_net`） ---
 
 fn cargo_domain(policy: &PolicyFile) -> &PolicyDomain {
     policy.domain("cargo").expect("cargo")
 }
 
-/// **通信を宣言しているドメインは、付与の一覧を作る前に断る**（`grants`を呼ばない）。判定順を入れ替えると、
-/// 使われない一覧のために台帳を読み、付かない宣言の理由で通信の理由が隠れる。
-#[test]
-fn a_domain_that_declares_network_is_refused_before_its_grants_are_computed() {
+/// `cargo`ドメインへ通信の宣言を足した`policy.json`。
+fn three_domains_with_net(values: &[&str]) -> PolicyFile {
     let mut policy = three_domains();
     policy
         .domains
@@ -327,19 +335,8 @@ fn a_domain_that_declares_network_is_refused_before_its_grants_are_computed() {
         .find(|d| d.name == "cargo")
         .unwrap()
         .net
-        .allow_domains
-        .push("crates.io".to_string());
-    let called = std::cell::Cell::new(false);
-    let readiness = domain_readiness(cargo_domain(&policy), |_| {
-        called.set(true);
-        crate::tier2a::policy_grants::DomainGrants::default()
-    });
-    assert!(
-        matches!(readiness, DomainReadiness::DeclaresNetwork { count: 1 }),
-        "{readiness:?}"
-    );
-    assert!(!called.get(), "the grant list was computed for a domain that is refused anyway");
-    assert_eq!(network_blocker(cargo_domain(&policy)), Some(1));
+        .allow_domains = values.iter().map(|v| v.to_string()).collect();
+    policy
 }
 
 /// 許可が付かない宣言が1件でもあれば用意できない（付いた分だけで用意すると、確かめたより狭い権限で黙って動く）。
@@ -347,7 +344,9 @@ fn a_domain_that_declares_network_is_refused_before_its_grants_are_computed() {
 fn a_domain_with_a_skipped_declaration_is_not_ready() {
     let policy = three_domains();
     let nothing = |_: DeclarationRef<'_>| false;
-    let readiness = domain_readiness(cargo_domain(&policy), |d| ctx().domain_grants(d, &nothing));
+    let readiness = domain_readiness(cargo_domain(&policy), &nothing, |d| {
+        ctx().domain_grants(d, &nothing)
+    });
     match readiness {
         DomainReadiness::NotGranted { skipped } => {
             assert_eq!(skipped.len(), 1);
@@ -357,16 +356,94 @@ fn a_domain_with_a_skipped_declaration_is_not_ready() {
     }
 }
 
-/// **対の側**: 通信を宣言せず、全部の宣言に許可が付くなら、付ける一覧ごと「用意できる」。
+/// **対の側**: 全部の宣言に許可が付くなら、付ける一覧ごと「用意できる」（通信の宣言は無い）。
 #[test]
 fn a_ready_domain_carries_its_passthrough() {
     let policy = three_domains();
-    assert_eq!(network_blocker(cargo_domain(&policy)), None);
-    let readiness = domain_readiness(cargo_domain(&policy), |d| ctx().domain_grants(d, &all_approved));
+    let readiness = domain_readiness(cargo_domain(&policy), &all_approved, |d| {
+        ctx().domain_grants(d, &all_approved)
+    });
     match readiness {
-        DomainReadiness::Ready { passthrough } => assert_eq!(paths(&passthrough), vec!["C:/cargo/db"]),
+        DomainReadiness::Ready { passthrough, net } => {
+            assert_eq!(paths(&passthrough), vec!["C:/cargo/db"]);
+            assert_eq!(net, DomainNet::default(), "宣言していない通信が付いてきた");
+        }
         other => panic!("expected Ready, got {other:?}"),
     }
+}
+
+/// [決定69(1)(2)] **承認済みの通信の宣言は、用意できるドメインの宛先として付いてくる。**
+///
+/// 2026-10-07 まではここで用意を断っていた（決定65の暫定(b)）。P7 でドメインごとの出口が入ったので、
+/// 通信の宣言は**断る理由ではなく出口の材料**になった。
+#[test]
+fn an_approved_net_declaration_is_carried_as_a_destination() {
+    let policy = three_domains_with_net(&["crates.io", "*.example.com"]);
+    let readiness = domain_readiness(cargo_domain(&policy), &all_approved, |d| {
+        ctx().domain_grants(d, &all_approved)
+    });
+    match readiness {
+        DomainReadiness::Ready { net, .. } => {
+            assert_eq!(net.allow_domains, vec!["crates.io", "*.example.com"]);
+            assert!(net.skipped.is_empty(), "{:?}", net.skipped);
+            assert!(net.wants_egress(), "出口が要るドメインだと答えていない");
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+}
+
+/// **禁止側の対**: このマシンで**未承認**の通信の宣言は宛先に入らず、理由が出る（`B-10`）。
+/// 入れてしまうと、同梱された`policy.json`の宛先へ承認なしで出られる（D-112 の発端と同じ穴）。
+#[test]
+fn an_unapproved_net_declaration_is_not_carried_and_is_reported() {
+    let policy = three_domains_with_net(&["crates.io"]);
+    let nothing = |_: DeclarationRef<'_>| false;
+    let net = domain_net(cargo_domain(&policy), &nothing);
+    assert!(net.allow_domains.is_empty(), "{:?}", net.allow_domains);
+    assert_eq!(net.skipped.len(), 1);
+    assert_eq!(net.skipped[0].value, "crates.io");
+    assert_eq!(
+        net.skipped[0].reason,
+        NetSkipReason::NotApprovedOnThisMachine
+    );
+    assert!(!net.wants_egress(), "宛先が0件なのに出口が要ると答えている");
+}
+
+/// **解釈できない宛先も宛先に入らない**（`DomainPolicy::new`は解釈できない値を黙って捨てるので、
+/// 渡す前に断る。`B-10`）。未承認とは**別の理由**として数える。
+#[test]
+fn an_unparsable_net_declaration_is_not_carried_and_is_reported() {
+    let policy = three_domains_with_net(&["127.0.0.1", "crates.io"]);
+    let net = domain_net(cargo_domain(&policy), &all_approved);
+    assert_eq!(net.allow_domains, vec!["crates.io"]);
+    assert_eq!(net.skipped.len(), 1);
+    assert_eq!(net.skipped[0].value, "127.0.0.1");
+    assert!(
+        matches!(net.skipped[0].reason, NetSkipReason::Unparsable(_)),
+        "{:?}",
+        net.skipped[0].reason
+    );
+}
+
+/// [決定69(1)] `plan`は入口の通信と、用意する遷移先の通信を**同じ1回**で決める（`policy.json`を読み直さない）。
+#[test]
+fn the_plan_carries_the_entry_and_target_destinations() {
+    let mut policy = three_domains_with_net(&["crates.io"]);
+    policy
+        .domains
+        .iter_mut()
+        .find(|d| d.name == ENTRY_DOMAIN)
+        .unwrap()
+        .net
+        .allow_domains = vec!["api.example.com".to_string()];
+    let plan = plan(&policy, &ctx(), &all_approved, true);
+    assert_eq!(plan.entry_net.allow_domains, vec!["api.example.com"]);
+    let cargo = plan
+        .domains_net
+        .iter()
+        .find(|(name, _)| name == "cargo")
+        .map(|(_, net)| net.allow_domains.clone());
+    assert_eq!(cargo, Some(vec!["crates.io".to_string()]));
 }
 
 // --- [P6.2・決定68 の前例の(11)] 付与台帳の記録の組み立て（`grant_records`） ---
