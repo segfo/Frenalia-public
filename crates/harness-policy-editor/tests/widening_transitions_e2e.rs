@@ -84,9 +84,10 @@ use harness_policy_editor::tui::state::{App, Confirm};
 use harness_sandbox::tier2a::spawnd::DenyReason;
 
 use common::{
-    case_dir, child_named, editor_exe, file_name, harness_exe, harness_profiles, middle_shell,
-    press, ps_run, record_tree, run_arm, run_arm_with, scope_root, scratch_dir, system32, Arm,
-    MiddleShell, Script, CASE_ROOT,
+    acl_sddl, case_dir, child_named, count_sid_prefix, expect_no_denials, file_name, fold,
+    harness_exe, harness_profiles, middle_shell, nonce, press, ps_run, record_tree, run_arm,
+    run_arm_with, scope_root, scratch_dir, system32, unapprove_all, Arm, MiddleShell, Script,
+    CASE_ROOT,
 };
 
 /// ワークスペースの名前。
@@ -105,15 +106,6 @@ fn marker_dir() -> PathBuf {
 
 fn cmd_exe() -> String {
     system32(CMD_EXE)
-}
-
-/// この回だけの印（前の回の出力や台帳の残りを今回の証拠として読まない）。
-fn nonce() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    format!("{}_{nanos}", std::process::id())
 }
 
 /// 撃つ行と、それぞれの期待に使う印。
@@ -444,15 +436,6 @@ fn a_widening_edge_written_by_the_editor_lets_the_child_use_its_own_domain_and_n
     let _ = std::fs::remove_dir_all(scratch_dir(CASE));
 }
 
-fn expect_no_denials(failures: &mut Vec<String>, name: &str, arm: &Arm) {
-    if !arm.denials.is_empty() {
-        failures.push(format!(
-            "{name}: 宣言した辺だけを撃つ腕で拒否が積まれた: {:?}",
-            arm.denials
-        ));
-    }
-}
-
 /// ⑥の読み方。**入口が届かない回は、子の失敗を数えない**（計器の失敗。判定不能として言う）。
 fn judge_network(name: &str, arm: &Arm) -> Vec<String> {
     let mut failures = Vec::new();
@@ -760,57 +743,4 @@ fn wanted_declarations(shell: &MiddleShell, plan: &Plan) -> Vec<(String, String)
         (CMD_DOMAIN.to_string(), secret),
         (CMD_DOMAIN.to_string(), marker_dir),
     ]
-}
-
-/// パスを比べる形へ畳む（区切りを`/`、小文字）。
-fn fold(path: &str) -> String {
-    path.replace('\\', "/").to_ascii_lowercase()
-}
-
-/// エディタの CLI でドメインの宣言を全部取り消す（`record_net_e2e.rs`の後片付けと同じ。取り消しは
-/// 狭める向きなので`--auto-approve`で書ける）。ACE はここでは剥がさない——次の`harness.exe`の起動が剥がす。
-fn unapprove_all(ws: &Path, domain: &str) {
-    let output = Command::new(editor_exe())
-        .args([
-            "unapprove",
-            "--workspace",
-            &ws.to_string_lossy(),
-            "--domain",
-            domain,
-            "--all",
-            "--auto-approve",
-        ])
-        .output()
-        .expect("unapprove should run");
-    eprintln!(
-        "[widening] unapprove {domain}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(output.status.success(), "unapprove {domain} が失敗した");
-}
-
-// --- DACL の読み方（`record_net_e2e.rs`の`acl_sddl`・`count_sid_prefix`の写し。`B-05`） -------------
-
-fn acl_sddl(path: &Path) -> String {
-    let script = format!(
-        "(Get-Acl -LiteralPath '{}').Sddl",
-        path.display().to_string().replace('\'', "''")
-    );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .expect("powershell.exe should run");
-    assert!(
-        output.status.success(),
-        "Get-Acl failed for {}: {}",
-        path.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-/// SDDLの中に現れる、指定した接頭辞を持つSIDの件数（`S-1-15-3-`＝capability SID、`S-1-15-2-`＝package SID）。
-fn count_sid_prefix(sddl: &str, prefix: &str) -> usize {
-    sddl.match_indices(prefix).count()
 }

@@ -1,5 +1,6 @@
-//! 位置ごとのドメインの E2E（`position_domains_e2e.rs`）と広げる遷移の E2E（`widening_transitions_e2e.rs`）が
-//! 共有する部品。2つのテストバイナリの両方から`mod common;`で取り込む（`plans/position-domains/P5.md`の P5.7）。
+//! 位置ごとのドメインの E2E（`position_domains_e2e.rs`）・広げる遷移の E2E（`widening_transitions_e2e.rs`）・
+//! 引数を固定した位置と Strict の辺の E2E（`split_strict_e2e.rs`）が共有する部品。どのテストバイナリからも
+//! `mod common;`で取り込む（`plans/position-domains/P5.md`の P5.7・P5.10.3）。
 //!
 //! # 置き場の注意
 //!
@@ -25,6 +26,9 @@
 //! - 中の段のシェルを探す場所（[`middle_shell`]の`which::which("pwsh")`と`SystemRoot`）:
 //!   `harness-sandbox`の`win_appcontainer/spawn.rs`の`shell_candidates`。**どれを外し、どれを最後に積むかの
 //!   判断は写さず**、公開した`shell_candidates_from`を呼ぶ
+//! - DACL の読み方（[`acl_sddl`]・[`count_sid_prefix`]）と宣言の取り消し（[`unapprove_all`]）: `tests/record_net_e2e.rs`の
+//!   同名の関数と後片付け。広げる遷移の E2E が写したものを、引数を固定した位置の E2E（`split_strict_e2e.rs`）も
+//!   使うのでここへ移した（P5.10.3）
 
 #![allow(dead_code)]
 
@@ -532,7 +536,79 @@ pub fn end_turn(text: &str) -> Vec<StreamEvent> {
     ]
 }
 
+/// この回だけの印（前の回の出力や台帳の残りを今回の証拠として読まない）。
+pub fn nonce() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    format!("{}_{nanos}", std::process::id())
+}
+
+/// パスを比べる形へ畳む（区切りを`/`、小文字）。
+pub fn fold(path: &str) -> String {
+    path.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// 宣言した辺だけを撃つ腕で、待ち行列に拒否が積まれていないか（積まれていたら`failures`へ足す）。
+pub fn expect_no_denials(failures: &mut Vec<String>, name: &str, arm: &Arm) {
+    if !arm.denials.is_empty() {
+        failures.push(format!(
+            "{name}: 宣言した辺だけを撃つ腕で拒否が積まれた: {:?}",
+            arm.denials
+        ));
+    }
+}
+
 // --- 後始末の確かめ ---------------------------------------------------------------
+
+/// エディタの CLI でドメインの宣言を全部取り消す（`record_net_e2e.rs`の後片付けと同じ。取り消しは
+/// 狭める向きなので`--auto-approve`で書ける）。ACE はここでは剥がさない——次の`harness.exe`の起動が剥がす。
+pub fn unapprove_all(ws: &Path, domain: &str) {
+    let output = Command::new(editor_exe())
+        .args([
+            "unapprove",
+            "--workspace",
+            &ws.to_string_lossy(),
+            "--domain",
+            domain,
+            "--all",
+            "--auto-approve",
+        ])
+        .output()
+        .expect("unapprove should run");
+    eprintln!(
+        "[position-domains] unapprove {domain}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "unapprove {domain} が失敗した");
+}
+
+/// ファイルの DACL を SDDL で（`record_net_e2e.rs`の`acl_sddl`の写し）。
+pub fn acl_sddl(path: &Path) -> String {
+    let script = format!(
+        "(Get-Acl -LiteralPath '{}').Sddl",
+        path.display().to_string().replace('\'', "''")
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .expect("powershell.exe should run");
+    assert!(
+        output.status.success(),
+        "Get-Acl failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// SDDLの中に現れる、指定した接頭辞を持つSIDの件数（`S-1-15-3-`＝capability SID、`S-1-15-2-`＝package SID）。
+/// `record_net_e2e.rs`の`count_sid_prefix`の写し。
+pub fn count_sid_prefix(sddl: &str, prefix: &str) -> usize {
+    sddl.match_indices(prefix).count()
+}
 
 /// このユーザーの AppContainer プロファイルのうち、harness の族（セッション・MCP・遷移先ドメイン）の名前。
 ///
