@@ -29,6 +29,7 @@ fn edge(exe: ExeMatcher, argv: ArgvMatcher, to: &str) -> TransitionEdge {
         cwd: None,
         to: to.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }
 }
 
@@ -223,6 +224,7 @@ fn a_literal_edge_wins_over_a_pattern_edge_that_also_matches() {
                     cwd: None,
                     to: "py-any".to_string(),
                     env: None,
+                    output: ChildOutput::Return,
                 },
                 TransitionEdge {
                     exe: literal_exe(r"C:\python\python.exe"),
@@ -230,6 +232,7 @@ fn a_literal_edge_wins_over_a_pattern_edge_that_also_matches() {
                     cwd: Some(r"C:\ws".to_string()),
                     to: "py-a".to_string(),
                     env: None,
+                    output: ChildOutput::Return,
                 },
             ]),
         )
@@ -277,6 +280,7 @@ fn two_matching_pattern_edges_are_refused_instead_of_picking_one() {
                     cwd: None,
                     to: "tools".to_string(),
                     env: None,
+                    output: ChildOutput::Return,
                 },
                 TransitionEdge {
                     exe: ExeMatcher::Pattern(r"c:/tools/gi.*".to_string()),
@@ -284,6 +288,7 @@ fn two_matching_pattern_edges_are_refused_instead_of_picking_one() {
                     cwd: None,
                     to: "git".to_string(),
                     env: None,
+                    output: ChildOutput::Return,
                 },
             ]),
         )
@@ -325,6 +330,7 @@ fn two_identical_literal_edges_are_rejected_at_edit_time() {
         cwd: Some(r"C:\ws".to_string()),
         to: "git".to_string(),
         env: None,
+        output: ChildOutput::Return,
     };
     let declared = Declared::new()
         .domain("shell", rules(vec![one(), one()]))
@@ -389,6 +395,7 @@ fn an_edge_entering_a_strict_domain_must_fix_argv_and_cwd_whatever_its_direction
                     cwd: cwd.map(str::to_string),
                     to: "logs".to_string(),
                     env: None,
+                    output: ChildOutput::Return,
                 }]),
             )
             .domain_with_fs("logs", vec![("C:/logs/**", FsAccess::Read)], rules(vec![]))
@@ -522,6 +529,7 @@ fn a_strict_edge_does_not_propagate_the_width_behind_it_but_a_merely_fixed_one_d
                 cwd: Some(r"C:\tools".to_string()),
                 to: "wide".to_string(),
                 env: None,
+                output: ChildOutput::Return,
             }]),
         )
         .domain_with_fs(
@@ -577,6 +585,7 @@ fn an_exe_pattern_may_only_narrow_but_an_argv_pattern_may_widen() {
         cwd: None,
         to: "dst".to_string(),
         env: None,
+        output: ChildOutput::Return,
     };
     let argv_pattern = || TransitionEdge {
         exe: literal_exe(r"C:\python\python.exe"),
@@ -584,6 +593,7 @@ fn an_exe_pattern_may_only_narrow_but_an_argv_pattern_may_widen() {
         cwd: None,
         to: "dst".to_string(),
         env: None,
+        output: ChildOutput::Return,
     };
     let wider = || vec![("C:/secret/**", FsAccess::Read)];
     let narrower = || vec![("C:/ws/src", FsAccess::Read)];
@@ -609,6 +619,7 @@ fn an_exe_pattern_into_a_wider_strict_domain_is_still_refused() {
                 cwd: Some(r"C:\tools".to_string()),
                 to: "logs".to_string(),
                 env: None,
+                output: ChildOutput::Return,
             }]),
         )
         .domain_with_fs("logs", vec![("C:/logs/**", FsAccess::Read)], rules(vec![]))
@@ -616,11 +627,52 @@ fn an_exe_pattern_into_a_wider_strict_domain_is_still_refused() {
     assert_rejects(&declared.input(), "an executable pattern may only narrow");
 }
 
-/// **ハンドルの引き継ぎの式はこの段では据え置く**（`plans/position-domains/P5.md` の P5.3。安全側）。広げる辺は
-/// 固定しなくても書けるようになったが、Daemon は呼び出し元の標準入出力を子へ渡さない（P5.4b で辺ごとの出力の設定へ
-/// 付け替える）。固定の検査も、固定していない辺には掛からない。
+/// [P5.4b] **広げる辺は普通のモードで、子の出力を返す**（決定66(3)(4)。既定は返す）。Strict ではないので
+/// Daemon は標準入力も断たない。P5.3 までは「固定していない、かつ広げない」でしか呼び出し元の標準入出力を渡さず、
+/// 広げる辺の子には渡していなかった。
 #[test]
-fn a_widening_edge_does_not_inherit_the_callers_handles_until_p5_4b() {
+fn with_output_changes_only_the_output_of_an_editor_edge() {
+    let base = editor_edge(r"C:\tools\gen.exe", any_argv(), "logs");
+    let discarding = base.clone().with_output(ChildOutput::Discard);
+    assert_eq!(discarding.output, ChildOutput::Discard);
+    assert_eq!(
+        TransitionEdge {
+            output: ChildOutput::Return,
+            ..discarding.clone()
+        },
+        base,
+        "the output setting must be the only difference (the shape stays editor_edge's)"
+    );
+    assert_eq!(
+        discarding.with_output(ChildOutput::Return).output,
+        ChildOutput::Return
+    );
+}
+
+/// [P5.10.1] **作業ディレクトリだけを替える**（決定67(3)。Strict の辺と相対パスの引数の辺はエディタが作業ディレクトリを
+/// 宣言する）。形の持ち主は`editor_edge`のまま——作業ディレクトリ以外の欄が変わったら赤くなる。`None`で宣言を外す（対の側）。
+#[test]
+fn with_cwd_changes_only_the_cwd_of_an_editor_edge() {
+    let base = editor_edge(
+        r"C:\Python312\python.exe",
+        ArgvMatcher::Literal(r"python C:\tools\mv.py".to_string()),
+        "python-mv",
+    );
+    let declared = base.clone().with_cwd(Some(r"C:\tools".to_string()));
+    assert_eq!(declared.cwd.as_deref(), Some(r"C:\tools"));
+    assert_eq!(
+        TransitionEdge {
+            cwd: None,
+            ..declared.clone()
+        },
+        base,
+        "the cwd must be the only difference (the shape stays editor_edge's)"
+    );
+    assert_eq!(declared.with_cwd(None), base);
+}
+
+#[test]
+fn a_widening_edge_returns_the_childs_output_and_is_not_strict() {
     let declared = Declared::new()
         .domain(
             "narrow",
@@ -639,81 +691,242 @@ fn a_widening_edge_does_not_inherit_the_callers_handles_until_p5_4b() {
     };
     assert_eq!(allowed.to, "wide");
     assert_eq!(allowed.direction, Direction::WiderOrUnknown);
-    assert!(!allowed.inherit_handles);
-    assert!(!allowed.fixed);
+    assert_eq!(allowed.output, ChildOutput::Return);
+    assert!(!allowed.strict);
+}
+
+/// [P5.4b] **辺の出力の設定と Strict の印が、そのまま Daemon への指示に載る**（`Allowed{output, strict}`）。
+/// 2つは独立している——Strict の辺でも出力は辺ごとの設定に従い（既定は返す。決定66の追記の束の表）、
+/// 捨てる設定は普通の辺にも Strict の辺にも書ける。4つの組を1本で見る（片方だけ読む実装を落とす）。
+#[test]
+fn the_output_setting_and_the_strict_mark_reach_the_daemons_instructions() {
+    let fixed_edge = |exe: &str, to: &str, output: ChildOutput| TransitionEdge {
+        exe: literal_exe(exe),
+        argv: literal_argv(&format!(r#""{exe}" --run"#)),
+        cwd: Some(r"C:\ws".to_string()),
+        to: to.to_string(),
+        env: None,
+        output,
+    };
+    let declared = Declared::new()
+        .domain(
+            "shell",
+            rules(vec![
+                fixed_edge(r"C:\t\plain.exe", "plain", ChildOutput::Return),
+                fixed_edge(r"C:\t\quiet.exe", "plain", ChildOutput::Discard),
+                fixed_edge(r"C:\t\sign.exe", "signer", ChildOutput::Return),
+                fixed_edge(r"C:\t\seal.exe", "signer", ChildOutput::Discard),
+            ]),
+        )
+        .domain("plain", rules(vec![]))
+        .domain("signer", rules(vec![]))
+        .mark_strict("signer");
+    let input = declared.input();
+    let graph = TransitionGraph::build(&input).expect("valid declaration");
+    let instructions = |exe: &str| {
+        let Resolution::Allowed(allowed) = graph.resolve(SpawnAttempt {
+            from_domain: "shell",
+            exe,
+            command_line: &format!(r#""{exe}" --run"#),
+            cwd: r"C:\ws",
+        }) else {
+            panic!("the edge {exe} should resolve");
+        };
+        (allowed.output, allowed.strict)
+    };
+
+    assert_eq!(
+        instructions(r"C:\t\plain.exe"),
+        (ChildOutput::Return, false)
+    );
+    assert_eq!(
+        instructions(r"C:\t\quiet.exe"),
+        (ChildOutput::Discard, false)
+    );
+    assert_eq!(instructions(r"C:\t\sign.exe"), (ChildOutput::Return, true));
+    assert_eq!(instructions(r"C:\t\seal.exe"), (ChildOutput::Discard, true));
+}
+
+/// [P5.4b] **書式の固定**: 出力の設定の綴りは`"output": "discard"`ただ1つで、返す（既定）辺には欄を書かない
+/// （出力の設定を使わないワークスペースの`policy.json`は、この変更の前と1バイトも変わらない）。知らない綴りは読まない。
+#[test]
+fn the_output_setting_is_written_only_when_discarding_and_in_one_spelling() {
+    let returning: TransitionEdge = serde_json::from_str(
+        r#"{"exe":{"literal":"C:\\x\\git.exe"},"argv":{"any":true},"to":"shell"}"#,
+    )
+    .unwrap();
+    assert_eq!(returning.output, ChildOutput::Return, "the default returns the output");
+    let plain = serde_json::to_string(&returning).unwrap();
+    assert!(!plain.contains("output"), "a returning edge must not carry the key: {plain}");
+
+    let discarding = TransitionEdge {
+        output: ChildOutput::Discard,
+        ..returning
+    };
+    let written = serde_json::to_string(&discarding).unwrap();
+    assert!(written.contains(r#""output":"discard""#), "{written}");
+    let read_back: TransitionEdge = serde_json::from_str(&written).unwrap();
+    assert_eq!(read_back.output, ChildOutput::Discard);
+
+    assert!(
+        serde_json::from_str::<TransitionEdge>(
+            r#"{"exe":{"literal":"C:\\x\\git.exe"},"argv":{"any":true},"to":"shell","output":"drop"}"#,
+        )
+        .is_err(),
+        "an unknown spelling must not be read as one of the two settings"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // 4. argvの粒度とenvの扱い
 // ---------------------------------------------------------------------------
 
+/// [P5.4c] **環境変数の決め方は、引数の種類ではなく Strict の印で分かれる**（決定66(5)と追記）。
+///
+/// 普通の辺は**引数の種類に関わらず**「呼び出し元の環境変数＋辺の差分」（[`EnvPolicy::CallerPlusDiff`]）で、
+/// Strict の辺だけが「harness の基準の値＋辺の差分」（[`EnvPolicy::BaselinePlusDiff`]）になる。
+/// P5.4b までは`argv: any`の辺が「呼び出し元のまま（差分は効かない）」・それ以外が「基準＋差分」で、
+/// **同じ普通の辺が引数の書き方で2つに割れていた**（決定66(5)が直すと言った不整合）。
+///
+/// 3つの辺を1本で見る（引数が任意の普通の辺・引数を固定した普通の辺・Strict の辺）——印だけが鍵であることは、
+/// **引数の書き方が同じで印だけ違う2本**（2つめと3つめ）が別の答えを返すことで示す。
 #[test]
-fn an_any_argv_edge_passes_the_environment_through_and_a_literal_one_fixes_it() {
+fn the_environment_is_keyed_by_the_strict_mark_not_by_the_kind_of_argv() {
+    let diff = || {
+        Some(EnvOverride {
+            set: BTreeMap::from([("GIT_PAGER".to_string(), "cat".to_string())]),
+            unset: Vec::new(),
+        })
+    };
+    let fixed_edge = |exe: &str, to: &str| TransitionEdge {
+        exe: literal_exe(exe),
+        argv: literal_argv(&format!(r#""{exe}" --run"#)),
+        cwd: Some(r"C:\ws".to_string()),
+        to: to.to_string(),
+        env: diff(),
+        output: ChildOutput::Return,
+    };
     let declared = Declared::new()
         .domain(
             "shell",
             rules(vec![
-                edge(literal_exe(r"C:\x\git.exe"), any_argv(), "shell"),
                 TransitionEdge {
-                    exe: literal_exe(r"C:\python\python.exe"),
-                    argv: literal_argv(r#""C:\python\python.exe" C:\ws\a.py"#),
-                    cwd: Some(r"C:\ws".to_string()),
-                    to: "shell".to_string(),
-                    env: None,
+                    env: diff(),
+                    ..edge(literal_exe(r"C:\x\git.exe"), any_argv(), "shell")
                 },
+                fixed_edge(r"C:\tools\fmt.exe", "plain"),
+                fixed_edge(r"C:\tools\sign.exe", "signer"),
             ]),
         )
-        .domain("py-a", rules(vec![]));
+        .domain("plain", rules(vec![]))
+        .domain("signer", rules(vec![]))
+        .mark_strict("signer");
     let input = declared.input();
     let graph = TransitionGraph::build(&input).expect("valid declaration");
-
-    let Resolution::Allowed(passed) = graph.resolve(SpawnAttempt {
-        from_domain: "shell",
-        exe: r"C:\x\git.exe",
-        command_line: "git status",
-        cwd: r"C:\ws",
-    }) else {
-        panic!("the any-argv edge should resolve");
+    let env_of = |exe: &str, command_line: &str| {
+        let Resolution::Allowed(allowed) = graph.resolve(SpawnAttempt {
+            from_domain: "shell",
+            exe,
+            command_line,
+            cwd: r"C:\ws",
+        }) else {
+            panic!("the edge {exe} should resolve");
+        };
+        allowed.env.clone()
     };
-    assert_eq!(passed.env, &EnvPolicy::PassThrough);
-    assert!(
-        passed.inherit_handles,
-        "an any-argv narrowing edge keeps the caller's stdio"
-    );
-    assert!(
-        !passed.fixed,
-        "an any-argv edge fixes nothing, so the daemon has no fixed file to check"
-    );
-
-    let Resolution::Allowed(fixed) = graph.resolve(SpawnAttempt {
-        from_domain: "shell",
-        exe: r"C:\python\python.exe",
-        command_line: r#""C:\python\python.exe" C:\ws\a.py"#,
-        cwd: r"C:\ws",
-    }) else {
-        panic!("the literal edge should resolve");
+    let expected_diff = EnvOverride {
+        set: BTreeMap::from([("GIT_PAGER".to_string(), "cat".to_string())]),
+        unset: Vec::new(),
     };
+
+    assert_eq!(
+        env_of(r"C:\x\git.exe", "git status"),
+        EnvPolicy::CallerPlusDiff(expected_diff.clone()),
+        "an any-argv ordinary edge keeps the caller's environment and the declared diff applies \
+         (until P5.4c the diff was silently dropped here)"
+    );
+    assert_eq!(
+        env_of(r"C:\tools\fmt.exe", r#""C:\tools\fmt.exe" --run"#),
+        EnvPolicy::CallerPlusDiff(expected_diff.clone()),
+        "a fixed-argv edge into a domain without the strict mark is still the ordinary mode"
+    );
+    assert_eq!(
+        env_of(r"C:\tools\sign.exe", r#""C:\tools\sign.exe" --run"#),
+        EnvPolicy::BaselinePlusDiff(expected_diff),
+        "an edge entering a strict domain must not carry the caller's environment"
+    );
+}
+
+/// [P5.4a] **起こす直前の検査（固定したファイルを呼び出し元が書き換えられないか）を Daemon へ頼むのは、
+/// Strict のドメインへ入る辺だけ**（決定66の追記）。鍵は書き方の形（引数のリテラル＋作業ディレクトリ）ではなく
+/// 遷移先の印で、印の判定は[`GraphFacts::is_strict_edge`]の1か所。P5.4b で欄の名前を`fixed`から
+/// [`Allowed::strict`]へ替えた（同じ欄で標準入力も断つ）。
+///
+/// 対で見る（`B-35`）——同じ形の辺でも、印の無いドメインへ入る辺と、Strict のドメインの中の自己ループは頼まない。
+/// 前者が頼むと、普通のモードの辺まで固定の検査で断られ得る（決定66が外した束が戻る）。
+#[test]
+fn only_an_edge_into_a_strict_domain_asks_the_daemon_to_check_its_fixed_files() {
+    let fixed_edge = |exe: &str, to: &str| TransitionEdge {
+        exe: literal_exe(exe),
+        argv: literal_argv(&format!(r#""{exe}" --run"#)),
+        cwd: Some(r"C:\ws".to_string()),
+        to: to.to_string(),
+        env: None,
+        output: ChildOutput::Return,
+    };
+    let declared = Declared::new()
+        .domain(
+            "shell",
+            rules(vec![
+                fixed_edge(r"C:\tools\sign.exe", "signer"),
+                fixed_edge(r"C:\tools\fmt.exe", "plain"),
+            ]),
+        )
+        .domain(
+            "signer",
+            rules(vec![fixed_edge(r"C:\tools\again.exe", "signer")]),
+        )
+        .domain("plain", rules(vec![]))
+        .mark_strict("signer");
+    let input = declared.input();
+    let graph = TransitionGraph::build(&input).expect("valid declaration");
+    let fixed_of = |from: &str, exe: &str| {
+        let Resolution::Allowed(allowed) = graph.resolve(SpawnAttempt {
+            from_domain: from,
+            exe,
+            command_line: &format!(r#""{exe}" --run"#),
+            cwd: r"C:\ws",
+        }) else {
+            panic!("the fixed edge {exe} from {from} should resolve");
+        };
+        allowed.strict
+    };
+
     assert!(
-        matches!(fixed.env, EnvPolicy::Fixed(_)),
-        "an argv-selector edge must not pass the caller's environment through"
+        fixed_of("shell", r"C:\tools\sign.exe"),
+        "an edge entering a strict domain must ask the daemon to check its fixed files"
     );
     assert!(
-        !fixed.inherit_handles,
-        "a fully fixed edge must not inherit the caller's handles (stdin can carry code)"
+        !fixed_of("shell", r"C:\tools\fmt.exe"),
+        "an edge into a domain without the strict mark is the ordinary mode: nothing is fixed"
     );
     assert!(
-        fixed.fixed,
-        "a fully fixed edge must tell the daemon to check its fixed files before spawning"
+        !fixed_of("signer", r"C:\tools\again.exe"),
+        "a self-loop inside a strict domain does not enter it"
     );
 }
 
 /// 固定したファイルの候補は、**書かれた綴りのまま**（大小も区切りも変えずに）返る
 /// ——Daemonはこの値でファイルを実際に開く。相対トークンとスイッチは候補にしない（対）。
+///
+/// [P5.4d] **作業ディレクトリも最後に並ぶ**（決定66の追記の束「呼び出し元が書ける場所なら断る」）。2層の検査が
+/// 同じ候補を見るので、片方だけが作業ディレクトリを見る形にならない。
 #[test]
 fn fixed_file_paths_are_the_image_and_absolute_arguments_as_written() {
     let paths = fixed_file_paths(
         r"C:\Tools\Gen.exe",
         r#""C:\Tools\Gen.exe" --in C:\Data\In.txt /c rel.txt --out "D:\Out Dir\x.bin""#,
+        Some(r"C:\Work Dir"),
     );
     assert_eq!(
         paths,
@@ -721,14 +934,24 @@ fn fixed_file_paths_are_the_image_and_absolute_arguments_as_written() {
             r"C:\Tools\Gen.exe".to_string(),
             r"C:\Data\In.txt".to_string(),
             r"D:\Out Dir\x.bin".to_string(),
+            r"C:\Work Dir".to_string(),
         ],
-        "the image first, then only the absolute path-like arguments, spelled as written"
+        "the image first, then only the absolute path-like arguments, then the cwd, spelled as written"
+    );
+    assert_eq!(
+        fixed_file_paths(r"C:\Tools\Gen.exe", r#""C:\Tools\Gen.exe""#, None),
+        vec![r"C:\Tools\Gen.exe".to_string()],
+        "an edge without a declared cwd adds no cwd candidate"
     );
 }
 
-/// 呼び出し元のenvを通す辺にenv差分を書いても効かない。**無言で効かない**のが最悪なので落とす。
+/// [P5.4c] **どの辺でも env の差分が効くので、引数が任意の辺に差分を書いても落とさない**（規則(f)を削除。決定66(5)）。
+///
+/// かつてこの形は「無言で効かない」ことを避けるために拒否していた。P5.4c で**普通の辺は引数の種類に関わらず
+/// 呼び出し元の環境変数＋差分**になったので、差分は効く——落とす理由そのものが消えた
+/// （[`the_environment_is_keyed_by_the_strict_mark_not_by_the_kind_of_argv`]が効くことの側を固定する）。
 #[test]
-fn an_env_diff_on_a_pass_through_edge_is_rejected_instead_of_silently_ignored() {
+fn an_env_diff_on_an_any_argv_edge_is_accepted_because_it_now_applies() {
     let declared = Declared::new().domain(
         "shell",
         rules(vec![TransitionEdge {
@@ -740,9 +963,10 @@ fn an_env_diff_on_a_pass_through_edge_is_rejected_instead_of_silently_ignored() 
                 set: BTreeMap::from([("GIT_PAGER".to_string(), "cat".to_string())]),
                 unset: Vec::new(),
             }),
+            output: ChildOutput::Return,
         }]),
     );
-    assert_rejects(&declared.input(), "would never be applied");
+    assert_accepts(&declared.input());
 }
 
 // ---------------------------------------------------------------------------
@@ -911,6 +1135,7 @@ fn a_relative_argument_requires_a_declared_cwd_but_an_absolute_one_does_not() {
             cwd: None,
             to: "cmd".to_string(),
             env: None,
+            output: ChildOutput::Return,
         }]),
     );
     assert_rejects(&relative.input(), "but the edge declares no cwd");
@@ -923,6 +1148,7 @@ fn a_relative_argument_requires_a_declared_cwd_but_an_absolute_one_does_not() {
             cwd: None,
             to: "cmd".to_string(),
             env: None,
+            output: ChildOutput::Return,
         }]),
     );
     assert_accepts(&absolute.input());
@@ -939,6 +1165,7 @@ fn a_declared_cwd_must_match_the_caller_and_a_matching_one_resolves() {
             cwd: Some(r"C:\ws".to_string()),
             to: "cmd".to_string(),
             env: None,
+            output: ChildOutput::Return,
         }]),
     );
     let input = declared.input();
@@ -971,61 +1198,153 @@ fn a_declared_cwd_must_match_the_caller_and_a_matching_one_resolves() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. 固定値が指すファイルの置き場
+// 7. 固定値が指すファイルの置き場（規則(i)。Strict の辺だけに掛かる——P5.4a）
 // ---------------------------------------------------------------------------
 
+/// `cmd`（ワークスペースへ書ける）から`to`へ、`script`を引数に固定した辺を1本持つ宣言。
+///
+/// 作業ディレクトリは書けない場所（`C:\tools`）に置く——P5.4d から作業ディレクトリも規則(i)の候補なので、
+/// ワークスペースに置くと許可側の対が作業ディレクトリのせいで落ちる（測りたいのは引数のスクリプトの置き場）。
+fn with_fixed_script(script: &str, to: &str) -> Declared {
+    Declared::new()
+        .domain_with_fs(
+            "cmd",
+            vec![("C:/ws/**", FsAccess::ReadWrite)],
+            rules(vec![TransitionEdge {
+                exe: literal_exe(r"C:\python\python.exe"),
+                argv: literal_argv(&format!(r#""C:\python\python.exe" {script}"#)),
+                cwd: Some(r"C:\tools".to_string()),
+                to: to.to_string(),
+                env: None,
+                output: ChildOutput::Return,
+            }]),
+        )
+        .domain("logs", rules(vec![]))
+}
+
+/// Strict のドメインへ入る辺で、固定した値を呼び出し元が書き換えられるなら断る（決定66の追記の束）。
 #[test]
-fn a_fixed_value_that_the_caller_can_rewrite_is_rejected() {
-    let writable_by_declaration = Declared::new().domain_with_fs(
-        "cmd",
-        vec![("C:/ws/**", FsAccess::ReadWrite)],
-        rules(vec![TransitionEdge {
-            exe: literal_exe(r"C:\python\python.exe"),
-            argv: literal_argv(r#""C:\python\python.exe" C:\ws\a.py"#),
-            cwd: Some(r"C:\ws".to_string()),
-            to: "cmd".to_string(),
-            env: None,
-        }]),
-    );
+fn a_fixed_value_that_the_caller_can_rewrite_is_rejected_on_an_edge_into_a_strict_domain() {
     assert_rejects(
-        &writable_by_declaration.input(),
+        &with_fixed_script(r"C:\ws\a.py", "logs")
+            .mark_strict("logs")
+            .input(),
         "which this domain can write",
     );
 
     // 呼び出し元から書けない場所にあれば通る（対）。
-    let elsewhere = Declared::new().domain_with_fs(
-        "cmd",
-        vec![("C:/ws/**", FsAccess::ReadWrite)],
-        rules(vec![TransitionEdge {
-            exe: literal_exe(r"C:\python\python.exe"),
-            argv: literal_argv(r#""C:\python\python.exe" C:\tools\a.py"#),
-            cwd: Some(r"C:\ws".to_string()),
-            to: "cmd".to_string(),
-            env: None,
-        }]),
+    assert_accepts(
+        &with_fixed_script(r"C:\tools\a.py", "logs")
+            .mark_strict("logs")
+            .input(),
     );
-    assert_accepts(&elsewhere.input());
+}
+
+/// [P5.4a] **印の無いドメインへ入る辺には規則(i)を掛けない**（普通のモード。決定66——守る線は子のドメインの権限で、
+/// 入力を固定しないので「固定した値が書き換えられる」という問いが無い）。Strict のドメインの中の自己ループも
+/// 入る辺ではないので掛けない（[`a_self_loop_inside_a_strict_domain_is_not_an_entering_edge`]と同じ扱い）。
+///
+/// 上の禁止側と**同じ形の辺**で、違うのは遷移先の印だけ——これが緑のまま上が赤なら、鍵は書き方の形ではなく印である。
+#[test]
+fn a_fixed_value_the_caller_can_rewrite_is_not_judged_on_an_edge_without_the_strict_mark() {
+    assert_accepts(&with_fixed_script(r"C:\ws\a.py", "logs").input());
+    assert_accepts(
+        &with_fixed_script(r"C:\ws\a.py", "cmd")
+            .mark_strict("cmd")
+            .input(),
+    );
 }
 
 /// 宣言の外から渡した「呼び出し元が書ける場所」も同じ検査に掛かる
 /// （ワークスペースは`policy.json`に宣言として現れないことがある）。
 #[test]
 fn caller_writable_roots_supplied_from_outside_the_declaration_are_honoured() {
-    let declared = Declared::new().domain(
-        "cmd",
-        rules(vec![TransitionEdge {
-            exe: literal_exe(r"C:\python\python.exe"),
-            argv: literal_argv(r#""C:\python\python.exe" C:\ws\a.py"#),
-            cwd: Some(r"C:\ws".to_string()),
-            to: "cmd".to_string(),
-            env: None,
-        }]),
-    );
+    let declared = Declared::new()
+        .domain(
+            "cmd",
+            rules(vec![TransitionEdge {
+                exe: literal_exe(r"C:\python\python.exe"),
+                argv: literal_argv(r#""C:\python\python.exe" C:\ws\a.py"#),
+                cwd: Some(r"C:\ws".to_string()),
+                to: "logs".to_string(),
+                env: None,
+                output: ChildOutput::Return,
+            }]),
+        )
+        .domain("logs", rules(vec![]))
+        .mark_strict("logs");
     let mut input = declared.input();
     assert_accepts(&input);
 
     input.caller_writable_roots = vec![r"C:\ws"];
     assert_rejects(&input, "which this domain can write");
+}
+
+/// `cmd`（ワークスペースへ書ける）から`to`へ、書けない場所のプログラムを固定し、作業ディレクトリを`cwd`に宣言した辺。
+fn with_fixed_cwd(cwd: &str, to: &str) -> Declared {
+    Declared::new()
+        .domain_with_fs(
+            "cmd",
+            vec![("C:/ws/**", FsAccess::ReadWrite)],
+            rules(vec![TransitionEdge {
+                exe: literal_exe(r"C:\tools\gen.exe"),
+                argv: literal_argv(r#""C:\tools\gen.exe" --check"#),
+                cwd: Some(cwd.to_string()),
+                to: to.to_string(),
+                env: None,
+                output: ChildOutput::Return,
+            }]),
+        )
+        .domain("logs", rules(vec![]))
+}
+
+/// [P5.4d] **Strict のドメインへ入る辺は、作業ディレクトリが呼び出し元から書ける場所なら断る**（決定66の追記の束
+/// 「作業ディレクトリ: 辺に宣言必須。呼び出し元が書ける場所なら断る」。残課題 サンドボックス周辺 #67）。
+/// 子は作業ディレクトリからモジュール・DLL・相対パスの引数を拾うので、プログラムと引数を固定しても、
+/// 呼び出し元がそこへ置いたものが子の権限で読まれる。
+///
+/// 対: 同じ辺で作業ディレクトリだけを書けない場所へ移すと通る。印の無いドメインへ入る同じ辺も通る
+/// （普通のモードは入力を固定しないので問いが無い。守る線は子のドメインの権限）。
+#[test]
+fn a_strict_edge_whose_cwd_the_caller_can_write_is_rejected_and_names_the_cwd() {
+    assert_rejects(
+        &with_fixed_cwd(r"C:\ws", "logs").mark_strict("logs").input(),
+        r#"the declared cwd "c:/ws" lies under "c:/ws", which this domain can write"#,
+    );
+    // 配下も同じ（書ける根の下の作業ディレクトリ）。
+    assert_rejects(
+        &with_fixed_cwd(r"C:\ws\sub", "logs")
+            .mark_strict("logs")
+            .input(),
+        "the declared cwd",
+    );
+
+    assert_accepts(&with_fixed_cwd(r"C:\tools", "logs").mark_strict("logs").input());
+    assert_accepts(&with_fixed_cwd(r"C:\ws", "logs").input());
+}
+
+/// [P5.4d] 宣言の外から渡した書ける場所（ワークスペース・`--fs-allow`）も、作業ディレクトリの検査に掛かる。
+#[test]
+fn a_strict_edge_whose_cwd_lies_under_a_place_writable_outside_the_declaration_is_rejected() {
+    let declared = Declared::new()
+        .domain(
+            "cmd",
+            rules(vec![TransitionEdge {
+                exe: literal_exe(r"C:\tools\gen.exe"),
+                argv: literal_argv(r#""C:\tools\gen.exe" --check"#),
+                cwd: Some(r"C:\work".to_string()),
+                to: "logs".to_string(),
+                env: None,
+                output: ChildOutput::Return,
+            }]),
+        )
+        .domain("logs", rules(vec![]))
+        .mark_strict("logs");
+    let mut input = declared.input();
+    assert_accepts(&input);
+
+    input.caller_writable_roots = vec![r"C:\work"];
+    assert_rejects(&input, "the declared cwd");
 }
 
 // ---------------------------------------------------------------------------

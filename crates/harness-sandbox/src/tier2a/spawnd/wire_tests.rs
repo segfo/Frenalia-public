@@ -31,13 +31,51 @@ fn control_request_hello_keeps_its_wire_shape() {
         // [残課題 サンドボックス周辺 #65] 空でない値で固定する——空だと、欄が
         // 落ちても`[]`と区別の付かない形でしか見えない。
         writable_outside_policy: vec!["C:/tools".to_string()],
+        // [決定68] 記録の名前（パスではなく1要素）。空でない値で固定する。
+        spawn_audit_record: Some("policy-editor-1-1".to_string()),
     })
     .expect("serialize");
     // `policy.schema_version`は`PolicyFile::default()`の版（`POLICY_SCHEMA_VERSION`）をそのまま運ぶ——2026-10-06
     // （P5.3、Strict の印）に 2 → 3。Daemon はこの値を見ずにグラフを組むので、欄の形は変わっていない。
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":8,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"]}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":13,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"],"spawn_audit_record":"policy-editor-1-1"}"#
+    );
+}
+
+/// [P5.4b] **`Hello`が運ぶ`policy.json`に、辺の出力の設定が載る**（`"output":"discard"`）。
+///
+/// これが[`PROTOCOL_VERSION`]を9へ上げた理由の現物である——欄を知らない古いDaemonは捨てて読み、
+/// 捨てたつもりの子の出力を呼び出し元へ返す。往復して設定が残ることまで見る。
+#[test]
+fn a_hello_carries_the_output_setting_of_an_edge() {
+    let mut policy = harness_policy::policy_file::PolicyFile::default();
+    let mut shell = harness_policy::policy_file::PolicyDomain::new("shell");
+    shell.process = serde_json::from_str(
+        r#"{"transitions":[{"exe":{"literal":"C:/x/git.exe"},"argv":{"any":true},"to":"shell","output":"discard"}]}"#,
+    )
+    .expect("the edge parses");
+    policy.domains.push(shell);
+    let json = serde_json::to_string(&ControlRequest::Hello {
+        harness_process: 4660,
+        protocol_version: PROTOCOL_VERSION,
+        policy: Box::new(policy),
+        workspace_root: "C:/w".to_string(),
+        domains: Vec::new(),
+        writable_outside_policy: Vec::new(),
+        spawn_audit_record: None,
+    })
+    .expect("serialize");
+    assert!(json.contains(r#""output":"discard""#), "{json}");
+
+    let ControlRequest::Hello { policy, .. } =
+        serde_json::from_str::<ControlRequest>(&json).expect("the hello parses back")
+    else {
+        panic!("not a hello: {json}");
+    };
+    assert_eq!(
+        policy.domains[0].process.transitions[0].output,
+        harness_policy::transition::ChildOutput::Discard
     );
 }
 
@@ -52,6 +90,31 @@ fn a_hello_without_writable_outside_policy_is_refused() {
         serde_json::from_str::<ControlRequest>(without).is_err(),
         "a Hello missing writable_outside_policy must not parse as an empty list"
     );
+}
+
+/// [決定68] 記録を頼まない`Hello`（`harness.exe`）は`null`を運び、Daemon は何も書かない書き手を作る。
+/// 欄の無い電文も「頼まない」と読む——欄が無いことは検査を緩めない（記録は境界ではない）。古い相手は版の一致で断る。
+#[test]
+fn a_hello_without_a_spawn_audit_record_asks_for_no_record() {
+    let json = serde_json::to_string(&ControlRequest::Hello {
+        harness_process: 1,
+        protocol_version: PROTOCOL_VERSION,
+        policy: Box::new(harness_policy::policy_file::PolicyFile::default()),
+        workspace_root: "C:/w".to_string(),
+        domains: Vec::new(),
+        writable_outside_policy: Vec::new(),
+        spawn_audit_record: None,
+    })
+    .expect("serialize");
+    assert!(json.ends_with(r#""spawn_audit_record":null}"#), "{json}");
+    let missing = r#"{"kind":"hello","harness_process":1,"protocol_version":13,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":[]}"#;
+    let ControlRequest::Hello {
+        spawn_audit_record, ..
+    } = serde_json::from_str::<ControlRequest>(missing).expect("parses")
+    else {
+        panic!("not a hello");
+    };
+    assert_eq!(spawn_audit_record, None);
 }
 
 #[test]
@@ -69,6 +132,8 @@ fn control_request_spawn_top_level_keeps_its_wire_shape() {
             identity: DomainIdentitySpec::Capability {
                 sid: "S-1-15-3-1024-9".to_string(),
             },
+            // [決定69] トップレベルの子の環境は harness が組むので、差し替えの宛先は空である。
+            proxy_env: Vec::new(),
         },
         handles: ChildHandles {
             job: 16,
@@ -86,7 +151,7 @@ fn control_request_spawn_top_level_keeps_its_wire_shape() {
     let json = serde_json::to_string(&request).expect("serialize");
     assert_eq!(
         json,
-        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","policy_domain":"workspace-shell","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"],"identity":{"kind":"capability","sid":"S-1-15-3-1024-9"}},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"redirector":{"kind":"lazy","workspace_root":"C:/w","broker_pipe":"\\\\.\\pipe\\lazy"},"console":"required"}"#
+        r#"{"kind":"spawn_top_level","exe":"C:/w/pwsh.exe","args":["-NoProfile"],"cwd":"C:/w","env":[["K","V"]],"domain":{"name":"pwsh-workspace","policy_domain":"workspace-shell","container_sid":"S-1-15-2-1","capability_sids":["S-1-15-3-1024-1"],"identity":{"kind":"capability","sid":"S-1-15-3-1024-9"},"proxy_env":[]},"handles":{"job":16,"stdin_read":20,"stdout_write":24,"stderr_write":28},"redirector":{"kind":"lazy","workspace_root":"C:/w","broker_pipe":"\\\\.\\pipe\\lazy"},"console":"required"}"#
     );
     let back: ControlRequest = serde_json::from_str(&json).expect("round trip");
     assert_eq!(back, request);
@@ -138,7 +203,7 @@ fn control_responses_keep_their_wire_shape() {
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":8}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":13}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {

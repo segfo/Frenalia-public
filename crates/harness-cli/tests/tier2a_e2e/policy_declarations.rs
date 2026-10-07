@@ -165,7 +165,7 @@ impl Case {
         DeclarationRef {
             domain: self.approved_domain,
             value,
-            access: harness_config::FsAccess::ReadExec,
+            key: harness_policy::generalize::SettingsKey::FsReadExec,
         }
     }
 
@@ -175,7 +175,7 @@ impl Case {
         let mut out = vec![DeclarationRef {
             domain: ENTRY_DOMAIN,
             value,
-            access: harness_config::FsAccess::ReadExec,
+            key: harness_policy::generalize::SettingsKey::FsReadExec,
         }];
         if self.crosses_domains() {
             out.push(self.approved_declaration(value));

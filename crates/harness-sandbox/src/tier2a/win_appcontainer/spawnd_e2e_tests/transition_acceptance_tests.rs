@@ -134,6 +134,41 @@ pub(super) fn ask_daemon_as_a_hook(
     // 区別できない（`spawn_report::record_handle_rights`のdoc）。
     suspended: bool,
 ) -> String {
+    ask_daemon_as_a_hook_with_stdin(
+        case,
+        profile,
+        caps,
+        image,
+        command_line,
+        stdout_file,
+        None,
+        None,
+        console,
+        suspended,
+    )
+}
+
+/// [P5.4b] 上に**子の標準入力にするファイル**を足した版（`stdin_file`。`None`なら電文の`stdin`は`null`）。
+///
+/// **`ask_daemon_as_a_hook`はこれを`None`で呼ぶ薄い包みである**（組み立てを2箇所に書かない、
+/// `docs/CODE-STRUCTURE-RULES.md`規則5）。標準入力が子へ届いたかは「子が何を読んだか」でしか分からないので、
+/// 呼び出し側は目印を書いたファイルを渡して、子にそれを標準出力へ写させて確かめる（`edge_stdio_tests`）。
+///
+/// [P5.4d] `cwd`は呼び出し元が申告する作業ディレクトリ（`--spawn-cwd`）。`None`ならワークスペース。Strict の辺は
+/// 作業ディレクトリを呼び出し元が書けない場所に宣言するので（[`policy_with_strict_edge`]）、同じ値をここへ渡す。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn ask_daemon_as_a_hook_with_stdin(
+    case: &Case,
+    profile: &OwnedContainerSid,
+    caps: &[crate::win_common::OwnedSid],
+    image: &str,
+    command_line: &str,
+    stdout_file: &std::path::Path,
+    stdin_file: Option<&std::path::Path>,
+    cwd: Option<&std::path::Path>,
+    console: &str,
+    suspended: bool,
+) -> String {
     let daemon = case.daemon.as_ref().expect("case owns the daemon");
     let workspace = case
         .dir
@@ -142,8 +177,9 @@ pub(super) fn ask_daemon_as_a_hook(
         .path()
         .to_path_buf();
     let spawn_cap = spawn_request_capability_sid().expect("spawn request capability");
-    let workspace_str = workspace.to_string_lossy().into_owned();
+    let cwd_str = cwd.unwrap_or(&workspace).to_string_lossy().into_owned();
     let stdout_str = stdout_file.to_string_lossy().into_owned();
+    let stdin_str = stdin_file.map(|p| p.to_string_lossy().into_owned());
 
     let (child, job, out, err) = super::spawn_via_daemon(
         daemon,
@@ -158,7 +194,7 @@ pub(super) fn ask_daemon_as_a_hook(
             "--spawn-command-line",
             command_line,
             "--spawn-cwd",
-            &workspace_str,
+            &cwd_str,
             "--spawn-stdout",
             &stdout_str,
             "--spawn-console",
@@ -169,6 +205,11 @@ pub(super) fn ask_daemon_as_a_hook(
         .iter()
         .copied()
         .chain(suspended.then_some("--spawn-suspended"))
+        .chain(
+            stdin_str
+                .iter()
+                .flat_map(|path| ["--spawn-stdin", path.as_str()]),
+        )
         .collect::<Vec<&str>>(),
     );
     eprintln!("[spawnd 6f-1] stdout={out}\nstderr={err}");
@@ -1044,7 +1085,18 @@ fn a_same_domain_child_is_still_fully_reachable_through_the_handle_the_caller_ge
     drop(case);
 }
 
-/// 固定辺（**リテラルargv＋cwd宣言**）を1本だけ持つ宣言。
+/// [P5.4a] Strict の印を付けた遷移先ドメイン（[`policy_with_strict_edge`]）。宣言を1件も持たない
+/// ——用意できるのは宣言が無いドメインだけだからである（[`policy_with_cross_domain_edge`]と同じ理由）。
+pub(super) const STRICT_DOMAIN: &str = "spawnd-strict-target";
+
+/// **Strict の辺**（Strict の印が付いたドメインへ入り、**リテラルargv＋cwd宣言**で入力を固定した辺）を1本だけ持つ宣言。
+/// 起こすには遷移先を用意する土台（[`setup_with_provisioned_domains`]）が要る。
+///
+/// # なぜ別ドメインへ入る辺なのか（P5.4a）
+///
+/// 固定値の書込可否（規則(i)・起こす直前の検査）と標準入力を断つ扱いは、決定66の追記で**Strict のドメインへ
+/// 入る辺にだけ**掛かるようになった。かつてここは同じドメインへの自己ループで固定辺を作っていたが、自己ループは
+/// 入る辺ではないので、今は何も掛からない（普通のモード）。
 ///
 /// # 固定値に呼び出し元が書ける場所を含めてはいけない
 ///
@@ -1052,7 +1104,11 @@ fn a_same_domain_child_is_still_fully_reachable_through_the_handle_the_caller_ge
 /// （「固定値が指す先を呼び出し元が書き換えられるなら、引数を固定しても無意味」）。
 /// だからこの辺の引数には**ワークスペースの中のパスを1つも書かない**——
 /// 走ったことは`exit`の終了コードで確かめる。
-pub(super) fn policy_with_fixed_edge(
+///
+/// **作業ディレクトリ（`cwd`）も同じ**（P5.4d。決定66の追記の束「呼び出し元が書ける場所なら断る」）。ワークスペースを
+/// 渡すと`Hello`のグラフ組み立てが辺ごと拒否するので、呼び出し元が書けない場所（[`strict_cwd`]）を渡し、
+/// 頼むときも同じ値を`--spawn-cwd`に渡す（宣言と違う作業ディレクトリは`cwd_mismatch`で断られる）。
+pub(super) fn policy_with_strict_edge(
     exe: &str,
     command_line: &str,
     cwd: &std::path::Path,
@@ -1064,93 +1120,28 @@ pub(super) fn policy_with_fixed_edge(
             "exe": { "literal": exe },
             "argv": { "literal": command_line },
             "cwd": cwd.to_string_lossy(),
-            "to": E2E_POLICY_DOMAIN,
+            "to": STRICT_DOMAIN,
         }]
     }))
-    .expect("the fixed transition declaration must parse");
+    .expect("the strict transition declaration must parse");
     file.domains.push(entry);
+    let mut target = PolicyDomain::new(STRICT_DOMAIN);
+    target.strict = true;
+    file.domains.push(target);
     file
 }
 
-/// **T8（BUG-161の本体）**: 固定辺では、呼び出し元のstdoutハンドルが子へ渡らない。
+/// [P5.4d] Strict の辺の作業ディレクトリにする、**呼び出し元が何の権利も持たない**ディレクトリ。
 ///
-/// # 壊れた状態を一文で
-///
-/// **固定した引数のシェルへ、呼び出し元が標準入力からコマンドを流し込める。**
-/// §19.1は固定する対象にstdinと継承ハンドル全体を挙げており、理由もそこに書いてある
-/// ——stdinが端末でなければシェルは**そこからコマンドを読んで実行する**ので、
-/// 引数を固定しても広いドメインで任意コードが走る。
-///
-/// # 測るのがstdoutなのはなぜか
-///
-/// 断ち方は3本まとめてで（`CallerHandles::default()`を渡す）、**渡ったかどうかが
-/// 見えるのはstdoutだけ**である。stdinが渡ったことは「子が何を読んだか」でしか分からず、
-/// それを測るには固定辺で任意コードを走らせる形を作ることになる。
-/// **同じ1本の分岐なので、見えるほうで固定する。**
-///
-/// # 「出力が無い」と「起きなかった」を分ける
-///
-/// 出力が落ちてこないだけなら、**子が起きていなくても同じに見える**。だから同じ回で
-/// 終了コードを読む——`exit 41`が返ってきた時点で、子は確かに走っている。
-///
-/// 対になるのは`argv: any`の辺を使う
-/// [`the_callers_own_stdout_handle_receives_the_childs_output_and_the_returned_handle_can_be_waited_on`]
-/// で、あちらは**同じハンドルに出力が落ちてくること**を固定している。
-#[test]
-#[ignore = "starts a real spawn daemon and AppContainer child; run through spawn-daemon"]
-fn a_fixed_edge_does_not_hand_the_callers_stdout_to_the_child() {
-    const MARKER: &str = "HARNESS-BUG161-SHOULD-NOT-ARRIVE";
-    const EXIT_CODE: u64 = 41;
-    let cmd = cmd_exe();
-    let command_line = format!("\"{cmd}\" /c echo {MARKER} & exit {EXIT_CODE}");
-
-    let declared = command_line.clone();
-    let (case, profile, caps) = setup_with_policy_and_transitions(
-        "spawnd-bug161-fixed",
-        ChildProcessPolicy::Unrestricted,
-        |workspace| policy_with_fixed_edge(&cmd, &declared, workspace),
-    );
-    let workspace = case
-        .dir
-        .as_ref()
-        .expect("case owns the dir")
-        .path()
-        .to_path_buf();
-    let captured = workspace.join("fixed-edge-stdout.txt");
-
-    let out = ask_daemon_as_a_hook(
-        &case,
-        &profile,
-        &caps,
-        &cmd,
-        &command_line,
-        &captured,
-        "not_needed",
-        false,
-    );
-
-    assert_eq!(
-        report_field(&out, "reply_kind").and_then(|v| v.as_str().map(str::to_string)),
-        Some("spawned".to_string()),
-        "固定辺の要求が拒否された。宣言したcwdと実cwdの綴りがずれている可能性がある\
-         （`cwd_mismatch`なら理由に宣言値と実値が載る）: {out}"
-    );
-    // **子は走っている。** これが無いと「起こさない」実装でも下のassertが緑になる。
-    assert_eq!(
-        report_field(&out, "child_exit_code").and_then(|v| v.as_u64()),
-        Some(EXIT_CODE),
-        "固定辺の子が走っていない（か、終了コードを読めていない）: {out}"
-    );
-
-    let text = std::fs::read_to_string(&captured).unwrap_or_default();
-    assert!(
-        !text.contains(MARKER),
-        "**固定辺なのに、呼び出し元が渡したハンドルが子へ渡っている。**\
-         §19.1は固定する対象にstdinと継承ハンドル全体を挙げており、判定器は辺ごとに\
-         `Allowed::inherit_handles`でそれを答えている。Daemonがその欄を読んでいない\
-         （BUG-161）: file={} content={text:?} {out}",
-        captured.display()
-    );
-
-    drop(case);
+/// `C:\`直下に作るだけで、呼び出し元（セッションのpackage SID）へのACEも workspace capability も付けない
+/// （`fixed_input_tests`の3で、同じ作り方の場所を起こす直前の検査が「書けない」と判定することを確かめている）。
+/// 戻り値を生かしている間だけ在る。
+pub(super) fn strict_cwd(label: &str) -> TestDirGuard {
+    TestDirGuard::create(&format!("{label}-cwd"))
 }
+
+// **T8（BUG-161の本体）はP5.4bで`edge_stdio_tests.rs`へ移した。** かつてここに在った
+// `a_fixed_edge_does_not_hand_the_callers_stdout_to_the_child`は「固定辺では標準入出力を3本まとめて断つ」を
+// 測っていたが、決定66の追記でStrictの辺は標準入力だけを断ち、出力は辺の設定に従う形になった。
+// Daemonが判定器の指示を読んでいること（BUG-161の要点）は、出力を捨てる辺・Strictの辺・広げる辺の3本が
+// 対で見張る。

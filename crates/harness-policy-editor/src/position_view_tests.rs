@@ -119,7 +119,7 @@ pub(crate) fn seed_position_record(
 }
 
 fn loaded(dir: &RecordSessionDir, manifest: &RecordManifest, policy: &PolicyFile) -> PositionView {
-    load(dir, manifest, policy)
+    load(dir, manifest, policy, &harness_policy::position_domains::SplitPositions::new())
         .expect("読めるはず")
         .expect("位置の情報がある記録")
 }
@@ -174,20 +174,20 @@ fn the_rows_follow_the_recorded_tree() {
 fn an_old_record_or_a_pass_2_record_has_no_positions() {
     let ws = workspace();
     let (old, old_manifest) = seed_record(ws.path(), "old");
-    assert!(load(&old, &old_manifest, &PolicyFile::default())
+    assert!(load(&old, &old_manifest, &PolicyFile::default(), &harness_policy::position_domains::SplitPositions::new())
         .expect("読める")
         .is_none());
 
     let (dir, mut manifest) = seed_position_record(ws.path(), "p2", &user_example());
     manifest.pass = 2;
     assert!(
-        load(&dir, &manifest, &PolicyFile::default())
+        load(&dir, &manifest, &PolicyFile::default(), &harness_policy::position_domains::SplitPositions::new())
             .expect("読める")
             .is_none(),
         "パス2は位置を読まない（パス2は process-audit.jsonl を書かない）"
     );
     manifest.pass = 1;
-    assert!(load(&dir, &manifest, &PolicyFile::default())
+    assert!(load(&dir, &manifest, &PolicyFile::default(), &harness_policy::position_domains::SplitPositions::new())
         .expect("読める")
         .is_some());
 }
@@ -235,7 +235,12 @@ fn a_widening_position_is_judged_by_the_checker() {
     let (dir, manifest) = seed_position_record(ws.path(), "s1", &user_example());
     let policy = PolicyFile::default();
     let view = loaded(&dir, &manifest, &policy);
-    let edges = position_edges(&view.assignment, &BTreeMap::new(), &BTreeSet::new());
+    let edges = position_edges(
+        &view.assignment,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+        &BTreeMap::new(),
+    );
     let index_of = |to: &str| {
         view.assignment
             .positions
@@ -244,7 +249,7 @@ fn a_widening_position_is_judged_by_the_checker() {
             .expect("位置がある")
     };
 
-    let plain = verdicts(&policy, ws.path(), &edges, &[]);
+    let plain = verdicts(&policy, ws.path(), &edges, &[], &BTreeSet::new());
     assert!(
         plain.iter().all(|v| *v == EdgeVerdict::Writable),
         "{plain:?}"
@@ -255,7 +260,7 @@ fn a_widening_position_is_judged_by_the_checker() {
         "C:/secret/**".to_string(),
         FsAccess::Read,
     )];
-    let widened = verdicts(&policy, ws.path(), &edges, &secret);
+    let widened = verdicts(&policy, ws.path(), &edges, &secret, &BTreeSet::new());
     let handed = vec![("C:/secret/**".to_string(), "read")];
     assert!(
         matches!(&widened[index_of("calc")], EdgeVerdict::Widens { newly } if newly.fs == handed),
@@ -275,4 +280,91 @@ fn a_widening_position_is_judged_by_the_checker() {
         ENTRY_DOMAIN,
         view.assignment.positions[index_of("pwsh")].from_domain
     );
+}
+
+/// [P5.5] **出力を捨てる位置の辺は`"output":"discard"`で書く**（決定66(4)。キー`o`の予約）。形の持ち主は`editor_edge`の
+/// まま（`with_output`が出力だけを替える）で、捨てない位置は既定の「返す」。
+#[test]
+fn a_position_whose_output_is_discarded_becomes_a_discarding_edge() {
+    use harness_policy::transition::ChildOutput;
+    let ws = workspace();
+    let (dir, manifest) = seed_position_record(ws.path(), "s1", &user_example());
+    let policy = PolicyFile::default();
+    let view = loaded(&dir, &manifest, &policy);
+    let calc = view
+        .assignment
+        .positions
+        .iter()
+        .find(|p| p.to_domain == "calc")
+        .expect("calc の位置");
+    let discard: BTreeSet<PositionKey> = [key_of(calc)].into_iter().collect();
+    let edges = position_edges(&view.assignment, &BTreeMap::new(), &discard, &BTreeMap::new());
+    for add in &edges {
+        let expected = if add.edge.to == "calc" {
+            ChildOutput::Discard
+        } else {
+            ChildOutput::Return
+        };
+        assert_eq!(add.edge.output, expected, "{}", add.edge.to);
+    }
+}
+
+/// [P5.10.2] 分けた位置（`fixed_command_line`あり）を作る。
+fn split_position(exe: &str, line: &str) -> Position {
+    Position {
+        depth: 1,
+        from_domain: ENTRY_DOMAIN.to_string(),
+        exe: exe.to_string(),
+        to_domain: "x".to_string(),
+        source: PositionSource::Proposed,
+        instances: vec![2],
+        command_lines: vec![line.to_string()],
+        fixed_command_line: Some(line.to_string()),
+        argv_missing: 0,
+        argv_truncated: 0,
+    }
+}
+
+/// [P5.10.2] **作業ディレクトリの候補**（決定67(3)）: 引数の中の絶対パスのスクリプトのフォルダ。無ければ実行ファイルの
+/// フォルダ。相対パスのスクリプトなら実行ファイルのフォルダを「推定」として出す。ドライブ直下は`C:\`の形で根を残す。
+#[test]
+fn the_cwd_candidate_is_the_script_folder_else_the_program_folder() {
+    const PY: &str = "C:/Python312/python.exe";
+    let candidate = |exe: &str, line: &str| {
+        let c = cwd_candidate(&split_position(exe, line));
+        (c.dir, c.estimated)
+    };
+    assert_eq!(
+        candidate(PY, r"python C:\tools\mv.py C:\a\x.txt"),
+        (r"C:\tools".to_string(), false)
+    );
+    assert_eq!(candidate(PY, "python mv.py"), ("C:/Python312".to_string(), true));
+    assert_eq!(
+        candidate("C:/Windows/System32/hostname.exe", "hostname"),
+        ("C:/Windows/System32".to_string(), false)
+    );
+    assert_eq!(candidate(PY, r"python C:\job.py"), (r"C:\".to_string(), false));
+}
+
+/// [P5.10.2] **作業ディレクトリを宣言した辺は、その場所から呼んだものとして行き先を引く**（決定67(4)）——ワークスペースから
+/// 引くと、宣言どおりの辺がいつも`CwdMismatch`で「着かない」になり、位置の行も確定も Strict の辺を書けない。
+/// 対の側: 宣言の無い同じ起動はワークスペースから引くので、作業ディレクトリを宣言した辺に着かない。
+#[test]
+fn lands_elsewhere_resolves_a_cwd_edge_from_its_declared_cwd() {
+    use harness_policy::policy_file::PolicyDomain;
+    const PY: &str = "C:/Python312/python.exe";
+    let line = r"python C:\tools\mv.py";
+    let edge = editor_edge(PY, ArgvMatcher::Literal(line.to_string()), "t")
+        .with_cwd(Some(r"C:\tools".to_string()));
+    let mut entry = PolicyDomain::new(ENTRY_DOMAIN);
+    entry.process.transitions.push(edge.clone());
+    let file = PolicyFile {
+        domains: vec![PolicyDomain::new("t"), entry],
+        ..PolicyFile::default()
+    };
+    let graph = TransitionGraph::build(&file.transition_graph_input(Some("C:/ws"), &[]))
+        .expect("検査に通る");
+    assert_eq!(lands_elsewhere(&graph, ENTRY_DOMAIN, &edge, "C:/ws"), None);
+    let undeclared = edge.clone().with_cwd(None);
+    assert!(lands_elsewhere(&graph, ENTRY_DOMAIN, &undeclared, "C:/ws").is_some());
 }

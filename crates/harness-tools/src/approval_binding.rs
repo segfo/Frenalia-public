@@ -332,7 +332,9 @@ pub fn bind_everything(
 ///
 /// - 見るのは`code_only`が真なら**スクリプトの拡張子を持つファイルだけ**（`run_shell`）。
 ///   偽ならすべて（`run_program`でコードを走らせるとき）
-/// - 全部合わせて[`MAX_FILE_LAYERS`]段まで。超えた分は見ない
+/// - 全部合わせて[`MAX_FILE_LAYERS`]段まで。超えた分は見ず、止めたところに
+///   [`DecodeOutcome::CountLimit`](harness_core::DecodeOutcome::CountLimit)の段を1つ残す
+///   （どのファイルの中かも書く。黙って落とすと、全部解けた段と区別がつかない。行の機械の解読と同じ形）
 pub fn decode_in_files(
     previews: &[FilePreview],
     code_only: bool,
@@ -343,10 +345,15 @@ pub fn decode_in_files(
             continue;
         }
         for mut layer in crate::encoded_command::decode_shell_line(&preview.text) {
+            layer.in_file = Some(preview.rel_path.clone());
             if out.len() >= MAX_FILE_LAYERS {
+                // 落とす段の深さと出どころのまま、止めた印にする（その段の親から見て、子が切られたと分かる）。
+                layer.outcome = harness_core::DecodeOutcome::CountLimit {
+                    max_layers: MAX_FILE_LAYERS,
+                };
+                out.push(layer);
                 return out;
             }
-            layer.in_file = Some(preview.rel_path.clone());
             out.push(layer);
         }
     }

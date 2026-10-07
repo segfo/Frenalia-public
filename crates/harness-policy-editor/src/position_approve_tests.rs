@@ -8,10 +8,10 @@
 //! データのパスは`C:/Users/x/...`の架空の場所（`C:/Windows`・`C:/Program Files`は既定で実行できる場所として
 //! 候補から外れる。D-58）。
 
+use harness_policy::transition::ChildOutput;
 use std::cell::Cell;
 use std::path::Path;
 
-use harness_config::FsAccess;
 use harness_policy::generalize::SettingsKey;
 use harness_policy::policy_file::{self, PolicyDomain, PolicyFile, ENTRY_DOMAIN};
 use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher, ExeMatcher, TransitionEdge};
@@ -51,6 +51,7 @@ fn edge(from: &str, exe: &str, to: &str) -> EdgeWrite {
         from_domain: from.to_string(),
         edge: editor_edge(exe, ArgvMatcher::Any(AnyMarker), to),
         replaces_self_loop: false,
+        strict: false,
     }
 }
 
@@ -97,7 +98,7 @@ fn approved(ws: &Path, domain: &str, value: &str) -> bool {
         DeclarationRef {
             domain,
             value,
-            access: FsAccess::Read,
+            key: harness_policy::generalize::SettingsKey::FsRead,
         },
     )
 }
@@ -130,6 +131,88 @@ fn three_domains(ws: &Path) -> PositionRequest<'_> {
         ],
         vec![edge(ENTRY_DOMAIN, PWSH, "pwsh"), edge("pwsh", CALC, "calc")],
     )
+}
+
+/// [決定68 の前例の(12)] **記録したコマンドと作業ディレクトリ（`commands`・`cwd`）は入口のドメインにだけ書く**
+/// （パス2は常に入口から始め、`record-net`はコマンドを省くと入口の`commands`を使う）。ファイルの宣言を書く他の
+/// ドメインには書かない（禁止側）。入口には書く（許可側）——入口のファイルの宣言を選んでいない回でも、入口が確定の後に
+/// 在れば由来として足す。P4 #44（「ファイルの宣言を書く全部のドメインへ」）を改めた。
+#[test]
+fn commands_and_cwd_are_written_only_to_the_entry_domain() {
+    // 入口のファイルの宣言を選んだ回（3つのドメインに書く）。
+    let ws = workspace();
+    let ok = plan(&three_domains(ws.path())).expect("書ける");
+    let entry = ok.file.domain(ENTRY_DOMAIN).expect("入口");
+    assert_eq!(entry.commands, vec!["cmd /c pwsh".to_string()]);
+    assert_eq!(entry.cwd.as_deref(), Some(ws.path()));
+    for name in ["pwsh", "calc"] {
+        let domain = ok.file.domain(name).expect("遷移先");
+        assert!(
+            domain.commands.is_empty(),
+            "{name} にコマンドを書いた: {:?}",
+            domain.commands
+        );
+        assert!(domain.cwd.is_none(), "{name} に作業ディレクトリを書いた");
+    }
+
+    // 入口のファイルの宣言を選んでいない回: 入口は辺の遷移元として確定の後に在るので、由来として足す。
+    let ws = workspace();
+    let ok = plan(&request(
+        ws.path(),
+        vec![select(
+            "calc",
+            vec![proposal("fs-3", SettingsKey::FsRead, "C:/Users/x/c.txt")],
+        )],
+        vec![edge(ENTRY_DOMAIN, CALC, "calc")],
+    ))
+    .expect("書ける");
+    let entry = ok.file.domain(ENTRY_DOMAIN).expect("入口は辺の遷移元として在る");
+    assert_eq!(entry.commands, vec!["cmd /c pwsh".to_string()]);
+    assert!(ok.file.domain("calc").expect("calc").commands.is_empty());
+}
+
+/// [決定68 の前例の(12)] **入口を`commands`のためだけに作らない。** 確定の後の`policy.json`に入口が無ければ（入口の
+/// ファイルの宣言も入口からの辺も無い回）、コマンドはどこにも書かない（入口へ書くと、権限の無い入口のドメインが
+/// 由来だけのために生まれる）。対の側: 入口が元から在れば足す（上の試験の2つ目の回と同じ向き）。
+#[test]
+fn the_entry_is_not_created_just_to_hold_the_command() {
+    let fs = || {
+        vec![select(
+            "pwsh",
+            vec![proposal("fs-2", SettingsKey::FsRead, "C:/Users/x/p.txt")],
+        )]
+    };
+
+    // 禁止側: 入口が無い。`pwsh`は元から在る（届く辺が無くても元から在るドメインには書ける）。
+    let ws = workspace();
+    seed(ws.path(), vec![domain_reading("pwsh", "C:/Users/x/old.txt")]);
+    let ok = plan(&request(ws.path(), fs(), Vec::new())).expect("書ける");
+    assert!(
+        ok.file.domain(ENTRY_DOMAIN).is_none(),
+        "コマンドのためだけに入口を作った: {:?}",
+        ok.file.domain(ENTRY_DOMAIN)
+    );
+    assert!(ok.file.domain("pwsh").expect("pwsh").commands.is_empty());
+    assert!(
+        !ok.created_domains.iter().any(|d| d == ENTRY_DOMAIN),
+        "{:?}",
+        ok.created_domains
+    );
+
+    // 許可側: 入口が元から在れば、そのファイルの宣言を選んでいなくても由来として足す。
+    let ws = workspace();
+    seed(
+        ws.path(),
+        vec![
+            domain_reading("pwsh", "C:/Users/x/old.txt"),
+            PolicyDomain::new(ENTRY_DOMAIN),
+        ],
+    );
+    let ok = plan(&request(ws.path(), fs(), Vec::new())).expect("書ける");
+    assert_eq!(
+        ok.file.domain(ENTRY_DOMAIN).expect("入口").commands,
+        vec!["cmd /c pwsh".to_string()]
+    );
 }
 
 /// **広がる辺も書ける**（決定66。守る線は子のドメインの権限）。書ける辺・ファイルの宣言と一緒に1回で書き、確認の明細に
@@ -313,6 +396,7 @@ fn self_loop(exe: ExeMatcher) -> TransitionEdge {
         cwd: None,
         to: ENTRY_DOMAIN.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }
 }
 
@@ -392,6 +476,7 @@ fn an_edge_that_resolves_elsewhere_after_writing_is_refused() {
         cwd: None,
         to: "tools".to_string(),
         env: None,
+        output: ChildOutput::Return,
     });
     seed(ws.path(), vec![entry, PolicyDomain::new("tools")]);
     let before = bytes(ws.path());
@@ -465,7 +550,7 @@ fn the_cli_approves_a_position_record_into_each_candidates_domain() {
             fs_event("C:/Users/x/c.txt", Some(3), CALC),
         ],
     );
-    let candidates = crate::position_candidates::load(&dir, &manifest, ws.path());
+    let candidates = crate::position_candidates::load(&dir, &manifest, ws.path(), &harness_policy::position_domains::SplitPositions::new());
     assert!(candidates.by_position());
     let id_of = |value: &str| -> (String, Option<String>) {
         let index = candidates
@@ -529,4 +614,52 @@ fn the_cli_approves_a_position_record_into_each_candidates_domain() {
     );
     assert!(file.domain("calc").is_none());
     assert!(approved(ws.path(), "pwsh", "C:/Users/x/b.txt"));
+}
+
+/// [P5.10.2] **Strict の行の辺（`EdgeWrite::strict`）は遷移先に印を付けて同じ1回の保存で書き**、明細に印・作業ディレクトリ・
+/// 「移ってから呼ぶ」が出る（決定67）。禁止側: 呼び出し元が書ける場所（ワークスペース）を作業ディレクトリにすると、書いた後の
+/// 検査（規則(i)）が全体を断り、1バイトも書かない。対: 印を付けない（普通の辺）なら同じ作業ディレクトリでも書ける。
+#[test]
+fn a_strict_write_marks_the_destination_and_a_writable_cwd_refuses_everything() {
+    let ws = workspace();
+    let fixed = editor_edge(
+        PWSH,
+        ArgvMatcher::Literal(format!("\"{PWSH}\" -File C:/tools/a.ps1")),
+        "logs",
+    )
+    .with_cwd(Some("C:/tools".to_string()));
+    let strict_write = |edge: TransitionEdge| EdgeWrite {
+        strict: true,
+        edge,
+        ..edge_for_strict()
+    };
+    let ok = plan(&request(ws.path(), Vec::new(), vec![strict_write(fixed.clone())])).expect("書ける");
+    assert_eq!(ok.strict_marked, vec!["logs".to_string()]);
+    assert!(ok.file.domain("logs").expect("遷移先").strict);
+    let text = confirmation_lines(ws.path(), &ok, &BTreeSet::new()).join("\n");
+    for needle in ["Strict の印を付けるドメイン 1個", "作業ディレクトリ C:/tools", "移ってから呼ぶ"] {
+        assert!(text.contains(needle), "{needle}:\n{text}");
+    }
+    commit(ws.path(), &ok, &policy_file::save).expect("書く");
+    assert!(policy_file::load(ws.path()).unwrap().domain("logs").unwrap().strict);
+
+    let ws = workspace();
+    let in_workspace = fixed.clone().with_cwd(Some(ws.path().to_string_lossy().into_owned()));
+    let refused = plan(&request(ws.path(), Vec::new(), vec![strict_write(in_workspace.clone())]));
+    assert!(refused.is_err(), "{:?}", refused.map(|p| p.strict_marked));
+    assert_eq!(bytes(ws.path()), None, "断った確定で書いた");
+    let ordinary = EdgeWrite {
+        strict: false,
+        ..strict_write(in_workspace)
+    };
+    let ordinary = plan(&request(ws.path(), Vec::new(), vec![ordinary])).expect("普通の辺は書ける");
+    assert!(ordinary.strict_marked.is_empty());
+    // 普通の辺でも作業ディレクトリを宣言すれば、呼び出し元はその場所から呼ぶ必要がある（明細の辺の行で言う）。
+    let text = confirmation_lines(ws.path(), &ordinary, &BTreeSet::new()).join("\n");
+    assert!(text.contains("移ってから呼ぶ") && !text.contains("Strict の印"), "{text}");
+}
+
+/// 入口のドメインから`PWSH`を起こす辺の書き込み（Strict の試験の土台。辺は呼び出し側が差し替える）。
+fn edge_for_strict() -> EdgeWrite {
+    edge(ENTRY_DOMAIN, PWSH, "logs")
 }

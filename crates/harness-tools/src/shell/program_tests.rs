@@ -233,6 +233,36 @@ async fn the_programs_own_exit_code_is_reported() {
     assert!(out.content.contains("[exit code: 7]"), "{}", out.content);
 }
 
+/// [BUG-238] `run_program`で`powershell -EncodedCommand`を起こしても、子がCLIXML（XML）で
+/// 書いた標準エラーは本文で文字へ戻る（`run_shell`と同じ`join_output`を通る）。
+#[cfg(windows)]
+#[tokio::test]
+async fn clixml_from_an_encoded_powershell_is_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ToolCtx::new(dir.path().to_path_buf());
+    // `Write-Error boom-238` を UTF-16LE で base64 にしたもの。
+    let args = json!([
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        "VwByAGkAdABlAC0ARQByAHIAbwByACAAYgBvAG8AbQAtADIAMwA4AA=="
+    ]);
+
+    let out = RunProgramTool::default()
+        .call(json!({ "program": "powershell", "args": args }), &ctx)
+        .await
+        .unwrap();
+
+    let body = &out.content[..out.content.find("\n[exit code:").expect("フッタがある")];
+    assert!(body.contains("boom-238"), "{}", out.content);
+    assert!(!body.contains("#< CLIXML"), "{}", out.content);
+    assert!(
+        out.content.contains("\n[powershell-clixml: "),
+        "{}",
+        out.content
+    );
+}
+
 /// **知らない項目は拒否する**（BUG-164 の片側を新しいツールでは最初から作らない）。
 #[tokio::test]
 async fn unknown_input_fields_are_rejected() {

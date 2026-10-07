@@ -19,7 +19,6 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use harness_sandbox::tier2a::win_appcontainer::passthrough_progress::ProgressCell as PassthroughProgressCell;
 
 use crate::child_run::AbortReason;
-use crate::policy_file::{self, PolicyDomain};
 use crate::record::{RecordEvent, RecordOutcome};
 use crate::record_net::NetRecordEvent;
 use crate::session_dir::{self, NetMode, RecordManifest, RecordSessionDir};
@@ -475,14 +474,12 @@ pub fn progress_bar(ratio: f64, width: usize) -> String {
     format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
-/// 記録画面のフォーカス。
+/// 記録画面のフォーカス。[決定68(2)] パス2にもドメイン欄は無い（始める場所は入口で、編集できない1行として描く）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordField {
     Pass,
     Command,
     Cwd,
-    /// パス2のドメイン名（パス1では飛ばす）。
-    Domain,
 }
 
 /// 編集画面のフォーカス。
@@ -554,7 +551,6 @@ pub struct App {
     pub net_mode: NetMode,
     pub command: TextInput,
     pub cwd: TextInput,
-    pub run_domain: TextInput,
     pub record_focus: RecordField,
     pub run: Option<RunState>,
     /// TUIの間に預かった、このプロセス自身の標準エラー出力（ライブラリの警告）。
@@ -694,7 +690,6 @@ impl App {
             pass: Pass::One,
             net_mode: NetMode::RecordAll,
             command: TextInput::default(),
-            run_domain: TextInput::default(),
             record_focus: RecordField::Command,
             run: None,
             notices: VecDeque::new(),
@@ -1033,6 +1028,10 @@ impl App {
                 run.log_line(format!("撤収 {done}/{total}: {}", path.display()));
             }
             NetRecordEvent::Tier2aReady => run.log_line("Tier2aへ着地しました"),
+            // 文言は実行側が持つ（CLIと同じ関数、規則5）。
+            NetRecordEvent::DomainsProvisioned { provisioned, skipped } => run.log_line(
+                crate::record_net::domains_provisioned_line(&provisioned, skipped),
+            ),
             NetRecordEvent::ExecReachability(reach) => {
                 // 文言は`ExecReach`が持つ（表示側で書き写さない、規則5）。問題が無ければ
                 // 何も出さない——毎回出る警告は読まれなくなる。
@@ -1502,19 +1501,14 @@ impl App {
         if harness_term::is_chorded_char(&key) {
             return None;
         }
-        let kind = self.modal.as_ref().map(|m| m.confirm);
-        let confirm = kind.is_some_and(Confirm::asks);
+        let confirm = self.modal.as_ref().is_some_and(|m| m.confirm.asks());
         // 差分が長いと画面に収まらない。**最後まで読めないと確認にならない**ので送れるようにする。
         // 上限（最後の行が枠の一番下に来る位置）はここでは掛けない——折り返した後の行数は描くまで
         // 分からない。行き過ぎた分は次の描画の後に`apply_draw_feedback`が切り詰める（BUG-196・BUG-076）。
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') if confirm => {
-                self.modal = None;
-                self.modal_scroll = 0;
-                // **何を書くのかはモーダルが持っている**（開いた画面を推測しない。振り分けは`tui::modal`）。
-                if let Some(kind) = kind {
-                    self.commit_confirmed(kind);
-                }
+            // `y`＝書いて留まる・`p`＝書いてパス2へ（決定68(3)）。何を書くのか・`p`を受けるかはモーダルが持つ（`tui::modal`）。
+            KeyCode::Char('y' | 'Y' | 'p' | 'P') if confirm => {
+                self.on_commit_key(key.code);
                 None
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -1593,14 +1587,6 @@ impl App {
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
                     (self.pass, self.net_mode) =
                         cycle_pass(self.pass, self.net_mode, key.code == KeyCode::Left);
-                    if self.pass == Pass::Two && self.run_domain.is_empty() {
-                        // 承認済みドメインが1件だけなら埋める（複数あるなら選ばせる）。
-                        if let Ok(policy) = policy_file::load(&self.workspace_root) {
-                            if let [only] = policy.domains.as_slice() {
-                                self.run_domain.set_text(only.name.clone());
-                            }
-                        }
-                    }
                 }
                 _ => {}
             }
@@ -1611,24 +1597,15 @@ impl App {
         let input = match self.record_focus {
             RecordField::Command => &mut self.command,
             RecordField::Cwd => &mut self.cwd,
-            RecordField::Domain => &mut self.run_domain,
             RecordField::Pass => unreachable!("上で返している"),
         };
         edit_text(input, key);
         None
     }
 
+    /// [決定68(2)] パス1とパス2で同じ3つを巡回する（パス2のドメイン欄は無くなった）。
     fn next_record_field(&self, backward: bool) -> RecordField {
-        let fields: &[RecordField] = if self.pass == Pass::Two {
-            &[
-                RecordField::Pass,
-                RecordField::Command,
-                RecordField::Cwd,
-                RecordField::Domain,
-            ]
-        } else {
-            &[RecordField::Pass, RecordField::Command, RecordField::Cwd]
-        };
+        let fields = [RecordField::Pass, RecordField::Command, RecordField::Cwd];
         let current = fields
             .iter()
             .position(|f| *f == self.record_focus)
@@ -1675,14 +1652,11 @@ impl App {
                     wfp: self.wfp.clone(),
                 })))
             }
+            // [決定68(2)] ドメインは選ばない——パス2は常に入口から始め、宣言は記録の側（`record_net`）が読む。
             Pass::Two => {
-                let name = self.run_domain.text().trim().to_string();
-                // `load_domain`が`None`を返したときは、そこで理由をstatusへ書いている。
-                let domain = self.load_domain(&name)?;
                 self.run = Some(RunState::new(Pass::Two));
                 self.status = String::new();
                 Some(Action::StartPass2(Box::new(Pass2Request {
-                    domain,
                     command,
                     cwd,
                     workspace_root: self.workspace_root.clone(),
@@ -1694,44 +1668,6 @@ impl App {
                     spawn_daemon: self.spawn_daemon.clone(),
                     net_mode: self.net_mode,
                 })))
-            }
-        }
-    }
-
-    /// パス2で使うドメインを`policy.json`から読む。**無ければ開始しない**——承認していない
-    /// ドメインで走らせても、開くべき穴が開いていない状態で失敗するだけである。
-    fn load_domain(&mut self, name: &str) -> Option<PolicyDomain> {
-        if name.is_empty() {
-            self.status =
-                "パス2にはドメイン名が要ります（編集画面で承認したときの名前）".to_string();
-            self.record_focus = RecordField::Domain;
-            return None;
-        }
-        let policy = match policy_file::load(&self.workspace_root) {
-            Ok(policy) => policy,
-            Err(e) => {
-                self.status = e.to_string();
-                return None;
-            }
-        };
-        match policy.domain(name) {
-            Some(domain) => Some(domain.clone()),
-            None => {
-                let known: Vec<&str> = policy.domains.iter().map(|d| d.name.as_str()).collect();
-                self.status = if known.is_empty() {
-                    format!(
-                        "ドメイン `{name}` は {} にありません。先にパス1で記録して、\
-                         編集画面で候補を承認してください",
-                        policy_file::path(&self.workspace_root).display()
-                    )
-                } else {
-                    format!(
-                        "ドメイン `{name}` はありません。定義済み: {}",
-                        known.join(", ")
-                    )
-                };
-                self.record_focus = RecordField::Domain;
-                None
             }
         }
     }

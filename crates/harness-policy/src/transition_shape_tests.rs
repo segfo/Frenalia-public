@@ -4,6 +4,7 @@
 //! **権限の要約は毎回`rights_summary`と比べる**——モデル向けのツールと同じ値であることが
 //! この機構の約束である（§19.3.8: 2つ作るとモデルとユーザーで見えるものがずれる）。
 
+use crate::transition::ChildOutput;
 use super::*;
 
 use crate::policy_file::{PolicyDomain, PolicyFile};
@@ -19,6 +20,7 @@ fn edge_to(exe: &str, to: &str) -> TransitionEdge {
         cwd: None,
         to: to.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }
 }
 
@@ -30,6 +32,7 @@ fn fixed_edge_to(exe: &str, argv: &str, cwd: &str, to: &str) -> TransitionEdge {
         cwd: Some(cwd.to_string()),
         to: to.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }
 }
 

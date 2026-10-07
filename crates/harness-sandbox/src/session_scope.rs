@@ -717,8 +717,9 @@ pub fn remove_overlay_dir(dir: &Path) -> std::io::Result<()> {
 ///   **プロセスの持ち物であって、変更の持ち物ではない。** 複製すると「このセッションの
 ///   通信/FS監査」のつもりで読んだものが、実際には別セッションの記録の写しになる。
 /// - `process-audit.jsonl`: 昇格した収集プロセスがポリシーエディタのパス1で書くプロセスの木
-///   （決定23(7)）。理由は監査ログと同じ。決定23(7)は決定17(1)の名前（許可した生成の記録）も
-///   同時に足すとしていたが、その名前はまだ無い（Spawn Daemonの着地時に決める）。
+///   （決定23(7)）。理由は監査ログと同じ。
+/// - `spawn-audit.jsonl`: Spawn Daemon がポリシーエディタのパス2で書く許可した生成の記録（決定17(1)の名前。
+///   2026-10-07 の決定68で置き場を決めた）。理由は監査ログと同じ。
 /// - `.harness-cow-session.json`: diff_layer_dirの由来（セッションID・workspace）。コピー先では
 ///   [`prepare_scope`]が新しいIDで書き直しており、それを上書きしてはならない。
 ///
@@ -726,10 +727,11 @@ pub fn remove_overlay_dir(dir: &Path) -> std::io::Result<()> {
 /// `.harness-cow-ops.jsonl`・`.harness-cow-baseline/`…）。除外を列挙する側にしてあるのは、
 /// オーバーレイへ新しいファイルが増えたとき、既定が「持っていく」＝変更が失われない側に
 /// 倒れるようにするためである。
-const OVERLAY_COPY_EXCLUDED: [&str; 4] = [
+const OVERLAY_COPY_EXCLUDED: [&str; 5] = [
     "net-audit.jsonl",
     "fs-audit.jsonl",
     harness_policy::process_event::PROCESS_AUDIT_FILE,
+    harness_policy::spawn_audit::SPAWN_AUDIT_FILE,
     ".harness-cow-session.json",
 ];
 
@@ -1009,7 +1011,7 @@ mod tests {
         ));
     }
 
-    /// 除外の一覧は昇格ヘルパーのシンク3つとセッションメタだけで、順序まで固定する。
+    /// 除外の一覧は昇格ヘルパーのシンク3つと Spawn Daemon の記録（決定68）とセッションメタだけで、順序まで固定する。
     /// 増やす（減らす）人がこの試験を直すことになり、黙って増減しない（決定23(7)）。
     #[test]
     fn the_overlay_copy_exclusion_list_is_exactly_the_helpers_sinks_and_the_session_meta() {
@@ -1019,6 +1021,7 @@ mod tests {
                 "net-audit.jsonl",
                 "fs-audit.jsonl",
                 "process-audit.jsonl",
+                "spawn-audit.jsonl",
                 ".harness-cow-session.json",
             ]
         );

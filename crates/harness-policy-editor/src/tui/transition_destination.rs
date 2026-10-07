@@ -179,5 +179,8 @@ fn outlook_from_table(
         .outlooks
         .get(name)
         .cloned()
-        .unwrap_or(Outlook::Provisioned { declarations: 0 })
+        .unwrap_or(Outlook::Provisioned {
+            declarations: 0,
+            net_destinations: 0,
+        })
 }

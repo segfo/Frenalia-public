@@ -212,7 +212,7 @@ impl std::fmt::Debug for SharedSpawnDaemon {
 
 impl SharedSpawnDaemon {
     /// `child_process_policy`は**呼び出し元が必ず選ぶ**（[`ChildProcessPolicy`]のdoc）。
-    /// 製品のホスト2つ（harness本体・ポリシーエディタ）は`Unrestricted`である。
+    /// 製品のホスト2つはどちらもこのプロセスが選んだ姿勢を渡す（harness本体は旗、ポリシーエディタのパス2は生成禁止。決定68）。
     ///
     /// [段階6b] `policy`も**呼び出し元が必ず渡す**。既定を持たせないのは、
     /// 渡し忘れた経路のDaemonが**宣言を1本も持たないまま立ち上がり、
@@ -689,6 +689,7 @@ fn hello_request(harness_process: u64, policy: super::TransitionPolicy) -> Contr
         workspace_root,
         writable_outside_policy,
         domains,
+        spawn_audit_record,
     } = policy;
     precreate_transition_queue(&workspace_root);
     ControlRequest::Hello {
@@ -702,6 +703,8 @@ fn hello_request(harness_process: u64, policy: super::TransitionPolicy) -> Contr
         domains,
         // [残課題 サンドボックス周辺 #65] harness側の検査と同じ入力をDaemonの検査へ渡す。
         writable_outside_policy,
+        // [決定68] 記録の名前（ファイルはホストが先に作っておく）。
+        spawn_audit_record,
     }
 }
 

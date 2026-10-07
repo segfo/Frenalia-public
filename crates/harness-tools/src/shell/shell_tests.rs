@@ -245,6 +245,75 @@ mod tests {
         assert!(out.content.contains("[tier:"));
     }
 
+    /// `[exit code: …]`より前（＝コマンドの出力の欄）。
+    #[cfg(windows)]
+    fn command_output_part(content: &str) -> &str {
+        &content[..content.find("\n[exit code:").expect("フッタがある")]
+    }
+
+    /// [BUG-238] コマンドが`powershell -Enc …`を起こすと、その子は標準エラーへCLIXML（XML）で
+    /// 書く。本物の`powershell.exe`を通して、本文では文字へ戻っていることを固定する。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_restores_clixml_from_a_nested_encoded_powershell() {
+        let dir = tempfile::tempdir().unwrap();
+        // `Write-Error boom-238` を UTF-16LE で base64 にしたもの。
+        let command =
+            "powershell -NoProfile -NonInteractive -Enc VwByAGkAdABlAC0ARQByAHIAbwByACAAYgBvAG8AbQAtADIAMwA4AA==";
+
+        let out = RunShellTool::default()
+            .call(
+                json!({ "command": command }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+
+        let body = command_output_part(&out.content);
+        assert!(body.contains("boom-238"), "{}", out.content);
+        assert!(!body.contains("#< CLIXML"), "{}", out.content);
+        assert!(!body.contains("<Objs"), "{}", out.content);
+        assert!(
+            out.content.contains("\n[powershell-clixml: "),
+            "{}",
+            out.content
+        );
+    }
+
+    /// [BUG-238] 出力を持たない成功（B-33 の試験紙）。子が進行表示しか出さないとき、
+    /// 本文はXMLで埋まらず、進行表示はフッタへ件数ごと残る。
+    ///
+    /// 進行表示は`Write-Progress`で自分で出す——PowerShell自身の「Preparing modules for
+    /// first use.」は環境によって出ないので、それに頼るとXMLが1行も来ずに素通りする
+    /// （実際、Tier1で`$null = 1`だけを撃つ形では、戻す処理を外しても緑だった）。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_silent_nested_encoded_powershell_leaves_no_xml_in_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        // `Write-Progress -Activity act-238 -Status s` を UTF-16LE で base64 にしたもの。
+        let command = "powershell -NoProfile -NonInteractive -Enc \
+             VwByAGkAdABlAC0AUAByAG8AZwByAGUAcwBzACAALQBBAGMAdABpAHYAaQB0AHkAIABhAGMAdAAtADIAMwA4ACAALQBTAHQAYQB0AHUAcwAgAHMA";
+
+        let out = RunShellTool::default()
+            .call(
+                json!({ "command": command }),
+                &ctx(dir.path().to_path_buf()),
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("[exit code: 0]"), "{}", out.content);
+        let body = command_output_part(&out.content);
+        assert!(!body.contains("#< CLIXML"), "{}", out.content);
+        assert!(!body.contains("act-238"), "{}", out.content);
+        assert!(
+            out.content.contains("\"act-238\" ×1"),
+            "進行表示がフッタに残っていない: {}",
+            out.content
+        );
+    }
+
     #[test]
     fn run_shell_tool_spec_mentions_sh_c_for_tier3() {
         let dir = tempfile::tempdir().unwrap();
@@ -1325,6 +1394,64 @@ mod tests {
         assert!(
             !out.content.contains("not_registered"),
             "Daemonが起こした子なのに「台帳に無い」で断られている（§12・BUG-116）: {}",
+            out.content
+        );
+    }
+
+    /// [BUG-238] 発端と同じ形——Tier2a（AppContainer）の中で`powershell -Enc …`を撃つ。
+    /// 内側のPowerShellは起動時警告と進行表示をCLIXML（XML）で前置きするので、戻さないと
+    /// コマンドのエラーが結果の奥へ押し出され、TUIの結果欄（先頭400文字）に入らなかった。
+    /// 中身は`pwsh`ではなく`Write-Error`にしてある——`pwsh`がTier2aから見えるかどうかに
+    /// 結果を左右させないため。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_shell_tier2a_nested_encoded_powershell_error_is_in_the_first_400_chars() {
+        use harness_core::{RequireSandbox, ShellTier};
+
+        let dir = Tier2aScratchWorkspace::new();
+        let selection = match harness_sandbox::select_tier(
+            RequireSandbox::None,
+            dir.path(),
+            harness_core::SandboxChoice::Tier2a,
+            &[],
+            None,
+            &harness_sandbox::shell_tier::WorkspaceWriteMode::DirectRw,
+            None,
+        ) {
+            Ok(selection) => selection,
+            Err(e) => {
+                eprintln!("skipping Tier2a test: Tier2a is unavailable here ({e})");
+                return;
+            }
+        };
+        assert_eq!(selection.tier, ShellTier::Tier2a);
+        let mut ctx = ToolCtx::new(dir.path().to_path_buf());
+        ctx.shell_tier = selection;
+        let daemon = harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
+            harness_sandbox::tier2a::spawnd::TransitionPolicy::empty(""),
+            harness_sandbox::tier2a::spawnd::ChildProcessPolicy::Unrestricted,
+        )
+        .expect("Tier2a product path requires a Spawn Daemon");
+        let tool = RunShellTool::with_spawn_daemon(daemon, false);
+        // `Write-Error boom-238` を UTF-16LE で base64 にしたもの。
+        let command =
+            "powershell -NoProfile -NonInteractive -Enc VwByAGkAdABlAC0ARQByAHIAbwByACAAYgBvAG8AbQAtADIAMwA4AA==";
+
+        let out = tool
+            .call(json!({ "command": command }), &ctx)
+            .await
+            .unwrap();
+
+        assert!(out.content.contains("[tier: tier2a]"), "{}", out.content);
+        let preview: String = out.content.chars().take(400).collect();
+        assert!(
+            preview.contains("boom-238"),
+            "コマンドのエラーがTUIの結果欄（先頭400文字）に入っていない:\n{}",
+            out.content
+        );
+        assert!(
+            !command_output_part(&out.content).contains("#< CLIXML"),
+            "{}",
             out.content
         );
     }

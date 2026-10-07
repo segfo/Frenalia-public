@@ -265,7 +265,7 @@ pub(crate) fn grant_root_warnings(
             || (d.domain == domain
                 && accepted
                     .iter()
-                    .any(|p| p.value == d.value && p.key.fs_access() == Some(d.access)))
+                    .any(|p| p.value == d.value && p.key == d.key))
     };
     let grant_roots = file
         .domain(domain)
@@ -311,7 +311,7 @@ pub fn commit(workspace_root: &Path, plan: &ApprovePlan<'_>) -> Result<(), Appro
         return Err(ApproveError::ApprovalNotRecorded(
             not_recorded
                 .iter()
-                .map(|d| format!("{} ({}) in {}", d.value, d.access.settings_key(), d.domain))
+                .map(|d| format!("{} ({}) in {}", d.value, d.key_label(), d.domain))
                 .collect::<Vec<_>>()
                 .join(", "),
         ));
@@ -319,7 +319,7 @@ pub fn commit(workspace_root: &Path, plan: &ApprovePlan<'_>) -> Result<(), Appro
     Ok(())
 }
 
-/// 今回受け入れた提案のうち、ファイル宣言のもの（承認台帳の鍵の形）。
+/// 今回受け入れた提案（承認台帳の鍵の形）。**通信の宣言も含む**（決定69(2)）。
 ///
 /// 値は提案の値そのまま——`merge_approved`は値を書き換えずに`policy.json`へ書くので、
 /// ここで記録する値と`policy.json`に書かれる値は同じ文字列になる（`R`で付けた`/**`も、
@@ -329,14 +329,12 @@ fn accepted_declarations<'p>(
 ) -> Vec<harness_sandbox::tier2a::policy_approval::DeclarationRef<'p>> {
     plan.accepted
         .iter()
-        .filter_map(|proposal| {
-            proposal.key.fs_access().map(|access| {
-                harness_sandbox::tier2a::policy_approval::DeclarationRef {
-                    domain: plan.domain,
-                    value: &proposal.value,
-                    access,
-                }
-            })
+        // [決定69(2)] **通信の候補も台帳へ記録する**（ファイルの宣言と同じ。承認していない宛先は
+        // 中継プロキシの許可に入らない）。種類は候補の`key`そのままで、値は`policy.json`へ書く綴りと同じ。
+        .map(|proposal| harness_sandbox::tier2a::policy_approval::DeclarationRef {
+            domain: plan.domain,
+            value: &proposal.value,
+            key: proposal.key,
         })
         .collect()
 }

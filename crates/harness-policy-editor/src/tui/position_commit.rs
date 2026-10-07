@@ -1,14 +1,16 @@
 //! 承認待ち画面（`F2`）の**確定を1回の保存で書く**——予約から[`crate::position_approve`]の要求を組み立て、確認ダイアログを
 //! 出し、`y`で`policy.json`を**1回だけ**保存する（`plans/POLICY-EDITOR-TOMOYO-DIG.md` 決定65、`plans/position-domains/P4.md`の
-//! P4.5・P4.6）。
+//! P4.5・P4.6）。`p`なら同じものを書いてから記録画面に次のパス2を用意する（決定68(3)。P4 #43 の「確定の後は留まる」を
+//! 「選べる」へ改めた。既定の`y`は留まる）。
 //!
 //! # いつここを通るか（範囲は2つ）
 //!
 //! - [`Scope::Everything`]: 選んでいる記録が位置の情報を持つとき（[`App::is_position_record`]）、承認待ちの**どのタブの`a`も**
 //!   ここへ来る。FS/ネットのタブで選んだドメインごとのファイルの宣言、観測のタブで選んだ位置の辺、拒否からの予約、取り消し、
 //!   却下印を1つの確認ダイアログにまとめる。タブごとに別々に書くと、片方だけ書けた状態（辺は書けたがファイルの宣言は
-//!   断られた）や、別のタブの予約が黙って残る状態を作る（`B-32`）。
-//! - [`Scope::TransitionsOnly`]: 位置の情報が無い記録（パス2・古い記録）の遷移タブの`a`（`tui::transition_commit`）。遷移の
+//!   断られた）や、別のタブの予約が黙って残る状態を作る（`B-32`）。許可した生成の記録を持つパス2の記録（候補が拒否を起こした
+//!   ドメインごとに分かれる。P6.6）もここへ来る——位置の木は無いので辺は無く、通信の候補は入口のドメインへ書く。
+//! - [`Scope::TransitionsOnly`]: 位置の情報が無い記録（許可した生成の記録の無いパス2・古い記録）の遷移タブの`a`（`tui::transition_commit`）。遷移の
 //!   予約と却下印だけ——ファイルの宣言は FS/ネットのタブの`a`がドメイン欄の1つのドメインへ書く（`tui::edit_commit`）。
 //!   遷移元の違う拒否を2つ予約しても保存は1回（P4.6）。
 //!
@@ -30,8 +32,11 @@ use harness_policy::policy_file::{self};
 use harness_policy::position_domains::PositionSource;
 
 use crate::position_approve::{self, DomainSelection, EdgeWrite, PositionPlan, PositionRequest};
-use crate::position_view::{key_of, position_edges, renamed_name};
+use crate::position_view::{
+    declared_cwds, key_of, position_edges, renamed_name, strict_destinations,
+};
 use crate::transition_approve::SourcedEdgeRef;
+use crate::tui::modal::{AfterCommit, PASS2_HINT};
 use crate::tui::state::{App, Confirm, Modal};
 use crate::tui::transition::CandidateKey;
 use crate::tui::transition_dismissed;
@@ -135,9 +140,23 @@ impl App {
         self.request_commit(Scope::Everything);
     }
 
-    /// [`Confirm::Position`]の`y`。
-    pub(crate) fn commit_position(&mut self) {
-        self.commit_scoped(Scope::Everything);
+    /// [`Confirm::Position`]の`y`（留まる）と`p`（書けたら記録画面に次のパス2を用意する。決定68(3)）。コマンドと作業
+    /// ディレクトリは開いている記録のマニフェストから、通信の扱いは記録のパスから決める（ファイルの確定と同じ`prepare_pass2`）。
+    pub(crate) fn commit_position(&mut self, after: AfterCommit) {
+        // 確定の入力（由来）と同じ記録から取る（`commit_inputs`は記録が無ければ書かない＝下の`None`の腕は書けた後には来ない）。
+        let record = self
+            .selected_session()
+            .map(|entry| (entry.manifest.pass, entry.manifest.command.clone(), entry.manifest.cwd.clone()));
+        if !self.commit_scoped(Scope::Everything) {
+            return;
+        }
+        match (after, record) {
+            (AfterCommit::Pass2, Some((pass, command, cwd))) => {
+                let note = self.status.clone();
+                self.prepare_pass2(pass, command, cwd, &note);
+            }
+            (AfterCommit::Stay, _) | (AfterCommit::Pass2, None) => self.status.push_str(PASS2_HINT),
+        }
     }
 
     /// 確定の内容を組み立てて確認ダイアログを出す（**まだ書かない**）。書けないならその理由のダイアログ。
@@ -224,15 +243,15 @@ impl App {
 
     /// 確認後に実際に書く。**入力も`plan`も作り直す**——ダイアログを見ている間に`policy.json`が別の経路（CLI・手編集）で
     /// 変わっていた場合に、古い読み込み結果で上書きしないため。却下印も、書く直前に読み直したファイルへ予約の差分を当てる
-    /// （[`transition_dismissed::update`]）。
-    pub(super) fn commit_scoped(&mut self, scope: Scope) {
+    /// （[`transition_dismissed::update`]）。**最後まで進んだら`true`**（何も書かずに断ったら`false`。`p`はそのときパス2へ進まない）。
+    pub(super) fn commit_scoped(&mut self, scope: Scope) -> bool {
         let Some(inputs) = self.commit_inputs(scope) else {
-            return;
+            return false;
         };
         if inputs.has_dismissals() {
             if let Err(e) = transition_dismissed::load(&self.workspace_root) {
                 self.status = format!("却下印を書けませんでした（何も書いていません）: {e}");
-                return;
+                return false;
             }
         }
         let mut done: Vec<String> = Vec::new();
@@ -241,7 +260,7 @@ impl App {
                 Ok(plan) => plan,
                 Err(e) => {
                     self.status = format!("書けませんでした（何も書いていません）: {e}");
-                    return;
+                    return false;
                 }
             };
             match position_approve::commit(&self.workspace_root, &plan, &policy_file::save) {
@@ -257,7 +276,7 @@ impl App {
                 ),
                 Err(e) => {
                     self.status = e.to_string();
-                    return;
+                    return false;
                 }
             }
             self.clear_written_reservations(scope);
@@ -293,6 +312,7 @@ impl App {
         // 宣言が変わったので重ね（`[x]`）と遷移の候補を作り直す。
         self.refresh_declared_overlay();
         self.reload_transitions();
+        true
     }
 
     /// 書いた予約を空にする。範囲の外の予約（[`Scope::TransitionsOnly`]のファイル・通信の選択）は残す。
@@ -303,8 +323,12 @@ impl App {
             self.unapproved.clear();
             if let Some(positions) = self.pending.positions.as_mut() {
                 positions.approve.clear();
-                positions.narrow.clear();
+                positions.discard_output.clear();
+                positions.strict.clear();
+                positions.cwd.clear();
                 positions.renamed.clear();
+                // 分ける集合（決定67）は残す——書いた分けた行は既にあるリテラルの辺として引かれ、書かなかった分けた行は
+                // 分けたまま（ファイルの候補も同じ集合で作ってある。`PositionsState::split`のdoc）。
             }
         }
         self.pending.approve.clear();
@@ -380,6 +404,7 @@ impl App {
                 from_domain: from.clone(),
                 edge: target.edge_to(&to),
                 replaces_self_loop: false,
+                strict: false,
             }));
             Some(to)
         };
@@ -416,17 +441,25 @@ fn changed_count(plan: &PositionPlan) -> usize {
         + plan.unapproved.len()
 }
 
-/// 位置の行で選んだ位置の辺（付け替え・絞り方を当てたもの。形は[`position_edges`]の1か所）。
+/// 位置の行で選んだ位置の辺（付け替え・分けた行の引数・出力・作業ディレクトリを当てたもの。形は[`position_edges`]の
+/// 1か所）。Strict の行（`s`）は遷移先に印を付ける辺として渡す（決定67。印と辺を同じ1回の保存で書く）。
 fn selected_position_edges(positions: &PositionsState) -> Vec<EdgeWrite> {
     let assignment = &positions.view.assignment;
-    position_edges(assignment, &positions.renamed, &positions.narrow)
-        .into_iter()
-        .zip(&assignment.positions)
-        .filter(|(_, position)| positions.approve.contains(&key_of(position)))
-        .map(|(add, _)| EdgeWrite {
-            replaces_self_loop: add.source == PositionSource::ReplacesSelfLoop,
-            from_domain: add.from_domain,
-            edge: add.edge,
-        })
-        .collect()
+    let strict = strict_destinations(assignment, &positions.renamed, &positions.strict);
+    position_edges(
+        assignment,
+        &positions.renamed,
+        &positions.discard_output,
+        &declared_cwds(assignment, &positions.cwd, &positions.strict),
+    )
+    .into_iter()
+    .zip(&assignment.positions)
+    .filter(|(_, position)| positions.approve.contains(&key_of(position)))
+    .map(|(add, _)| EdgeWrite {
+        replaces_self_loop: add.source == PositionSource::ReplacesSelfLoop,
+        strict: strict.contains(&add.edge.to),
+        from_domain: add.from_domain,
+        edge: add.edge,
+    })
+    .collect()
 }

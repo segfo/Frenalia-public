@@ -51,7 +51,7 @@ fn approved(ws: &Path, value: &str, access: harness_config::FsAccess) -> bool {
         DeclarationRef {
             domain: "cargo",
             value,
-            access,
+            key: harness_policy::generalize::SettingsKey::from_access(access),
         },
     )
 }
@@ -169,13 +169,32 @@ fn a_value_the_candidate_rules_would_not_propose_is_refused() {
     assert_eq!(plan.refused.len(), 1, "{plan:?}");
 }
 
-/// ネットワークの宣言は承認台帳の対象外（断って理由を返す）。
+/// [決定69(2)] **通信の宣言も承認できる**（同梱された`policy.json`の宛先は、承認するまで中継プロキシの
+/// 許可に入らない）。2026-10-07 までは台帳の対象外として断っていた。
 #[test]
-fn a_network_declaration_is_refused_with_a_reason() {
-    let ws = workspace_with(shipped());
+fn a_network_declaration_can_be_approved() {
+    let mut domain = shipped();
+    domain.net.allow_domains.push("crates.io".to_string());
+    let ws = workspace_with(domain);
     let plan = plan_none(ws.path(), target(SettingsKey::NetAllowDomains, "crates.io"));
+    assert_eq!(plan.approve.len(), 1, "{plan:?}");
+    assert!(plan.refused.is_empty(), "{plan:?}");
+}
+
+/// **禁止側の対**: 宛先として解釈できない値は承認しない（承認しても許可に入らないので、断る側へ倒す）。
+#[test]
+fn an_unparsable_network_declaration_is_refused_with_a_reason() {
+    let mut domain = shipped();
+    domain.net.allow_domains.push("127.0.0.1".to_string());
+    let ws = workspace_with(domain);
+    let plan = plan_none(ws.path(), target(SettingsKey::NetAllowDomains, "127.0.0.1"));
     assert!(plan.approve.is_empty());
-    assert_eq!(plan.refused.len(), 1);
+    assert_eq!(plan.refused.len(), 1, "{plan:?}");
+    assert!(
+        plan.refused[0].1.contains("解釈できません"),
+        "{:?}",
+        plan.refused
+    );
 }
 
 /// **候補の承認と同じ幅の検査（`breadth`）を通す。** 配下すべてへの書込は、同梱された宣言でも断る。

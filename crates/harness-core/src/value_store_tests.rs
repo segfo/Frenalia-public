@@ -107,3 +107,109 @@ fn a_decoded_value_says_whether_it_reads_as_a_command_line() {
     assert!(!text.contains("pwsh"), "{text}");
     assert!(!text.contains("cwB5"), "{text}");
 }
+
+// --- 人の文ごとの置き場（D-127。`ReferenceBook`） ---
+
+/// 今の文に1つ、1つ前の文に何も無く、2つ前の文に1つ（＋解読した段）ある束。
+fn book_with_two_back() -> ReferenceBook {
+    let mut two_back = ValueStore::from_user_values(vec![blob('c')]);
+    two_back.push_decoded(1, "base64", "systeminfo".to_string());
+    ReferenceBook {
+        current: ValueStore::from_user_values(vec![blob('a')]),
+        back: vec![ValueStore::default(), two_back],
+    }
+}
+
+/// **システムプロンプトの一覧には直近の文の値だけを並べる。** 前の文に値があるときだけ、
+/// `{{back:K:N}}`で指せると1行足す（番号も値も並べない）。
+#[test]
+fn the_menu_lists_only_current_values_and_a_back_line_only_when_needed() {
+    let book = book_with_two_back();
+    let menu = book.render_menu().expect("空ではない");
+    // 直近の文の一覧は、今までと同じ文面のまま。
+    let current = book.current.render().unwrap();
+    assert!(menu.starts_with(&current), "{menu}");
+    assert!(menu.contains(BACK_REFERENCE_LINE), "{menu}");
+    // 前の文の値は1行も並ばない。
+    assert!(
+        !menu.lines().any(|l| l.trim_start().starts_with("{{back:")),
+        "{menu}"
+    );
+    assert!(!menu.contains("{{back:2:"), "{menu}");
+    // 中身はどこにも出ない。
+    for content in [blob('a'), blob('c'), "systeminfo".to_string()] {
+        assert!(!menu.contains(&content), "{menu}");
+    }
+
+    // 対: 前の文に値が無ければ、1行は足さない（今までと同じ文面ちょうど）。
+    let only_current = ReferenceBook {
+        current: ValueStore::from_user_values(vec![blob('a')]),
+        back: vec![ValueStore::default()],
+    };
+    assert_eq!(only_current.render_menu(), only_current.current.render());
+
+    // 直近の文に値が無く前の文にだけあるときは、その1行だけ。
+    let only_back = ReferenceBook {
+        current: ValueStore::default(),
+        back: book.back.clone(),
+    };
+    assert_eq!(
+        only_back.render_menu().as_deref(),
+        Some(BACK_REFERENCE_LINE)
+    );
+
+    // どちらにも無ければ何も送らない。
+    assert_eq!(ReferenceBook::default().render_menu(), None);
+}
+
+/// **断る文の一覧は、写しと分かった前の文の値を`{{back:K:N}}`で綴る**（解読した段の親も同じ綴り）。
+/// モデルはそのまま指し直せる。中身は出さない。
+#[test]
+fn the_refusal_list_spells_back_values_with_their_own_prefix() {
+    let book = book_with_two_back();
+    let list = book.render_for(&[2]).expect("空ではない");
+    assert!(
+        list.contains("{{val:1}} 308文字・ユーザーの文から"),
+        "{list}"
+    );
+    assert!(
+        list.contains("{{back:2:1}} 308文字・ユーザーの文から"),
+        "{list}"
+    );
+    assert!(
+        list.contains("{{back:2:2}} 10文字・{{back:2:1}} を base64 として解読したもの"),
+        "{list}"
+    );
+    assert!(!list.contains("systeminfo"), "{list}");
+    assert!(!list.contains(&blob('c')), "{list}");
+
+    // 対: 写しと分かった文を挙げなければ、直近の文の一覧だけ（今までの断る文と同じ）。
+    assert_eq!(book.render_for(&[]), book.current.render());
+    // 値の無い文・無い文を挙げても何も足さない。
+    assert_eq!(book.render_for(&[1, 9]), book.current.render());
+}
+
+/// `resolve`は K で置き場を選び、N で値を選ぶ。どちらかが無ければ`None`。
+#[test]
+fn resolve_reaches_each_store_and_nothing_else() {
+    use crate::reference_syntax::ValueRef;
+    let book = book_with_two_back();
+    let text = |back, number| {
+        book.resolve(ValueRef { back, number })
+            .map(|v| v.text.clone())
+    };
+    assert_eq!(text(0, 1), Some(blob('a')));
+    assert_eq!(text(2, 1), Some(blob('c')));
+    assert_eq!(text(2, 2).as_deref(), Some("systeminfo"));
+    assert_eq!(text(1, 1), None, "1つ前の文には値が無い");
+    assert_eq!(text(3, 1), None, "3つ前の文は無い");
+    assert_eq!(text(0, 2), None);
+
+    // 審査の相手は全部で、直近の文が先。
+    let all: Vec<(usize, usize)> = book
+        .all_values()
+        .iter()
+        .map(|(r, _)| (r.back, r.number))
+        .collect();
+    assert_eq!(all, vec![(0, 1), (2, 1), (2, 2)]);
+}

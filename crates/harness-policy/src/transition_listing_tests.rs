@@ -6,7 +6,7 @@
 
 use super::*;
 
-use crate::transition::{AnyMarker, DomainView, TransitionEdge, TransitionRules};
+use crate::transition::{AnyMarker, ChildOutput, DomainView, TransitionEdge, TransitionRules};
 use harness_config::FsAccess;
 
 // ---------------------------------------------------------------------------
@@ -77,6 +77,7 @@ fn edge(exe: ExeMatcher, argv: ArgvMatcher, to: &str) -> TransitionEdge {
         cwd: None,
         to: to.to_string(),
         env: None,
+        output: ChildOutput::Return,
     }
 }
 

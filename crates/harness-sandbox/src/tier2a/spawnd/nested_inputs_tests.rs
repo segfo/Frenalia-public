@@ -1,11 +1,12 @@
-//! [`env_for_nested`]・[`force_request_pipe`]の単体テスト（`mod nested_env_tests`）。
+//! [`env_for_nested`]・[`force_request_pipe`]・[`caller_handles_for`]の単体テスト（`mod nested_env_tests`）。
 //!
 //! 2026-10-06 に`server.rs`のインラインの試験からそのまま移した（`plans/position-domains/P5.md` P5.1）。
 //! モジュールの名前は`nested_env_tests`のまま残した——試験の絞り込みの文字列と、
 //! 後続の段（P5.4c）がこの名前で試験を足す。
 
 use super::*;
-use harness_policy::transition::{EnvOverride, EnvPolicy};
+use harness_policy::transition::{ChildOutput, EnvOverride, EnvPolicy};
+use crate::tier2a::spawnd::CallerHandles;
 use windows::Win32::Foundation::HANDLE;
 
 use crate::tier2a::spawnd::child_plan::ChildPlan;
@@ -48,7 +49,7 @@ fn value_of<'a>(env: &'a [(String, String)], name: &str) -> Option<&'a str> {
 /// 「孫が作れない」という判定とは無関係な形で出る。
 #[test]
 fn pass_through_hands_the_callers_own_environment_to_the_child() {
-    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, "FOO"),
@@ -78,7 +79,7 @@ fn pass_through_hands_the_callers_own_environment_to_the_child() {
 /// 「宣言は合っているのに起きない」で、**宣言の側をいくら直しても直らない**。
 #[test]
 fn an_unstated_environment_falls_back_to_the_lineage_but_an_empty_one_does_not() {
-    let unstated = env_for_nested(&base(), None, &EnvPolicy::PassThrough);
+    let unstated = env_for_nested(&base(), None, &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
     assert_eq!(
         value_of(&unstated, "PATH"),
         Some("C:/w/bin"),
@@ -86,7 +87,7 @@ fn an_unstated_environment_falls_back_to_the_lineage_but_an_empty_one_does_not()
          **`SystemRoot`の無い環境ブロックで子を起こすことになる**: {unstated:?}"
     );
 
-    let declared_empty = env_for_nested(&base(), Some(&[]), &EnvPolicy::PassThrough);
+    let declared_empty = env_for_nested(&base(), Some(&[]), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
     assert_eq!(
         value_of(&declared_empty, "PATH"),
         None,
@@ -118,7 +119,7 @@ fn a_caller_cannot_redeclare_a_harness_owned_variable() {
         r"C:\attacker\diff".to_string(),
     ));
 
-    let env = env_for_nested(&base(), Some(&claimed), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base(), Some(&claimed), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
@@ -143,7 +144,7 @@ fn the_one_shot_ready_handle_is_not_carried_over_from_the_lineage() {
     let mut base = base();
     base.push((redirector_env::READY_HANDLE.to_string(), "284".to_string()));
 
-    let env = env_for_nested(&base, Some(&caller()), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base, Some(&caller()), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, redirector_env::READY_HANDLE),
@@ -193,7 +194,7 @@ fn the_os_rewritten_names_come_from_the_lineage_not_from_the_caller() {
         r"C:\Users\u\AppData\Local\Packages\pkg\AC".to_string(),
     ));
 
-    let env = env_for_nested(&base, Some(&caller), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base, Some(&caller), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, "TEMP"),
@@ -237,7 +238,7 @@ fn an_os_rewritten_name_absent_from_the_lineage_does_not_survive_from_the_caller
     ));
 
     // 基準envには`TEMP`が無い。
-    let env = env_for_nested(&base(), Some(&caller), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base(), Some(&caller), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, "TEMP"),
@@ -246,18 +247,18 @@ fn an_os_rewritten_name_absent_from_the_lineage_does_not_survive_from_the_caller
     );
 }
 
-/// `Fixed`は**呼び出し元の申告へ**差分を当てる。**`set`は上書き、`unset`は取り除く。**
+/// [P5.4c] **普通の辺は呼び出し元の申告へ差分を当てる**（決定66(5)）。**`set`は上書き、`unset`は取り除く。**
 ///
 /// 対で見る（`B-35`）——`set`だけを測ると、`unset`を無視する実装でも緑になる。
 #[test]
-fn fixed_applies_the_edge_overrides_on_top_of_the_callers_environment() {
+fn an_ordinary_edge_applies_the_edge_overrides_on_top_of_the_callers_environment() {
     let over = EnvOverride {
         set: [("PATH".to_string(), "C:/fixed".to_string())]
             .into_iter()
             .collect(),
         unset: vec!["FOO".to_string()],
     };
-    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::Fixed(over));
+    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::CallerPlusDiff(over));
 
     assert_eq!(
         value_of(&env, "PATH"),
@@ -276,6 +277,82 @@ fn fixed_applies_the_edge_overrides_on_top_of_the_callers_environment() {
     );
 }
 
+/// [P5.4c] **Strict の辺は harness の基準の値＋辺の差分で、呼び出し元の値は1つも通さない**（決定66の追記）。
+///
+/// # 何が守られるのか
+///
+/// Strict のドメインは呼び出し元に自由に使わせたくない権利を持つ。引数を固定しても、環境変数で振る舞いを
+/// 変えられる実行ファイルは多い（`PYTHONSTARTUP`・`GIT_EXTERNAL_DIFF`等）ので、**固定した操作の中身を
+/// 呼び出し元が選べてしまう**。基準の値から組み直すとその経路が閉じる。
+///
+/// **対で見る**（`B-35`）: 同じ入力を普通の辺へ渡すと呼び出し元の値が届く（上の試験と同じ入力）。
+/// 片方だけだと、「常に基準から組む」実装でも「常に呼び出し元から組む」実装でも緑になる。
+#[test]
+fn a_strict_edge_starts_from_the_harness_baseline_not_from_the_caller() {
+    let over = || EnvOverride {
+        set: [("GIT_PAGER".to_string(), "cat".to_string())]
+            .into_iter()
+            .collect(),
+        unset: Vec::new(),
+    };
+    let strict = env_for_nested(
+        &base(),
+        Some(&caller()),
+        &EnvPolicy::BaselinePlusDiff(over()),
+    );
+
+    assert_eq!(
+        value_of(&strict, "FOO"),
+        None,
+        "**呼び出し元がシェルで設定した変数が、Strict の辺の子へ届いている。** 固定した操作の中身を\
+         呼び出し元が環境変数で選べる形である: {strict:?}"
+    );
+    assert_eq!(
+        value_of(&strict, "PATH"),
+        Some("C:/w/bin"),
+        "Strict の辺の`PATH`が系統の基準の値になっていない（呼び出し元の値が通っている）: {strict:?}"
+    );
+    assert_eq!(
+        value_of(&strict, "GIT_PAGER"),
+        Some("cat"),
+        "Strict の辺でも辺の差分は効く（決定66の追記の束の表）: {strict:?}"
+    );
+
+    // 対: 同じ入力の普通の辺では、呼び出し元の値が届く。
+    let ordinary = env_for_nested(&base(), Some(&caller()), &EnvPolicy::CallerPlusDiff(over()));
+    assert_eq!(value_of(&ordinary, "FOO"), Some("set-in-the-shell"));
+    assert_eq!(value_of(&ordinary, "PATH"), Some("C:/caller/bin"));
+    assert_eq!(value_of(&ordinary, "GIT_PAGER"), Some("cat"));
+}
+
+/// [P5.4c] **Strict の辺でも、辺の宣言は`unset`で基準の名前を落とせる**（差分の両側が効く。`B-35`）。
+/// あわせて、harness が所有する名前は**どちらのモードでも**系統の値で強制される
+/// （[`an_edge_declaration_cannot_redirect_the_request_pipe`]の Strict 版）。
+#[test]
+fn a_strict_edge_honours_both_sides_of_the_diff_but_not_the_harness_owned_names() {
+    let over = EnvOverride {
+        set: [(
+            crate::tier2a::spawnd::REQUEST_PIPE_ENV.to_string(),
+            r"\\.\pipe\declared".to_string(),
+        )]
+        .into_iter()
+        .collect(),
+        unset: vec!["PATH".to_string()],
+    };
+    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::BaselinePlusDiff(over));
+
+    assert_eq!(
+        value_of(&env, "PATH"),
+        None,
+        "Strict の辺で宣言した取り除きが効いていない（基準の値が残っている）: {env:?}"
+    );
+    assert_eq!(
+        value_of(&env, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
+        Some(PIPE),
+        "Strict の宣言から窓口の名前を差し替えられている: {env:?}"
+    );
+}
+
 /// **辺の宣言でも、harnessが所有する名前は差し替えられない。**
 ///
 /// `policy.json`は人が書くものだが、**そこから窓口の名前を差し替えられる形にはしない**
@@ -291,7 +368,7 @@ fn an_edge_declaration_cannot_redirect_the_request_pipe() {
         .collect(),
         unset: Vec::new(),
     };
-    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::Fixed(over));
+    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::CallerPlusDiff(over));
 
     assert_eq!(
         value_of(&env, crate::tier2a::spawnd::REQUEST_PIPE_ENV),
@@ -345,7 +422,7 @@ fn overrides_match_environment_variable_names_case_insensitively() {
             .collect(),
         unset: vec!["foo".to_string()],
     };
-    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::Fixed(over));
+    let env = env_for_nested(&base(), Some(&caller()), &EnvPolicy::CallerPlusDiff(over));
 
     assert_eq!(
         env.iter()
@@ -378,7 +455,7 @@ fn the_redirector_settings_are_not_restored_from_the_lineage() {
         r"C:\cow\s1".to_string(),
     ));
 
-    let env = env_for_nested(&base, Some(&caller()), &EnvPolicy::PassThrough);
+    let env = env_for_nested(&base, Some(&caller()), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
 
     assert_eq!(
         value_of(&env, redirector_env::EXT_ROOTS),
@@ -418,6 +495,7 @@ fn a_cross_domain_child_gets_no_ext_roots_but_a_self_loop_child_gets_exactly_one
         container_sid: "S-1-15-2-1-2-3".to_string(),
         capability_sids: vec!["S-1-15-3-1024-102".to_string()],
         identity: DomainIdentitySpec::OwnPackage,
+        proxy_env: Vec::new(),
     };
     let target = DomainSpec {
         name: "d0-profile".to_string(),
@@ -432,7 +510,7 @@ fn a_cross_domain_child_gets_no_ext_roots_but_a_self_loop_child_gets_exactly_one
     let top = table.resolve(4200, |_| true).expect("resolve");
 
     let env_for = |plan: &ChildPlan<'_>| {
-        let mut env = env_for_nested(&top.base_env, Some(&caller()), &EnvPolicy::PassThrough);
+        let mut env = env_for_nested(&top.base_env, Some(&caller()), &EnvPolicy::CallerPlusDiff(EnvOverride::default()));
         if let Some(spec) = plan.redirector() {
             write_redirector_env(spec, &mut env, HANDLE(0x5678 as *mut _));
         }
@@ -466,5 +544,144 @@ fn a_cross_domain_child_gets_no_ext_roots_but_a_self_loop_child_gets_exactly_one
         occurrences(&self_loop, redirector_env::DIFF_LAYER),
         1,
         "{self_loop:?}"
+    );
+}
+
+/// 呼び出し元が載せてきた3本（値は区別できるように別々にする）。
+fn requested() -> CallerHandles {
+    CallerHandles {
+        stdin: Some(0x10),
+        stdout: Some(0x20),
+        stderr: Some(0x30),
+    }
+}
+
+/// [P5.4b] **普通の辺は、呼び出し元の標準入力・標準出力・標準エラーを3本とも子へ渡す**（決定66(3)(4)。
+/// 出力の既定は返す）。P5.3 までは「固定していない、かつ広げない」辺でしか渡しておらず、広げる辺の子は
+/// 何も受け取れなかった——その巻き戻りをここで止める。
+#[test]
+fn an_ordinary_edge_hands_all_three_stdio_handles_to_the_child() {
+    assert_eq!(
+        caller_handles_for(ChildOutput::Return, false, requested()),
+        requested()
+    );
+}
+
+/// [P5.4b] **Strict の辺は標準入力だけを断つ**（決定66の追記の束。固定argvのシェルは、stdinが端末でなければ
+/// そこからコマンドを読む）。出力は辺の設定に従うので、返す辺なら標準出力・標準エラーは渡す（対）
+/// ——3本まとめて断つ旧来の形（BUG-161 の`CallerHandles::default()`）へ戻すと、Strict のログ分析が結果を返せない。
+#[test]
+fn a_strict_edge_cuts_only_the_callers_stdin() {
+    assert_eq!(
+        caller_handles_for(ChildOutput::Return, true, requested()),
+        CallerHandles {
+            stdin: None,
+            stdout: Some(0x20),
+            stderr: Some(0x30),
+        }
+    );
+}
+
+/// [P5.4b] **捨てる辺は標準出力・標準エラーを渡さない**（`None`＝子は`NUL`へ書く）。標準入力は普通の辺なら渡す（対）。
+/// Strict かつ捨てる辺は3本とも渡さない（2つの指示は独立している）。
+#[test]
+fn a_discarding_edge_cuts_stdout_and_stderr_but_not_stdin() {
+    assert_eq!(
+        caller_handles_for(ChildOutput::Discard, false, requested()),
+        CallerHandles {
+            stdin: Some(0x10),
+            stdout: None,
+            stderr: None,
+        }
+    );
+    assert_eq!(
+        caller_handles_for(ChildOutput::Discard, true, requested()),
+        CallerHandles::default()
+    );
+}
+
+// --- [決定69 の前例の(6)] 遷移先のドメインの中継プロキシの宛先への差し替え ---
+
+/// そのドメインの出口（`DomainSpec::proxy_env`が持つ宛先）。
+///
+/// **組み立てはここで書く**——製品で組むのは`harness_tools::net_proxy::proxy_env_vars`だが、
+/// `harness-sandbox`は`harness-tools`に依存しない（逆向きの依存）。名前の一覧だけは
+/// `harness_core`の正本を読む（綴りを写さない。`B-05`）。
+fn domain_proxy(port: u16) -> Vec<(String, String)> {
+    let addr = format!("127.0.0.1:{port}");
+    let mut env: Vec<(String, String)> = harness_core::SOCKS_PROXY_ENV_NAMES
+        .iter()
+        .map(|name| (name.to_string(), format!("socks5h://{addr}")))
+        .collect();
+    env.extend(
+        harness_core::HTTP_PROXY_ENV_NAMES
+            .iter()
+            .map(|name| (name.to_string(), format!("http://{addr}"))),
+    );
+    env
+}
+
+/// **許可側**: 出口を持つドメインへ入る子は、**そのドメインの宛先**を受け取る（呼び出し元の値は消える）。
+#[test]
+fn a_child_entering_a_domain_with_a_proxy_gets_that_domains_proxy() {
+    let mut env = vec![
+        ("HTTP_PROXY".to_string(), "http://127.0.0.1:1111".to_string()),
+        ("ALL_PROXY".to_string(), "socks5h://127.0.0.1:1111".to_string()),
+        ("PATH".to_string(), r"C:\Windows".to_string()),
+    ];
+    force_domain_proxy(&mut env, &domain_proxy(2222));
+
+    assert_eq!(
+        value_of(&env, "HTTP_PROXY"),
+        Some("http://127.0.0.1:2222"),
+        "呼び出し元の宛先が残った（別のドメインの出口を使える）: {env:?}"
+    );
+    assert_eq!(value_of(&env, "ALL_PROXY"), Some("socks5h://127.0.0.1:2222"));
+    assert_eq!(
+        env.iter().filter(|(name, _)| name == "HTTP_PROXY").count(),
+        1,
+        "同じ名前が2つ並んでいる（環境ブロックでは先の方が効くので、消し忘れは黙って効く）: {env:?}"
+    );
+    assert_eq!(value_of(&env, "PATH"), Some(r"C:\Windows"), "関係の無い名前を消した");
+}
+
+/// **禁止側の対**: 出口を持たないドメインへ入る子からは、中継プロキシの名前を**全部消す**。
+///
+/// 消さないと、その子は呼び出し元（入口）のプロキシの宛先を知ったまま走る——WFPの既定拒否で繋げないが、
+/// 「宛先を知らない」と「繋げない」が混ざって、拒否の理由が読めなくなる。
+#[test]
+fn a_child_entering_a_domain_without_a_proxy_loses_the_callers_proxy() {
+    let mut env = vec![
+        ("HTTP_PROXY".to_string(), "http://127.0.0.1:1111".to_string()),
+        ("http_proxy".to_string(), "http://127.0.0.1:1111".to_string()),
+        ("HTTPS_PROXY".to_string(), "http://127.0.0.1:1111".to_string()),
+        ("https_proxy".to_string(), "http://127.0.0.1:1111".to_string()),
+        ("ALL_PROXY".to_string(), "socks5h://127.0.0.1:1111".to_string()),
+        ("all_proxy".to_string(), "socks5h://127.0.0.1:1111".to_string()),
+        ("PATH".to_string(), r"C:\Windows".to_string()),
+    ];
+    force_domain_proxy(&mut env, &[]);
+
+    assert!(
+        !env.iter()
+            .any(|(name, _)| harness_core::is_proxy_env_name(name)),
+        "出口を持たないドメインの子に中継プロキシの宛先が残った: {env:?}"
+    );
+    assert_eq!(value_of(&env, "PATH"), Some(r"C:\Windows"));
+}
+
+/// 呼び出し元が**大文字小文字を変えて**名乗っても差し替えが効く（環境変数の名前は大文字小文字を区別しない）。
+#[test]
+fn the_caller_cannot_keep_its_own_proxy_by_respelling_the_name() {
+    let mut env = vec![(
+        "Http_Proxy".to_string(),
+        "http://127.0.0.1:1111".to_string(),
+    )];
+    force_domain_proxy(&mut env, &domain_proxy(2222));
+
+    assert!(
+        !env.iter()
+            .any(|(_, value)| value.contains("1111")),
+        "綴りを変えた宛先が生き残った: {env:?}"
     );
 }

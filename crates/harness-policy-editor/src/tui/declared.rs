@@ -90,18 +90,8 @@ impl App {
         self.declared_approval.not_approved = self
             .declared
             .iter()
-            .filter(|target| {
-                target.key.fs_access().is_some_and(|access| {
-                    !approvals.is_approved_for_key(
-                        &workspace_key,
-                        harness_sandbox::tier2a::policy_approval::DeclarationRef {
-                            domain: &target.domain,
-                            value: &target.value,
-                            access,
-                        },
-                    )
-                })
-            })
+            // [決定69(2)] 通信の宣言も未承認として数える（鍵を持つようになった）。
+            .filter(|target| !approvals.is_approved_for_key(&workspace_key, target.declaration()))
             .cloned()
             .collect();
         let not_approved = &self.declared_approval.not_approved;
@@ -174,6 +164,12 @@ impl App {
                 self.status = "policy.jsonを読み直しました".to_string();
             }
             KeyCode::Char('a') => self.request_declared_changes(),
+            // [P5.5] Strict の印は遷移のタブのドメインの見出しで付け外す。何も起きないので理由を言う（`B-32`）。
+            KeyCode::Char('s') => {
+                self.status = "s は遷移のタブ（F3 をもう一度）のキーです。ドメインの見出しの行で Strict の印を\
+                               付け外しします"
+                    .to_string();
+            }
             _ => {}
         }
         None

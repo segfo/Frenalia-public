@@ -35,8 +35,9 @@
 //! パス2の強制モードで行う**（決定64、[`session_dir::NetMode`]）。記録画面の「パス」欄で
 //! パス2の「記録」（通信先を全部許して集める）と「強制」（`net.allow_domains`だけを許し、
 //! 断られた宛先を候補に出す）を選ぶ。FSはどちらのモードでも宣言どおりに強制される。
-//! **強制で効くのはこの試験実行の中だけ**で、`harness.exe`本体はまだ`policy.json`の
-//! `net.allow_domains`で通信を許さない（決定6の移設が残っている）。
+//! [決定69] **`harness.exe`の Tier2a も、このマシンで承認した`policy.json`の`net.allow_domains`で通信を許す**
+//! （ドメインごとに専用の中継プロキシ・`internetClient`・WFPの項目）。`settings.json`の`net.allow_domains`は
+//! Tier2a には効かない（ほかの Tier は作業の一覧の P8）。
 //!
 //! CLI（`record`→`approve`→`record-net`と`show`/`sessions`）も**そのまま使える**。TUIは
 //! その上に載るだけで、コマンドは**互いに独立**している（決定13：記録し直す・過去の記録を

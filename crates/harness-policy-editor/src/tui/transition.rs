@@ -27,8 +27,8 @@
 //! いたので、位置ごとのドメインの`pwsh`から断られた生成を入口のドメインの宣言で判定し、入口のドメインの辺として
 //! 書いていた）。拒否の行の遷移元は記録された呼び出し元で、**記録に無い拒否は承認できない**。位置の木の行の遷移元は
 //! その位置の親のドメインである（[`super::transition_positions`]）。
-//! **記録画面のドメイン欄とは混ぜない**——あちらは「パス2で記録中のドメイン名」で由来が違う。混ぜると、
-//! **Daemonが一度も見ないドメインへ遷移を書く**ことになる。
+//! （記録画面のドメイン欄は決定68で無くなった——パス2は常に入口のドメインから始まり、遷移元はこの行の
+//! 記録された呼び出し元とは別に決まる。混ぜると、**Daemonが一度も見ないドメインへ遷移を書く**ことになる。）
 //!
 //! 遷移先は`Tab`で入る欄で選ぶ（2026-10-01。**欄は空で始まる**——自己ループ辺の凍結（決定65(3)、P0c）から。
 //! [`super::transition_destination`]）。欄は1つで、1回の確定で予約した全部の辺に効く。
@@ -368,9 +368,9 @@ impl App {
             }
         };
         // 遷移先ごとの用意の見込み（`harness.exe`と同じ付与の関数・同じ承認台帳。ここで1回だけ読む）。
-        let grants = crate::transition_destination::grants_on_this_machine(&workspace_root);
+        let checks = crate::transition_destination::MachineChecks::for_workspace(&workspace_root);
         self.pending.outlooks =
-            crate::transition_destination::outlooks(&file, ENTRY_DOMAIN, &grants);
+            crate::transition_destination::outlooks(&file, ENTRY_DOMAIN, &checks);
         let provisioned = crate::transition_destination::provisioned_names(&self.pending.outlooks);
         let workspace = workspace_root.to_string_lossy().into_owned();
         // 拒否の記録を先に読む——その行の遷移元ごとに宣言を組む（P4.6）。入口のドメインは宣言済みの
@@ -496,6 +496,18 @@ impl App {
             KeyCode::Char('x') => self.toggle_selected_dismissal(),
             KeyCode::Char('X') => self.reserve_visible_dismissals(),
             KeyCode::Char('u') => self.toggle_selected_argv_width(),
+            // [P5.5] 出力の切り替えは位置の木にだけある。何も起きないので理由を言う（`B-32`）。
+            KeyCode::Char('o') => {
+                self.status = "子の出力を捨てる切り替え（o）は「遷移・観測から」の位置の木だけです。拒否からの\
+                               辺は出力を返す設定で書きます（変えるなら policy.json の辺に \"output\": \"discard\"）"
+                    .to_string();
+            }
+            // [P5.10.2] Strict（s）と作業ディレクトリ（w）も位置の木にだけある（決定67）。理由を言う（`B-32`）。
+            KeyCode::Char('s') | KeyCode::Char('w') => {
+                self.status = "Strict（s）と作業ディレクトリ（w）は「遷移・観測から」の位置の木で、u で引数を固定した\
+                               行にだけ付けられます。拒否からの辺は任意の引数で書きます"
+                    .to_string();
+            }
             KeyCode::Char('f') => {
                 self.pending.filter = self.pending.filter.next();
                 let rows = self.pending.visible().len();

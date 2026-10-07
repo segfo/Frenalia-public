@@ -5,6 +5,70 @@
 
 use super::*;
 
+fn domain_allowing(name: &str, hosts: &[&str]) -> crate::policy_file::PolicyDomain {
+    let mut domain = crate::policy_file::PolicyDomain::new(name);
+    domain.net.allow_domains = hosts.iter().map(|h| h.to_string()).collect();
+    domain
+}
+
+/// [決定68(2)・決定69(1)] **入口の中継プロキシへ渡す宣言は入口のドメインのものだけ**である
+/// （遷移先のドメインの宛先は、そのドメインの専用プロキシが持つ＝`domain_egress`）。
+/// 別のドメインが宣言した宛先は入口のプロキシでは通さない（禁止側）。入口の宣言は通す（許可側）。
+#[test]
+fn the_network_declarations_come_from_the_entry_domain() {
+    let policy = crate::policy_file::PolicyFile {
+        domains: vec![
+            domain_allowing("cargo", &["github.com"]),
+            domain_allowing(crate::policy_file::ENTRY_DOMAIN, &["crates.io"]),
+        ],
+        ..crate::policy_file::PolicyFile::default()
+    };
+
+    // [決定69(2)] 承認の照合は`policy_fs::domain_net`が持つ（ここでは全部承認済みとして見る）。
+    let declared = harness_sandbox::tier2a::policy_fs::domain_net(
+        policy.domain(crate::policy_file::ENTRY_DOMAIN).expect("入口"),
+        &|_| true,
+    );
+    assert_eq!(declared.allow_domains, ["crates.io".to_string()]);
+
+    let plan = net_policy_plan(NetMode::Declared, &declared.allow_domains).expect("plan");
+    assert!(plan.policy.evaluate_host("crates.io").allowed, "入口の宣言は通す");
+    assert!(
+        !plan.policy.evaluate_host("github.com").allowed,
+        "入口でないドメインの宣言を通した"
+    );
+}
+
+/// 入口のドメインが無い`policy.json`では宣言は空——強制で走らせると全部断る（「全部許す」へ倒れない）。
+/// 入口でないドメインの宣言を代わりに使わない。
+#[test]
+fn a_policy_without_an_entry_domain_runs_with_no_declarations() {
+    let policy = crate::policy_file::PolicyFile {
+        domains: vec![domain_allowing("cargo", &["crates.io"])],
+        ..crate::policy_file::PolicyFile::default()
+    };
+
+    assert!(
+        policy.domain(crate::policy_file::ENTRY_DOMAIN).is_none(),
+        "この policy.json には入口のドメインが無い"
+    );
+    let plan = net_policy_plan(NetMode::Declared, &[]).expect("plan");
+    assert!(!plan.policy.evaluate_host("crates.io").allowed);
+}
+
+/// 遷移先のドメインを用意した結果の1行（CLI と画面が共有する）。用意したドメインの名前と、用意できなかった数を出す
+/// ——用意できなかったものを黙らない（`B-10`。理由は警告の側が1件ずつ持つ）。0件なら0件と言う。
+#[test]
+fn the_provisioned_line_names_the_domains_and_counts_the_ones_left_out() {
+    let line = domains_provisioned_line(&["cargo".to_string(), "npm".to_string()], 1);
+    assert!(line.contains("cargo") && line.contains("npm"), "{line}");
+    assert!(line.contains('1'), "用意できなかった数を出す: {line}");
+
+    let none = domains_provisioned_line(&[], 0);
+    assert!(none.contains("ありません"), "{none}");
+    assert!(!none.contains("用意できなかった"), "{none}");
+}
+
 /// 記録は今までどおり全許可（IPリテラルだけを断る）。設定型の許可リストは空のまま。
 #[test]
 fn record_all_lets_every_named_host_through() {

@@ -127,7 +127,13 @@ impl ConsoleHolders {
     /// 起こせない・借りられないときは`Err`を返す。呼び出し側は**そのspawn要求ごと失敗させる**
     /// （§7.1.2の決定4）。コンソール無しでシェルを起こすと`0xC0000142`で落ちるか、
     /// 何も実行せず終了コード0で終わり、どちらも「シェルが壊れた」としか見えない。
-    pub(crate) fn borrow(&self, domain_key: &str) -> Result<ConsoleWindow<'_>, String> {
+    ///
+    /// `on_restarted`は立て直したときに（旧PID・旧終了コード・新PID）で呼ばれる（§7.1.2 決定4。記録が無ければ何もしない側が渡る）。
+    pub(crate) fn borrow(
+        &self,
+        domain_key: &str,
+        on_restarted: &dyn Fn(u32, Option<u32>, u32),
+    ) -> Result<ConsoleWindow<'_>, String> {
         let mut table = self
             .inner
             .lock()
@@ -135,14 +141,16 @@ impl ConsoleHolders {
 
         let index = table.iter().position(|(key, _)| key == domain_key);
         // **死んでいたら、その場で起こし直す。** 旧ハンドルは先に閉じる（`B-01`）。
+        let mut restarted: Option<(u32, Option<u32>)> = None;
         if let Some(index) = index {
             if !table[index].1.is_alive() {
                 let (_, dead) = table.remove(index);
                 let dead_pid = dead.pid;
                 let dead_exit = dead.exit_code();
                 dead.close();
-                // [縮退] 記録はモジュールdocのとおり標準エラーだけである。
-                // **本番ではこの行は誰にも届かない。**
+                restarted = Some((dead_pid, dead_exit));
+                // [縮退] 記録の無い Daemon（`harness.exe`）では標準エラーだけである——**本番ではこの行は誰にも届かない。**
+                // 記録がある Daemon（ポリシーエディタのパス2）は、起こし直した後で`on_restarted`が同じ記録へ書く（決定68）。
                 eprintln!(
                     "harness-spawnd: console holder for {domain_key} died \
                      (pid={dead_pid}, exit={dead_exit:?}); rebuilding"
@@ -151,6 +159,9 @@ impl ConsoleHolders {
         }
         if !table.iter().any(|(key, _)| key == domain_key) {
             let holder = launch_holder()?;
+            if let Some((old_pid, old_exit)) = restarted {
+                on_restarted(old_pid, old_exit, holder.pid);
+            }
             table.push((domain_key.to_string(), holder));
         }
 

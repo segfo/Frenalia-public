@@ -556,6 +556,27 @@ pub struct NetProxyConfig {
     pub tls_inspection: TlsInspection,
 }
 
+/// 子プロセスへ注入する中継プロキシの環境変数の名前のうち、**SOCKS5の形**（`socks5h://<addr>`）を取るもの。
+pub const SOCKS_PROXY_ENV_NAMES: &[&str] = &["ALL_PROXY", "all_proxy"];
+/// 子プロセスへ注入する中継プロキシの環境変数の名前のうち、**HTTPの形**（`http://<addr>`）を取るもの。
+pub const HTTP_PROXY_ENV_NAMES: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"];
+/// 名前解決の診断用エージェントの宛先を渡す環境変数の名前。
+pub const FAKE_DNS_ENV_NAME: &str = "HARNESS_FAKE_DNS_ADDR";
+
+/// その名前は中継プロキシの宛先を運ぶものか（大文字小文字を無視）。
+///
+/// **この一覧の正本はここ1か所である**（`B-05`）。読むのは3つ——
+/// 組む側（`harness_tools::net_proxy::proxy_env_vars`）、**遷移先のドメインの値へ差し替える側**
+/// （Spawn Daemonの`spawnd::nested_inputs::force_domain_proxy`。決定69 の前例の(6)）、
+/// そして「出口を持たないドメインへ入る子からは消す」側（同じ関数）である。
+/// 名前を1つ足してここだけ直すと、**消し忘れた名前で呼び出し元のプロキシが子へ漏れる**。
+pub fn is_proxy_env_name(name: &str) -> bool {
+    SOCKS_PROXY_ENV_NAMES
+        .iter()
+        .chain(HTTP_PROXY_ENV_NAMES)
+        .any(|known| known.eq_ignore_ascii_case(name))
+}
+
 /// CONNECT/SOCKS5トンネル内のTLS検査強度。`harness_tools::tunnel`の`TunnelHandler`実装選択に
 /// 対応する。バリアントを追加する実装者は、このenumを`match`で分解している箇所（本ファイルの
 /// `Default`実装、`crates/harness-core/src/prompt.rs`の`render_net_proxy`）が全て追随することを
@@ -849,6 +870,23 @@ pub trait Tool: Send + Sync {
         ctx: &ToolCtx,
     ) -> Result<crate::PermissionSubject, ToolError>;
     async fn call(&self, input: serde_json::Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError>;
+    /// 会話を読む道具のための口。**エンジン（`harness_engine::turn`）はツールを常にこちらで呼ぶ**。
+    /// 既定は[`Tool::call`]へそのまま渡すので、会話を読まないツールは何も書かなくてよい。
+    ///
+    /// `conversation`は、そのターンの値の置き場が**本物の会話**から組まれたときだけ`Some`
+    /// （判定するのは`harness_engine::References`の組み立ての1か所）。認知レイヤーのように組み直した文を
+    /// 送る経路では`None`——送る文は会話ではないので、それを会話として読ませない（D-127「認知レイヤーの経路は未決」）。
+    ///
+    /// **判定（`PermissionGate`）はこれを呼ぶ前に済んでいる。** ここは判定を変えない。
+    async fn call_in_conversation(
+        &self,
+        input: serde_json::Value,
+        ctx: &ToolCtx,
+        conversation: Option<&[crate::Message]>,
+    ) -> Result<ToolOutput, ToolError> {
+        let _ = conversation;
+        self.call(input, ctx).await
+    }
 }
 
 /// ツールの入力を型付き構造体へ読む。`permission_subject`と`call`が**同じ関数で**読むための共通の口

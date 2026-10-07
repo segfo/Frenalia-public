@@ -44,6 +44,15 @@ use cli_candidates::{run_approve, run_show};
 mod cli_overview;
 use cli_overview::print_overview;
 
+/// 書込の同意（`--auto-approve`／`--force-approve`。決定66(8)、P5.6）と、書く前の確認。
+/// [D-112・決定69(2)] `approve-declared`（既にある宣言をこのマシンで承認する）。2026-10-07にこのファイルから
+/// **そのまま**移した（P7.7 で通信の宣言を受ける`--net`を足す前に置き場を分けた）。
+mod cli_declared;
+use cli_declared::run_approve_declared;
+
+mod cli_consent;
+use cli_consent::{confirm_write, Consent, ConsentArgs};
+
 #[derive(Parser, Debug)]
 #[command(
     name = "harness-policy-editor",
@@ -91,8 +100,8 @@ enum Command {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
-    /// 承認済みのドメインをTier2a（AppContainer＋WFP＋Proxy）で実行し、
-    /// 接続したドメインを記録する（パス2）。
+    /// 入口のドメイン（workspace-shell）から、遷移を強制してTier2a（AppContainer＋WFP＋Proxy）で
+    /// 実行し、接続したドメインを記録する（パス2。決定68——本番で遷移を強制したときと同じ形）。
     ///
     /// **ここで初めてACEが付く**（`preflight`経由）。Tier2aへ着地しない場合とWFPが立たない
     /// 場合は中止する——強制の無い観測を「記録できた」と言わないため。
@@ -101,16 +110,13 @@ enum Command {
     /// `net.allow_domains`に一致する通信先だけを許し、ほかは断る（決定64）。
     #[command(name = "record-net")]
     RecordNet {
-        /// 承認済みのドメイン名（`approve --domain`で使ったもの）。
-        #[arg(long)]
-        domain: String,
         /// 通信を宣言どおりに強制する（`policy.json`の`net.allow_domains`だけを許し、ほかは断る）。
         /// 候補には断られた宛先だけが出る。省略時は通信先を全部許して記録する。
         #[arg(long)]
         enforce_net: bool,
         #[arg(long)]
         workspace: Option<PathBuf>,
-        /// 作業ディレクトリ（既定: policy.jsonに記録されたcwd、無ければworkspace）。
+        /// 作業ディレクトリ（既定: 入口のドメインに記録されたcwd、無ければworkspace）。
         #[arg(long)]
         cwd: Option<PathBuf>,
         /// この秒数を過ぎたら対象コマンドを打ち切る。
@@ -118,7 +124,7 @@ enum Command {
         timeout: Option<u64>,
         #[arg(long)]
         limit: Option<usize>,
-        /// 実行するコマンド（`--`のあと）。省略時はドメインが1件だけ持つコマンドを使う。
+        /// 実行するコマンド（`--`のあと）。省略時は入口のドメインが1件だけ持つコマンドを使う。
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -147,8 +153,8 @@ enum Command {
         session: Option<String>,
         #[arg(long)]
         workspace: Option<PathBuf>,
-        /// ドメイン名（「このコマンドに何を許すか」の単位、既定: コマンドの先頭トークン）。
-        /// 位置の情報がある記録（パス1のプロセスの木を持つ記録）では使えない——候補ごとに書く先のドメインが決まっている。
+        /// ドメイン名（「このコマンドに何を許すか」の単位、既定: パス2は記録したドメイン・パス1はコマンドの先頭トークン）。
+        /// 位置の情報がある記録（パス1のプロセスの木・パス2の許可した生成の記録を持つ記録）では使えない——候補ごとに書く先が決まっている。
         #[arg(long)]
         domain: Option<String>,
         /// 承認する提案id（カンマ区切り可）。**全件受理のショートハンドは無い**（D-42）。
@@ -157,9 +163,8 @@ enum Command {
         /// 承認を`--require-sandbox`の宣言と突き合わせる（none/write-containment/confidential）。
         #[arg(long)]
         require_sandbox: Option<String>,
-        /// 差分を確認済みとして書き込む（非対話では必須）。
-        #[arg(long)]
-        yes: bool,
+        #[command(flatten)]
+        consent: ConsentArgs,
     },
     /// 記録セッションの一覧（新しい順）。
     Sessions {
@@ -200,9 +205,8 @@ enum Command {
         /// **同じ関数**を通る（`exclusion::ExclusionRules`）。
         #[arg(long)]
         excluded: bool,
-        /// 差分を確認済みとして書き込む（非対話では必須）。
-        #[arg(long)]
-        yes: bool,
+        #[command(flatten)]
+        consent: ConsentArgs,
     },
     /// [D-112] **既に`policy.json`にあるファイル宣言を、このマシンで承認する。**
     ///
@@ -218,17 +222,22 @@ enum Command {
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// 承認するFS宣言の値（`policy.json`に書かれている綴り）。繰り返して複数指定できる。
-        #[arg(long, required = true)]
-        fs: Vec<String>,
-        /// `--fs`のaccess種別（`read`/`read_write`/`read_exec`）。
         #[arg(long)]
-        access: String,
+        fs: Vec<String>,
+        /// `--fs`のaccess種別（`read`/`read_write`/`read_exec`）。`--fs`を使うときは必須。
+        #[arg(long)]
+        access: Option<String>,
+        /// [決定69(2)] 承認する通信の宣言（`net.allow_domains`の値）。繰り返して複数指定できる。
+        ///
+        /// 承認していない宛先は、`harness.exe`でもパス2でも**中継プロキシの許可に入らない**
+        /// （同梱された`policy.json`の宛先へ承認なしで出られないようにするため）。
+        #[arg(long)]
+        net: Vec<String>,
         /// 承認を`--require-sandbox`の宣言と突き合わせる（none/write-containment/confidential）。
         #[arg(long)]
         require_sandbox: Option<String>,
-        /// 確認済みとして書き込む（非対話では必須）。
-        #[arg(long)]
-        yes: bool,
+        #[command(flatten)]
+        consent: ConsentArgs,
     },
 }
 
@@ -257,14 +266,13 @@ fn main() -> ExitCode {
             command,
         }) => run_record(cwd, workspace, timeout, limit, &command),
         Some(Command::RecordNet {
-            domain,
             enforce_net,
             workspace,
             cwd,
             timeout,
             limit,
             command,
-        }) => run_record_net(&domain, enforce_net, workspace, cwd, timeout, limit, &command),
+        }) => run_record_net(enforce_net, workspace, cwd, timeout, limit, &command),
         Some(Command::Show {
             session,
             workspace,
@@ -278,14 +286,14 @@ fn main() -> ExitCode {
             domain,
             accept,
             require_sandbox,
-            yes,
+            consent,
         }) => run_approve(
             session.as_deref(),
             workspace,
             domain.as_deref(),
             &accept,
             require_sandbox.as_deref(),
-            yes,
+            consent.consent(),
         ),
         Some(Command::Sessions { workspace }) => run_sessions(workspace),
         Some(Command::ApproveDeclared {
@@ -293,15 +301,17 @@ fn main() -> ExitCode {
             workspace,
             fs,
             access,
+            net,
             require_sandbox,
-            yes,
+            consent,
         }) => run_approve_declared(
             &domain,
             workspace,
             &fs,
-            &access,
+            access.as_deref(),
+            &net,
             require_sandbox.as_deref(),
-            yes,
+            consent.consent(),
         ),
         Some(Command::Unapprove {
             domain,
@@ -311,7 +321,7 @@ fn main() -> ExitCode {
             net,
             all,
             excluded,
-            yes,
+            consent,
         }) => run_unapprove(
             UnapproveSelector {
                 domain: domain.as_deref(),
@@ -322,7 +332,7 @@ fn main() -> ExitCode {
                 excluded,
             },
             workspace,
-            yes,
+            consent.consent(),
         ),
         None => run_tui(cli.workspace, cli.require_sandbox.as_deref()),
     }
@@ -496,9 +506,7 @@ fn run_record(
 }
 
 #[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
 fn run_record_net(
-    domain_name: &str,
     enforce_net: bool,
     workspace: Option<PathBuf>,
     cwd: Option<PathBuf>,
@@ -536,41 +544,26 @@ fn run_record_net(
             return ExitCode::FAILURE;
         }
     };
-    let Some(domain) = policy.domain(domain_name) else {
-        eprintln!(
-            "ドメイン `{domain_name}` は {} にありません。先に \
-             `harness-policy-editor approve --domain {domain_name} --accept <id>...` を実行してください。",
-            harness_policy_editor::policy_file::path(&workspace_root).display()
-        );
-        if !policy.domains.is_empty() {
-            eprintln!(
-                "定義済みのドメイン: {}",
-                policy
-                    .domains
-                    .iter()
-                    .map(|d| d.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-        return ExitCode::FAILURE;
-    };
+    // [決定68(2)] パス2は常に入口のドメインから始める。コマンドと作業ディレクトリを省いたら入口のものを使う
+    // （記録したコマンドを書くのは入口だけ、決定68 の前例の(12)）。
+    let entry_name = harness_policy_editor::policy_file::ENTRY_DOMAIN;
+    let entry = policy.domain(entry_name);
 
     // コマンドは明示指定が優先。省略時は**1件だけ**のときに限りそれを使う
     // ——複数あるなら黙って1つ選ばず、どれかを言わせる。
     let command = if command.is_empty() {
-        match domain.commands.as_slice() {
+        match entry.map(|d| d.commands.as_slice()).unwrap_or_default() {
             [only] => only.clone(),
             [] => {
                 eprintln!(
-                    "ドメイン `{domain_name}` にはコマンドが記録されていません。\
+                    "入口のドメイン `{entry_name}` にはコマンドが記録されていません。\
                      `-- <コマンド>` で明示してください。"
                 );
                 return ExitCode::FAILURE;
             }
             many => {
                 eprintln!(
-                    "ドメイン `{domain_name}` には複数のコマンドがあります。`-- <コマンド>` で\
+                    "入口のドメイン `{entry_name}` には複数のコマンドがあります。`-- <コマンド>` で\
                      どれを走らせるか明示してください:"
                 );
                 for c in many {
@@ -585,12 +578,12 @@ fn run_record_net(
 
     let cwd = cwd
         .map(|p| harness_sandbox::session_scope::normalize_workspace_root(&p))
-        .or_else(|| domain.cwd.clone())
+        .or_else(|| entry.and_then(|d| d.cwd.clone()))
         .unwrap_or_else(|| workspace_root.clone());
 
     eprintln!("パス2（Tier2aでのドメイン記録）");
     eprintln!("通信の扱い: {}", net_mode.label());
-    eprintln!("ドメイン: {domain_name}");
+    eprintln!("{}", harness_policy_editor::record_net::pass2_start_line());
     eprintln!("コマンド: {command}");
     eprintln!("作業ディレクトリ: {}", cwd.display());
 
@@ -599,7 +592,6 @@ fn run_record_net(
     // 畳まれ、パイプ切断でnetfilterdも自発終了する（寿命がOSハンドルに紐付いている）。
     let never_cancel = || false;
     let request = RecordNetRequest {
-        domain,
         command: &command,
         cwd: &cwd,
         workspace_root: &workspace_root,
@@ -651,6 +643,10 @@ fn run_record_net(
             );
         }
         NetRecordEvent::Tier2aReady => eprintln!("Tier2aへ着地しました"),
+        NetRecordEvent::DomainsProvisioned { provisioned, skipped } => eprintln!(
+            "{}",
+            harness_policy_editor::record_net::domains_provisioned_line(&provisioned, skipped)
+        ),
         // 文言は`ExecReach`が持つ（表示側で書き写さない、規則5）。問題が無ければ黙る。
         NetRecordEvent::ExecReachability(reach) => {
             if let Some(message) = reach.message() {
@@ -768,20 +764,18 @@ fn run_record_net(
         }
     }
     println!(
-        "この記録を見直す: harness-policy-editor show {} --net",
+        "この記録を見直す: harness-policy-editor show {}",
         outcome.session_id
     );
     println!(
-        "候補を承認する: harness-policy-editor approve {} --domain {domain_name} --accept <id>...",
+        "候補を承認する: harness-policy-editor approve {} --accept <id>...",
         outcome.session_id
     );
     ExitCode::SUCCESS
 }
 
 #[cfg(not(windows))]
-#[allow(clippy::too_many_arguments)]
 fn run_record_net(
-    _domain_name: &str,
     _enforce_net: bool,
     _workspace: Option<PathBuf>,
     _cwd: Option<PathBuf>,
@@ -808,9 +802,6 @@ fn resolve_require_sandbox(raw: Option<&str>) -> Option<harness_core::RequireSan
     }
 }
 
-/// 書込前の確認。非対話（パイプ・リダイレクト）では`--yes`を必須にする——ヘッドレスは
-/// 対話プロンプトを一切出さない原則に従い、「答えが返ってこないまま既定で進む」形を作らない
-/// （`harness policy apply`と同じ作法）。
 /// `harness-policy-editor unapprove` — 承認済み宣言を取り消す。
 ///
 /// 表示の作法は`approve`と同じ2段（差分を見せる→確認→書く）。**消える件数と「元から無かった」
@@ -832,7 +823,7 @@ struct UnapproveSelector<'a> {
 fn run_unapprove(
     selector: UnapproveSelector<'_>,
     workspace: Option<PathBuf>,
-    yes: bool,
+    consent: Consent,
 ) -> ExitCode {
     use harness_policy_editor::unapprove;
 
@@ -912,7 +903,7 @@ fn run_unapprove(
             ExitCode::FAILURE
         };
     }
-    if !confirm_write(yes) {
+    if !confirm_write(consent, &plan.widening) {
         println!("何も書いていません");
         return ExitCode::FAILURE;
     }
@@ -935,113 +926,6 @@ fn run_unapprove(
     }
 }
 
-/// [D-112] `approve-declared`: 既に`policy.json`にあるファイル宣言を、このマシンで承認する。
-fn run_approve_declared(
-    domain: &str,
-    workspace: Option<PathBuf>,
-    values: &[String],
-    access: &str,
-    require_sandbox: Option<&str>,
-    yes: bool,
-) -> ExitCode {
-    use harness_policy::generalize::SettingsKey;
-    use harness_policy_editor::approve_declared;
-    use harness_policy_editor::unapprove::UnapproveTarget;
-
-    let Some(require_sandbox) = resolve_require_sandbox(require_sandbox) else {
-        return ExitCode::FAILURE;
-    };
-    // 語彙は`unapprove --access`と同じ（新しい綴りを作らない）。
-    let key = match access {
-        "read" => SettingsKey::FsRead,
-        "read_write" => SettingsKey::FsReadWrite,
-        "read_exec" => SettingsKey::FsReadExec,
-        other => {
-            eprintln!("--access は read / read_write / read_exec のいずれかです（指定: {other}）");
-            return ExitCode::FAILURE;
-        }
-    };
-    let workspace_root = resolve_workspace(workspace);
-    let targets: Vec<UnapproveTarget> = values
-        .iter()
-        .map(|value| UnapproveTarget {
-            domain: domain.to_string(),
-            key,
-            value: value.clone(),
-        })
-        .collect();
-    let plan = match approve_declared::plan(&workspace_root, &targets, require_sandbox) {
-        Ok(plan) => plan,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    println!(
-        "{}:",
-        harness_policy_editor::policy_file::path(&workspace_root).display()
-    );
-    if !plan.approve.is_empty() {
-        println!("  このマシンで承認する宣言 {}件:", plan.approve.len());
-        for target in &plan.approve {
-            println!("    + [{}] {} {}", target.domain, target.key.dotted(), target.value);
-        }
-    }
-    for target in &plan.already {
-        println!(
-            "  = [{}] {} {}（承認済みでした）",
-            target.domain,
-            target.key.dotted(),
-            target.value
-        );
-    }
-    // **断った宣言と無かった指定を黙らない**（B-09）。「承認しました」だけを見せると、
-    // 綴りの間違いや検査で止まった宣言に許可が付くと思い込む。
-    for (target, reason) in &plan.refused {
-        println!(
-            "  ✗ [{}] {} {}: {reason}",
-            target.domain,
-            target.key.dotted(),
-            target.value
-        );
-    }
-    for target in &plan.not_found {
-        println!(
-            "  ? [{}] {} {}（policy.jsonにありません）",
-            target.domain,
-            target.key.dotted(),
-            target.value
-        );
-    }
-    // **部分適用しない**（`approve`と同じ判断）。名指しした宣言の1件でも断る・無いなら何も書かない
-    // ——指定の誤りを直してから撃ち直す方が、一部だけ通った状態より読み違えにくい。
-    if !plan.refused.is_empty() || !plan.not_found.is_empty() {
-        eprintln!("承認できない指定があるので、何も書いていません");
-        return ExitCode::FAILURE;
-    }
-    if plan.is_empty() {
-        return ExitCode::SUCCESS;
-    }
-    println!();
-    println!(
-        "承認すると、次の record-net と harness.exe の起動でこの宣言に許可（ACE）が付きます。"
-    );
-    if !confirm_write(yes) {
-        println!("何も書いていません");
-        return ExitCode::FAILURE;
-    }
-    match approve_declared::commit(&workspace_root, &plan) {
-        Ok(count) => {
-            println!("このマシンで{count}件を承認しました");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::FAILURE
-        }
-    }
-}
 
 /// CLIの引数から取り消し対象を組み立てる。組み立てに失敗した理由は文字列で返す。
 fn collect_unapprove_targets(
@@ -1155,28 +1039,6 @@ fn collect_unapprove_targets(
         });
     }
     Ok(targets)
-}
-
-fn confirm_write(yes: bool) -> bool {
-    use std::io::IsTerminal;
-
-    if yes {
-        return true;
-    }
-    if !std::io::stdin().is_terminal() {
-        eprintln!(
-            "確認なしには書きません: 標準入力が端末ではないためプロンプトを出せません。\
-             上の差分を確認したうえで --yes を付けて実行してください。"
-        );
-        return false;
-    }
-    eprint!("この内容を .harness/policy.json へ書きますか？ [y/N] ");
-    let _ = std::io::Write::flush(&mut std::io::stderr());
-    let mut answer = String::new();
-    if std::io::stdin().read_line(&mut answer).is_err() {
-        return false;
-    }
-    matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
 }
 
 fn run_sessions(workspace: Option<PathBuf>) -> ExitCode {

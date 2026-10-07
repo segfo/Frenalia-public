@@ -36,6 +36,8 @@ pub struct Spec<'a> {
     pub cwd: &'a str,
     /// 子の標準出力を落とす先。**ここを開いたハンドルを電文へ載せる。**
     pub stdout_file: Option<&'a str>,
+    /// [P5.4b] 子の標準入力にするファイル（読み取りで開いたハンドルを電文の`stdin`へ載せる）。`None`なら載せない。
+    pub stdin_file: Option<&'a str>,
     /// 電文の`console`欄。**`"required"`か`"not_needed"`の綴りをそのまま運ぶ**
     /// ——ここで真偽値へ畳むと、取り違えたときにどちらを送ったのか報告から読めなくなる。
     pub console: &'a str,
@@ -55,6 +57,7 @@ pub fn run(spec: &Spec) -> Value {
     // **受け皿と待ち方はフック経由の腕と共有する**（[`crate::spawn_report`]）。
     // 欄がずれると2つの腕を比べられない。
     let mut stdout = crate::spawn_report::open_inheritable(spec.stdout_file);
+    let mut stdin = crate::spawn_report::open_inheritable_for_read(spec.stdin_file);
 
     let payload = json!({
         "kind": "spawn",
@@ -67,7 +70,7 @@ pub fn run(spec: &Spec) -> Value {
         // フックの本番（6f-2）はここで呼び出し元の環境を`Some`で載せる。
         "env": Value::Null,
         "handles": {
-            "stdin": Value::Null,
+            "stdin": stdin.value(),
             "stdout": stdout.value(),
             "stderr": Value::Null,
         },
@@ -88,6 +91,8 @@ pub fn run(spec: &Spec) -> Value {
     // 子側の端はもう要らない。**閉じないと、子が終わってもファイルが掴まれたままになる。**
     let stdout_opened = stdout.handle.is_some();
     stdout.close();
+    let stdin_opened = stdin.handle.is_some();
+    stdin.close();
 
     let reply: Option<Value> = round_trip
         .get("reply")
@@ -103,6 +108,8 @@ pub fn run(spec: &Spec) -> Value {
         "reply_kind": reply.as_ref().and_then(|r| r.get("kind")).cloned(),
         "stdout_handle_opened": stdout_opened,
         "stdout_open_error": stdout.open_error.clone(),
+        "stdin_handle_opened": stdin_opened,
+        "stdin_open_error": stdin.open_error.clone(),
     });
 
     if let Some(reply) = reply.as_ref() {

@@ -81,13 +81,14 @@ struct Lineage {
     ///
     /// # なぜ系統が持つのか
     ///
-    /// nestedのspawnで子へ渡す環境が要る。要求電文（[`super::SpawnRequest`]）には
-    /// envの欄が無く、**あってもならない**——サンドボックスの中の呼び出し元が申告した
-    /// 環境をそのまま使うと、`PATH`や`HARNESS_SPAWN_REQUEST_PIPE`を差し替えられる。
+    /// nestedのspawnで子へ渡す環境が要る。**呼び出し元の申告をそのまま使ってはいけない**——
+    /// `PATH`や`HARNESS_SPAWN_REQUEST_PIPE`を差し替えられるためである。要求電文は申告の欄を持つが
+    /// （段階6f-1）、harnessが所有する名前はこの基準の値で必ず上書きする。
     /// harnessが組んだトップレベルの環境が、この系統で唯一信頼できる出発点である。
     ///
-    /// 辺が`env`の差分を宣言していれば、これへ当てたものを渡す
-    /// （`harness_policy::transition::EnvPolicy::Fixed`）。
+    /// [P5.4c] **Strict の辺（決定66の追記）では、この値だけが出発点になる**（呼び出し元の申告は読まない。
+    /// `harness_policy::transition::EnvPolicy::BaselinePlusDiff`）。普通の辺では申告が出発点で、
+    /// 申告が無いときにここへ落ちる。
     base_env: Vec<(String, String)>,
     members: HashSet<u32>,
 }

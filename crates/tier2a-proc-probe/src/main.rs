@@ -18,15 +18,18 @@ use std::fs;
 use std::io::Write as _;
 use std::io::{self};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use fs_checks::{run_escape_checks, run_fs_checks};
+
 /// [残課題#52] 壊した瞬間の場所を記録する受け皿（VEH）と、わざと壊す的。
 /// **環境変数を張ったときだけ**動くので、他の的の挙動は変わらない（モジュールdoc参照）。
 mod fault_log;
+mod fs_checks;
 mod load_library;
 /// 指定した権利を要求して開くだけのモード（`AccessCheck`の答えと実際を突き合わせる計器）。
 mod open_rights;
@@ -153,6 +156,8 @@ struct Args {
     spawn_cwd: Option<String>,
     /// 子の標準出力を落とす先。**指定するとハンドルを作って電文へ載せる。**
     spawn_stdout: Option<String>,
+    /// [P5.4b] 子の標準入力にするファイル（Daemon経由の腕だけ。読み取りで開いたハンドルを電文へ載せる）。
+    spawn_stdin: Option<String>,
     /// 電文の`console`欄（`required` か `not_needed`）。**既定は`not_needed`**
     /// ——段階6bまでの挙動と同じ側に倒してある。
     spawn_console: Option<String>,
@@ -217,6 +222,7 @@ fn parse_args() -> Args {
     let mut spawn_command_line: Option<String> = None;
     let mut spawn_cwd: Option<String> = None;
     let mut spawn_stdout: Option<String> = None;
+    let mut spawn_stdin: Option<String> = None;
     let mut spawn_console: Option<String> = None;
     let mut spawn_suspended = false;
     // [段階6f-2] フック経由の腕。指定しなければ`None`なので、既存の腕は1つも変わらない。
@@ -318,6 +324,7 @@ fn parse_args() -> Args {
             "--spawn-command-line" => spawn_command_line = Some(next()),
             "--spawn-cwd" => spawn_cwd = Some(next()),
             "--spawn-stdout" => spawn_stdout = Some(next()),
+            "--spawn-stdin" => spawn_stdin = Some(next()),
             "--spawn-console" => spawn_console = Some(next()),
             "--spawn-suspended" => spawn_suspended = true,
             // [段階6f-2] 値は生成フラグの選び方（モードの選択と同時に運ぶ）。
@@ -431,6 +438,7 @@ fn parse_args() -> Args {
         spawn_command_line,
         spawn_cwd,
         spawn_stdout,
+        spawn_stdin,
         spawn_console,
         spawn_transparently,
         spawn_set_env,
@@ -451,101 +459,6 @@ fn compiled_arch() -> &'static str {
     } else {
         "unknown"
     }
-}
-
-fn fs_op(op: &str, path: &Path, result: std::io::Result<()>) -> Value {
-    match result {
-        Ok(()) => {
-            json!({"op": op, "path": path.display().to_string(), "ok": true, "os_error": null})
-        }
-        Err(e) => json!({
-            "op": op,
-            "path": path.display().to_string(),
-            "ok": false,
-            "os_error": e.raw_os_error(),
-            "error": e.to_string(),
-        }),
-    }
-}
-
-fn run_fs_checks(tag: &str) -> Vec<Value> {
-    let mut out = Vec::new();
-
-    let new_path = PathBuf::from(format!("{tag}-new.txt"));
-    out.push(fs_op(
-        "create",
-        &new_path,
-        fs::write(&new_path, format!("created-by-{tag}")),
-    ));
-
-    let seed_path = PathBuf::from(format!("{tag}-seed.txt"));
-    out.push(fs_op(
-        "modify",
-        &seed_path,
-        fs::write(&seed_path, format!("modified-by-{tag}")),
-    ));
-
-    let del_path = PathBuf::from(format!("{tag}-del.txt"));
-    out.push(fs_op("delete", &del_path, fs::remove_file(&del_path)));
-
-    let ren_from = PathBuf::from(format!("{tag}-ren.txt"));
-    let ren_to = PathBuf::from(format!("{tag}-ren2.txt"));
-    out.push(fs_op("rename", &ren_from, fs::rename(&ren_from, &ren_to)));
-
-    out
-}
-
-fn run_escape_checks(tag: &str, outside_read: Option<&Path>) -> Vec<Value> {
-    let mut out = Vec::new();
-
-    let windows_target = PathBuf::from(format!("C:\\Windows\\harness-escape-{tag}.txt"));
-    out.push(fs_op(
-        "escape-write-windows",
-        &windows_target,
-        fs::write(&windows_target, "should-not-be-writable"),
-    ));
-
-    if let Some(profile) = env::var_os("USERPROFILE") {
-        let profile_target = PathBuf::from(profile).join(format!("harness-escape-{tag}.txt"));
-        out.push(fs_op(
-            "escape-write-userprofile",
-            &profile_target,
-            fs::write(&profile_target, "should-not-be-writable"),
-        ));
-    } else {
-        out.push(json!({
-            "op": "escape-write-userprofile", "path": null, "ok": false,
-            "os_error": null, "error": "USERPROFILE not set",
-        }));
-    }
-
-    if let Ok(cwd) = env::current_dir() {
-        if let Some(parent) = cwd.parent() {
-            let parent_target = parent.join(format!("harness-escape-{tag}.txt"));
-            out.push(fs_op(
-                "escape-write-parent",
-                &parent_target,
-                fs::write(&parent_target, "should-not-be-writable"),
-            ));
-        }
-    }
-
-    let win_ini = PathBuf::from("C:\\Windows\\win.ini");
-    out.push(fs_op(
-        "escape-read-baseline",
-        &win_ini,
-        fs::read(&win_ini).map(|_| ()),
-    ));
-
-    if let Some(outside) = outside_read {
-        out.push(fs_op(
-            "escape-read-outside",
-            outside,
-            fs::read(outside).map(|_| ()),
-        ));
-    }
-
-    out
 }
 
 fn run_net_checks(net_target: &str, dns_name: &str) -> Value {
@@ -959,6 +872,7 @@ fn main() -> ExitCode {
             command_line: &command_line,
             cwd: args.spawn_cwd.as_deref().unwrap_or("C:/"),
             stdout_file: args.spawn_stdout.as_deref(),
+            stdin_file: args.spawn_stdin.as_deref(),
             console: args.spawn_console.as_deref().unwrap_or("not_needed"),
             report_file: args.report_file.as_deref(),
             suspended: args.spawn_suspended,

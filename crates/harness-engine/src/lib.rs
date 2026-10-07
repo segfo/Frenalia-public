@@ -16,7 +16,9 @@ pub mod approval_summary;
 pub mod compaction;
 pub mod degeneracy;
 pub mod encoded_span;
+pub mod past_requests;
 pub mod permission;
+pub mod references;
 mod sanitize;
 pub mod session;
 pub mod side_call;
@@ -34,10 +36,13 @@ pub use permission::{
     parse_allowlist_rule, AllowRule, AllowlistRule, Classification, Decision, PermissionArbiter,
     PermissionGate, PermissionMode, Remembered,
 };
+pub use past_requests::PastRequestsTool;
+pub use references::{value_store_for, References};
 pub use session::{SessionStore, SessionSummary};
 pub use turn::{
     CompletedToolCall, EngineError, Executor, RawTurn, RawTurnRequest, RawTurnResult,
-    ToolCallDecision, TurnExecutor, TurnVisibility, INVALID_TOOL_INPUT_PREFIX,
+    RecordedOutcome, ToolCallDecision, TurnExecutor, TurnVisibility, CANCELLED_BEFORE_START,
+    DENIAL_PREFIX, INVALID_TOOL_INPUT_PREFIX,
 };
 
 /// TUI等のフロントエンドへ`AgentEvent`を流すための送信口。ヘッドレスCLIは`None`を渡し
@@ -226,46 +231,6 @@ pub struct AgentLoopConfig {
     pub degeneracy: Option<degeneracy::DegeneracyDetector>,
 }
 
-/// 会話の文から**値の置き場**を組む（D-116）。ユーザーの文の長い値に加え、**ハーネスが機械で
-/// 解けた解読の段にも番号を付ける**ので、モデルは中の層も番号で指せる
-/// （`pwsh --enc {{val:2}}` のように）。
-///
-/// **組み立てはこの関数の1か所だけを通すこと。** モデルへ一覧を見せる段（[`build_request`]）と、
-/// 番号を中身へ置き換える段（[`crate::turn`]）が同じ会話の文でこれを呼ぶので、**モデルが見た番号と
-/// 差し込まれる値が食い違わない**。中身は`messages`だけで決まるので、2回呼んでも同じものが返る。
-///
-/// 解読に使うのは `run_shell` の行と同じ関数（`harness_tools::encoded_command::decode_shell_line`）で、
-/// 承認画面に出る段と**同じ解き方**である。読めなかった段（符号化でなかった・上限に当たった）は
-/// 番号を取らない——中身の無いものを指せても意味が無い。
-pub fn value_store_for(messages: &[harness_core::Message]) -> harness_core::ValueStore {
-    use harness_core::DecodeOutcome;
-
-    let mut store = harness_core::value_store_for(messages);
-    // 元の値それぞれを解いて、読めた段に番号を付ける。`depth`は1から始まり、深い段の親は
-    // 1つ浅い段である（親の番号を`depth`ごとに控えて引き継ぐ）。
-    for number in 1..=store.len() {
-        let Some(text) = store.get(number).map(|v| v.text.clone()) else {
-            continue;
-        };
-        let mut parent: Vec<usize> = vec![number];
-        for layer in harness_tools::encoded_command::decode_shell_line(&text) {
-            let DecodeOutcome::Text { encoding, text } = &layer.outcome else {
-                continue;
-            };
-            let depth = layer.depth as usize;
-            let Some(from) = parent.get(depth - 1).copied() else {
-                continue; // 浅い段が読めていない（親を特定できない）
-            };
-            let at = store.push_decoded(from, encoding.name(), text.clone());
-            if parent.len() <= depth {
-                parent.resize(depth + 1, at);
-            }
-            parent[depth] = at;
-        }
-    }
-    store
-}
-
 /// `ConversationState`全体を1リクエストへ写す。認知レイヤー（M14以降）はここを通らず、
 /// `ContextAssembler`が組んだ最小コンテキストを直接[`TurnExecutor`]へ渡す。
 fn build_request(
@@ -273,16 +238,12 @@ fn build_request(
     tool_specs: &[ToolSpec],
     config: &AgentLoopConfig,
 ) -> CompletionRequest {
-    // ハーネスが持っている値の一覧を**毎ターン作り直して**足す（D-115。`harness_core::value_store`）。
+    // ハーネスが持っている値の一覧を**毎ターン作り直して**足す（D-116・D-127。`harness_core::value_store`）。
+    // 並べるのは直近の人の文の値だけで、前の文に値があれば`{{back:K:N}}`で指せると1行足す。
     // 中身は1文字も載らない——載せればモデルが書き写せてしまうし、解読した中身は攻撃者が
-    // 書いたかもしれないデータで、ここはモデルが最も信用する位置だから。
-    //
-    // **`cache: false`。** 中身がターンごとに変わるので、送り直しを前提にする
-    // （1つめの塊＝環境の事実は変わらないので、そちらの使い回しは壊さない）。
+    // 書いたかもしれないデータで、ここはモデルが最も信用する位置だから。`cache: false`（`menu_block`）。
     let mut system = state.system.clone();
-    if let Some(text) = value_store_for(&state.messages).render() {
-        system.push(SystemBlock { text, cache: false });
-    }
+    system.extend(References::from_messages(&state.messages).menu_block());
     CompletionRequest {
         system,
         messages: state.messages.clone(),
@@ -480,10 +441,11 @@ where
                         },
                     );
                 }
-                let mut retry_req = CompletionRequest {
-                    messages: state.messages.clone(),
-                    ..req
-                };
+                // 畳んだ後の会話から**組み直す**（値の一覧も作り直す。D-127）。`messages`だけを
+                // 差し替えると、システムプロンプトの一覧は畳む前の会話のまま残り、差し込む段
+                // （畳んだ後の会話から組む）と食い違う。K は新しい方から数えるので、残った文の K は
+                // 変わらない。畳まれた文を指す`{{back:K:N}}`は置き換わらずに残る。
+                let mut retry_req = build_request(state, &tool_specs, &config);
                 if tier3 {
                     sanitize::completion_request(&mut retry_req);
                 }

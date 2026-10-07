@@ -6,7 +6,7 @@
 //! 1. plan()      宣言の検証と承認照合（D-39）。未承認は起動対象から外す
 //! 2. prepare()   サーバごとのAppContainerプロファイル作成 + preflight（D-38）
 //! 3. proxies     network要求のあるサーバごとに専用の協調プロキシを立てる（§3.2）
-//! 4. WFP         全プロファイル分の出口ポリシーを一度に適用する（呼び出し元が行う）
+//! 4. WFP         プロキシが立ったサーバの分の出口ポリシーを一度に適用する（呼び出し元が行う）
 //! 5. launch()    実プロセス起動 + initialize/tools/list + ToolRegistryへの登録
 //! ```
 //!
@@ -37,18 +37,18 @@ pub(super) struct McpStartup {
     /// サーバ専用の協調プロキシ。**セッション中は保持し続ける必要がある**（dropすると
     /// accept loopが止まり、そのサーバの通信が全て落ちる）。
     proxies: Vec<harness_tools::net_proxy::LocalProxy>,
-    /// WFPへ渡すサーバ別の出口ポリシー（D-38）。
-    #[cfg(windows)]
-    netfilter_entries: Vec<harness_sandbox::tier2a::netfilterd::McpNetfilterPolicy>,
 }
 
 impl McpStartup {
-    /// WFPへ渡すサーバ別ポリシー。`prepare`の後・WFP適用の前に呼ぶ。
+    /// WFPへ渡すサーバ別ポリシー（D-38）。`prepare`の後・WFP適用の前に呼ぶ。
+    ///
+    /// **起動対象（`prepared`）から毎回導く**——別の一覧として持たない。持っていた頃は、
+    /// サーバを起動対象から外すたびに一覧の側も揃え直す必要があった（2つの正本、`B-13`）。
     #[cfg(windows)]
     pub(super) fn netfilter_entries(
         &self,
     ) -> Vec<harness_sandbox::tier2a::netfilterd::McpNetfilterPolicy> {
-        self.netfilter_entries.clone()
+        netfilter_entries_of(&self.prepared)
     }
 
     /// WFPの出口強制が有効にならなかったとき、**networkを要求しているサーバを起動対象から外す**。
@@ -77,17 +77,42 @@ impl McpStartup {
             });
         }
         self.prepared = kept;
-        #[cfg(windows)]
-        {
-            let live: std::collections::BTreeSet<&str> = self
-                .prepared
-                .iter()
-                .filter_map(|s| s.isolation.profile_name())
-                .collect();
-            self.netfilter_entries
-                .retain(|e| live.contains(e.profile.as_str()));
-        }
     }
+}
+
+/// WFPへ渡す項目を、**専用プロキシが立ったサーバの分だけ**作る（D-38 §3.2）。
+///
+/// 形は`harness_tools::domain_egress::EgressPlan::netfilter_entries`（決定69）の写しである——
+/// 立ったプロキシのポートだけを許す項目を作り、UDPは開けない（専用プロキシはTCPだけを待ち受け、
+/// MCPサーバには名前解決の代役を立てない）。
+///
+/// # 通信を要求しないサーバの項目は作らない（[BUG-239]、決定69 の前例の(2)）
+///
+/// `WfpSession::apply`は許可ポートがTCP・UDPとも空だと`NoAddressesResolved`で**失敗**し、
+/// `netfilterd`は1件の失敗で**全部の項目**を失敗させる。かつてはここで通信を要求しないサーバ
+/// （いちばん普通の形）にも空の項目を積んでいたので、そういうサーバを1つ承認しただけで
+/// **セッション全体のWFPが毎回立たなかった**（入口の`run_shell`の通信・通信を要求するMCPサーバ・
+/// ドメインごとの出口がまとめて閉じる。fail-closedなので素通しにはならない）。
+///
+/// 項目が要らない根拠は、そのサーバの子が`internetClient`を持たないことである
+/// （`harness_mcp::transport_stdio`は`proxy_addr`が無ければ`NetworkCapability::Deny`で起こす）。
+/// capabilityの無いAppContainerはソケットで外へ出られないので、既定拒否を重ねる先が無い。
+#[cfg(windows)]
+fn netfilter_entries_of(
+    prepared: &[PreparedServer],
+) -> Vec<harness_sandbox::tier2a::netfilterd::McpNetfilterPolicy> {
+    prepared
+        .iter()
+        .filter_map(|server| {
+            let profile = server.isolation.profile_name()?;
+            let proxy = server.isolation.proxy_addr()?;
+            Some(harness_sandbox::tier2a::netfilterd::McpNetfilterPolicy {
+                profile: profile.to_string(),
+                allow_loopback_tcp_ports: vec![proxy.port()],
+                allow_loopback_udp_ports: Vec::new(),
+            })
+        })
+        .collect()
 }
 
 /// 手順1〜3。**プロセスはまだ起こさない。**
@@ -103,8 +128,6 @@ pub(super) async fn prepare_mcp_servers(
         prepared: Vec::new(),
         skipped: Vec::new(),
         proxies: Vec::new(),
-        #[cfg(windows)]
-        netfilter_entries: Vec::new(),
     };
     if decls.is_empty() {
         return startup;
@@ -207,15 +230,7 @@ pub(super) async fn prepare_mcp_servers(
 
         // §3.2: network要求のあるサーバには**そのサーバ専用の**協調プロキシを立てる。
         // 宛先の粒度はここが持ち、WFPは「このSIDはこのポートだけ」を強制する。
-        let mut entry = harness_sandbox::tier2a::netfilterd::McpNetfilterPolicy {
-            profile: prepared
-                .isolation
-                .profile_name()
-                .unwrap_or_default()
-                .to_string(),
-            allow_loopback_tcp_ports: Vec::new(),
-            allow_loopback_udp_ports: Vec::new(),
-        };
+        // WFPの項目は立ったプロキシの待受から導く（[`netfilter_entries_of`]。要求の無いサーバには作らない）。
         if !decl.network.is_deny() {
             let config = harness_core::NetProxyConfig {
                 allow_domains: decl.network.allow_domains.clone(),
@@ -225,7 +240,6 @@ pub(super) async fn prepare_mcp_servers(
             };
             match harness_tools::net_proxy::spawn_local_proxy(&config).await {
                 Ok(Some(proxy)) => {
-                    entry.allow_loopback_tcp_ports.push(proxy.addr.port());
                     prepared.set_proxy_addr(proxy.addr);
                     startup.proxies.push(proxy);
                 }
@@ -243,7 +257,6 @@ pub(super) async fn prepare_mcp_servers(
                 }
             }
         }
-        startup.netfilter_entries.push(entry);
         startup.prepared.push(prepared);
     }
 
@@ -266,8 +279,6 @@ pub(super) fn launch_mcp_servers(
         prepared,
         mut skipped,
         proxies,
-        #[cfg(windows)]
-            netfilter_entries: _,
     } = startup;
 
     if prepared.is_empty() {
@@ -315,3 +326,7 @@ fn report_skipped(skipped: &[SkippedServer]) {
         eprintln!("warning: {}", entry.message());
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "mcp_tests.rs"]
+mod mcp_tests;

@@ -34,15 +34,18 @@
 //! - **覆うか**は判定器の包含[`super::fs_covers`]、**場所が重なるか**は覆うかの唯一の規則
 //!   [`crate::insufficient::covers`]と、宣言値が開く範囲（[`crate::normalize::literal_prefix`]・
 //!   [`crate::normalize::declared_scope`]。付与層と同じ境目）を組むだけ
-//! - **外部と通信できるか**は呼び出し側が渡す関数で決める（今は[`provisional_net_capable`]を渡す。
+//! - **外部と通信できるか**は呼び出し側が渡す関数で決める（今は[`net_capable`]を渡す。
 //!   決定66(9)の寿命どおり、通信をドメインごとに分ける P7 で差し替える）
 //!
 //! # 限界（同じ場所に書く）
 //!
 //! - **宣言されていない遷移先には空を返す**（[`super::rights_summary`]と同じ）。向きの判定に使うときは、
 //!   未宣言を「証明できない」へ倒す判定（[`super::GraphFacts::direction`]の先頭）を先に通すこと
-//! - **組み合わせの書く側は、ドメインの宣言（`read_write`）だけを数える。** 宣言の外で書ける場所
-//!   （[`super::GraphInput::caller_writable_roots`]＝ワークスペース等）は、P5.4a で入口のドメインが書ける場所として足す
+//! - **組み合わせの書く側は、ドメインの宣言（`read_write`）と、宣言の外で書ける場所**
+//!   （[`super::GraphInput::caller_writable_roots`]＝ワークスペース・`policy.json`の外で書込を許した場所。P5.4a）。
+//!   後者は**入口のドメインが書く**として数える（`--fs-allow`の穴を持つのは入口だけ）。遷移先のドメインも土台として
+//!   ワークスペースを書ける（`domain_provision`の共通の土台）が、それは数えていない——読む側も宣言だけを見るので、
+//!   宣言せずに土台で読むワークスペースの組は出ない（少なめに出る側）
 //! - 組み合わせは**ドメインの宣言どうし**で見る。そのドメインへ実際に遷移で届くかは問わない（届かない組も出る
 //!   ＝多めに出す側）
 //! - 外部と通信できるかの判定は暫定（上）。P7 までは強制で効くのは入口のドメインの通信宣言だけである（決定66の限界）
@@ -88,6 +91,15 @@ pub struct CombinationPair {
     pub use_: PairUse,
 }
 
+/// [P5.6] Strict のドメインへ入る辺1本（入力を固定するので、呼び出し元は子を操れない。決定66の追記）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictEdge {
+    pub from: String,
+    /// `from`の`transitions`配列の添字（**変更後**の宣言での位置。[`EdgeExposure::edge_index`]と同じ）。
+    pub edge_index: usize,
+    pub to: String,
+}
+
 /// 変更（`before` → `after`）で増えたもの（[`exposure_delta`]の答え）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExposureDelta {
@@ -95,6 +107,9 @@ pub struct ExposureDelta {
     pub edges: Vec<EdgeExposure>,
     /// 変更で生まれた組み合わせの対（欄の順）。前からあった対は入らない。
     pub pairs: Vec<CombinationPair>,
+    /// [P5.6] 変更で**新しく** Strict のドメインへ入るようになった辺（変更後の宣言の順）。何も渡さないので[`Self::edges`]
+    /// には入らないが、明細は辺のモード（普通か Strict か）を示すためにこれを出す。前から Strict だった辺は入らない。
+    pub strict_edges: Vec<StrictEdge>,
 }
 
 /// `from`から`to`へ遷移すると、呼び出し元が子を通して新しく使えるようになる権限
@@ -118,7 +133,7 @@ pub fn newly_usable(
 ///   （辺はそのままでも、遷移先のファイルの宣言が増えれば渡る権限は増える）。無かったなら全部。
 ///   同じ遷移先への辺が前からあっても、内容の違う新しい辺は全部を出す——並行する辺は互いを正当化しない
 /// - **対**: 変更後の対のうち、変更前に無かったもの。外部と通信できるかは`net_capable`だけで決める
-///   （今は[`provisional_net_capable`]を渡す）
+///   （今は[`net_capable`]を渡す）
 pub fn exposure_delta<F>(
     before: &GraphInput<'_>,
     after: &GraphInput<'_>,
@@ -131,9 +146,21 @@ where
     let after_facts = GraphFacts::new(after)?;
 
     let mut edges = Vec::new();
+    let mut strict_edges = Vec::new();
     for view in &after.domains {
         let before_view = before_facts.by_name.get(view.name);
         for (edge_index, edge) in view.process.transitions.iter().enumerate() {
+            // Strict の辺の鍵は`enters_strict`の1か所（`usable_through`が数えないのと同じ判定。`B-13`）。
+            let was_strict = before_view
+                .is_some_and(|b| b.process.transitions.contains(edge))
+                && before_facts.enters_strict(view.name, &edge.to);
+            if after_facts.enters_strict(view.name, &edge.to) && !was_strict {
+                strict_edges.push(StrictEdge {
+                    from: view.name.to_string(),
+                    edge_index,
+                    to: edge.to.clone(),
+                });
+            }
             let now = after_facts.usable_through(view.name, &edge.to);
             let added = match before_view {
                 Some(before_view) if before_view.process.transitions.contains(edge) => {
@@ -157,17 +184,34 @@ where
         .into_iter()
         .filter(|pair| !existed.contains(pair))
         .collect();
-    Ok(ExposureDelta { edges, pairs })
+    Ok(ExposureDelta {
+        edges,
+        pairs,
+        strict_edges,
+    })
 }
 
-/// 外部と通信できるかの**暫定**の判定（決定66(9)）: 入口のドメイン（[`ENTRY_DOMAIN`]）は常に通信できる、
-/// 他は通信先（`net`）を1つでも宣言していれば通信できる、とみなす。
+/// 外部と通信できるか（決定66(9)の暫定を決定69で差し替えた）: 入口のドメイン（[`ENTRY_DOMAIN`]）は
+/// 常に通信できる、ほかは**通信先（`net`）を宣言しているドメイン**が通信できる。
 ///
-/// **暫定である理由**: いまはドメインごとの通信の分離が無く（P7）、強制で効くのは入口のドメインの通信宣言だけ
-/// である（決定64・決定66の限界）。P7 で通信をドメインごとに分けたら、実際の可否を返す関数に差し替える。
-/// **呼び出し側は自分で閉包を書かずにこれを渡す**——暫定の規則の持ち主を1か所にして、差し替えを1か所で済ませる
-/// （`B-05`）。
-pub fn provisional_net_capable(domain: &DomainView<'_>) -> bool {
+/// # なぜ「宣言している」で判定してよいのか（P7 で差し替えた中身）
+///
+/// 決定69 で、通信を宣言したドメインには**そのドメイン専用の中継プロキシ・`internetClient`・WFPの項目**が
+/// 付くようになった（`harness_tools::domain_egress`）。宣言していないドメインは`internetClient`を持たず、
+/// プロキシの宛先も渡らないので、**外部へは1バイトも出られない**。つまり宣言の有無がそのまま可否である。
+///
+/// # 入口を常に通信できるとみなす理由（多めに出す側へ倒す）
+///
+/// 入口のドメインの宛先は`policy.json`の宣言だけでなく`--net-allow-domain`でも足せる（決定69(4)）ので、
+/// 宣言が0件でもその起動では通信できることがある。組み合わせ（Limit 1）は**断らずに見せる**ものなので、
+/// 多めに出す側へ倒す（`exposure_delta`のdoc）。
+///
+/// # 限界
+///
+/// **このマシンでの承認は見ていない**（未承認の宛先は出口に入らないので、実際には通信できない）。
+/// 承認は`policy.json`の外（`%APPDATA%`の台帳）にあり、判定器（`harness-policy`）はそこを読まない
+/// ——読ませると、同じ`policy.json`が機械によって違う判定になる。ここも多めに出す側である。
+pub fn net_capable(domain: &DomainView<'_>) -> bool {
     domain.name == ENTRY_DOMAIN || !domain.net.is_empty()
 }
 
@@ -231,37 +275,48 @@ fn subtract<'a>(minuend: Rights<'a>, subtrahend: &Rights<'_>) -> Rights<'a> {
     }
 }
 
-/// 宣言どうしの組み合わせの対を全部（モジュールdocの限界のとおり、ドメインの宣言だけを見る）。
+/// 組み合わせの対を全部。書く側は各ドメインの`read_write`宣言と、宣言の外で書ける場所
+/// （[`GraphInput::caller_writable_roots`]。**入口のドメイン**が書く。P5.4a）。読む側はドメインの宣言だけを見る
+/// （モジュールdocの限界）。
 fn combination_pairs<F>(input: &GraphInput<'_>, net_capable: &F) -> BTreeSet<CombinationPair>
 where
     F: Fn(&DomainView<'_>) -> bool,
 {
-    let mut pairs = BTreeSet::new();
+    // (書く側のドメイン, 見せる綴り, 重なりを見る綴り)。宣言はそのまま、根は配下全部を書ける場所として
+    // `**`を付けて見る（規則(i)の`caller_writable_roots`が根を配下ごとに数えるのと揃える）。
+    let mut writes: Vec<(&str, &str, String)> = Vec::new();
     for writer in &input.domains {
-        for (writer_place, _) in writer
-            .fs
-            .iter()
-            .filter(|(_, access)| *access == FsAccess::ReadWrite)
-        {
-            for reader in &input.domains {
-                if reader.name == writer.name || !net_capable(reader) {
+        for (place, access) in &writer.fs {
+            if *access == FsAccess::ReadWrite {
+                writes.push((writer.name, place, place.to_string()));
+            }
+        }
+    }
+    for root in &input.caller_writable_roots {
+        let span = format!("{}/**", root.trim_end_matches(['/', '\\']));
+        writes.push((ENTRY_DOMAIN, root, span));
+    }
+
+    let mut pairs = BTreeSet::new();
+    for (writer, writer_place, span) in &writes {
+        for reader in &input.domains {
+            if reader.name == *writer || !net_capable(reader) {
+                continue;
+            }
+            for (reader_place, access) in &reader.fs {
+                if !places_overlap(span, reader_place) {
                     continue;
                 }
-                for (reader_place, access) in &reader.fs {
-                    if !places_overlap(writer_place, reader_place) {
-                        continue;
-                    }
-                    pairs.insert(CombinationPair {
-                        writer: writer.name.to_string(),
-                        writer_place: writer_place.to_string(),
-                        reader: reader.name.to_string(),
-                        reader_place: reader_place.to_string(),
-                        use_: match access {
-                            FsAccess::ReadExec => PairUse::Execute,
-                            FsAccess::Read | FsAccess::ReadWrite => PairUse::Read,
-                        },
-                    });
-                }
+                pairs.insert(CombinationPair {
+                    writer: writer.to_string(),
+                    writer_place: writer_place.to_string(),
+                    reader: reader.name.to_string(),
+                    reader_place: reader_place.to_string(),
+                    use_: match access {
+                        FsAccess::ReadExec => PairUse::Execute,
+                        FsAccess::Read | FsAccess::ReadWrite => PairUse::Read,
+                    },
+                });
             }
         }
     }

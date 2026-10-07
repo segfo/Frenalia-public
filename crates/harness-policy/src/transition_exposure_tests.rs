@@ -7,6 +7,7 @@
 //! **数える側と数えない側を対で測る**（`bug-pattern-rules` B-35）——「新しく使える権限がある」だけを
 //! 測ると、何でも広げると答える実装でも緑になる。
 
+use crate::transition::ChildOutput;
 use super::*;
 
 use crate::policy_file::{PolicyDomain, PolicyFile, ENTRY_DOMAIN};
@@ -55,6 +56,7 @@ impl Decl {
             cwd: Some("C:/t".to_string()),
             to: to.to_string(),
             env: None,
+            output: ChildOutput::Return,
         });
         self
     }
@@ -67,6 +69,7 @@ impl Decl {
             cwd: None,
             to: to.to_string(),
             env: None,
+            output: ChildOutput::Return,
         });
         self
     }
@@ -214,7 +217,7 @@ fn two_parallel_edges_do_not_justify_each_other() {
 
     assert_eq!(newly(&after, "a", "b"), handed);
     assert_eq!(
-        delta(&before, &after, provisional_net_capable).edges,
+        delta(&before, &after, net_capable).edges,
         vec![
             EdgeExposure {
                 from: "a".to_string(),
@@ -257,7 +260,7 @@ fn an_edge_that_existed_before_reports_only_what_the_edit_added() {
     ]);
 
     assert_eq!(
-        delta(&before, &after, provisional_net_capable).edges,
+        delta(&before, &after, net_capable).edges,
         vec![
             EdgeExposure {
                 from: "a".to_string(),
@@ -285,7 +288,7 @@ fn an_edge_entering_a_strict_domain_hands_nothing_to_the_caller() {
 
     let strict_after = after(logs().strict());
     assert_eq!(newly(&strict_after, "a", "logs"), Rights::default());
-    assert!(delta(&before(logs().strict()), &strict_after, provisional_net_capable)
+    assert!(delta(&before(logs().strict()), &strict_after, net_capable)
         .edges
         .is_empty());
 
@@ -293,7 +296,7 @@ fn an_edge_entering_a_strict_domain_hands_nothing_to_the_caller() {
     let handed = rights(&[("C:/logs/**", "read")], &[]);
     assert_eq!(newly(&plain_after, "a", "logs"), handed);
     assert_eq!(
-        delta(&before(logs()), &plain_after, provisional_net_capable).edges,
+        delta(&before(logs()), &plain_after, net_capable).edges,
         vec![EdgeExposure {
             from: "a".to_string(),
             edge_index: 0,
@@ -336,7 +339,7 @@ fn a_writer_and_a_net_capable_reader_of_one_place_form_a_pair() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        delta(&file(vec![]), &after, net_capable).pairs,
         vec![pair(
             "w",
             "C:/shared/**",
@@ -363,7 +366,7 @@ fn an_exec_overlap_is_a_pair() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        delta(&file(vec![]), &after, net_capable).pairs,
         vec![
             pair("w", "C:/drop/run.ps1", "r", "C:/drop/**", PairUse::Execute),
             pair(
@@ -390,11 +393,11 @@ fn a_pair_without_a_net_capable_reader_is_not_reported() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &offline, provisional_net_capable).pairs,
+        delta(&file(vec![]), &offline, net_capable).pairs,
         vec![]
     );
     assert_eq!(
-        delta(&file(vec![]), &online, provisional_net_capable)
+        delta(&file(vec![]), &online, net_capable)
             .pairs
             .len(),
         1
@@ -410,7 +413,7 @@ fn the_entry_domain_counts_as_net_capable_until_p7() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        delta(&file(vec![]), &after, net_capable).pairs,
         vec![pair(
             "w",
             "C:/shared/**",
@@ -418,6 +421,52 @@ fn the_entry_domain_counts_as_net_capable_until_p7() {
             "C:/shared/in.txt",
             PairUse::Read
         )],
+    );
+}
+
+/// [P5.4a] 宣言の外で書ける場所（[`GraphInput::caller_writable_roots`]＝ワークスペースと、`policy.json`の外で書込を
+/// 許した場所）は、**入口のドメインが書ける場所**として対に数える——ファイルの宣言に書込が1つも無くても、入口の
+/// コードがそこへ置いたものを通信できる別のドメインが読む／実行すれば持ち出しの経路になる。根は**配下全部**を書ける
+/// 場所として重なりを見る（規則(i)が根を同じく配下ごとに数えるのと揃える）。
+///
+/// 対照: 同じ宣言でも根を渡さなければ対は無い（宣言の`read_write`だけを数えていた P5.2 の形）。
+#[test]
+fn places_writable_outside_the_declarations_are_written_by_the_entry_domain() {
+    let after = file(vec![Decl::new("r")
+        .read("C:/ws/out/report.txt")
+        .read_exec("C:/tools/**")
+        .net("example.com")]);
+    let roots = ["C:/tools".to_string()];
+    let with_roots = exposure_delta(
+        &file(vec![]).transition_graph_input(Some("C:/ws"), &roots),
+        &after.transition_graph_input(Some("C:/ws"), &roots),
+        net_capable,
+    )
+    .expect("同じ名前のドメインは無い");
+
+    assert_eq!(
+        with_roots.pairs,
+        vec![
+            pair(
+                ENTRY_DOMAIN,
+                "C:/tools",
+                "r",
+                "C:/tools/**",
+                PairUse::Execute
+            ),
+            pair(
+                ENTRY_DOMAIN,
+                "C:/ws",
+                "r",
+                "C:/ws/out/report.txt",
+                PairUse::Read
+            ),
+        ],
+    );
+    assert_eq!(
+        delta(&file(vec![]), &after, net_capable).pairs,
+        vec![],
+        "根を渡さなければ、宣言に書込が無いので対は無い"
     );
 }
 
@@ -457,7 +506,7 @@ fn neighbouring_places_and_a_domain_alone_are_not_pairs() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        delta(&file(vec![]), &after, net_capable).pairs,
         vec![]
     );
 }
@@ -478,7 +527,7 @@ fn pairs_that_existed_before_are_not_new() {
     ]);
 
     assert_eq!(
-        delta(&before, &after, provisional_net_capable).pairs,
+        delta(&before, &after, net_capable).pairs,
         vec![pair(
             "w",
             "C:/shared/**",
@@ -501,7 +550,47 @@ fn a_value_the_grant_layer_refuses_opens_no_place() {
     ]);
 
     assert_eq!(
-        delta(&file(vec![]), &after, provisional_net_capable).pairs,
+        delta(&file(vec![]), &after, net_capable).pairs,
         vec![]
     );
+}
+
+// ---------------------------------------------------------------------------
+// [P5.6] Strict の辺を明細に出す（辺のモードを示す）
+// ---------------------------------------------------------------------------
+
+/// [P5.6] **変更で新しく Strict になった辺**（入る先に印が付いた・印の付いたドメインへ新しく入った）を返す——明細はそれを
+/// 「入力を固定するので呼び出し元は子を操れない（広がる遷移に数えない）」と1行で言う（辺のモードを示す。P5.md の P5.6）。
+///
+/// 対（`B-35`）: 前から Strict だった辺・自己ループ・印の無いドメインへ入る辺は出さない。
+#[test]
+fn edges_that_newly_enter_a_strict_domain_are_reported_but_old_ones_are_not() {
+    let plain = file(vec![
+        Decl::new(ENTRY_DOMAIN).fixed_edge("C:/t/report.exe", "logs"),
+        Decl::new("logs").read("C:/logs/**"),
+    ]);
+    let marked = file(vec![
+        Decl::new(ENTRY_DOMAIN).fixed_edge("C:/t/report.exe", "logs"),
+        Decl::new("logs").read("C:/logs/**").strict(),
+    ]);
+    let d = delta(&plain, &marked, net_capable);
+    assert_eq!(
+        d.strict_edges,
+        vec![StrictEdge {
+            from: ENTRY_DOMAIN.to_string(),
+            edge_index: 0,
+            to: "logs".to_string(),
+        }]
+    );
+    assert!(d.edges.is_empty(), "Strict の辺は何も渡さない: {:?}", d.edges);
+
+    // 前から Strict だった辺は新しくない。
+    assert!(delta(&marked, &marked, net_capable).strict_edges.is_empty());
+    // 印の無いドメインへ入る辺・Strict のドメインの中の自己ループは Strict の辺ではない。
+    let self_loop = file(vec![
+        Decl::new(ENTRY_DOMAIN),
+        Decl::new("logs").fixed_edge("C:/t/report.exe", "logs").strict(),
+    ]);
+    assert!(delta(&plain, &plain, net_capable).strict_edges.is_empty());
+    assert!(delta(&file(vec![]), &self_loop, net_capable).strict_edges.is_empty());
 }

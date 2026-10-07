@@ -195,6 +195,29 @@ pub(crate) fn run_prompt_subcommand(cli: &Cli, workspace_root: &Path) -> ExitCod
         eprintln!("error: invalid network domain policy: {e}");
         return ExitCode::FAILURE;
     }
+    // [決定69(1)] **Tier2a の通信の宛先は`policy.json`の承認済みの宣言＋`--net-allow-domain`だけ**である。
+    // 下見（この経路）も実セッションと**同じ関数**で組む（`B-06`）——食い違えば、モデルへ見える制約を
+    // 確かめる道具としての意味が無い。Tier2a 以外は上の`settings.json`の値のまま（P8 で決め直す）。
+    if matches!(
+        sandbox_choice,
+        SandboxChoice::OsDefault | SandboxChoice::Tier2a | SandboxChoice::Tier2aCow
+    ) {
+        match crate::cli::startup::entry_destinations_from_workspace(
+            workspace_root,
+            &cli.net_allow_domain,
+        ) {
+            Ok(destinations) => {
+                for warning in &destinations.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                net_proxy.allow_domains = destinations.allow_domains;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
     let mut net_app = settings.net.clone().unwrap_or_default().to_net_app_policy();
     for app in &cli.net_allow_app {
         if !net_app.allow_apps.contains(app) {

@@ -36,26 +36,53 @@ pub const MAX_LOCATED_SPANS: usize = 4;
 
 /// `line`の中で LLM が示した`spans`を解読する。**`line`の中にそのまま在る文字列だけ**を読み、在らないものは捨てる。
 /// 読めた中身にさらに機械で読める符号化（`-EncodedCommand`等）があれば、2段目以降として続けて解読する。
+///
+/// **上限で止めたことも1段として出す**（[`DecodeOutcome::CountLimit`]。行の機械の解読と同じ）。示された箇所が
+/// [`MAX_LOCATED_SPANS`]より多い・段の数が上限に達した、のどちらも黙って落とすと、示された箇所を全部解けた行と
+/// 区別がつかない（全部解けた行への判定モデルの点数は数えない。D-126）。
 pub fn decode_located(line: &str, spans: &[LocatedSpan]) -> Vec<DecodedLayer> {
     let mut layers = Vec::new();
     let mut decoded_bytes = 0usize;
-    for span in spans
+    let in_line = spans
         .iter()
-        .filter(|s| !s.text.trim().is_empty() && line.contains(&s.text))
-        .take(MAX_LOCATED_SPANS)
-    {
-        if layers.len() >= MAX_DECODED_LAYERS {
+        .filter(|s| !s.text.trim().is_empty() && line.contains(&s.text));
+    for (i, span) in in_line.enumerate() {
+        let source = EncodedSource::LocatedByModel(span.encoding);
+        let cap = if i >= MAX_LOCATED_SPANS {
+            Some(MAX_LOCATED_SPANS)
+        } else if layers.len() >= MAX_DECODED_LAYERS {
+            Some(MAX_DECODED_LAYERS)
+        } else {
+            None
+        };
+        if let Some(max_layers) = cap {
+            layers.push(DecodedLayer {
+                depth: 1,
+                source,
+                outcome: DecodeOutcome::CountLimit { max_layers },
+                in_file: None,
+            });
             break;
         }
-        let source = EncodedSource::LocatedByModel(span.encoding);
         let (outcome, used) =
             decode_payload(&span.text, span.encoding, MAX_DECODED_BYTES - decoded_bytes);
         decoded_bytes += used;
         let nested = match &outcome {
-            DecodeOutcome::Text { text, .. } => decode_nested(text, 2, decoded_bytes),
+            DecodeOutcome::Text { text, .. } => {
+                decode_nested(text, 2, decoded_bytes, layers.len() + 1)
+            }
             _ => Vec::new(),
         };
-        let stop = matches!(outcome, DecodeOutcome::SizeLimit { .. });
+        // 入れ子の解読が上限で止めたら（止めた印は最後の段）、ここでも止める。行の機械の解読と同じ。
+        let stop = matches!(outcome, DecodeOutcome::SizeLimit { .. })
+            || nested.last().is_some_and(|l| {
+                matches!(
+                    l.outcome,
+                    DecodeOutcome::DepthLimit { .. }
+                        | DecodeOutcome::SizeLimit { .. }
+                        | DecodeOutcome::CountLimit { .. }
+                )
+            });
         layers.push(DecodedLayer {
             depth: 1,
             source,
@@ -67,7 +94,6 @@ pub fn decode_located(line: &str, spans: &[LocatedSpan]) -> Vec<DecodedLayer> {
             break;
         }
     }
-    layers.truncate(MAX_DECODED_LAYERS);
     layers
 }
 

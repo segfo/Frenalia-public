@@ -162,3 +162,33 @@ fn extract_flags_ignores_separators_and_takes_the_whole_name() {
     );
     assert_eq!(extract_flags("--a --b2"), vec!["a", "b2"]);
 }
+
+/// [決定68(2)] **`record-net`は`--domain`を受け付けない**（パス2は常に入口のドメインから始める）。旧い綴りで打つと
+/// clap がエラーにする（禁止側）。`--domain`を外した形は通る（許可側——サブコマンドそのものが壊れていない対）。
+#[test]
+fn record_net_has_no_domain_flag() {
+    use clap::Parser;
+
+    let with_domain = Cli::try_parse_from([
+        "harness-policy-editor",
+        "record-net",
+        "--domain",
+        "cargo",
+        "--",
+        "cargo build",
+    ]);
+    let error = with_domain.expect_err("record-net が --domain を受け付けた");
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::UnknownArgument,
+        "{error}"
+    );
+
+    let without = Cli::try_parse_from(["harness-policy-editor", "record-net", "--", "cargo build"])
+        .expect("--domain を外した record-net が通らない");
+    assert!(
+        matches!(without.command, Some(super::Command::RecordNet { .. })),
+        "{:?}",
+        without.command
+    );
+}

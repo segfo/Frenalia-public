@@ -106,14 +106,7 @@ pub fn plan(
 
     let mut out = DeclaredApprovalPlan::default();
     for target in targets {
-        let Some(access) = target.key.fs_access() else {
-            out.refused.push((
-                target.clone(),
-                "ネットワークの宣言は、このマシンでの承認の対象外です（承認台帳はファイル宣言だけを持つ）"
-                    .to_string(),
-            ));
-            continue;
-        };
+        // [決定69(2)] 通信の宣言も承認の対象である（検査は[`refusal`]が種類で分ける）。
         let Some(target) = stored_spelling(&file, target) else {
             out.not_found.push(target.clone());
             continue;
@@ -125,7 +118,7 @@ pub fn plan(
         let declaration = DeclarationRef {
             domain: &target.domain,
             value: &target.value,
-            access,
+            key: target.key,
         };
         if approvals.is_approved_for_key(&workspace_key, declaration) {
             out.already.push(target);
@@ -138,12 +131,34 @@ pub fn plan(
 
 /// 承認しない理由（承認してよいなら`None`）。順序は「候補にしない規則 → 許可を付けない値 →
 /// `--require-sandbox`との矛盾 → 広すぎる値」。
+///
+/// [決定69(2)] **通信の宣言はファイルの検査を通さない**（値はパスではなく宛先の綴りなので、
+/// 候補にしない規則も付与ルートの検査も当たらない）。代わりに**宛先として解釈できるか**を見て、
+/// `--require-sandbox`との矛盾と広すぎる値の検査（`gate`・`breadth`）は同じものを通す。
 fn refusal(
     target: &UnapproveTarget,
     require_sandbox: RequireSandbox,
     exclusion: &crate::exclusion::ExclusionRules,
     grants: &harness_sandbox::tier2a::policy_grants::GrantContext,
 ) -> Option<String> {
+    if target.key == SettingsKey::NetAllowDomains {
+        if let Err(detail) = harness_core::normalize_domain_pattern(&target.value) {
+            return Some(format!(
+                "宛先として解釈できません（{detail}）。承認しても中継プロキシの許可に入りません"
+            ));
+        }
+        let proposal = RuleProposal {
+            id: String::new(),
+            key: target.key,
+            value: target.value.clone(),
+            evidence: Vec::new(),
+            warnings: Vec::new(),
+        };
+        if let GateVerdict::Rejected(message) = gate::check_proposal(&proposal, require_sandbox) {
+            return Some(message);
+        }
+        return breadth::check(&proposal).message().map(str::to_string);
+    }
     if let Some(reason) = exclusion.excluded(&target.value) {
         return Some(format!(
             "いまの規則なら候補にしない値です（{reason:?}）。`unapprove --excluded`で宣言ごと消せます"
@@ -211,7 +226,7 @@ pub fn commit(
     let declarations: Vec<DeclarationRef<'_>> = plan
         .approve
         .iter()
-        .filter_map(UnapproveTarget::declaration)
+        .map(UnapproveTarget::declaration)
         .collect();
     if declarations.is_empty() {
         return Ok(0);
@@ -222,7 +237,7 @@ pub fn commit(
         return Err(ApproveDeclaredError::NotRecorded(
             not_recorded
                 .iter()
-                .map(|d| format!("{} ({}) in {}", d.value, d.access.settings_key(), d.domain))
+                .map(|d| format!("{} ({}) in {}", d.value, d.key_label(), d.domain))
                 .collect::<Vec<_>>()
                 .join(", "),
         ));

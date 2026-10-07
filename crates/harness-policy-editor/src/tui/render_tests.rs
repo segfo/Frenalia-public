@@ -42,6 +42,44 @@ fn the_record_screen_renders() {
     render(&app, 80, 24);
 }
 
+/// [決定68(2)] **パス2の記録画面にドメイン欄は無い。** 欄の場所には編集できない1行（始める場所＝入口のドメイン）が
+/// 出る——文言は CLI と同じ関数（`record_net::pass2_start_line`）が持つ。パス1ではその行も出ない（対の側）。
+#[test]
+fn the_record_screen_has_no_domain_field_in_pass_two() {
+    let ws = workspace();
+    let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    app.command.set_text("cargo build");
+
+    app.pass = crate::tui::state::Pass::Two;
+    let grid = paint_grid(120, 30, |frame| {
+        draw(frame, &app);
+    });
+    let form: Vec<String> = box_inner(&grid, " 記録 ").iter().map(|row| squash(row)).collect();
+    assert_eq!(
+        form.get(3).map(String::as_str),
+        Some(squash(&crate::record_net::pass2_start_line()).as_str()),
+        "パス2の4行目が始める場所の1行ではない: {form:?}"
+    );
+    assert!(
+        form.iter().any(|row| row.contains(crate::policy_file::ENTRY_DOMAIN)),
+        "入口のドメインの名前が出ていない: {form:?}"
+    );
+    assert!(
+        !form.iter().any(|row| row.starts_with("ドメイン")),
+        "ドメインの入力欄が残っている: {form:?}"
+    );
+
+    app.pass = crate::tui::state::Pass::One;
+    let grid = paint_grid(120, 30, |frame| {
+        draw(frame, &app);
+    });
+    let form: Vec<String> = box_inner(&grid, " 記録 ").iter().map(|row| squash(row)).collect();
+    assert!(
+        !form.iter().any(|row| row.contains("始める場所")),
+        "パス1に始める場所の行が出た: {form:?}"
+    );
+}
+
 /// 記録中（進行ログ・出力・起動時ノイズの3枠が出る）。
 #[test]
 fn the_record_screen_renders_while_running() {
@@ -739,10 +777,12 @@ fn the_end_key_reaches_the_last_line_even_when_every_line_wraps() {
         .map(|i| format!("{i:02}{}", "折り返す長さの行".repeat(6)))
         .collect();
     lines.push("ここが最後の行です".to_string());
+    // [P6.7] 種類は遷移の確定（ボタン2つ）。ファイルの確定はボタンが3つになり、80桁では送り方の案内が収まらず
+    // 「N〜M/T行」だけになる（決定68(3)。その形は`modal_tests`が測る）。ここで測るのは折り返した後の行で送ること。
     app.modal = Some(state::Modal {
         title: "承認の確認".to_string(),
         lines,
-        confirm: Confirm::Approval,
+        confirm: Confirm::Transition,
     });
     let modal_screen = |app: &mut App| {
         let rows: Vec<String> = frame(app, 80, 24)
@@ -1026,10 +1066,11 @@ fn pressing_down_at_the_end_does_not_bank_up_rows_to_unwind() {
 fn a_long_diff_scrolls_row_by_row_and_page_by_page_and_stops_at_the_end() {
     let ws = workspace();
     let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    // [P6.7] 種類は遷移の確定（ボタン2つ）。ファイルの確定のボタン3つでは送り方の案内が下辺に収まらない（`modal_tests`）。
     app.modal = Some(state::Modal {
         title: "承認の確認".to_string(),
         lines: (0..50).map(|i| format!("  + fs.read = C:/x/{i}")).collect(),
-        confirm: Confirm::Approval,
+        confirm: Confirm::Transition,
     });
     // 下辺の「N〜M/T行」と、枠の中の行数。
     let shown = |app: &mut App| {
@@ -3029,15 +3070,24 @@ fn every_key_hint_appears_in_the_help_section_of_its_screen() {
 /// - 足す: 候補の選択（`accepted`）・`R`の再帰・遷移の承認の予約・位置の予約・このマシンでの承認の予約
 /// - 減らす: 宣言の取り消し（`unapproved`）・遷移の辺の取り消し（承認待ちと宣言画面の遷移タブ）
 /// - 数えない: 却下（表示だけの印）・引数の絞り・遷移先の付け替え・種類や`**`の付け替え（宣言を足しも消しもしない。
-///   付け替えが広げる向きかは、付け替えの確認ダイアログが言う）
+///   付け替えが広げる向きかは、付け替えの確認ダイアログが言う）・子の出力の設定（`o`。渡すものを減らすだけで、
+///   選んだ位置の予約の上に乗る）
+/// - [P5.5] Strict の印: **付ける予約は減らす側**（入る辺の子を呼び出し元が操れなくなる）、**外す予約は足す側**
 fn reservation_sizes(app: &App) -> (usize, usize) {
+    let strict = &app.declared_transitions.strict;
+    let unmark = strict.values().filter(|mark| !**mark).count();
     let adds = app.accepted.len()
         + app.recursive.len()
         + app.pending.approve.len()
         + app.pending.positions.as_ref().map_or(0, |p| p.approve.len())
-        + app.declared_approval.reserved.len();
-    let removes =
-        app.unapproved.len() + app.pending.remove.len() + app.declared_transitions.remove.len();
+        + app.declared_approval.reserved.len()
+        + unmark;
+    // [P5.10.2] 位置の木の Strict の行（`s`。決定67）も数える——宣言画面の`s`と同じく、呼び出し元が子を操れなくなる向き。
+    let removes = app.unapproved.len()
+        + app.pending.remove.len()
+        + app.declared_transitions.remove.len()
+        + (strict.len() - unmark)
+        + app.pending.positions.as_ref().map_or(0, |p| p.strict.len());
     (adds, removes)
 }
 
@@ -3174,11 +3224,17 @@ fn no_key_has_opposite_directions_in_two_tabs_of_one_screen() {
         ("承認待ち", "FS/ネット", 'd', BY_ROW),
         ("承認待ち", "FS/ネット", 'R', ADDS),
         ("承認待ち", "遷移・拒否から", ' ', BY_ROW),
+        // [P5.10.2] 位置の木は選んで分けた行（`Space`→`u`）でも測る（選んだ行の`Space`は予約を外すだけで、減らす予約は作らない）。
         ("承認待ち", "位置の木", ' ', ADDS),
+        // [P5.10.2] Strict にする（決定67。`F3`の`s`と同じ「減らす」向き）。分けた行でだけ効く。
+        ("承認待ち", "位置の木", 's', REMOVES),
         ("宣言", "ファイル・通信", ' ', REMOVES),
         ("宣言", "ファイル・通信", 'A', REMOVES),
         ("宣言", "ファイル・通信", 'y', ADDS),
         ("宣言", "遷移", ' ', REMOVES),
+        // [P5.5] Strict の印を付ける（入る辺の子を呼び出し元が操れなくなる）。外す予約は印の付いたドメインでだけ
+        // 起き、この画面の試験の宣言には無いので「減らす」だけが出る。ファイル・通信のタブの`s`は理由を言うだけ。
+        ("宣言", "遷移", 's', REMOVES),
     ];
 
     let pending = pending_fixture();
@@ -3223,11 +3279,18 @@ fn no_key_has_opposite_directions_in_two_tabs_of_one_screen() {
             "承認待ち",
             "位置の木",
             |row| {
+                // 前半の行は何も選んでいない木、後半の行は同じ行を`Space`で選んで`u`で分けた木（P5.10.2。`s`は分けた行に
+                // だけ効くので、分けた行で測らないと向きを見張れない）。
                 let mut app = positions_app(positions.path());
-                app.pending.positions.as_mut().expect("位置の木").row = row;
+                let rows = app.pending.positions.as_ref().map_or(0, |p| p.visible().len());
+                app.pending.positions.as_mut().expect("位置の木").row = row % rows;
+                if row >= rows {
+                    press(&mut app, KeyCode::Char(' '));
+                    press(&mut app, KeyCode::Char('u'));
+                }
                 app
             },
-            |app| app.pending.positions.as_ref().map_or(0, |p| p.visible().len()),
+            |app| 2 * app.pending.positions.as_ref().map_or(0, |p| p.visible().len()),
         ),
         tab_probe(
             "宣言",

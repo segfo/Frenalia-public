@@ -3,6 +3,7 @@
 //! **端末もWin32も要らない**（`cargo test -p harness-policy-editor`に入る）。
 //! 実際に`policy.json`をtempdirへ書いて読み直すので、**書いたものが読めること**まで測る。
 
+use harness_policy::transition::ChildOutput;
 use super::*;
 
 use harness_policy::policy_file::ENTRY_DOMAIN;
@@ -111,6 +112,7 @@ fn an_existing_self_loop_can_still_be_removed() {
         cwd: None,
         to: ENTRY_DOMAIN.to_string(),
         env: None,
+        output: ChildOutput::Return,
     });
     file.domains.push(entry);
     policy_file::save(tmp.path(), &file).expect("手で書いた自己ループ辺が保存できない");
@@ -211,7 +213,8 @@ fn a_widening_destination_can_be_written_and_what_it_hands_over_is_listed() {
 }
 
 /// **禁止側（対）**: 遷移先に Strict の印があれば、入る辺は引数と作業ディレクトリを固定しなければ書けない（決定66の
-/// 追記）。このエディタは作業ディレクトリを宣言しない（[`edge_for`]）ので書けず、検査の理由をそのまま出して何も書かない。
+/// 追記）。拒否のタブの辺は引数も作業ディレクトリも固定しない（[`edge_for`]）ので書けず、検査の理由をそのまま出して
+/// 何も書かない。直し方は位置の木の`u`→`s`（決定67）か、宣言画面で Strict を外すこと。
 #[test]
 fn a_strict_destination_is_refused_because_this_editor_does_not_fix_inputs() {
     let tmp = tempfile::tempdir().unwrap();
@@ -224,6 +227,16 @@ fn a_strict_destination_is_refused_because_this_editor_does_not_fix_inputs() {
     match plan(&request_to(tmp.path(), "wide", &[any("C:/curl.exe")], &[])) {
         Err(TransitionApproveError::Rejected(detail)) => {
             assert!(detail.contains("is strict"), "検査の理由が落ちている: {detail}");
+            // [P5.5] このエディタで取れる直し方で先に言い直す（検査の英文は「cwd を宣言せよ」で、この画面では取れない）。
+            assert!(
+                detail.contains("遷移先「wide」は Strict です") && detail.contains("Strict を外す"),
+                "直し方を言っていない: {detail}"
+            );
+            // [P5.10.4] 位置の木で書ける直し方（決定67）も言う。「手で書く」しか言わない古い文面へ戻さない。
+            assert!(
+                detail.contains("位置の木") && detail.contains("Space→u") && detail.contains("→s"),
+                "位置の木の u→s を案内していない: {detail}"
+            );
         }
         other => panic!("Strict のドメインへの辺が別の形で返った: {other:?}"),
     }
@@ -287,8 +300,11 @@ fn removing_alone_does_not_look_at_the_destination() {
 /// 「呼び出し元から書ける場所」を足しても（`settings.json`の`fs.read_write`・`--fs-allow :rw`）
 /// 起動時に落ちない——作業ディレクトリを宣言しないので固定した遷移にならず、その検査の対象外だからである。
 ///
-/// **歯の確認（対）**: 同じ場所の下を指す**固定した**辺（手で書いたもの）は、同じ入力で落ちる。
-/// これが落ちなければ、上の「落ちない」は何も測っていない。
+/// **歯の確認（対）**: 同じ場所の下を指す**固定した**辺（手で書いたもの）を **Strict のドメインへ**向けると、
+/// 同じ入力で落ちる。これが落ちなければ、上の「落ちない」は何も測っていない。
+///
+/// [P5.4a] 固定値の書込可否（規則(i)）は Strict の印が付いたドメインへ入る辺にだけ掛かる（決定66の追記）ので、
+/// 対の辺の遷移先には印を付ける（かつては同じドメインへの自己ループで作っていたが、自己ループは入る辺ではない）。
 #[test]
 fn an_edge_this_editor_writes_survives_the_writable_places_harness_adds() {
     let tmp = tempfile::tempdir().unwrap();
@@ -305,9 +321,14 @@ fn an_edge_this_editor_writes_survives_the_writable_places_harness_adds() {
     policy_file::load_for_session(tmp.path(), &writable_outside)
         .expect("このエディタが書いた辺がharness.exeの起動時の検査で落ちた");
 
-    // 対: 同じ実行ファイルを、作業ディレクトリまで固定した辺（手で書いたもの）で足す。
+    // 対: 同じ実行ファイルを、作業ディレクトリまで固定した辺（手で書いたもの）で Strict のドメインへ足す。
+    // [P5.4d] 作業ディレクトリは書けない場所に置く——ワークスペースに置くと、作業ディレクトリのせいでエディタの
+    // 保存が先に落ちる（作業ディレクトリも規則(i)の候補になった）。測りたいのはプログラムの置き場である。
     let mut file = policy_file::load(tmp.path()).unwrap();
-    let ws = tmp.path().to_string_lossy().into_owned();
+    let cwd = "C:/work".to_string();
+    let mut sealed = PolicyDomain::new("sealed");
+    sealed.strict = true;
+    file.domains.push(sealed);
     let entry = file
         .domains
         .iter_mut()
@@ -316,9 +337,10 @@ fn an_edge_this_editor_writes_survives_the_writable_places_harness_adds() {
     entry.process.transitions.push(TransitionEdge {
         exe: ExeMatcher::Literal("C:/tools/gen.exe".to_string()),
         argv: ArgvMatcher::Literal("\"C:/tools/gen.exe\" --fixed".to_string()),
-        cwd: Some(ws),
-        to: ENTRY_DOMAIN.to_string(),
+        cwd: Some(cwd),
+        to: "sealed".to_string(),
         env: None,
+        output: ChildOutput::Return,
     });
     policy_file::save(tmp.path(), &file).expect("エディタの検査（書ける場所を知らない）は通る");
     assert!(
@@ -349,6 +371,7 @@ fn approving_a_file_declaration_into_the_destination_cannot_break_the_transition
         cwd: None,
         to: "iso".to_string(),
         env: None,
+        output: ChildOutput::Return,
     });
     file.domains.push(entry);
     file.domains.push(PolicyDomain::new("iso"));
@@ -563,11 +586,13 @@ fn editor_edge_is_the_only_shape_the_editor_writes() {
             source: PositionSource::Proposed,
             instances: vec![2],
             command_lines: Vec::new(),
+            fixed_command_line: None,
             argv_missing: 0,
             argv_truncated: 0,
         }],
         roots: Vec::new(),
         unassigned: Vec::new(),
+        split_refused: Vec::new(),
     };
     let expected =
         transition::editor_edge(EXE, ArgvMatcher::Any(transition::AnyMarker), "pwsh");
@@ -576,6 +601,15 @@ fn editor_edge_is_the_only_shape_the_editor_writes() {
     assert_eq!(from_positions.len(), 1);
     assert_eq!(from_positions[0].edge, expected, "位置ごとの割り当ての辺の形が違う");
     assert_eq!(edge_for(&any(EXE), "pwsh"), expected, "遷移タブの承認の辺の形が違う");
+
+    // [P5.10.1] コマンドラインごとに分けた位置（決定67）の辺も同じ形——リテラルの引数で作った遷移タブの辺と等しい。
+    let mut split = assignment.clone();
+    split.positions[0].fixed_command_line = Some("pwsh -c x".to_string());
+    assert_eq!(
+        split.edges_to_add()[0].edge,
+        edge_for(&literal(EXE, "pwsh -c x"), "pwsh"),
+        "分けた位置の辺の形が違う"
+    );
 
     // 対の側: リテラルの引数で作った辺は、任意の引数の辺と等しくない。
     assert_ne!(edge_for(&literal(EXE, "pwsh -c x"), "pwsh"), expected);

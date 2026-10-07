@@ -71,9 +71,14 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App) -> crate::tui::DrawFeedbac
     feedback
 }
 
-/// 選んでいる位置の遷移先の欄。欄に居る間は打っている名前、居ないときはいまの遷移先を出す。
+/// 選んでいる位置の遷移先の欄。欄に居る間は打っている名前（`w`なら作業ディレクトリ）、居ないときはいまの遷移先を出す。
 fn draw_destination(frame: &mut Frame, area: Rect, positions: &PositionsState) {
     let focused = positions.editing.is_some();
+    let title = if positions.editing_cwd {
+        " 選んだ位置の作業ディレクトリ（Enter で決める。空のまま Enter で宣言を外す。呼び出し元はここから呼ぶ必要がある） "
+    } else {
+        " 選んだ位置の遷移先（Tab で編集。Enter で決める。子の行の遷移元も一緒に変わる） "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(if focused {
@@ -81,7 +86,7 @@ fn draw_destination(frame: &mut Frame, area: Rect, positions: &PositionsState) {
         } else {
             Style::default().fg(Color::DarkGray)
         })
-        .title(" 選んだ位置の遷移先（Tab で編集。Enter で決める。子の行の遷移元も一緒に変わる） ");
+        .title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let line = match (&positions.editing, positions.selected_index()) {
@@ -191,10 +196,10 @@ fn row_line<'a>(positions: &'a PositionsState, row: &PositionRow) -> Line<'a> {
     } else {
         Mark::None
     };
-    let argv = if positions.is_narrowed(position) {
-        truncate(&position.command_lines[0], 40)
-    } else {
-        harness_policy::transition_listing::ANY_ARGV.to_string()
+    // 書く辺の引数: コマンドラインごとに分けた行（`u`。決定67）はそのリテラル、他は任意の引数。
+    let argv = match &position.fixed_command_line {
+        Some(line) => truncate(line, 40),
+        None => harness_policy::transition_listing::ANY_ARGV.to_string(),
     };
     let source = match position.source {
         PositionSource::ExistingEdge => "宣言済み",
@@ -216,6 +221,26 @@ fn row_line<'a>(positions: &'a PositionsState, row: &PositionRow) -> Line<'a> {
         ),
         Span::styled(format!("  {source}"), Style::default().fg(Color::DarkGray)),
     ];
+    // [P5.10.2] Strict（`s`）と、辺に書く作業ディレクトリ（`w`・Strict の候補。決定67）。
+    if positions.is_strict(position) {
+        spans.push(Span::styled(
+            "  ［Strict］".to_string(),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    if let Some(cwd) = positions.edge_cwd(position) {
+        spans.push(Span::styled(
+            format!("  cwd:{}{}", truncate(&cwd, 30), estimated_mark(positions, position)),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    // [P5.5] 子の出力を捨てる辺にする予約（`o`）。既定の「返す」は出さない（行を既定の説明で埋めない）。
+    if positions.is_output_discarded(position) {
+        spans.push(Span::styled(
+            "  出力:捨てる".to_string(),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
     if row.startable.note().is_some() {
         spans.push(Span::styled(
             "  ［この綴りは起こせない］".to_string(),
@@ -237,6 +262,18 @@ fn row_line<'a>(positions: &'a PositionsState, row: &PositionRow) -> Line<'a> {
     Line::from(spans)
 }
 
+/// 作業ディレクトリが当てずっぽうの候補のままなら「（推定）」（決定67(3)。`w`で宣言した値には付けない）。
+fn estimated_mark(positions: &PositionsState, position: &harness_policy::position_domains::Position) -> &'static str {
+    let declared = positions
+        .cwd
+        .contains_key(&crate::position_view::key_of(position));
+    if !declared && crate::position_view::cwd_candidate(position).estimated {
+        "（推定）"
+    } else {
+        ""
+    }
+}
+
 /// 説明欄の中身。並びは平らな一覧と同じく「最初に見えていなければならない順」——(1)ACEの注記→(2)予約と操作→
 /// (3)読めなかった・割り当てなかった事実→(4)選んでいる位置の詳しいこと（`tui::transition_screen::notes_text`のdoc）。
 fn notes_text(app: &App, positions: &PositionsState) -> String {
@@ -246,8 +283,8 @@ fn notes_text(app: &App, positions: &PositionsState) -> String {
         text.push_str("遷移先の名前を入力中です（Enter で決める・空のまま Enter でやめる）。\n");
     } else if positions.approve.is_empty() {
         text.push_str(
-            "Spaceで選ぶ／Tabで遷移先／uで引数の広さ／fで表示の切替／rで読み直し／aで確定\
-             （承認待ちの全タブの予約をまとめて書きます）。\n",
+            "Spaceで選ぶ／Tabで遷移先／uで引数を固定してコマンドラインごとに分ける・戻す／sでStrict／wで作業ディレクトリ／\
+             oで子の出力を捨てる・返す／fで表示の切替／rで読み直し／aで確定（承認待ちの全タブの予約をまとめて書きます）。\n",
         );
     } else {
         text.push_str(&format!(
@@ -288,6 +325,39 @@ fn notes_text(app: &App, positions: &PositionsState) -> String {
             position.exe,
             positions.destination_name(position)
         ));
+        // [P5.5] 出力の行き先（決定66(4)）。返す辺は、子が読めるものが出力を通って呼び出し元へ渡る。
+        if positions.is_reserved(position) {
+            text.push_str(if positions.is_output_discarded(position) {
+                "  子の出力: 捨てる（標準出力・標準エラーは呼び出し元へ返りません。子が書いたファイルは残ります）\n"
+            } else {
+                "  子の出力: 返す（子が読めるものは呼び出し元へ渡ります。o で捨てる設定にできます）\n"
+            });
+        }
+        // [P5.10.2] 引数を固定した行・Strict・作業ディレクトリ（決定67）。
+        match &position.fixed_command_line {
+            Some(line) => text.push_str(&format!(
+                "  引数を記録どおりに固定した行です（{line}）。この辺は記録に無い引数では起こせません。u で元の1行へ戻します\n"
+            )),
+            None if position.source != PositionSource::ExistingEdge && position.can_split() => {
+                text.push_str(&format!(
+                    "  u で引数を記録どおりに固定し、コマンドライン{}通りごとの行（それぞれ別のドメイン）に分けられます\n",
+                    position.command_lines.len()
+                ))
+            }
+            None => {}
+        }
+        if positions.is_strict(position) {
+            text.push_str(
+                "  Strict: 引数と作業ディレクトリを固定し、遷移先に strict の印を付けます（標準入力は断ち、環境変数は\
+                 harness の基準の値から始めます——決定66の追記）\n",
+            );
+        }
+        if let Some(cwd) = positions.edge_cwd(position) {
+            text.push_str(&format!(
+                "  作業ディレクトリ: {cwd}{}——呼び出し元はこの場所へ移ってから呼ぶ必要があります（w で直す）\n",
+                estimated_mark(positions, position)
+            ));
+        }
         let lines = &position.command_lines;
         text.push_str(&format!("  記録したコマンドライン {}通り", lines.len()));
         for line in lines.iter().take(3) {

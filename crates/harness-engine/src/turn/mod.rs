@@ -10,6 +10,8 @@
 //! |---|---|
 //! | 本ファイル | 型・[`Executor`]・回復の梯子のドライバ・ツール実行 |
 //! | [`stream`] | 1回のストリーム受信・ブロック組み立て・縮退検知器への供給 |
+//! | [`references`] | ツール呼び出し1件の入力への、書き写しの審査と値の差し込み |
+//! | [`outcome`] | 会話に残ったツールの結果の顛末の見分け（結果の文の頭の綴りはここにだけ置く） |
 //!
 //! # なぜツール実行までこの中に置くか
 //!
@@ -27,8 +29,14 @@
 //! `TextDelta`/`ThinkingDelta`/`ToolCallProposed`/`ToolStarted`/`ToolFinished`と、
 //! 縮退で捨てた回の`TurnDiscarded`だけ。
 
+mod outcome;
+mod references;
 mod stream;
 mod text_tool_call;
+
+pub use outcome::{
+    RecordedOutcome, CANCELLED_BEFORE_START, DENIAL_PREFIX, INVALID_TOOL_INPUT_PREFIX,
+};
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -79,6 +87,21 @@ pub enum TurnVisibility {
 pub struct RawTurnRequest {
     pub req: CompletionRequest,
     pub visibility: TurnVisibility,
+    /// 値の置き場（`{{val:N}}`・`{{back:K:N}}`が指すもの。D-127）。**`None`なら`req.messages`から組む**
+    /// （素朴ループ。送る文がそのまま会話なので、それで正しい）。
+    ///
+    /// 送る文が会話そのものでない呼び出し側（認知レイヤーは1つの文に組み直して送る）は、会話から組んだ
+    /// 置き場を[`RawTurnRequest::with_references`]で渡す——送る文から組むと、ツールの出力に出てきた値まで
+    /// 番号を取ってしまう（BUG-235）。`Arc`なのは、同じ発話の中の何回ものコールで使い回すため。
+    pub references: Option<std::sync::Arc<crate::References>>,
+    /// `req.messages`が**会話そのもの**か。決めるのは作る関数（[`RawTurnRequest::user_facing`]は`true`、
+    /// [`RawTurnRequest::internal`]は`false`）だけで、外からは書けない。
+    ///
+    /// `references`が`None`のとき、これが`true`なら置き場を会話として組み（[`crate::References::from_conversation`]）、
+    /// 会話を読む道具（`Tool::call_in_conversation`）へ会話を渡す。`false`なら送る文から組むだけで、道具には
+    /// 会話を渡さない——組み直した文を会話として読ませると、ツールの出力の中の文まで「人の文」に見える
+    /// （D-127「認知レイヤーの経路は未決」）。
+    request_is_conversation: bool,
 }
 
 impl RawTurnRequest {
@@ -87,6 +110,9 @@ impl RawTurnRequest {
         Self {
             req,
             visibility: TurnVisibility::UserFacing,
+            references: None,
+            // 素朴ループは`ConversationState`をそのまま写して送る（`crate::build_request`）。
+            request_is_conversation: true,
         }
     }
 
@@ -95,14 +121,19 @@ impl RawTurnRequest {
         Self {
             req,
             visibility: TurnVisibility::Internal,
+            references: None,
+            // 認知レイヤーは作業記憶から1つの文に組み直して送る。会話ではない。
+            request_is_conversation: false,
         }
     }
-}
 
-/// 判定の材料が作れなかった（ツールの入力として読めなかった）呼び出しへ返す文言の接頭辞。
-/// ヘッドレスの JSON 出力がこれで「実行しなかった」と見分けるので、綴りはここにだけ置く
-/// （別々に持つと片方だけ変わる、B-05）。
-pub const INVALID_TOOL_INPUT_PREFIX: &str = "invalid tool input";
+    /// 値の置き場を、送る文からではなく呼び出し側が組んだもので渡す（[`RawTurnRequest::references`]）。
+    /// 道具へ会話を渡すかは、渡した置き場が会話から組まれたか（[`crate::References::conversation`]）で決まる。
+    pub fn with_references(mut self, references: std::sync::Arc<crate::References>) -> Self {
+        self.references = Some(references);
+        self
+    }
+}
 
 /// 「対話なら聞いていた」拒否に足す一言（[`harness_engine::Decision::DenyWouldPrompt`]）。
 ///
@@ -317,6 +348,8 @@ impl<'a> TurnExecutor<'a> {
         let RawTurnRequest {
             req: mut base_req,
             visibility,
+            references,
+            request_is_conversation,
         } = request;
         let visible = visibility == TurnVisibility::UserFacing;
         // 呼び出し側が伏字化済みのリクエストを渡してくる経路（`run_agent_loop`）もあるが、
@@ -327,9 +360,17 @@ impl<'a> TurnExecutor<'a> {
 
         // ハーネスが持っている値（モデルに書き写させず、番号で指させる。`harness_core::value_store`）。
         // **この回の会話の文から1回だけ組む**——ツール呼び出しごとに数え直すと、途中で番号の意味が変わる。
-        // 組み立ては`value_store_for`の1か所だけを通す。ここと`build_request`（モデルへ一覧を見せる段）が
-        // 同じ関数を同じ`messages`で呼ぶので、**モデルが見た番号と差し込まれる値が食い違わない**。
-        let values = crate::value_store_for(&base_req.messages);
+        // 組み立ては`References::from_messages`の1か所だけを通す。ここと`build_request`（モデルへ一覧を
+        // 見せる段）が同じ関数を同じ`messages`で呼ぶので、**モデルが見た番号と差し込まれる値が食い違わない**。
+        // 呼び出し側が組んだ置き場を渡したなら、そちらを使う（`RawTurnRequest::references`）。
+        // 送る文が会話そのものなら、会話として組む——会話を読む道具へ渡るのはこの場合と、呼び出し側が
+        // 会話から組んで渡した場合だけである（`Tool::call_in_conversation`）。
+        let references = references.unwrap_or_else(|| {
+            std::sync::Arc::new(match request_is_conversation {
+                true => crate::References::from_conversation(&base_req.messages),
+                false => crate::References::from_messages(&base_req.messages),
+            })
+        });
 
         let mut ladder: Option<ladder::Ladder> = None;
         // 現在の段。`None`は「素の1回目」（梯子はまだ登っていない）。
@@ -398,7 +439,7 @@ impl<'a> TurnExecutor<'a> {
                         w.record_clean();
                     }
                     return self
-                        .complete(content, malformed, stop_reason, usage, &values)
+                        .complete(content, malformed, stop_reason, usage, &references)
                         .await
                         .map(RawTurnResult::Completed);
                 }
@@ -541,7 +582,7 @@ impl<'a> TurnExecutor<'a> {
         malformed: std::collections::HashMap<String, MalformedToolInput>,
         stop_reason: StopReason,
         usage: Usage,
-        values: &harness_core::ValueStore,
+        references: &crate::References,
     ) -> Result<RawTurn, EngineError> {
         if self.is_tier3() {
             sanitize::content_blocks(&mut content);
@@ -556,8 +597,9 @@ impl<'a> TurnExecutor<'a> {
             .collect::<Vec<_>>()
             .join("");
 
-        let (tool_calls, cancelled_mid_tool) =
-            self.execute_tool_calls(&content, &malformed, values).await;
+        let (tool_calls, cancelled_mid_tool) = self
+            .execute_tool_calls(&content, &malformed, references)
+            .await;
 
         Ok(RawTurn {
             content,
@@ -575,7 +617,7 @@ impl<'a> TurnExecutor<'a> {
         &self,
         content: &[ContentBlock],
         malformed: &std::collections::HashMap<String, MalformedToolInput>,
-        values: &harness_core::ValueStore,
+        references: &crate::References,
     ) -> (Vec<CompletedToolCall>, bool) {
         let mut tool_calls = Vec::new();
         let mut cancelled_mid_tool = false;
@@ -596,7 +638,7 @@ impl<'a> TurnExecutor<'a> {
                     name: name.clone(),
                     input: input.clone(),
                     output: ToolOutput {
-                        content: "cancelled by user".to_string(),
+                        content: CANCELLED_BEFORE_START.to_string(),
                         is_error: true,
                     },
                     decision: ToolCallDecision::CancelledBeforeStart,
@@ -605,70 +647,15 @@ impl<'a> TurnExecutor<'a> {
                 continue;
             }
 
-            // モデルが参照の書き方を使わず**書き写していないか**を先に見る（D-115）。
-            // **差し込みより前**に見る——差し込んだ後では、`{{user:1}}`と正しく書いた呼び出しにも
-            // 値が入っているので、書き写したものと区別できなくなる。
-            let references = values.texts();
-            let transcriptions = harness_core::review_user_references(input, &references);
-            let damaged = transcriptions.iter().find(|t| !t.is_exact());
-            let bypass_damaged = damaged.is_some()
-                && self
-                    .transcription_refusal_streak
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    + 1
-                    >= TRANSCRIPTION_REFUSAL_BYPASS_THRESHOLD;
-            for t in &transcriptions {
-                emit(
-                    self.events,
-                    AgentEvent::UserValueTranscribed {
-                        value_chars: t.value_chars,
-                        differences: t.differences,
-                        refused: damaged.is_some() && !bypass_damaged,
-                    },
-                );
-            }
-            if let Some(damaged) = damaged {
-                if bypass_damaged {
-                    // 連続拒否の閾値に達した。**カウンタを0に戻して、この呼び出しは素通りさせる**
-                    // ——モデルは番号参照で書き直せない形で詰まっていて（`edit_file`の`old_string`等）、
-                    // 拒否を続けると無限ループになる。下流（コマンドの構文失敗・承認画面・ファイル照合）が
-                    // 本当に別物の実行を受けるので、ここで止め続ける意味は薄い。
-                    self.transcription_refusal_streak
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
-                    emit(
-                        self.events,
-                        AgentEvent::TranscriptionCheckBypassed {
-                            value_chars: damaged.value_chars,
-                            differences: damaged.differences,
-                        },
-                    );
-                    // 素通りなので、下の正常な実行経路（差し込み→承認→実行）へ流す。
-                } else {
-                    // **走らせない。** 壊れた写しは別のものを実行する命令なので、人に承認を聞く意味も無い。
-                    // 断った理由はツールの結果としてモデルへ返し、番号で書き直させる。
-                    self.transcription_refusal_streak
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tool_calls.push(CompletedToolCall {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: input.clone(),
-                        output: ToolOutput {
-                            // **一覧をそのまま渡して、どれを指すかはモデルに選ばせる**
-                            // （ハーネスは「どれに近いか」までしか言えない。`Transcription::refusal_ja`）。
-                            content: damaged.refusal_ja(&values.render().unwrap_or_default()),
-                            is_error: true,
-                        },
-                        decision: ToolCallDecision::TranscribedValue,
-                        subject: None,
-                    });
+            // 書き写しの審査 → 断るか素通りか → 差し込み（D-113・D-115。`references`モジュール）。
+            let input = match self.screen_references(id, name, input, references) {
+                references::Screened::Refused(call) => {
+                    tool_calls.push(*call);
                     continue;
                 }
-            }
-
-            // **ユーザーの文の値を差し込むのはここ1か所だけ**（`harness_core::user_reference`）。危険度の判定・
-            // 承認画面の材料・実際の実行・画面のカード、どれもこの後ろにあるので、**同じ文字列**を見る
-            // （D-101「判定器が見る材料」と、走るものを食い違わせない）。
-            let input = &harness_core::substitute_user_references(input, &references);
+                references::Screened::Proceed(input) => input,
+            };
+            let input = &input;
 
             emit(
                 self.events,
@@ -679,7 +666,9 @@ impl<'a> TurnExecutor<'a> {
                 },
             );
 
-            let (output, decision, subject) = self.dispatch_one(id, name, input, malformed).await;
+            let (output, decision, subject) = self
+                .dispatch_one(id, name, input, malformed, references.conversation())
+                .await;
 
             // ツールが実際に走ったら、拒否連続カウンタを0に戻す（別のユーザー値の写しが来たときに
             // 直前の無関係な拒否が引き継がれないようにする）。
@@ -717,12 +706,15 @@ impl<'a> TurnExecutor<'a> {
     }
 
     /// 1件のツール呼び出しをディスパッチする。**`PermissionGate`を通す唯一の場所**。
+    ///
+    /// `conversation`は判定を通った後で道具へ渡すだけ（`Tool::call_in_conversation`）。判定には使わない。
     async fn dispatch_one(
         &self,
         id: &str,
         name: &str,
         input: &serde_json::Value,
         malformed: &std::collections::HashMap<String, MalformedToolInput>,
+        conversation: Option<&[harness_core::Message]>,
     ) -> (
         ToolOutput,
         ToolCallDecision,
@@ -783,7 +775,7 @@ impl<'a> TurnExecutor<'a> {
             };
             return (
                 ToolOutput {
-                    content: format!("permission denied by policy: {name} ({risk:?}){hint}"),
+                    content: format!("{DENIAL_PREFIX}: {name} ({risk:?}){hint}"),
                     is_error: true,
                 },
                 ToolCallDecision::DeniedByPolicy,
@@ -802,7 +794,7 @@ impl<'a> TurnExecutor<'a> {
                 return (
                     ToolOutput {
                         content: format!(
-                            "permission denied by policy: {name} ({risk:?}) — the files it depends \
+                            "{DENIAL_PREFIX}: {name} ({risk:?}) — the files it depends \
                              on or the program it resolves to changed while it was being approved, \
                              so it was not run"
                         ),
@@ -822,7 +814,9 @@ impl<'a> TurnExecutor<'a> {
                 subject: Some(subject.clone()),
             },
         );
-        let output = self.call_with_wait_reasons(id, tool, input).await;
+        let output = self
+            .call_with_wait_reasons(id, tool, input, conversation)
+            .await;
         (output, ToolCallDecision::Executed, Some(subject))
     }
 
@@ -835,13 +829,17 @@ impl<'a> TurnExecutor<'a> {
     /// （`WaitReason`のdoc参照）。ポーリング間隔（300ms）はツールカードの更新として十分な
     /// 頻度で、かつ通常（待たされない）ツール呼び出しには実質コストを足さない——
     /// `tokio::select!`は`tool.call(...)`が先に終わればそちらを即座に返す。
+    ///
+    /// 道具は**常に`Tool::call_in_conversation`で呼ぶ**（既定は`Tool::call`へそのまま渡す）。名前で
+    /// 道具を見分けて呼び分けない——会話を渡すかは`conversation`の有無だけで決まる。
     async fn call_with_wait_reasons(
         &self,
         id: &str,
         tool: &std::sync::Arc<dyn harness_core::Tool>,
         input: &serde_json::Value,
+        conversation: Option<&[harness_core::Message]>,
     ) -> ToolOutput {
-        let call_future = tool.call(input.clone(), self.ctx);
+        let call_future = tool.call_in_conversation(input.clone(), self.ctx, conversation);
         tokio::pin!(call_future);
         let wait_reasons = harness_tools::wait_reasons::known_wait_reasons();
         let mut last_reason: Option<String> = None;

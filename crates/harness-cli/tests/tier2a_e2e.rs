@@ -26,6 +26,13 @@ mod support;
 #[path = "tier2a_e2e/policy_declarations.rs"]
 mod policy_declarations;
 
+/// M16: 妥当性の経路を本物のMCPサーバで通す（`e2e-mcp-corroboration`）。2026-10-07に上と同じ理由で移した。
+#[path = "tier2a_e2e/mcp_corroboration.rs"]
+mod mcp_corroboration;
+/// 段5の測定の git に与える完全一致の規則（D-123）。
+#[path = "tier2a_e2e/census_rules.rs"]
+mod census_rules;
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -2799,9 +2806,9 @@ const CENSUS_STEPS: &[CensusStep] = &[
         path: "src/new.txt",
         content: "new file committed by the agent\n",
     },
-    // 4: .git（index）。`add -A`は使わない——ハーネスは起動のたびに本物のワークスペースへ
-    // `.harness/`を作り、サンドボックスからの読み書きを剥がすので、全体を拾うと当たる。
-    CensusStep::Git(&["add", "--", "src/lib.txt", "src/new.txt"]),
+    // 4: .git（index）。`add -A`は使わない（起動のたびに作られる`.harness/`に当たる）。ファイルを名指しすると
+    // D-123 で中身が縛られ、2・3段で書き換えた後なので起動時の規則とも一致しない（`census_rules`のdoc）。
+    CensusStep::Git(&["add", "--", "src"]),
     // 5: .git（ゆるいオブジェクト・ref）。種付けで全部packへ畳んであるので、gitがpackの
     // 時刻だけを更新しに来れば「中身の変わらないコピー」が.gitの中に出る（出るかは観測）。
     CensusStep::Git(&[
@@ -3421,7 +3428,9 @@ fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, St
     let ws = case_dir(&case_name);
     census_seed_repo(&ws)?;
 
-    let extra: &[&str] = &[
+    // D-123: 実在ファイルを名指しする git は accept-all でも規則が要る（`census_rules`のdoc）。
+    let rules = census_rules::program_rule_args();
+    let mut extra = vec![
         "--sandbox",
         "tier2a-cow",
         "--max-turns",
@@ -3429,6 +3438,7 @@ fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, St
         "--cognition",
         "off",
     ];
+    extra.extend(rules.iter().map(String::as_str));
     let mock_turns = census_mock_turns();
     let live_prompt = census_live_prompt();
     let before = ex.list_cow_sessions();
@@ -3447,7 +3457,7 @@ fn run_census(ex: &CowExclusive, arm: CensusArm) -> Result<serde_json::Value, St
         &ws.to_string_lossy(),
         None,
         driver,
-        extra,
+        &extra,
         &case_name,
         &[],
     );
@@ -6872,331 +6882,6 @@ fn tier2a_chain_launch_uses_the_no_extra_uac_path() {
 }
 
 // ============================================================================
-// M16: 妥当性（Validity）の経路を**本物のMCPサーバ**で通す
-//
-// `docs/STATUS.md`認知レイヤー残課題#4は「M16はスタブMCPツールで全経路を単体・統合テスト
-// 済みだが、M15.5が実装した本物のMCPサーバ経由での裏取りは通していない」だった。ここが
-// 埋めるのは**配線**である——実MCPクライアント（AppContainer隔離下のstdioサーバ）→
-// `ToolRegistry`への`mcp__<server>__<tool>`登録 → SourceBrokerのカタログ →
-// `Corroborated`昇格 → 最終回答の表示、が実起動経路で繋がっているか。
-//
-// **モデルのツール選択能力は測らない。** 2026-08-04のLMStudio実機E2Eが表示経路へ到達
-// しなかった原因はそちら（`docs/STATUS.md`認知レイヤー残課題#10＝ローカルモデルが
-// `read_file`を呼べない）で、M16の配線とは別の変数である。混ぜると「配線が壊れている」と
-// 「モデルが道具を選べない」を切り分けられないので、`--provider mock --mock-turns`で
-// フェーズ出力を台本化して固定する。
-//
-// 成功対照（宣言あり＝`corroborated`）と失敗対照（宣言なし＝`single_source`＋「MCP裏取り
-// 不可」）を必ず**組**で回す。片方だけでは、見えた表示が本当にMCP由来かを言えない。
-//
-// `dev-elevated-run.exe e2e-mcp-corroboration`（フィルタ`tier2a_mcp_corroboration`）。
-
-/// 検証用MCPサーバ（`crates/harness-mcp/src/bin/mcp-mock-server.rs`）。
-///
-/// `cargo test -p harness-cli`はこのbinをビルドしない（`CARGO_BIN_EXE_*`が渡るのは
-/// 同じパッケージのbinだけ）ので、`net_probe_exe`と同じく**事前ビルドを前提条件**にする。
-/// 無ければ手順を添えて落とす——黙って飛ばすと「0件で緑」になる（BUG-056と同じ形）。
-fn mcp_mock_server_exe() -> Result<PathBuf, String> {
-    let exe = harness_exe()
-        .parent()
-        .expect("harness exe has a parent dir")
-        .join("mcp-mock-server.exe");
-    if !exe.exists() {
-        return Err(format!(
-            "{} not found. build it first: cargo build -p harness-mcp --bin mcp-mock-server",
-            exe.display()
-        ));
-    }
-    Ok(exe)
-}
-
-/// M16の台本が使うMCPサーバid（`mcp__docs__search`へ名前空間化される）。
-const MCP_SERVER_ID: &str = "docs";
-const MCP_SEARCH_TOOL: &str = "mcp__docs__search";
-
-/// ワークスペースを作る。`declare_server`が偽なら**MCPの宣言だけを落とす**——他は
-/// 完全に同一にして、2つの実行の差が「サーバが居るかどうか」だけになるようにする。
-fn mcp_case_workspace(name: &str, declare_server: bool) -> Result<PathBuf, String> {
-    let ws = case_dir(name);
-    // ローカル一次証拠（§4.2の接地優先順位1）。台本のラウンド1がこれを読む。
-    std::fs::write(
-        ws.join("shell.rs"),
-        "let mut cmd = Command::new(\"powershell.exe\");",
-    )
-    .map_err(|e| e.to_string())?;
-
-    let harness_dir = ws.join(".harness");
-    std::fs::create_dir_all(&harness_dir).map_err(|e| e.to_string())?;
-
-    // `cognition.sources`はどちらの構成でも書く。宣言だけあってツールが登録されていなければ
-    // `SourceCatalog::available`から落ちる＝MCP未接続として扱われる、という設計
-    // （`harness-cognition`の`source.rs`）そのものを実起動経路で確認するため。
-    let mut settings = serde_json::json!({
-        "cognition": {
-            "sources": [
-                { "id": "mcp/docs", "kind": "mcp", "use_for": ["社内仕様"], "trust": "high" }
-            ]
-        }
-    });
-    if declare_server {
-        let exe = mcp_mock_server_exe()?;
-        settings["mcp"] = serde_json::json!({
-            "servers": [{
-                "id": MCP_SERVER_ID,
-                "transport": "stdio",
-                "command": exe.display().to_string(),
-                // D-40: 宣言したツールだけがread扱いになる。`search`をread-onlyにするのは
-                // Investigate（ToolGateがReadOnlyしか候補に入れない）で呼ばせるため。
-                // workspace要求もnetwork要求も**書かない**（既定＝ACE無し・全拒否）。
-                // 裏取りに要るのはサーバ自身の応答だけで、workspaceを読ませる理由が無い。
-                "tools": { "search": "read_only" }
-            }]
-        });
-    }
-    std::fs::write(
-        harness_dir.join("settings.json"),
-        serde_json::to_string_pretty(&settings).unwrap(),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(ws)
-}
-
-/// `harness mcp approve <id> --yes` / `revoke <id>`（D-39の承認台帳）。
-/// 台帳はユーザグローバル（`%APPDATA%\harness\config\mcp-approval-ledger.json`）なので、
-/// ケースの最後で必ず`revoke`して元へ戻す。
-fn mcp_approval(ws: &Path, action: &str) -> Result<String, String> {
-    let mut cmd = Command::new(harness_exe());
-    cmd.args(["--cwd", ws.to_str().unwrap(), "mcp", action, MCP_SERVER_ID]);
-    if action == "approve" {
-        cmd.arg("--yes");
-    }
-    let out = cmd
-        .output()
-        .map_err(|e| format!("failed to run `harness mcp {action}`: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    if !out.status.success() {
-        return Err(format!(
-            "`harness mcp {action} {MCP_SERVER_ID}` failed: {stdout}{}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    Ok(stdout)
-}
-
-fn phase_text_turn(value: serde_json::Value) -> Vec<StreamEvent> {
-    end_turn(&value.to_string())
-}
-
-/// Investigateのターン。**計画のJSONとツール呼び出しを同じメッセージで返す**
-/// （mockの`schema_with_tools:true`により`CallKind::Fused`になる）。
-///
-/// `recall_e2e.rs`の同名の関数とは計画の形が違う（こちらはJSONの計画で呼び出しIDを変える）
-/// ので共有していない（`support`のdoc）。
-fn plan_and_tool_turn(id: &str, tool: &str, input: serde_json::Value) -> Vec<StreamEvent> {
-    vec![
-        StreamEvent::BlockStart {
-            index: 0,
-            kind: BlockKind::Text,
-        },
-        StreamEvent::TextDelta {
-            index: 0,
-            text: serde_json::json!({
-                "plan": [{ "source": tool, "query": "run_shell", "expects": "起動するシェル名" }]
-            })
-            .to_string(),
-        },
-        StreamEvent::BlockStop { index: 0 },
-        StreamEvent::BlockStart {
-            index: 1,
-            kind: BlockKind::ToolUse {
-                id: id.to_string(),
-                name: tool.to_string(),
-            },
-        },
-        StreamEvent::ToolInputDelta {
-            index: 1,
-            json_fragment: input.to_string(),
-        },
-        StreamEvent::BlockStop { index: 1 },
-        StreamEvent::Done {
-            stop_reason: StopReason::ToolUse,
-            usage: Usage::default(),
-        },
-    ]
-}
-
-/// 「ローカルで見つけた主張を、次のラウンドでMCPが裏取りする」2ラウンドの台本。
-/// `crates/harness-cognition/tests/m16_validity_transcript.rs`の`corroboration_script`と
-/// 同じ形で、**MCPツールだけが本物**（あちらはスタブツール）。
-fn mcp_corroboration_turns() -> Vec<Vec<StreamEvent>> {
-    let distill = |claim: &str| {
-        phase_text_turn(serde_json::json!({
-            "evidence": [{
-                "claim": claim,
-                "relation": "supports",
-                "source": "（自己申告の出典は台帳に入らない）",
-                "contradicts": []
-            }]
-        }))
-    };
-    vec![
-        phase_text_turn(serde_json::json!({
-            "hypotheses": [{
-                "statement": "run_shellはPowerShellを起動している",
-                "predicts": ["shell.rsにpowershellの記述が無ければ偽"],
-                "confidence": 0.7
-            }]
-        })),
-        // ラウンド1: ワークスペースの実ファイル（接地優先順位1）。
-        plan_and_tool_turn(
-            "call_1",
-            "read_file",
-            serde_json::json!({ "path": "shell.rs" }),
-        ),
-        distill("shell.rsがpowershell.exeを起動している"),
-        // まだ裏取りできていないので決着させない。
-        phase_text_turn(serde_json::json!({
-            "verdict": "inconclusive", "missing": ["別系統の裏取り"], "note": "ローカル観測のみ"
-        })),
-        // ラウンド2: 実MCPサーバで裏取り（接地優先順位2）。
-        plan_and_tool_turn(
-            "call_2",
-            MCP_SEARCH_TOOL,
-            serde_json::json!({ "query": "run_shell" }),
-        ),
-        distill("社内仕様もPowerShellを既定としている"),
-        phase_text_turn(serde_json::json!({
-            "verdict": "confirms", "missing": [], "note": "2系統で一致した"
-        })),
-        phase_text_turn(serde_json::json!({
-            "action": "PowerShellを前提に手順を書く",
-            "then_verify": "run_shellでecho $PSVersionTableを実行する"
-        })),
-    ]
-}
-
-fn run_cognition_harness(ws: &Path, case_name: &str) -> HarnessRun {
-    run_harness(
-        ws,
-        &mcp_corroboration_turns(),
-        &["--cognition", "always"],
-        case_name,
-    )
-}
-
-/// モックへ実際に送られたリクエストの中に、そのツール名のspecが載っていたか。
-/// 「MCPサーバが起動して`tools/list`が返り、`ToolRegistry`へ登録された」ことの直接の証拠。
-fn recorded_requests_offer_tool(run: &HarnessRun, tool: &str) -> Result<bool, String> {
-    let data = std::fs::read_to_string(&run.record_path)
-        .map_err(|e| format!("failed to read {}: {e}", run.record_path.display()))?;
-    for line in data.lines() {
-        let req: CompletionRequest = serde_json::from_str(line)
-            .map_err(|e| format!("recorded request is not valid JSON: {e}"))?;
-        if req.tools.iter().any(|t| t.name == tool) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// 成功対照: 宣言・承認済みの実MCPサーバがあると、ローカル観測がMCPで裏取りされて
-/// `corroborated`まで上がり、「MCP裏取り不可」の注記は出ない。
-fn mcp_case_real_server_corroborates_a_local_observation() -> Result<(), String> {
-    let ws = mcp_case_workspace("mcp-corroborated", true)?;
-    mcp_approval(&ws, "approve")?;
-    let run = run_cognition_harness(&ws, "mcp-corroborated");
-    // 承認台帳はユーザグローバルなので、判定より先に必ず戻す。
-    let revoked = mcp_approval(&ws, "revoke");
-
-    let json = parse_json_stdout(&run)?;
-    // 探す語はどちらも**最終応答文**に着地する（`corroborated`は`Grade::Corroborated`のラベル、
-    // 「MCP裏取り不可」は`hiv/answer.rs`が本文へ書く注記）。JSON全体を見ると、無関係な
-    // ツール入力にも当たり得る（BUG-137）。
-    let text = json.answer();
-    revoked?;
-
-    if !recorded_requests_offer_tool(&run, MCP_SEARCH_TOOL)? {
-        return Err(format!(
-            "{MCP_SEARCH_TOOL} was never offered to the model -- the mcp server did not start or \
-             its tools were not registered. stderr={}",
-            run.stderr
-        ));
-    }
-    if !text.contains("corroborated") {
-        return Err(format!(
-            "the answer does not report a corroborated grade (real-mcp cross-source did not \
-             land): {text}\nstderr={}",
-            run.stderr
-        ));
-    }
-    if text.contains("MCP裏取り不可") {
-        return Err(format!(
-            "the answer claims MCP corroboration was unavailable even though the server ran: {text}"
-        ));
-    }
-
-    cleanup_on_success(&ws, &[], "mcp-corroborated");
-    Ok(())
-}
-
-/// 失敗対照: **同じ台本**でMCPの宣言だけを外すと、裏取りは成立せず`single_source`のまま
-/// 結論し、「MCP裏取り不可」を明記する（§4.2「隠さない」）。上のケースで見えた
-/// `corroborated`が本当にMCP由来だったことは、この対照が付いて初めて言える。
-fn mcp_case_without_the_declaration_it_stays_single_source() -> Result<(), String> {
-    let ws = mcp_case_workspace("mcp-single-source", false)?;
-    let run = run_cognition_harness(&ws, "mcp-single-source");
-
-    let json = parse_json_stdout(&run)?;
-    // 上のケースと対称に、最終応答文だけを見る（BUG-137）。
-    let text = json.answer();
-
-    if recorded_requests_offer_tool(&run, MCP_SEARCH_TOOL)? {
-        return Err(format!(
-            "{MCP_SEARCH_TOOL} was offered even though no server is declared -- the two runs are \
-             not differing only in the declaration. stderr={}",
-            run.stderr
-        ));
-    }
-    if !text.contains("single_source") {
-        return Err(format!("the answer does not report single_source: {text}"));
-    }
-    if !text.contains("MCP裏取り不可") {
-        return Err(format!(
-            "a single-source conclusion must say that MCP corroboration was unavailable: {text}"
-        ));
-    }
-
-    cleanup_on_success(&ws, &[], "mcp-single-source");
-    Ok(())
-}
-
-#[test]
-#[ignore]
-fn tier2a_mcp_corroboration() {
-    let cases: Vec<(&str, CaseFn)> = vec![
-        (
-            "real-server-corroborates",
-            mcp_case_real_server_corroborates_a_local_observation,
-        ),
-        (
-            "no-declaration-stays-single-source",
-            mcp_case_without_the_declaration_it_stays_single_source,
-        ),
-    ];
-    let mut passed = 0;
-    let total = cases.len();
-    for (name, f) in cases {
-        if run_named_case(name, f) {
-            passed += 1;
-        }
-    }
-    assert_eq!(
-        passed, total,
-        "{passed}/{total} mcp corroboration cases passed (see per-case JSON above)"
-    );
-}
-
-// ============================================================================
 // D-27: fs passthrough台帳のライフサイクル（参照カウントと並行起動時の整合性）
 //
 // `docs/STATUS.md`は「手動E2E（複数ワークスペース共有時の安全性・並行起動時のledger整合性）は
@@ -7994,10 +7679,10 @@ const EXEC_PROBES: &[ExecProbe] = &[
 /// **T-09の危険構文マーカーを踏まないように書いてある**（`harness-engine/src/permission.rs`の
 /// `looks_like_allowlist_bypass`）。`Invoke-Expression`と`cmd.exe /c`は`accept-all`下でも
 /// 強制Promptへ落ち、ヘッドレスでは自動拒否になる——最初の実測はこれで`run_shell`ごと
-/// 拒否された。ここで測りたいのは**ACLの層**なので、同じ意味の別の綴り
-/// （`[scriptblock]::Create`・`.cmd`の直接起動）へ置き換えてある。
-/// **この置き換えが成立すること自体が、T-09が境界ではないこと**（`DESIGN.md`が
-/// 「明白物の追加ブロックであり安全の根拠にしない」と書いているとおり）**の実例**である。
+/// 拒否された。ここで測りたいのは**ACLの層**なので、同じ意味の別の綴り（`function:`ドライブへ文字列を
+/// 置く＝プロセス内で文字列をスクリプトブロックへ変える・`.cmd`の直接起動）へ置き換えてある。2026-10-07まで
+/// 前者は`[scriptblock]::Create`だったが、BUG-226（2026-10-04）でT-09が`scriptblock]`を拾うようになり拒否された。
+/// **この置き換えが成立すること自体が、T-09が境界ではないこと**（`DESIGN.md`）**の実例**である。
 const EXEC_PROBE_SCRIPT: &str = "\
 $ErrorActionPreference='SilentlyContinue'; \
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force } catch { }; \
@@ -8006,7 +7691,7 @@ try { & '.\\evil.exe' /c echo HP_A_EXE } catch { }; \
 try { Copy-Item -LiteralPath '.\\evil.exe' -Destination '.\\copied.exe' -Force -ErrorAction Stop; \
       & '.\\copied.exe' /c echo HP_B_EXECOPY } catch { }; \
 try { & '.\\evil.ps1' } catch { }; \
-try { & ([scriptblock]::Create((Get-Content -LiteralPath '.\\evil_iex.ps1' -Raw))) } catch { }; \
+try { New-Item -Path 'function:hp_probe_d' -Value (Get-Content -LiteralPath '.\\evil_iex.ps1' -Raw) -Force | Out-Null; hp_probe_d } catch { }; \
 try { & '.\\evil.cmd' } catch { }; \
 try { & $env:ComSpec '/c' '.\\evil2.cmd' } catch { }; \
 try { & '.\\evil_readdeny.ps1' } catch { }; \
@@ -10978,7 +10663,7 @@ fn a_transition_target_domain_is_narrower_than_the_caller() {
                 .map(|domain| harness_sandbox::tier2a::policy_approval::DeclarationRef {
                     domain,
                     value: &declared,
-                    access: harness_config::FsAccess::ReadExec,
+                    key: harness_policy::generalize::SettingsKey::FsReadExec,
                 })
                 .collect();
         let not_recorded = approvals.approve(&ws, &approved_declarations);

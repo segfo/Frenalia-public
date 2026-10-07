@@ -77,6 +77,11 @@ pub mod workspace_capability;
 /// `harness.exe`が同じ関数を通る）。純粋関数なのでwindows専用にしない。
 pub mod policy_grants;
 
+/// [#30・決定68] `policy.json`から**どの許可をどの一覧で付け、付いた結果をどの子へ渡すか**を決める手順。
+/// `harness.exe`の起動とポリシーエディタのパス2が同じこれを通る（`harness-cli`の`startup/policy_fs.rs`から
+/// そのまま移した。P6.2）。純粋関数なのでwindows専用にしない。
+pub mod policy_fs;
+
 /// [#30・D-112] `policy.json`のファイル宣言の、このマシンでの承認の台帳。リポジトリに同梱された
 /// 宣言は、承認するまで許可を付けない。台帳と照合は純粋なのでwindows専用にしない。
 pub mod policy_approval;
@@ -127,6 +132,17 @@ pub(crate) mod wfp;
 /// loopback exemptionの所有権管理（D-36）。`wfp`と同じく昇格プロセス内でのみ意味を持つ。
 #[cfg(windows)]
 pub(crate) mod loopback_exemption;
+
+/// `internetClient` capability（D-10）のSID。**直接生成・Daemon経由・ドメインごとの出口の3つが同じ綴りを使う**
+/// ——文字列を散らすと、片方だけ直った状態が黙って成立する（`B-05`）。
+///
+/// **これを積んでよいのは、WFPの既定拒否が立っている回だけである**（`internetClient`を持ったまま既定拒否を
+/// 失うと素通しになる。`tier2a::wfp`のdoc）。判定は`harness_tools::should_grant_tier2a_network_capability`（入口）と
+/// `harness_tools::domain_egress::EgressPlan::attach`（遷移先のドメイン。決定69）が持つ。
+///
+/// **2026-10-07に`win_appcontainer::spawn`から移した**（windows専用モジュールの外へ——
+/// ドメインごとの出口を組む`harness-tools`が同じ綴りを積むため）。
+pub const INTERNET_CLIENT_SID: &str = "S-1-15-3-1";
 
 /// **測定専用スパイク**（BUG-111の残り: シナリオ(A)のE2Eが成立するかの前提を測る）。
 /// 昇格した`dev-elevated-runner`配下から非昇格の子を起こせるか。

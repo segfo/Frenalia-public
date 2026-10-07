@@ -80,7 +80,10 @@ use crate::win_pipe_ipc::{
 
 use super::child_plan::ChildPlan;
 use super::console_holder::ConsoleHolders;
-use super::nested_inputs::{env_for_nested, force_request_pipe};
+use super::spawn_audit::SpawnAudit;
+use super::nested_inputs::{
+    caller_handles_for, close_all, env_for_nested_child, force_request_pipe, pull_caller_stdio, OpenedStdio,
+};
 use super::table::ProcessTable;
 use super::transitions::TransitionQueue;
 use super::{
@@ -114,7 +117,7 @@ impl std::fmt::Display for SpawnDaemonError {
 
 impl std::error::Error for SpawnDaemonError {}
 
-fn err(message: impl Into<String>) -> SpawnDaemonError {
+pub(super) fn err(message: impl Into<String>) -> SpawnDaemonError {
     SpawnDaemonError {
         kind: SpawnFailureKind::Spawn,
         message: message.into(),
@@ -194,6 +197,8 @@ struct Shared {
     /// nestedの子は`env_for_nested`が同じ名前を系統の基準envから強制するので、
     /// **ここを入口にすれば系統の全員が持つ**。
     request_pipe: String,
+    /// [決定68] 許可した生成の記録。Hello が名前を運ばなければ何も書かない（`harness.exe`）。
+    spawn_audit: SpawnAudit,
 }
 
 /// [段階6b・残課題 サンドボックス周辺 #65] `Hello`で受け取った入力から遷移のグラフを組む。
@@ -246,7 +251,7 @@ pub fn serve(
     let _control_guard = HandleGuard(control);
 
     // --- ハンドシェイク: harnessのプロセスハンドルと遷移ポリシーを受け取る ---
-    let (harness_process, graph, transitions, provisioned_domains) = match read_control(control)? {
+    let (harness_process, graph, transitions, provisioned_domains, spawn_audit) = match read_control(control)? {
         ControlRequest::Hello {
             harness_process,
             protocol_version,
@@ -254,6 +259,7 @@ pub fn serve(
             workspace_root,
             domains,
             writable_outside_policy,
+            spawn_audit_record,
         } => {
             // **harnessと同じ関数を通る**（`protocol_version_mismatch`のdoc）。
             // 片側だけが検査すると、検査していない側から古いバイナリが入れる。
@@ -273,11 +279,15 @@ pub fn serve(
             // 置き場のパスを電文で受け取らないのは、昇格した書き手が後から来るためである
             // （§10.2・`P-01`。`client::hello_request`のdocが対になっている）。
             let transitions = TransitionQueue::new(std::path::Path::new(workspace_root.as_str()));
+            // [決定68] 許可した生成の記録も**同じ`workspace_root`から**置き場を組む（名前だけを受け取る）。
+            let spawn_audit = SpawnAudit::open(&workspace_root, spawn_audit_record.as_deref())
+                .map_err(protocol_err)?;
             (
                 HANDLE(harness_process as *mut _),
                 graph,
                 transitions,
                 domains,
+                spawn_audit,
             )
         }
         other => {
@@ -302,6 +312,7 @@ pub fn serve(
         console_holders: ConsoleHolders::default(),
         transitions,
         request_pipe: request_pipe_name.clone(),
+        spawn_audit,
     });
 
     let user =
@@ -415,6 +426,8 @@ pub fn serve(
     // Jobのkill-on-closeでも畳まれるが、**それは保険であって正面の畳み方ではない**
     // （§10.1.1がキャンセルについて採ったのと同じ形）。
     shared.console_holders.shutdown();
+    // [決定68] あふれた生成の数を1行書く（あれば）。
+    shared.spawn_audit.finish();
 
     // [段階6c] **畳み込みバッファに残った回数を書き切る**（§10.2）。
     //
@@ -781,11 +794,11 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
         to,
         cwd: declared_cwd,
         env: env_policy,
-        inherit_handles,
-        // 向きは判定器の中で使い終わっている（`inherit_handles`の計算に入っている）。
+        output,
+        // 向きは判定器の中で使い終わっている（規則(g)と表示に使う。標準入出力は向きで決めない、P5.4b）。
         // ここで再判定しない——同じ規則を2箇所に置くと、片方だけ直る。
         direction: _,
-        fixed,
+        strict,
     } = allowed;
 
     // [#55] **遷移先ドメインの実体を表から引く。**
@@ -821,47 +834,38 @@ fn serve_spawn_request(pipe: HANDLE, shared: &Arc<Shared>, request: &NestedReque
     // §8.3: 辺が`cwd`を宣言していれば**その値を渡す**（検査するだけでは足りない）。
     // 宣言が無い辺は呼び出し元の実cwdをそのまま渡す（決定66(6)。広げる辺でも同じ——守る線は子のドメインの権限）。
     let effective_cwd = declared_cwd.unwrap_or(request.cwd);
-    // [段階6f-1] 呼び出し元の申告を使うが、**harnessが所有する名前だけは系統の値で強制する**。
-    let env = env_for_nested(&caller.base_env, request.env.as_deref(), env_policy);
+    // [段階6f-1・決定69 の前例の(6)] 申告＋harness所有の名前の強制＋遷移先のドメインのプロキシの宛先（3段の表は`env_for_nested_child`）。
+    let env = env_for_nested_child(&caller, request.env.as_deref(), env_policy, target_domain);
 
-    // [BUG-161] **固定辺では、呼び出し元由来のハンドルを1本も渡さない**（§19.1）。
+    // [P5.4b] **呼び出し元の標準入出力は、判定器の2つの指示で絞ってから渡す**（[`caller_handles_for`]の表）。
     //
-    // 判定器が`false`を返すのは「辺が完全に固定されている」か「広げる／証明できない辺」で、
-    // どちらも**呼び出し元が子へ入力を渡せてはいけない**辺である。
-    // `CallerHandles::default()`を渡すと`pull_caller_stdio`は`(None, NUL, NUL)`を返す
-    // ——Daemonが自分で開いた物しか子へ行かない、という§19.1の要求そのものになる。
+    // 標準入力は Strict の辺でだけ断つ——固定argvのシェルは、stdinが端末でなければ**そこからコマンドを読んで
+    // 実行する**ので、引数を固定しても呼び出し元がスクリプトを流し込めばその辺の権限で任意コードが走る（BUG-161）。
+    // 普通の辺では渡す（決定66(3)。守る線は子のドメインの権限）。標準出力・標準エラーは辺の出力の設定に従う
+    // （決定66(4)。捨てる辺では`None`＝`pull_caller_stdio`が`NUL`を開く）。
     //
-    // **stdinを断つのが要点である。** 固定argvのシェルは、stdinが端末でなければ
-    // **そこからコマンドを読んで実行する**——引数を固定しても、呼び出し元が
-    // ワークスペースに置いたスクリプトをstdinで流し込めば広いドメインで任意コードが走る。
-    //
-    // **代償**: 固定辺では子の出力が呼び出し元へ返らない。§19.1がそう書いており、
-    // 逃げ道も書いてある（`argv: any`の辺にする）。
-    let handles = if inherit_handles {
-        request.handles
-    } else {
-        super::CallerHandles::default()
-    };
+    // BUG-161〜P5.4a は`inherit_handles`が偽の辺で3本まとめて`CallerHandles::default()`へ差し替えていた。
+    // **その代償だった「固定辺では子の出力が返らない」は、Strict の辺でも出力の設定に従う形で解けた。**
+    let handles = caller_handles_for(output, strict, request.handles);
 
-    // **固定辺なら、固定したファイルを呼び出し元が書き換えられないかをOSに聞く**
-    // （`plans/DESIGN-MAC.md` §19.1）。読み込み時の検査は綴りで比べるので、8.3形式の短い名前・
-    // リンク・ハードリンクを挟むと見逃す。ここは実体のアクセス制御リストを**呼び出し元のトークン**で
+    // **Strict の辺なら、固定したファイルと作業ディレクトリを呼び出し元が書き換えられないかをOSに聞く**（P5.4a で
+    // 鍵を印へ、P5.4d で作業ディレクトリも。決定66の追記・§19.1）。読み込み時の検査は綴りで比べるので、8.3形式の
+    // 短い名前・リンク・ハードリンクを挟むと見逃す。ここは実体のアクセス制御リストを**呼び出し元のトークン**で
     // 評価するので、どの名前で書かれていても同じ答えになる（`fixed_inputs`のモジュールdoc）。
     //
-    // 見るのは**実際に`CreateProcessW`へ渡す値**（`request.image`と呼び出し元のコマンドライン）で、
-    // 宣言の綴りではない——判定したのと別のファイルが起きる形を作らない（B-21）。
-    //
-    // **理由はサンドボックスへ返さない**（パスと権利の名前を含むので、`SpawnFailed`と同じ扱い）。
-    // Daemonの標準エラーにだけ出す（B-10）。
-    if fixed {
+    // 見るのは**実際に`CreateProcessW`へ渡す値**（`request.image`・コマンドライン・`effective_cwd`）で、宣言の綴り
+    // ではない——判定したのと別のものが起きる形を作らない（B-21）。**理由はサンドボックスへ返さない**（パスと
+    // 権利の名前を含むので、`SpawnFailed`と同じ扱い）。Daemonの標準エラーにだけ出す（B-10）。
+    if strict {
         if let Some(reason) = super::fixed_inputs::refusal(
             HANDLE(caller.process as *mut _),
             caller.pid,
             request.image,
             &command_line,
+            effective_cwd,
         ) {
             eprintln!(
-                "[spawnd] refused a fixed transition for pid {}: {reason}",
+                "[spawnd] refused a strict transition for pid {}: {reason}",
                 caller.pid
             );
             return Served::denied(DenyReason::FixedInputWritable, from_domain, command_line);
@@ -1076,7 +1080,10 @@ fn borrow_console_if_needed<'a>(
     );
     shared
         .console_holders
-        .borrow(&domain_key)
+        .borrow(&domain_key, &|old_pid, old_exit, new_pid| {
+            // [決定68] §7.1.2 決定4の立て直しの記録を、記録があれば同じファイルへ束ねる。
+            shared.spawn_audit.console_holder_restarted(&domain.policy_domain, old_pid, old_exit, new_pid)
+        })
         .map(Some)
         .map_err(|e| err(format!("console holder: {e}")))
 }
@@ -1355,6 +1362,8 @@ fn spawn_top_level(
         close_received_handles(job, &inherit_handles, false);
         return Err(err(format!("process table registration failed: {e}")));
     }
+    // [決定68] 許可した生成の記録（**書く点は2つのうち1つ目**。Resume より前＝子がファイルに触る前に行が在る）。
+    shared.spawn_audit.spawned(pid, info.hProcess, &request.domain.policy_domain, &request.exe, true);
 
     // harnessへ返すハンドル。**必要最小限に絞る**（§14と同じ姿勢）——harnessがこれで
     // したいのは「終わるまで待つ」と「終了コードを読む」だけである。
@@ -1426,7 +1435,7 @@ fn spawn_top_level(
 /// **残っているのはフック側**（`CreateProcessW`を横取りしてここへ頼む）で、それが6f-2である。
 // **引数は多いが、まとめない。** 出どころが全部違う（上の表）ので、1つの構造体へ畳むと
 // 「誰が決めた値か」が呼び出し側からも見えなくなる。とくに`handles`は
-// **判定の結果を当てたあとの値**で、`request.handles`と取り違えると固定辺の約束が消える。
+// **判定の結果を当てたあとの値**で、`request.handles`と取り違えると辺ごとの約束が消える。
 #[allow(clippy::too_many_arguments)]
 fn spawn_nested(
     shared: &Arc<Shared>,
@@ -1437,7 +1446,7 @@ fn spawn_nested(
     target_domain: &DomainSpec,
     request: &NestedRequest<'_>,
     // [BUG-161] **この子へ実際に渡すハンドル。** `request.handles`ではない
-    // ——固定辺では呼び出し元由来を1本も渡さないので、判定の結果を当てたあとの値が来る
+    // ——Strict の辺は標準入力を、捨てる辺は標準出力と標準エラーを渡さないので、絞ったあとの値が来る
     // （`serve_spawn_request`）。**`request.handles`を直接読まないこと**：読むと、
     // 「渡してよいか」の判断がここで消える。
     handles: &super::CallerHandles,
@@ -1592,6 +1601,8 @@ fn spawn_nested(
             "process table registration failed for the nested child: {e}"
         )));
     }
+    // [決定68] 許可した生成の記録（**書く点は2つのうち2つ目**）。ドメインは起こした先（自己ループなら呼び出し元と同じ）。
+    shared.spawn_audit.spawned(pid, info.hProcess, &target_domain.policy_domain, request.image, false);
 
     // [段階6f-1] **呼び出し元へ返すハンドルを、動かす前に作る。**
     //
@@ -1767,141 +1778,6 @@ fn duplicate_to_caller(
             }
             Err(e)
         }
-    }
-}
-
-/// [段階6f-1] 申告が無かった欄の代わりに何を開くか。
-///
-/// **`Read`の側を作っていないのは意図である**——標準入力の申告が無い子は
-/// 「標準入力を持たない」（`None`）であって、「空を読む」ではない。`NUL`を読ませると
-/// **即EOF**になり、`None`とほぼ同じに見えるが、`isatty`相当の問い合わせの答えが変わる。
-enum Nul {
-    Write,
-}
-
-/// [段階6f-1] nestedの子へ渡すstdio一式を**集める**入れ物。
-///
-/// # なぜ入れ物が要るのか
-///
-/// 3本のうち2本目で失敗したとき、**1本目を閉じなければ漏れる**。返り道ごとに閉じる形にすると、
-/// 4本目が生えた日に必ずどれかが漏れる（`B-01`・`B-06`）。集めておいて、
-/// 失敗したら[`close_all`]へ渡す。
-///
-/// 成功した場合は`create_suspended_in_job`が**成否によらず全部閉じる**契約を持っているので、
-/// こちら側で閉じるのは「あそこへ渡す前に落ちたとき」だけである。
-#[derive(Default)]
-struct OpenedStdio {
-    opened: Vec<HANDLE>,
-}
-
-impl OpenedStdio {
-    /// 呼び出し元のハンドルを引き抜く。申告が無ければ`fallback`（`None`ならハンドル無し）。
-    ///
-    /// **`DUPLICATE_SAME_ACCESS`で引き抜く。** アクセスを広げない——広げても得る物は無いが、
-    /// 「Daemonを通すと権限が増える」形を1つも作らないためである（`P-01`）。
-    fn pull(
-        &mut self,
-        caller_process: HANDLE,
-        claimed: Option<u64>,
-        fallback: Option<Nul>,
-    ) -> Result<Option<HANDLE>, SpawnDaemonError> {
-        let handle = match claimed {
-            Some(value) => {
-                let mut mine = HANDLE::default();
-                unsafe {
-                    DuplicateHandle(
-                        caller_process,
-                        HANDLE(value as *mut _),
-                        GetCurrentProcess(),
-                        &mut mine,
-                        0,
-                        // 子へ継承させる値なので、複製の時点で継承可にしておく。
-                        true,
-                        DUPLICATE_SAME_ACCESS,
-                    )
-                }
-                .map_err(|e| {
-                    // **嘘の値を送られただけのことがある。** 理由を具体的に残しておかないと、
-                    // 「起こせなかった」としか分からない（`B-10`）。
-                    err(format!("DuplicateHandle(caller stdio {value:#x}): {e}"))
-                })?;
-                Some(mine)
-            }
-            None => match fallback {
-                Some(Nul::Write) => Some(open_nul_for_write()?),
-                None => None,
-            },
-        };
-        if let Some(handle) = handle {
-            self.opened.push(handle);
-        }
-        Ok(handle)
-    }
-
-    /// 集めたハンドルを`inherit_handles`として取り出す。
-    fn take_for_inherit(self) -> Vec<HANDLE> {
-        self.opened
-    }
-}
-
-/// 3本まとめて引き抜く。**途中で落ちたら、開いたぶんは呼び出し側が[`close_all`]で閉じる。**
-///
-/// 標準出力・標準エラーは`NUL`の逃げ道があるので必ず値が返る。標準入力だけは
-/// 「持たない」があり得る（[`Nul`]のdoc）。
-fn pull_caller_stdio(
-    opened: &mut OpenedStdio,
-    caller_process: HANDLE,
-    handles: &super::CallerHandles,
-) -> Result<(Option<HANDLE>, HANDLE, HANDLE), SpawnDaemonError> {
-    let stdin_read = opened.pull(caller_process, handles.stdin, None)?;
-    let stdout_write = opened
-        .pull(caller_process, handles.stdout, Some(Nul::Write))?
-        .expect("the NUL fallback always yields a handle");
-    let stderr_write = opened
-        .pull(caller_process, handles.stderr, Some(Nul::Write))?
-        .expect("the NUL fallback always yields a handle");
-    Ok((stdin_read, stdout_write, stderr_write))
-}
-
-/// 集めたハンドルを全部閉じる。**`create_suspended_in_job`へ渡す前に落ちたときだけ呼ぶ。**
-fn close_all(handles: &[HANDLE]) {
-    unsafe {
-        for handle in handles {
-            let _ = CloseHandle(*handle);
-        }
-    }
-}
-
-/// 継承させられる`NUL`（書き込み用）を1本開く。
-///
-/// # なぜ`NUL`なのか
-///
-/// [`create_suspended_in_job`]は`stdout_write`・`stderr_write`を**必ず**要求する
-/// （`Option`ではない）。nestedの子の出力を運ぶ先が6bには無いので、捨てる先を渡す。
-/// **パイプを作って読み捨てるスレッドを立てるより、OSに捨てさせるほうが部品が少ない。**
-///
-/// **継承させるハンドルなので`bInheritHandle`を立てる。** サンドボックスの子は`NUL`を
-/// 自分で開くこともできるが、それは別の話である——ここで渡すのは
-/// `STARTUPINFO`の`hStdOutput`に入れる値で、無効ハンドルを入れると子の起動自体が不安定になる。
-fn open_nul_for_write() -> Result<HANDLE, SpawnDaemonError> {
-    let sa = windows::Win32::Security::SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<windows::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: std::ptr::null_mut(),
-        bInheritHandle: true.into(),
-    };
-    unsafe {
-        let name = wide("NUL");
-        CreateFileW(
-            PCWSTR(name.as_ptr()),
-            FILE_GENERIC_WRITE.0,
-            windows::Win32::Storage::FileSystem::FILE_SHARE_WRITE
-                | windows::Win32::Storage::FileSystem::FILE_SHARE_READ,
-            Some(&sa as *const _),
-            OPEN_EXISTING,
-            Default::default(),
-            None,
-        )
-        .map_err(|e| err(format!("CreateFileW(NUL): {e}")))
     }
 }
 
@@ -2112,10 +1988,21 @@ mod hello_graph_tests {
     use super::*;
 
     /// ワークスペースの外にあるプログラムを、引数と作業ディレクトリごと固定した辺を1本持つ宣言。
+    ///
+    /// [P5.4a] 遷移先に Strict の印を付ける——固定値の書込可否は Strict のドメインへ入る辺にだけ掛かる
+    /// （決定66の追記）。かつての同じドメインへの自己ループでは、今は何も検査されない。
+    ///
+    /// [P5.4d] 作業ディレクトリは書けない場所（`C:\work`）に置く——作業ディレクトリも検査の候補になったので、
+    /// ワークスペースに置くと許可側の対が作業ディレクトリのせいで落ちる。
     fn fixed_edge_policy() -> harness_policy::policy_file::PolicyFile {
+        fixed_edge_policy_in(r"C:\\work")
+    }
+
+    /// [`fixed_edge_policy`]の作業ディレクトリを選べる版（`cwd`は JSON の文字列の中身として書く）。
+    fn fixed_edge_policy_in(cwd: &str) -> harness_policy::policy_file::PolicyFile {
         serde_json::from_str(
-            r#"{
-              "schema_version": 2,
+            &r#"{
+              "schema_version": 3,
               "domains": [
                 {
                   "name": "shell",
@@ -2124,14 +2011,16 @@ mod hello_graph_tests {
                       {
                         "exe":  { "literal": "C:\\tools\\gen.exe" },
                         "argv": { "literal": "\"C:\\tools\\gen.exe\" --check" },
-                        "cwd":  "C:\\ws",
-                        "to":   "shell"
+                        "cwd":  "CWD",
+                        "to":   "sealed"
                       }
                     ]
                   }
-                }
+                },
+                { "name": "sealed", "strict": true }
               ]
-            }"#,
+            }"#
+            .replace("CWD", cwd),
         )
         .expect("the fixture is a valid policy.json")
     }
@@ -2156,5 +2045,19 @@ mod hello_graph_tests {
         graph_from_hello(&fixed_edge_policy(), r"C:\ws", &[]).expect(r"nothing covers C:\tools");
         graph_from_hello(&fixed_edge_policy(), r"C:\ws", &[r"C:\other".to_string()])
             .expect(r"a writable place elsewhere does not cover C:\tools\gen.exe");
+    }
+
+    /// [P5.4d] **禁止側**: Strict の辺の作業ディレクトリがワークスペースなら`Hello`ごと失敗させる
+    /// ——Daemonも harness と同じくワークスペースを書ける場所として判定器へ渡している。対は上の許可側
+    /// （作業ディレクトリが`C:\work`なら組める）。
+    #[test]
+    fn a_strict_edge_whose_cwd_is_the_workspace_fails_the_hello() {
+        let error = graph_from_hello(&fixed_edge_policy_in(r"C:\\ws"), r"C:\ws", &[])
+            .expect_err("the daemon must refuse a strict edge that runs in the workspace");
+        let text = error.to_string();
+        assert!(
+            text.contains("the declared cwd") && text.contains("c:/ws"),
+            "the rejection should name the working directory: {text}"
+        );
     }
 }

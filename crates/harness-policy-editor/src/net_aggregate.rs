@@ -29,6 +29,10 @@ use crate::session_dir::NetMode;
 pub struct NetAggregate {
     /// 観測した行（そのまま。候補の計算は`harness_policy`へ通し直す）。
     lines: Vec<String>,
+    /// [決定69 の前例の(7)] **行の持ち主のドメインごと**に分けた行（`domain`の印。印の無い行は入口）。
+    /// 候補をドメインごとに出すのに使う（`proposals_by_domain`）。`lines`と二重に持つのは、
+    /// 全体の件数・注記（入口と遷移先をまとめた見出し）がこれまでと同じ計算で要るためである。
+    lines_by_domain: BTreeMap<String, Vec<String>>,
     pub events_seen: u64,
     /// うち許可されたもの（記録モードではほぼ全部）。
     pub allowed: u64,
@@ -84,6 +88,13 @@ impl NetAggregate {
         }
         self.events_seen = self.events_seen.saturating_add(1);
         if let Ok(line) = serde_json::to_string(event) {
+            // [決定69 の前例の(7)] 行の持ち主のドメイン（印が無ければ入口＝セッションの中継プロキシ）。
+            let domain = event
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .unwrap_or(crate::policy_file::ENTRY_DOMAIN)
+                .to_string();
+            self.lines_by_domain.entry(domain).or_default().push(line.clone());
             self.lines.push(line);
         }
 
@@ -139,6 +150,40 @@ impl NetAggregate {
     /// 許可ルールの提案。**適用はしない**（D-42: 反映は常にユーザーの明示操作）。
     pub fn proposals(&self) -> Vec<RuleProposal> {
         harness_policy::generalize::generalize(&self.candidates())
+    }
+
+    /// [決定69 の前例の(7)] **ドメインごとの**候補（`(ドメイン, 提案)`。並びは入口が先、残りは名前の順）。
+    ///
+    /// 行の印で振り分ける——1つの`net-audit.jsonl`へ入口とドメインのプロキシが追記するので、
+    /// ファイル単位では分けられない。印の無い行は入口のドメインとして数える（古い記録もそうなる）。
+    /// **番号は呼び出し側が振り直す**（ファイルの候補と1列に並べるため。`position_candidates::renumber`と同じ理由）。
+    pub fn proposals_by_domain(&self) -> Vec<(String, RuleProposal)> {
+        let entry = crate::policy_file::ENTRY_DOMAIN.to_string();
+        let order: Vec<&String> = std::iter::once(&entry)
+            .chain(self.lines_by_domain.keys().filter(|name| **name != entry))
+            .collect();
+        let mut out = Vec::new();
+        for domain in order {
+            let Some(lines) = self.lines_by_domain.get(domain) else {
+                continue;
+            };
+            let report = harness_policy::normalize::normalize_net_audit_with_mode(
+                &lines.join("
+"),
+                self.mode.intake(),
+            );
+            for proposal in harness_policy::generalize::generalize(&report.candidates) {
+                out.push((domain.clone(), proposal));
+            }
+        }
+        out
+    }
+
+    /// 印を持つ行が1つでもあるか（＝ドメインごとに分けられる記録か）。
+    pub fn has_domain_tags(&self) -> bool {
+        self.lines_by_domain
+            .keys()
+            .any(|domain| domain != crate::policy_file::ENTRY_DOMAIN)
     }
 
     /// 正規化が付けた注記（ホスト名を持たなかった件数の説明など）。

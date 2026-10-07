@@ -17,6 +17,8 @@
 //!    `approve --domain`を何も書かずに断る（P4.5。CLI が画面と同じ候補の作り方に繋がっているか）。`approve`が
 //!    書く側はここでは撃たない——統合試験は本物の承認台帳（`%APPDATA%`）を使うので、書く側は
 //!    `position_approve_tests`（試験ごとの一時台帳）が持つ
+//! 5. 許可した生成の記録（`spawn-audit.jsonl`）を持つパス2の記録でも、`show`が拒否の候補ごとに書く先のドメインを出す
+//!    （P6.6。パス2の`show`は通信の候補と拒否の欄を出す別の枝を通るので、そこが同じ候補の作り方に繋がっているか）
 
 #![cfg(windows)]
 
@@ -236,4 +238,78 @@ fn approving_a_position_record_with_a_domain_flag_writes_nothing() {
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("--domain は付けないでください"), "{stderr}");
     assert!(!harness_policy_editor::policy_file::path(ws.path()).exists());
+}
+
+/// パス2の記録（決定68: 入口から始めた）を作り、入口の子（seq 10）と`p6-child`の子（seq 11）の拒否を書く。`spawn_audit`なら
+/// Daemon が書く許可した生成の記録（版の行＋2人の生成）も書く。形は書式そのもの（`position_candidates_tests`の補助の写し。
+/// 統合試験からは`cfg(test)`の補助を呼べない）。
+fn seed_pass2_record(workspace_root: &Path, id: &str, spawn_audit: bool) {
+    use harness_policy::spawn_audit::{SpawnAuditRecord, SPAWN_AUDIT_SCHEMA_VERSION};
+    let dir = RecordSessionDir::create(workspace_root, id).unwrap();
+    let mut manifest = pass2_manifest(id, workspace_root);
+    manifest.domain = Some("workspace-shell".to_string());
+    manifest.status = RecordStatus::Finished;
+    manifest.collector_started = true;
+    manifest.etw_available = true;
+    manifest.exit_code = Some(0);
+    dir.write_manifest(&manifest).unwrap();
+
+    let mut fs = String::new();
+    for (path, seq) in [("C:/a/x", 10u64), ("C:/b/y", 11)] {
+        let mut event = harness_policy::FsAuditEvent::denied(
+            harness_policy::FsAuditKind::Etw,
+            path,
+            harness_config::FsAccess::Read,
+            "deny_only",
+            1_700_000_000_000,
+        );
+        event.process_sequence_number = Some(seq);
+        event.process_id = Some(seq as u32);
+        fs.push_str(&event.to_jsonl_line().unwrap());
+        fs.push('\n');
+    }
+    std::fs::write(dir.audit_log_path(), fs).unwrap();
+
+    if spawn_audit {
+        let mut text = String::new();
+        let header = SpawnAuditRecord::Header {
+            schema_version: SPAWN_AUDIT_SCHEMA_VERSION,
+        };
+        let spawned = |seq: u64, domain: &str| SpawnAuditRecord::Spawned {
+            ts_unix_ms: 1_700_000_000_000,
+            pid: seq as u32,
+            process_sequence_number: Some(seq),
+            domain: domain.to_string(),
+            exe: "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe".to_string(),
+            top_level: domain == "workspace-shell",
+        };
+        for record in [header, spawned(10, "workspace-shell"), spawned(11, "p6-child")] {
+            text.push_str(&record.to_jsonl_line().unwrap());
+            text.push('\n');
+        }
+        std::fs::write(dir.spawn_audit_path(), text).unwrap();
+    }
+}
+
+/// **許可した生成の記録を持つパス2の記録では、`show`が拒否の候補ごとに書く先のドメインを出す**（P6.6。画面と`approve`と
+/// 同じ`position_candidates::load`を通る——`approve --accept fs-N`が見た番号の候補を指す）。対の側: 記録の無い古いパス2の
+/// 記録は今までどおりドメインを添えない。
+#[test]
+fn show_prefixes_pass2_candidates_with_their_domain() {
+    let ws = workspace();
+    seed_pass2_record(ws.path(), "p2-new", true);
+    seed_pass2_record(ws.path(), "p2-old", false);
+
+    let output = show(ws.path(), "p2-new");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("fs-1     [workspace-shell] fs.read = C:/a/x"), "{stdout}");
+    assert!(stdout.contains("fs-2     [p6-child] fs.read = C:/b/y"), "{stdout}");
+
+    let output = show(ws.path(), "p2-old");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success());
+    assert!(stdout.contains("fs.read = C:/a/x"), "{stdout}");
+    assert!(!stdout.contains("[workspace-shell]"), "古い記録にドメインが付いた: {stdout}");
 }

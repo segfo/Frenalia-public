@@ -498,20 +498,26 @@ mod tests {
         );
     }
 
-    /// [段階⑤] **生成禁止の姿勢を、製品コードが1箇所で1回だけ選んでいること**を固定する。
+    /// [段階⑤・決定68] **生成禁止の姿勢を選ぶ場所は、Daemonを起こす製品のホストごとに1つで、どちらもpreflightより前**
+    /// であることを固定する。
     ///
     /// 製品でDaemonを起こすホストは2つある——harness本体（`harness-cli`の`run_agent.rs`）と
-    /// ポリシーエディタ（`harness-policy-editor`の`record_net.rs`）。**片方だけを直すと、
+    /// ポリシーエディタ（`harness-policy-editor`の`record_net/hosts.rs`）。**片方だけを直すと、
     /// もう片方だけが別の姿勢で動く**（`B-06`。段階5bでMCPの経路が1本だけ取り残されていたのと
     /// 同じ形で、そのときも赤くするテストが1本も無かった）。
     ///
-    /// **どちらも「このプロセスが選んだ姿勢」を読む**（`child_process_policy_for_this_process`）。
-    /// 既定は`Unrestricted`のままで、変えられるのは旗（`--enforce-transitions`）を立てた
-    /// セッションだけである。**常時適用へ切り替えるときは、この件数ではなく
-    /// 引数そのものを消す**のが正しい畳み方で、そのときこのテストも一緒に消える。
+    /// **どちらも「このプロセスが選んだ姿勢」を読む**（`child_process_policy_for_this_process`）。選ぶ場所は
+    /// ホストごとに1つ——harness本体は旗（`--enforce-transitions`）を姿勢へ変える`startup/sandbox.rs`、
+    /// エディタはパス2の関数（`record_net/run.rs`。決定68 の前例の(15)——パス2は常に遷移を強制する）。
+    /// **どちらもpreflight（`select_tier`）より前**でなければならない——Tier2aのシェルの候補がこの姿勢を見て決まる
+    /// （残課題#50・§S62）。後ろで選ぶと、シェルだけが遷移先にできない綴りのまま生成禁止が積まれる。
+    /// 製品の既定（`PRODUCT_DEFAULT`）は`Unrestricted`のままで、読み口の既定としてだけ現れる。
+    /// **常時適用へ切り替えるときは、この件数ではなく引数そのものを消す**のが正しい畳み方で、
+    /// そのときこのテストも一緒に消える。
     ///
     /// **限界**: `grep`なので、別名で束ねてから呼ばれると数えられない。緑は
-    /// 「**この綴りの**起こし方が2つで、2つとも同じ姿勢」しか意味しない（§10.1.1と同じ限界）。
+    /// 「**この綴りの**選び方・起こし方が数えたとおり」しか意味しない（§10.1.1と同じ限界）。
+    /// 「preflightより前」も同じファイルの中の行の順で見ている（実行の順ではない）。
     #[test]
     fn both_product_hosts_start_the_daemon_with_the_same_child_process_policy() {
         // 綴りは実行時に組み立てる（このテスト自身が数え上げに掛からないように。
@@ -535,49 +541,73 @@ mod tests {
              （0件マッチで黙って緑になる形＝BUG-056）"
         );
 
-        // [⑤'] **姿勢を選ぶ場所そのものを数える。** 上の件数だけでは「2つとも在る」しか
+        // [⑤'・決定68] **姿勢を選ぶ場所そのものを数える。** 上の件数だけでは「2つとも在る」しか
         // 言えず、どちらが何を選んだかは見ていない。
         //
-        // **2026-09-18に0件から1件へ変えた。** 旗（`--enforce-transitions`）を足したので、
-        // 製品コードが`Restricted`を綴る場所がちょうど1つできた——旗を姿勢へ変える
-        // `harness-cli`の`startup/sandbox.rs`である。**0件という形はもう使えないが、
-        // 意図は変わっていない**——「選ぶ場所は1つで、そこ以外は選べない」。
+        // **2026-09-18に0件から1件へ、2026-10-07（決定68）に2件へ変えた。** 旗を足して harness本体に1つ、
+        // パス2を常に強制にしてエディタに1つ。**件数は変わったが意図は変わっていない**——
+        // 「選ぶ場所はホストごとに1つで、preflightより前」。
         let restricted = format!("ChildProcessPolicy{}Restricted", "::");
         let (restricted_product, _) =
             super::super::test_support::product_callers_of(&restricted, "enum ChildProcessPolicy");
+        let is_cli_choice = |site: &str| site.contains("startup") && site.contains("sandbox.rs");
+        let is_editor_choice = |site: &str| site.contains("record_net") && site.contains("run.rs");
         assert_eq!(
             restricted_product.len(),
-            1,
-            "生成禁止を選ぶ製品コードがちょうど1箇所ではない。**1箇所だけ**が正しい\
-             ——旗（`--enforce-transitions`）を姿勢へ変える`startup/sandbox.rs`である。\
-             増えたなら、旗を読む場所が2つになっている（いつか片方だけ真になる、`B-06`）。\
-             減ったなら、旗が姿勢に変わらなくなっている（＝立てても何も起きない）:\n  {}",
+            2,
+            "生成禁止を選ぶ製品コードが2箇所ではない。**ホストごとに1箇所**が正しい——harness本体の\
+             `startup/sandbox.rs`（旗を姿勢へ変える）と、ポリシーエディタの`record_net/run.rs`（パス2は常に強制、\
+             決定68）である。増えたなら、同じホストで選ぶ場所が2つになっている（いつか片方だけ真になる、`B-06`）。\
+             減ったなら、どちらかのホストで姿勢が選ばれなくなっている（＝強制しないまま走る）:\n  {}",
             restricted_product.join("\n  ")
         );
         assert!(
-            restricted_product[0].contains("sandbox.rs"),
-            "生成禁止を選んでいるのが、旗を姿勢へ変える場所ではない。**preflightより前で\
-             選ばなければならない**——シェルの候補がこの姿勢を見て決まるからである\
-             （残課題#50・§S62）。後ろで選ぶと、シェルだけが遷移先にできない綴りのまま\
-             生成禁止が積まれる:\n  {}",
-            restricted_product[0]
+            restricted_product.iter().any(|s| is_cli_choice(s))
+                && restricted_product.iter().any(|s| is_editor_choice(s)),
+            "生成禁止を選んでいる2箇所が、harness本体の旗を姿勢へ変える場所とエディタのパス2の関数ではない:\n  {}",
+            restricted_product.join("\n  ")
         );
 
-        // **選んだ姿勢を配るのは1つの読み口だけである。**
+        // **選んだ姿勢を宣言するのも、同じ2箇所だけである。**
         let declare = format!("declare_child_process_policy{}", '(');
         let (declare_product, _) =
             super::super::test_support::product_callers_of(&declare, "pub fn ");
         assert_eq!(
             declare_product.len(),
-            1,
-            "このプロセスの姿勢を宣言する製品コードが1箇所ではない。`OnceLock`は\
-             プロセス単位なので、2箇所から書くと**先に走った方が勝つ**——症状は\
+            2,
+            "このプロセスの姿勢を宣言する製品コードが2箇所（ホストごとに1つ）ではない。`OnceLock`は\
+             プロセス単位なので、同じホストの2箇所から書くと**先に走った方が勝つ**——症状は\
              「なぜかこのセッションだけ強制されない」という形でしか出ない:\n  {}",
             declare_product.join("\n  ")
         );
+        assert!(
+            declare_product.iter().any(|s| is_cli_choice(s))
+                && declare_product.iter().any(|s| is_editor_choice(s)),
+            "姿勢を宣言している2箇所が、生成禁止を選ぶ2箇所と違う:\n  {}",
+            declare_product.join("\n  ")
+        );
+        // **どちらもpreflight（`select_tier`）より前で宣言する。** 同じファイルの中で、宣言の行が`select_tier(`を呼ぶ
+        // 最初の行より上にあることを見る（後ろへ移すと、シェルの候補が姿勢を見ないまま決まる）。
+        for site in &declare_product {
+            let (path, line) = site.rsplit_once(':').expect("path:line");
+            let declared_at: usize = line.parse().expect("line number");
+            let text = std::fs::read_to_string(path).expect("read the declaring file");
+            let preflight = text.lines().position(|l| {
+                !l.trim_start().starts_with("//") && l.contains(&format!("select_tier{}", '('))
+            });
+            let preflight = preflight.unwrap_or_else(|| {
+                panic!("姿勢を宣言するファイルにpreflight（select_tier）の呼び出しが無い: {site}")
+            }) + 1;
+            assert!(
+                declared_at < preflight,
+                "姿勢の宣言がpreflightより後ろにある（{site}、select_tier は {preflight} 行目）。\
+                 シェルの候補はこの姿勢を見て決まる（残課題#50・§S62）"
+            );
+        }
 
-        // [残課題#50] **姿勢を読む場所を数える。** 2つある——Daemonへ渡す側（`run_agent`）と、
-        // Tier2aのシェルの選び方（`shell_candidates`）である。後者は、生成禁止を積むなら
+        // [残課題#50] **姿勢を読む場所を数える。** 3つある——harness本体がDaemonへ渡す側（`run_agent`）、
+        // Tier2aのシェルの選び方（`shell_candidates`）、エディタがDaemonへ渡しパス2が宣言の直後に確かめる側
+        // （`record_net/hosts.rs`の1つの関数。エディタで読む場所はそこ1つ）。シェルの選び方は、生成禁止を積むなら
         // 「呼び出し元の中から起こせる綴り」しか選べないという実測（§S62）に基づく。
         //
         // **`spawn.rs`側はこの数え方では「製品」に見えない**——`shell_candidates`より前に
@@ -588,12 +618,33 @@ mod tests {
             super::super::test_support::product_callers_of(&reader, "pub fn ");
         assert_eq!(
             reader_product.len() + reader_elsewhere,
-            2,
-            "選んだ姿勢を読む場所の合計が2件ではない。**Daemonへ渡す側とシェルの選び方の\
-             両方が同じ値を読む**ことが要である——片方が直書きへ戻ると、\
-             「生成禁止は積んだのに、シェルは遷移先にできない綴りのまま」という状態が\
-             作れてしまい、サンドボックスの中でシェルが1本も起こせなくなる:\n  {}",
+            3,
+            "選んだ姿勢を読む場所の合計が3件ではない。**Daemonへ渡す側とシェルの選び方が\
+             同じ値を読む**ことが要である——片方が直書きへ戻ると、\
+             「生成禁止は積んだのに、シェルは遷移先にできない綴りのまま」や「宣言したのに生成禁止の無い\
+             Daemonが起きる」という状態が作れてしまう:\n  {}",
             reader_product.join("\n  ")
+        );
+
+        // **既定を直接渡す製品コードが無いこと。** 読み口が宣言の無いときに返す既定（`child_process_policy.rs`の1件）
+        // だけが綴る。ホストが`PRODUCT_DEFAULT`を直接渡すと、宣言しても生成禁止の無いDaemonが起きる——読む場所の
+        // 件数は変わらないことがあるので、ここで別に数える。
+        let product_default = format!("ChildProcessPolicy{}PRODUCT_DEFAULT", "::");
+        let (default_product, _) = super::super::test_support::product_callers_of(
+            &product_default,
+            "pub const PRODUCT_DEFAULT",
+        );
+        assert_eq!(
+            default_product.len(),
+            1,
+            "既定の姿勢（PRODUCT_DEFAULT）を綴る製品コードが、読み口の既定の1件ではない。\
+             ホストが既定を直接渡すと、選んだ姿勢が Daemon に届かない:\n  {}",
+            default_product.join("\n  ")
+        );
+        assert!(
+            default_product[0].contains("child_process_policy.rs"),
+            "既定を綴っているのが読み口ではない:\n  {}",
+            default_product[0]
         );
     }
 

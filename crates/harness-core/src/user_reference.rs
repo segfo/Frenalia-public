@@ -57,8 +57,9 @@
 //!
 //! - **差し込めなかったときは、書いた綴りがそのまま残る**（勝手に消さない）。承認画面にも`{{user:1}}`が見えるので、
 //!   人は「モデルが指した値が無い」と分かって断れる。黙って空文字へ畳むと、別のコマンドが静かに走る
-//! - **参照できるのは、長い値を含む直近のユーザーの文1つだけ**。それより前の文・ツールの出力・ファイルの中身は
-//!   参照できない（モデルはそれらを書き写すしかなく、この仕組みでは守れない）
+//! - **`{{val:N}}`で参照できるのは、人が書いた直近の文1つだけ**（値が無ければ何も指せない）。
+//!   それより前の人の文の値は`{{back:K:N}}`で指す（D-127。綴りの読み方は[`crate::reference_syntax`]）。
+//!   ツールの出力・ファイルの中身は参照できない（モデルはそれらを書き写すしかなく、この仕組みでは守れない）
 //! - **差し込む中身はユーザー自身が書いたもの**である。中身がコマンドの意味を変えること（`; rm -rf /`）は
 //!   止めない——止めるのは承認画面と判定器の仕事で、人は差し込んだ後の文字列を見て決める
 //! - **形フィルタに合わない Payload**（空白を含む生スクリプト・Base64 文字集合に収まる長い純英単語）は
@@ -66,7 +67,8 @@
 
 use serde_json::Value;
 
-use crate::{Message, Role};
+use crate::reference_syntax::ValueRef;
+use crate::Message;
 
 /// モデルが書いた語を「ユーザーの値を写したもの」とみなす、違いの割合の上限
 /// （ユーザーの値の長さに対して）。
@@ -100,21 +102,19 @@ pub const MIN_HEX_SHAPE_CHARS: usize = 32;
 /// モデルへ伝える書き方（システムプロンプトと、ここの取り出しが同じ綴りを見る）。
 pub const SYNTAX_EXAMPLE: &str = "{{val:1}}";
 
-/// 番号で指す書き方の綴り。**`{{val:N}}`が正で、`{{user:N}}`は古い別名**
-/// （置き場が[`crate::value_store`]へ移る前の綴り。覚え直しを強いないために読み続ける）。
-const MARKERS: [&str; 2] = ["{{val:", "{{user:"];
+/// 書き写しを断った文（[`Transcription::refusal_ja`]）の頭。会話に残ったツールの結果を後から読む側
+/// （`harness_engine::RecordedOutcome`）が「断った」と見分けるのに使うので、綴りはここにだけ置く（B-05）。
+pub const TRANSCRIPTION_REFUSAL_PREFIX: &str = "書き写した値は実行しませんでした。";
 
-/// `messages`から、モデルが参照できる値を取り出す（並び順が番号になる。1つ目が`{{user:1}}`）。
+/// `messages`から、モデルが参照できる値を取り出す（並び順が番号になる。1つ目が`{{val:1}}`）。
 ///
-/// **長い値を含む直近のユーザーの文1つ**だけを見る。前の文まで通して数えると、文脈の圧縮（古い文を畳む）で
-/// 番号がずれて、別の値が差し込まれる。
+/// **人が書いた直近の文1つ**だけを見る（[`crate::human_turns`]。ツールの結果を運ぶ文と、会話を畳んだ
+/// 要約の文は「直近」にならない）。**その文に長い値が無ければ空**で、前の文へは遡らない（D-127）
+/// ——遡ると、新しい文に値が無いときに前の文の値が今の番号で指せてしまい、モデルは前に貼られた値を
+/// 走らせようとした（BUG-234、2026-10-06 のユーザーの実機。「実行しないで」と書いて渡した値も同じ形で指せた）。
 pub fn values_in(messages: &[Message]) -> Vec<String> {
-    messages
-        .iter()
-        .rev()
-        .filter(|m| m.role == Role::User)
-        .map(|m| long_values(&text_of(m)))
-        .find(|values| !values.is_empty())
+    crate::human_turns::nth_back(messages, 0)
+        .map(|turn| long_values(turn.text))
         .unwrap_or_default()
 }
 
@@ -127,7 +127,9 @@ pub fn values_in(messages: &[Message]) -> Vec<String> {
 ///
 /// そこで**形フィルタ**を足す——候補にするのは、1文字変えると実行が狂う値の形（Base64形か hex形）に
 /// 合うものだけ。[`looks_like_payload`]で判定する。
-fn long_values(text: &str) -> Vec<String> {
+///
+/// 置き場は人の文ごとに作る（D-127）ので、組み立てる側（`harness_engine::references`）が文1つずつ呼ぶ。
+pub fn long_values(text: &str) -> Vec<String> {
     text.split_whitespace()
         .filter(|word| word.chars().count() >= MIN_REFERENCE_CHARS)
         .filter(|word| looks_like_payload(word))
@@ -196,75 +198,28 @@ fn looks_like_hex(chars: &[char]) -> bool {
     chars.iter().all(|c| c.is_ascii_hexdigit())
 }
 
-/// メッセージの文字の中身（文字でないブロックは無視する）。
-fn text_of(message: &Message) -> String {
-    message
-        .content
-        .iter()
-        .filter_map(|block| match block {
-            crate::ContentBlock::Text(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// ツールの入力の**すべての文字列**の中の`{{val:N}}`（と古い別名`{{user:N}}`）を、
-/// `values`のN番目（1始まり）へ置き換える。
+/// `values`のN番目（1始まり）へ置き換える。`values`は直近の文の値だけなので、`{{back:K:N}}`は置き換えない。
 ///
 /// 置き換えるのは番号が在るものだけで、**無い番号はそのまま残す**（モジュールdoc「守らないもの」）。
+/// 綴りの読み方は[`crate::reference_syntax`]の1か所が持つ（前の文も引ける置き場で置き換えるなら、
+/// そちらの[`crate::reference_syntax::substitute`]を直接使う）。
 pub fn substitute(input: &Value, values: &[String]) -> Value {
-    match input {
-        Value::String(text) => Value::String(substitute_text(text, values)),
-        Value::Array(items) => Value::Array(items.iter().map(|v| substitute(v, values)).collect()),
-        Value::Object(fields) => Value::Object(
-            fields
-                .iter()
-                .map(|(k, v)| (k.clone(), substitute(v, values)))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-/// 1つの文字列の中の`{{val:N}}`（と古い別名`{{user:N}}`）を置き換える。
-fn substitute_text(text: &str, values: &[String]) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some((at, marker)) = MARKERS
-        .iter()
-        .filter_map(|m| rest.find(m).map(|at| (at, *m)))
-        .min_by_key(|(at, _)| *at)
-    {
-        let (before, from_marker) = rest.split_at(at);
-        out.push_str(before);
-        let after_marker = &from_marker[marker.len()..];
-        let Some(end) = after_marker.find("}}") else {
-            // 閉じていない。これ以降は綴りとして残す。
-            out.push_str(from_marker);
-            return out;
-        };
-        let (number, after) = (&after_marker[..end], &after_marker[end + "}}".len()..]);
-        match number
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n >= 1)
-            .and_then(|n| values.get(n - 1))
-        {
-            Some(value) => out.push_str(value),
-            // 番号が無い・数でない: 書いた綴りをそのまま残す（人が承認画面で見て気付ける）。
-            None => out.push_str(&from_marker[..=marker.len() + end + 1]),
+    crate::reference_syntax::substitute(input, &mut |r| {
+        if r.back == 0 {
+            values.get(r.number - 1).cloned()
+        } else {
+            None
         }
-        rest = after;
-    }
-    out.push_str(rest);
-    out
+    })
 }
 
 /// モデルがユーザーの値を**書き写していた**という審査の結果1件（[`review`]）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcription {
-    /// 何番目の値を写したか（1始まり。`{{val:N}}`のN）。
+    /// 何個前の人の文の値を写したか（0 が直近の文。`{{back:K:N}}`のK）。
+    pub back: usize,
+    /// その文の何番目の値を写したか（1始まり。`{{val:N}}`・`{{back:K:N}}`のN）。
     pub number: usize,
     /// モデルが書いた部分の長さ（文字）。
     pub written_chars: usize,
@@ -280,13 +235,18 @@ impl Transcription {
         self.differences == 0
     }
 
-    /// 参照の書き方（`{{val:N}}`）。
+    /// 参照の書き方（直近の文なら`{{val:N}}`、それより前なら`{{back:K:N}}`）。
     pub fn reference(&self) -> String {
-        format!("{{{{val:{}}}}}", self.number)
+        ValueRef {
+            back: self.back,
+            number: self.number,
+        }
+        .spelling()
     }
 
     /// 実行を断ったことを**モデルへ**伝える文（ツールの結果として返す）。`menu`には
-    /// [`crate::ValueStore::render`]が組んだ値の一覧をそのまま渡す。
+    /// [`crate::ValueStore::render`]（前の文の値を写したときは[`crate::value_store::ReferenceBook::render_for`]）が
+    /// 組んだ値の一覧をそのまま渡す。
     ///
     /// **どの番号を指すべきかはハーネスが決めない。** 「どれに近いか」までしか言えないからである
     /// ——実測（2026-10-04）では、ユーザーの値を途中まで書き写した語が、**その値を解読して得た
@@ -298,7 +258,7 @@ impl Transcription {
     /// 手で数え始め、1往復をまるごと使った。だから「数え直す必要はない」と明示する。
     pub fn refusal_ja(&self, menu: &str) -> String {
         format!(
-            "書き写した値は実行しませんでした。あなたが書いた{written}文字の値は、ハーネスが持っている値のどれかを写したものに見えますが、{differences}文字分違います（足す・消す・書き換えるの合計）。1文字でも違えば別のものが走ります。\n\n値を書き写さず、番号で指し直してください。文字を数え直す必要はありません。\n{menu}",
+            "{TRANSCRIPTION_REFUSAL_PREFIX}あなたが書いた{written}文字の値は、ハーネスが持っている値のどれかを写したものに見えますが、{differences}文字分違います（足す・消す・書き換えるの合計）。1文字でも違えば別のものが走ります。\n\n値を書き写さず、番号で指し直してください。文字を数え直す必要はありません。\n{menu}",
             written = self.written_chars,
             differences = self.differences,
         )
@@ -312,23 +272,43 @@ impl Transcription {
 ///
 /// [`Transcription::is_exact`]が`false`のものが1つでもあれば、呼び出し側は**そのツール呼び出しを
 /// 実行してはいけない**。一字一句同じものは走らせてよい（記録には残す）。
+///
+/// `values`は直近の文の値（`{{val:N}}`）だけを相手にする。前の文の値も相手にするなら[`review_against`]。
 pub fn review(input: &Value, values: &[String]) -> Vec<Transcription> {
+    let candidates: Vec<(ValueRef, &str)> = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (ValueRef::current(index + 1), value.as_str()))
+        .collect();
+    review_against(input, &candidates)
+}
+
+/// [`review`]を、指せる値**全部**（`{{val:N}}`と`{{back:K:N}}`。D-127 の4）を相手に掛ける。
+///
+/// `candidates`の並びは、違いの回数が同じ候補が2つあったときの勝ち順になる（前にあるものが勝つ）。
+/// 置き場（`ReferenceBook::all_values`）は直近の文を先に並べるので、同じ値が今の文と前の文の両方に
+/// あれば今の文の番号で報告する。
+pub fn review_against(input: &Value, candidates: &[(ValueRef, &str)]) -> Vec<Transcription> {
     let mut found = Vec::new();
-    review_value(input, values, &mut found);
+    review_value(input, candidates, &mut found);
     found
 }
 
-fn review_value(input: &Value, values: &[String], found: &mut Vec<Transcription>) {
+fn review_value(input: &Value, candidates: &[(ValueRef, &str)], found: &mut Vec<Transcription>) {
     match input {
         Value::String(text) => {
             for word in text.split_whitespace() {
-                if let Some(t) = transcription_of(word, values) {
+                if let Some(t) = transcription_of(word, candidates) {
                     found.push(t);
                 }
             }
         }
-        Value::Array(items) => items.iter().for_each(|v| review_value(v, values, found)),
-        Value::Object(fields) => fields.values().for_each(|v| review_value(v, values, found)),
+        Value::Array(items) => items
+            .iter()
+            .for_each(|v| review_value(v, candidates, found)),
+        Value::Object(fields) => fields
+            .values()
+            .for_each(|v| review_value(v, candidates, found)),
         _ => {}
     }
 }
@@ -338,13 +318,13 @@ fn review_value(input: &Value, values: &[String], found: &mut Vec<Transcription>
 /// **語まるごとを比べてはいけない。** モデルは値の前後に自分で飾りを付ける（`payload=`・引用符・
 /// `--enc=`）ので、まるごと比べると飾りの分まで違いに数え、短い値では写しを見落とす。
 /// だから[`closest_region`]で**語の中の、値に当たる部分だけ**を見る。
-fn transcription_of(word: &str, values: &[String]) -> Option<Transcription> {
+fn transcription_of(word: &str, candidates: &[(ValueRef, &str)]) -> Option<Transcription> {
     let written: Vec<char> = word.chars().collect();
     if written.len() > MAX_SCANNED_WORD_CHARS {
         return None;
     }
     let mut best: Option<Transcription> = None;
-    for (index, value) in values.iter().enumerate() {
+    for &(reference, value) in candidates {
         let user_value: Vec<char> = value.chars().collect();
         // **上限はユーザーの値の長さで決める。** モデルが短く切り詰めても基準が動かない。
         let limit = (user_value.len() as f32 * MAX_TRANSCRIPTION_RATIO) as usize;
@@ -356,7 +336,8 @@ fn transcription_of(word: &str, values: &[String]) -> Option<Transcription> {
         };
         if best.as_ref().is_none_or(|b| differences < b.differences) {
             best = Some(Transcription {
-                number: index + 1,
+                back: reference.back,
+                number: reference.number,
                 written_chars: end - start,
                 value_chars: user_value.len(),
                 differences,

@@ -429,7 +429,7 @@ pub fn denial_sources(records: &[PendingRecord]) -> std::collections::BTreeSet<S
 /// 画面に出す必要がある（用意されるかは遷移先の宣言の承認・通信の宣言・遷移の強制で決まる）。
 ///
 /// **`FixTheEnvironment`も候補にしない**（固定したファイルを呼び出し元が書き換えられるので
-/// 固定辺を断ったもの）。直す場所は宣言ではない。**除いた件数はこの画面に出ない**——
+/// Strict の辺を断ったもの）。直す場所は宣言ではない。**除いた件数はこの画面に出ない**——
 /// `NotAboutPolicy`と同じ扱いで、出すなら画面の側に件数の欄を足す必要がある。
 ///
 /// **各行はその行の遷移元の宣言で判定する**（`declared`から引く。2026-10-05、P4.6）。遷移元を観測していない行と、
@@ -448,7 +448,7 @@ pub fn from_denials(records: &[PendingRecord], declared: &DeclaredEdgesByDomain)
             match remedy(&denial.reason) {
                 Remedy::FixTheDeclaration | Remedy::BlockedUntilHarnessImplementsIt => {}
                 Remedy::NotAboutPolicy => return None,
-                // 固定辺の前提（固定したファイルを呼び出し元が書き換えられないこと）が崩れて断られた。
+                // Strict の辺の前提（固定したファイルを呼び出し元が書き換えられないこと）が崩れて断られた。
                 // 辺は宣言済みなので、候補にしても「承認しても直りません」の行が並ぶだけで、
                 // 直し方（置き場所か書込許可を変える）は伝わらない。直す案内はモデルへの注記と
                 // Daemonの標準エラーが持つ。

@@ -41,7 +41,9 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         policy,
         writable_outside_policy,
         domain_fs_grants,
+        domains_net,
         approved_fs_values,
+        approved_net_values,
         policy_learn: policy_learn_enabled,
         wfp_prelude,
         write_mode,
@@ -57,216 +59,46 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     #[cfg(windows)]
     let mut transition_facts: Option<std::sync::Arc<harness_core::TransitionFacts>> = None;
 
-    // Tier2a preflightが成功した後、このhost process用のDaemonを1本だけ起こす。
-    // 起動できなければTier2aセッション自体を開始せず、直接spawnへは降格しない。
+    // **手順1: 遷移先ドメインの用意**（`startup::transitions`のモジュールdocの順序）。**Daemonはまだ起こさない**
+    // ——間にドメインごとの中継プロキシ（手順2a）とWFPの適用（手順3）が入り、出口（`internetClient`）を
+    // 表へ積むのはWFPが立った後（手順4a）である。Daemonを先に起こすと、出口の有無が確定する前に
+    // `Hello`で表を渡してしまう。
     #[cfg(windows)]
-    let spawn_daemon = if shell_tier.tier == harness_core::ShellTier::Tier2a {
-        // [段階⑤] **製品の既定は「生成禁止を積まない」。** 積むと、遷移ポリシーの評価
-        // （段階E）が無い今はDaemonの答えが常に「未実装なので断る」になり、
-        // サンドボックスの中で外部プログラムが1つも起動できなくなる。
-        // 常時適用へ切り替えるのは段階Eが着地してからで、そのときはこの引数ごと消す。
-        // [段階6b・#30] **遷移の宣言はharnessが読んでDaemonへ渡す**
-        // （`plans/DESIGN-MAC-PROTOCOL.md` §12.1）。`policy.json`を読むのは`stage_prepare_sandbox`の
-        // 1回だけで、ここはその値を使う——ファイル宣言から許可を付ける付与処理（#30）より前に読む必要が
-        // あるためで、読み直すと付与に使った宣言とDaemonへ渡す宣言が別物になり得る（`B-13`）。
-        //
-        // **読めなければTier2aセッションを始めない**——その判断は`stage_prepare_sandbox`が既にしており、
-        // Tier2aでここへ来たなら読めている。`None`はその不変条件の破れなので、起動しない側へ倒す。
-        //
-        // [残課題 サンドボックス周辺 #65] **`policy.json`の外で書込を許した場所も検査へ渡す。**
-        // 一覧は`stage_prepare_sandbox`で1回だけ作り、harnessの検査・モデルへ見せる一覧・
-        // Daemonの検査の3つへ同じ値を渡す——別々に作ると、どれか1つだけ入力が違う状態が
-        // 黙って成立する（`B-13`）。
-        let Some(policy) = policy else {
-            eprintln!(
-                "error: the transition policy (.harness/policy.json) was not read before the \
-                 Tier2a session started; refusing to start a Spawn Daemon without it"
-            );
-            let outcome = harness_sandbox::tier2a::session_profile::end_session(
-                &harness_sandbox::tier2a::win_appcontainer::revoke_session_grant,
-            );
-            if let Some(summary) = outcome.summary() {
-                eprintln!("note: {summary}");
-            }
-            return ExitCode::FAILURE;
-        };
-        // [#55] **遷移先ドメインの実体をここで用意する**（`plans/DESIGN-MAC-BROKER.md` §22.9）。
-        //
-        // 判定器は「Dへ移してよい」までしか答えない。Dで実際に起こすには
-        // Dのpackage SIDとcapabilityの組が要り、それは`policy.json`には書かれていない。
-        // **Daemonを起こす前に作って、宣言と同じ電文で渡す**——表を持たないDaemonが
-        // 要求を捌く瞬間を作らないためである（`Hello`に載せた理由そのもの）。
-        //
-        // [#30] **宣言の宛先は、このセッションの付与処理が付けたものを渡す**（台帳を引き直さない、
-        // BUG-185）。付与は`stage_prepare_sandbox`が入口の宣言と一緒に1回で済ませている。
-        let canonical_workspace = workspace_root
-            .canonicalize()
-            .unwrap_or_else(|_| workspace_root.clone());
-        let provisioned =
-            harness_sandbox::tier2a::win_appcontainer::domain_provision::provision_target_domains(
-                &policy,
-                &canonical_workspace,
-                // **`preflight`が付与したのと同じ語彙**でなければ別の宛先SIDを導出し、
-                // 用意したドメインからワークスペースが一切見えなくなる。
-                write_mode.capability_mode(),
-                &domain_fs_grants,
-            );
-        // **用意できなかったものを黙って落とさない**（`B-10`）。落とすと、
-        // 宣言したのに断られる理由が画面のどこにも出ない。
-        for (domain, reason) in &provisioned.skipped {
-            eprintln!("warning: transitions into the domain {domain:?} will be refused: {reason}");
-        }
-        // [段階6e] **モデルへ見せる一覧は、Daemonへ渡すのと同じ宣言と同じ表から作る**
-        // （§19.3.8）。ここで読み直すと判定に使うグラフとずれ、「起こせる」と
-        // 答えたものをDaemonが拒否する形になる（正本を2つ持たない、`B-13`）。
-        // [#30] 権限欄にはこのマシンで承認済みの宣言だけを載せる（付いていない許可を伝えない）。
-        // [2026-10-01] 「いま起こせるか」は**用意できた表**（Daemonへ渡す`provisioned.domains`）で決める
-        // ——そのため一覧は用意の**後**に作る（§10.1.2の撤去一覧5点目を外した）。
-        let provisioned_domains: std::collections::BTreeSet<String> = provisioned
-            .domains
-            .iter()
-            .map(|domain| domain.policy_domain.clone())
-            .collect();
-        transition_facts = Some(std::sync::Arc::new(
-            super::transition_tool::facts_from_policy(
-                &policy,
-                &workspace_root.to_string_lossy(),
-                &writable_outside_policy,
-                &approved_fs_values,
-                &provisioned_domains,
-            ),
-        ));
-        let transition_policy = harness_sandbox::tier2a::spawnd::TransitionPolicy {
+    let mut provisioned_transitions = if shell_tier.tier == harness_core::ShellTier::Tier2a {
+        match super::transitions::provision(
             policy,
-            workspace_root: workspace_root.to_string_lossy().into_owned(),
+            &workspace_root,
+            &write_mode,
+            &domain_fs_grants,
             writable_outside_policy,
-            domains: provisioned.domains,
-        };
-        // **この値が段階6eの露出条件の3つ目である。** `Unrestricted`である限り、
-        // 子は要求受付パイプへ頼まずに自分で生成できるので、モデルへ
-        // 「宣言された組み合わせだけ起こせる」と言ってはならない（§19.3.8）。
-        // [残課題#50] **姿勢の綴りをここに書かない。** 読む場所が3つに増えた
-        // （ここ・ポリシーエディタ・Tier2aのシェルの選び方）ので、
-        // 既定を持つのは`PRODUCT_DEFAULT`1箇所だけにしてある。
-        // [⑤'] **このセッションで選ばれた姿勢を読む。** 旗（`--enforce-transitions`）を
-        // 姿勢へ変えるのは`stage_prepare_sandbox`1箇所で、シェルの選び方も同じものを読む
-        // ——ここで旗をもう一度読むと、いつか片方だけ真になる（`B-06`）。
-        let child_process_policy =
-            harness_sandbox::tier2a::spawnd::child_process_policy_for_this_process();
-        match harness_sandbox::tier2a::spawnd::SharedSpawnDaemon::start(
-            transition_policy,
-            child_process_policy,
+            &approved_fs_values,
+            &approved_net_values,
         ) {
-            Ok(daemon) => {
-                // [段階6e] 強制が効いているときだけ、モデルへ見せる（§19.3.8）。
-                // **判定は`should_expose`ただ1つが持つ**——ここへ条件を書くと、
-                // 今日は通らない分岐なので配線したこと自体をテストできない。
-                // **姿勢を読むのに綴りを書かない**（`ChildProcessPolicy::is_restricted`のdoc）。
-                // 生成禁止の綴りが製品コードに0件であることを数え上げテストが固定しており、
-                // 比較のために書いた行まで「選んだ」と数えられてしまう。
-                //
-                // [段階6f-3] **この1つの値を、ツール登録と`run_shell`の両方へ配る。**
-                // 拒否の注記は「`can_run_program`を引け」と書くので、
-                // **ツールを登録しない構成でその注記を出すと、存在しないツールを指す**。
-                // 判定を2箇所に置くと、いつか片方だけ真になる（`B-06`）。
-                let expose_transitions = super::transition_tool::should_expose(
-                    shell_tier.tier,
-                    true,
-                    child_process_policy.is_restricted(),
-                );
-                tools.register(Arc::new(harness_tools::RunShellTool::with_spawn_daemon(
-                    daemon.clone(),
-                    expose_transitions,
-                )));
-                // `run_program`も同じ接続と同じ注記の判定で差し替える。**片方だけ差し替えると、
-                // もう片方は接続なしの既定値のままTier2aで内部エラーになる**（`B-06`）。
-                tools.register(Arc::new(harness_tools::RunProgramTool::with_spawn_daemon(
-                    daemon.clone(),
-                    expose_transitions,
-                )));
-                if expose_transitions {
-                    tools.register(Arc::new(harness_tools::CanRunProgramTool));
-                } else {
-                    // 出さないなら**事実も積まない**。積んだままにすると、
-                    // `EnvironmentFacts`が1行を出してしまう（`Some`が「強制が効いている」の
-                    // 意味を持つ、`TransitionFacts`のdoc）。
-                    transition_facts = None;
-                }
-                Some(daemon)
+            Ok(provisioned) => {
+                transition_facts = Some(provisioned.facts.clone());
+                Some(provisioned)
             }
-            Err(error) => {
-                eprintln!("error: could not start the Tier2a Spawn Daemon: {error}");
-                // **Daemonが起こせないならTier2aセッションを始めない**（直接生成へ降格しない、
-                // `plans/DESIGN-MAC-PROTOCOL.md` §12）。preflightが既に付けたACEと
-                // プロファイルはここで撤収する。
-                //
-                // [BUG-103] **剥がせなかったノードは名前で出す。** 正常終了の末尾と同じ扱いに
-                // する——失敗パスだけ黙ると、撤収が1件も成功しなくても何も出ない状態が
-                // 早期returnの側にだけ残る（`B-09`）。
-                let outcome = harness_sandbox::tier2a::session_profile::end_session(
-                    &harness_sandbox::tier2a::win_appcontainer::revoke_session_grant,
-                );
-                if let Some(summary) = outcome.summary() {
-                    eprintln!("note: {summary}");
-                }
-                return ExitCode::FAILURE;
-            }
+            Err(code) => return code,
         }
     } else {
         None
     };
 
-    let _session_proxy = if net_proxy.domain_policy_enabled {
-        match harness_tools::net_proxy::spawn_local_proxy(&net_proxy).await {
-            Ok(Some(proxy)) => {
-                net_proxy.proxy_addr = Some(proxy.addr);
-                Some(proxy)
-            }
-            Ok(None) => None,
-            Err(e) => {
-                if shell_tier.tier == harness_core::ShellTier::Tier2a {
-                    eprintln!(
-                        "warning: failed to start session-scoped local proxy; Tier2a domain \
-                         enforcement will remain fail-closed instead of opening network: {e}"
-                    );
-                } else {
-                    eprintln!(
-                        "warning: failed to start session-scoped local proxy; run_shell will try \
-                         a per-command proxy instead: {e}"
-                    );
-                }
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let _session_fake_dns = if net_proxy.domain_policy_enabled {
-        match harness_tools::fake_dns::spawn_fake_dns(&harness_tools::fake_dns::FakeDnsConfig {
-            allow_domains: net_proxy.allow_domains.clone(),
-            policy_required: net_proxy.domain_policy_enabled,
-            audit_log_path: net_proxy.audit_log_path.clone(),
-            preferred_port: Some(53),
-        })
-        .await
-        {
-            Ok(agent) => {
-                net_proxy.fake_dns_addr = Some(agent.addr);
-                Some(agent)
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: failed to start session-scoped Fake DNS diagnostic agent; run_shell \
-                     will try a per-command Fake DNS agent instead: {e}"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let net_loopback_ports =
-        net_loopback_ports_for_agents(net_proxy.proxy_addr, net_proxy.fake_dns_addr);
+    // **手順2a: ドメインごとの中継プロキシ**（決定69）。用意できた遷移先のうち、承認済みの通信の宛先を
+    // 持つドメインに1本ずつ立てる。WFPの項目は下で一緒に積み、`internetClient`はWFPが立った後に積む。
+    #[cfg(windows)]
+    let mut domain_egress = super::transitions::start_domain_egress(
+        provisioned_transitions.as_ref(),
+        &domains_net,
+        net_proxy.audit_log_path.clone(),
+    )
+    .await;
+
+    // **手順2b: 入口（セッション）の中継プロキシと名前解決**（`net_sources::start_session_agents`。
+    // 2026-10-07に`run_agent`から移した——P7.6 で手順が増えて本体が上限を超えたため）。
+    let session_agents =
+        super::net_sources::start_session_agents(&mut net_proxy, shell_tier.tier).await;
+    let net_loopback_ports = session_agents.loopback_ports();
 
     // MCP手順1〜3（D-38/D-39、`startup::mcp`のモジュールdoc）: 承認照合 → サーバごとの
     // AppContainerプロファイル作成 → サーバ専用プロキシ起動。**プロセスはまだ起こさない**——
@@ -280,8 +112,16 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         net_proxy.audit_log_path.clone(),
     )
     .await;
+    // [決定69 の前例の(3)] **WFPの項目は1つの`ApplyRules`で積む**——MCPサーバの分と、ドメインごとの出口の分。
+    // 欄（`mcp_profiles`）を使い回すのは、昇格側（`harness-netfilterd.exe`）が古い個体でも読む欄だからである
+    // （新しい欄を足すと、古い個体が欄を捨てて`internetClient`だけが効く＝fail-openになる）。
     #[cfg(windows)]
-    let mcp_netfilter_entries = mcp_startup.netfilter_entries();
+    let mcp_netfilter_entries: Vec<harness_sandbox::tier2a::netfilterd::McpNetfilterPolicy> =
+        mcp_startup
+            .netfilter_entries()
+            .into_iter()
+            .chain(domain_egress.netfilter_entries())
+            .collect();
 
     // M15.7: OS監査収集器を**netfilterdの昇格トークンから連鎖起動する**ための接続先を先に作る
     // （追加UACを出さない経路）。netfilterdが起動しない構成ではこのパイプは使われず、
@@ -473,56 +313,25 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         // ある構成では数百MBのI/Oになる。**人へ見せる行は1件ずつのまま**——まとめるのは
         // 台帳の書込だけで、どの穴が開いたかの説明は落とさない。
         //
-        // [#30] 記録するのは入口の子の分と、遷移先ドメインの子の分。**同じパスは記録の前に1行へ畳む**
-        // ——付与台帳はパスごとに1行で、後から書いた行が`forced`/`writable`/`scope`を上書きする
-        // （`upsert_grant`）。ドメインの分（`forced=false`）が後に来ると、撤収が`SeRestorePrivilege`を
-        // 使わなくなる（BUG-119の逆行）。`forced`・`writable`はOR、範囲は再帰が勝つ。
-        // 比べる綴りは宛先SIDの鍵と同じ畳み方（`declaration_key`）。
-        use harness_sandbox::tier2a::workspace_capability::declaration_key;
-        let mut by_path: Vec<harness_core::GrantedPassthrough> = Vec::new();
-        for granted in shell_tier.granted_passthrough.iter().chain(
-            domain_fs_grants
-                .values()
-                .filter_map(|result| result.as_ref().ok())
-                .flatten(),
-        ) {
-            let key = declaration_key(&granted.path);
-            match by_path
-                .iter_mut()
-                .find(|seen| declaration_key(&seen.path) == key)
-            {
-                Some(seen) => {
-                    seen.writable |= granted.writable;
-                    seen.used_restore_privilege |= granted.used_restore_privilege;
-                }
-                None => by_path.push(granted.clone()),
-            }
-        }
-        let records: Vec<crate::fs_grants::FsPassthroughGrantRecord> = by_path
+        // [#30] 記録するのは入口の子の分と、遷移先ドメインの子の分。組み立て（同じパスを1行に畳む・`forced`は使った
+        // 特権から〔BUG-119〕・範囲は宣言から・承認済みの宣言のルートならワークスペースを参照に載せる）は
+        // `policy_fs::grant_records`が持つ（ポリシーエディタのパス2も同じこれを通る。決定68の前例の(11)）。
+        let granted: Vec<&harness_core::GrantedPassthrough> = shell_tier
+            .granted_passthrough
             .iter()
-            .map(|granted| {
-                let key = declaration_key(&granted.path);
-                // [D-63] 宣言側から引くのは**範囲だけ**である（同じパスの宣言が複数あれば再帰が勝つ）。
-                // [BUG-119] `forced`は宣言側から引かない——`--force-system-acl`は
-                // セッション全域のスイッチで、**そのパスで特権を使ったかという事実ではない**。
-                // 組み立ては`FsPassthroughGrantRecord::from_granted`が唯一の定義を持つ。
-                let declared = fs_passthrough
-                    .iter()
-                    .filter(|fp| declaration_key(&fp.path) == key)
-                    .max_by_key(|fp| fp.scope.is_recursive());
-                let path_str = granted.path.to_string_lossy();
-                // [#30] 「ファイルで宣言された」（＝自動撤収の対象）かは、台帳と同じ比べ方で決める。
-                // 文字列の完全一致では`C:\x`と`C:/x`が別物になり、毎起動で印が外れて撤収される。
-                let file_declared = file_declared_fs_paths
-                    .iter()
-                    .any(|declared| harness_grant_ledger::same_ledger_path(declared, &path_str));
-                crate::fs_grants::FsPassthroughGrantRecord::from_granted(
-                    granted,
-                    declared,
-                    file_declared.then(|| workspace_root.to_string_lossy().into_owned()),
-                )
-            })
+            .chain(
+                domain_fs_grants
+                    .values()
+                    .filter_map(|result| result.as_ref().ok())
+                    .flatten(),
+            )
             .collect();
+        let records = harness_sandbox::tier2a::policy_fs::grant_records(
+            granted,
+            &fs_passthrough,
+            &file_declared_fs_paths.iter().cloned().collect::<Vec<_>>(),
+            &workspace_root,
+        );
         crate::fs_grants::record_fs_passthrough_grants(&records);
         // [#30] 遷移先ドメインの分は**ドメインごとに1行**で知らせる（入口の分は下で1件ずつ出す）。
         for (domain, result) in &domain_fs_grants {
@@ -590,6 +399,30 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
     if net_wfp.is_some() {
         net_proxy.enforced_by_wfp = true;
     }
+
+    // **手順4: 出口を表へ付ける（WFPが立った回だけ）／立たなければ畳む。** 逆順にすると、既定拒否が
+    // 効くまでの間だけ`internetClient`を持った子が走れる窓ができる（`domain_egress`のモジュールdoc）。
+    // **手順5: Spawn Daemonを起こす**——表はここで確定している（`Hello`で渡す値がもう変わらない）。
+    #[cfg(windows)]
+    let spawn_daemon = match provisioned_transitions.take() {
+        Some(mut provisioned) => {
+            super::transitions::attach_domain_egress(
+                &mut domain_egress,
+                &mut provisioned,
+                net_wfp.is_some(),
+            );
+            match super::transitions::start_daemon(
+                provisioned,
+                &mut tools,
+                shell_tier.tier,
+                &mut transition_facts,
+            ) {
+                Ok(daemon) => Some(daemon),
+                Err(code) => return code,
+            }
+        }
+        None => None,
+    };
 
     // M15.7: OS監査によるFSアクセス拒否の収集（`--policy-learn`、`plans/DESIGN-SANDBOX-APPPOLICY.md` §11）。
     //
@@ -801,13 +634,13 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
         compaction.context_window,
     )));
 
-    // `recall`ツール（`plans/PLAN-RECALL-MEMORY.md`段階3）。`census`と異なり内部で新しい
-    // `TurnExecutor`を組まない（`search`は決定的検索のみ、`remember`はファイル書込みのみ）
-    // ため、再帰対策（レジストリのスナップショット）は不要。`CognitionLevel`に関わらず常時
-    // 登録する（未使用時のコストはゼロ、`Off`の等価性を壊さない）。
+    // `recall`（`plans/PLAN-RECALL-MEMORY.md`段階3。`search`は決定的検索、`remember`はファイル書込みのみ）と
+    // `past_requests`（D-127。会話を読むだけ）は内部で`TurnExecutor`を組まないので再帰対策は不要。`inner_tools`より後
+    // なので`census`の内側には見えない。`CognitionLevel`に関わらず常時登録する（未使用時のコストはゼロ）。
     tools.register(Arc::new(RecallTool::new(
         cognition.recall_allow_unversioned(),
     )));
+    tools.register(Arc::new(harness_engine::PastRequestsTool));
 
     // `/workspace`で選ばれた移動先。ここでは**まだ起動しない**——teardownを全部通した後で
     // 起こす（`startup::relaunch`のモジュールdoc「置き場所が末尾でなければならない」）。

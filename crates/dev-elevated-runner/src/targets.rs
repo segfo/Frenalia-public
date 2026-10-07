@@ -788,10 +788,75 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--nocapture",
         ],
     ),
+    // 広げる遷移（決定66）の実機E2E。パス1で2つの子（中の段のシェル・cmd）がワークスペースの外の目印を
+    // 読む行を記録し、エディタの画面で子のドメインの読み取りと位置の辺を承認し（cmd の辺は出力を捨てる）、
+    // `harness.exe --enforce-transitions`（e2e-mock のビルド）で子だけが目印を読めること・標準入力が届くこと・
+    // 出力を捨てる辺・子のドメインからの拒否・子の通信を測る
+    // （`crates/harness-policy-editor/tests/widening_transitions_e2e.rs`）。⑥は外部（example.com）への到達性が要る。
+    // フィルタはテスト関数名と一致させる（0件マッチは`check_tests_actually_ran`が非0で落とす、BUG-056同型）。
+    (
+        "e2e-policy-editor-widening",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "widening_transitions_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "a_widening_edge_written_by_the_editor_lets_the_child_use_its_own_domain_and_no_more",
+        ],
+    ),
+    // 決定69（P7.8）: **ドメインごとの通信**の実機E2E。`policy.json`の承認済みの`net`宣言が、そのドメインの子だけに
+    // 効くことを`harness.exe --enforce-transitions`（e2e-mock のビルド）で測る
+    // （`crates/harness-policy-editor/tests/domain_net_e2e.rs`）。7本の腕——外の対照・子が自分の宛先へ届く・
+    // 他のドメインの宛先は断られる・入口の対照・他のドメインのプロキシのポートへは繋げない・通信を宣言しない
+    // ドメインは宛先を知らない・ssh が`ProxyCommand`で22番へ届く・監査の行のドメインの印。
+    // **外部への到達性が要る**（`example.com`の HTTP と`github.com`の22番）。届かなければ判定不能で落ちる。
+    // フィルタはテスト関数名と一致させる（0件マッチは`check_tests_actually_ran`が非0で落とす、BUG-056同型）。
+    (
+        "e2e-policy-editor-domain-net",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "domain_net_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "each_domain_reaches_only_its_own_destinations_through_its_own_proxy",
+        ],
+    ),
+    // 引数を固定した位置の分割と Strict の辺（決定67）の実機E2E。パス1で同じ親から同じ`powershell.exe`で
+    // 3つのスクリプトを記録し、エディタの画面の`u`でコマンドラインごとのドメインに分け、1行を`s`で Strict にして
+    // 承認し、`harness.exe --enforce-transitions`（e2e-mock のビルド）で、分けたドメインが別のスクリプトの目印を
+    // 読めないこと・記録に無いスクリプトを断ること・Strict の辺は宣言した作業ディレクトリからだけ通り標準入力が
+    // 届かないことを測る（`crates/harness-policy-editor/tests/split_strict_e2e.rs`）。Strict の置き場を`C:\`直下に作る。
+    // フィルタはテスト関数名と一致させる（0件マッチは`check_tests_actually_ran`が非0で落とす、BUG-056同型）。
+    (
+        "e2e-policy-editor-split-strict",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "split_strict_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "split_rows_give_each_script_its_own_domain_and_a_strict_row_runs_only_from_its_declared_cwd",
+        ],
+    ),
     // ポリシーエディタのパス2（Tier2aでのドメイン記録）の実機E2E。WFPの出口強制daemonを
     // 起こすため管理者権限と外部への到達性が要る（`crates/harness-policy-editor/tests/
     // record_net_e2e.rs`）。**2本目は対のテスト**で、生ソケットがWFPに落とされることを
     // 確かめる——落とされないなら1本目の「到達できた」は強制の証明にならない。
+    // [決定68] パス2は入口から・生成禁止つきで走るので、子を起こす試験は入口から入口への辺を書く。
     //
     // **`harness_grants::`（#71の4点目）は外す**——付与側が残した状態を撤収側が片付ける順序を持つ対で、
     // `e2e-mock`付きの`harness.exe`も要る（下の`e2e-policy-editor-keeps-harness-grants`の注記）。
@@ -1036,8 +1101,8 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "transport_stdio_e2e_tests",
         ],
     ),
-    // T2の対の片側: **ポリシーエディタのパス2の子は要求受付パイプへ届き、
-    // `unknown_source_domain`で断られる**。`e2e-policy-editor-pass2`へ混ぜないのは
+    // T2の対の片側: **ポリシーエディタのパス2の子は要求受付パイプへ届き、入口のドメインから
+    // `no_matching_edge`で断られる**（決定68。遷移元は入口`workspace-shell`）。`e2e-policy-editor-pass2`へ混ぜないのは
     // `e2e-policy-editor-exec-ace`と同じ理由で、**1要素＝1測定**にするため
     // ——あちらの3本は外部到達性を要するので、所要時間がそちらに引きずられる。
     // フィルタ文字列はテスト関数名と一致していなければならない（0件マッチを
@@ -1055,6 +1120,27 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--test-threads=1",
             "--nocapture",
             "pass2_reaches_the_request_pipe",
+        ],
+    ),
+    // 決定68: パス2を本番と同じ形（入口から・遷移を強制して）で走らせ、断られたファイル操作を Spawn Daemon の
+    // 許可した生成の記録（`spawn-audit.jsonl`）で起こした子のドメインへ振り分けることを、遷移先のドメイン`p6-child`への
+    // 辺つきで測る（`crates/harness-policy-editor/tests/pass2_domains_e2e.rs`）。Daemon が取った子の通し番号と ETW の
+    // 番号の一致の実測・撤収後の AppContainer プロファイルの数・プロセス内の2回目のパス2で後から書いた辺が効くことも
+    // 同じ1本で見る。目印を`C:\harness-e2e\_pass2-domains-marker`に作り、緑なら消す。
+    // フィルタはテスト関数名と一致させる（0件マッチは`check_tests_actually_ran`が非0で落とす、BUG-056同型）。
+    (
+        "e2e-policy-editor-pass2-domains",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "pass2_domains_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "a_pass2_from_the_entry_attributes_each_denial_to_the_domain_that_spawned_it",
         ],
     ),
     (

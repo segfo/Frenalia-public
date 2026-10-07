@@ -40,8 +40,9 @@
 //! 遷移先が呼び出し元より広い権限に届く辺も、入力（引数・作業ディレクトリ）を固定せずに書ける——守る線は子の
 //! ドメインの権限（OSが強制する）である。決定65(6) の暫定（「P5 まで書けない」・`WidensWithoutFixing`）は外した。
 //! 書くと呼び出し元が子を通して何を使えるようになるかは、確認の画面が[`crate::exposure_view`]で見せる。
-//! 書けないのは Strict の印が付いたドメインへ入る辺（入力の固定が要り、このエディタは作業ディレクトリを宣言しない。
-//! 決定66の追記）で、検査の理由をそのまま[`TransitionApproveError::Rejected`]で返す。
+//! 書けないのは Strict の印が付いたドメインへ入る辺（入力の固定が要る。決定66の追記）で、検査の理由をそのまま
+//! [`TransitionApproveError::Rejected`]で返す。ここ（拒否のタブの辺）は引数を固定しない——Strict の辺を書けるのは
+//! 位置の木の`u`→`s`だけである（決定67。`tui::position_split`・`tui::position_strict`）。
 
 use std::path::Path;
 
@@ -411,11 +412,34 @@ pub fn apply_edge_changes(file: &mut PolicyFile, changes: &EdgeChanges<'_>) -> E
 /// （残課題 サンドボックス周辺 #65。`policy_file::load_for_session`のdoc）。
 /// **このエディタが書く辺は固定した遷移にならない**（`cwd`を宣言しない。[`edge_for`]）ので、
 /// 足した辺がそれで落ちることは無い（試験`an_edge_this_editor_writes_survives_the_writable_places_harness_adds`）。
+///
+/// [P5.5] 落ちた辺の遷移先が Strict なら、検査の理由の前に**このエディタで取れる直し方**を1行置く（検査の英文は
+/// 「引数をリテラルに・cwd を宣言せよ」）。直し方は位置の木の`u`→`s`（決定67。P5.10.2 から）か、宣言画面で Strict を
+/// 外すか。拒否のタブの辺（[`edge_for`]）は引数を固定できない。印を見るだけで判定はしない（`B-13`）。
 pub fn check_added(file: &PolicyFile, workspace_root: &Path) -> Result<(), TransitionApproveError> {
     let workspace = workspace_root.to_string_lossy();
     let input = file.transition_graph_input(Some(workspace.as_ref()), &[]);
     let rejected = match transition::check_all(&input) {
-        Ok(rejections) => rejections.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+        Ok(rejections) => rejections
+            .iter()
+            .map(|r| {
+                let into_strict = file
+                    .domain(&r.domain)
+                    .and_then(|d| d.process.transitions.get(r.edge_index))
+                    .filter(|edge| file.domain(&edge.to).is_some_and(|to| to.strict));
+                match into_strict {
+                    Some(edge) => format!(
+                        "遷移先「{}」は Strict です——入る辺は入力（引数・作業ディレクトリ）を固定する必要があり、\
+                         この辺は固定していないので書けません。記録の位置の木（承認待ちの観測のタブ）でその行を\
+                         Space→u（引数を記録どおりに固定）→s（作業ディレクトリを宣言して Strict に）にすると書けます\
+                         （拒否のタブの辺は固定できません）。もう1つの直し方は、宣言画面（F3）の遷移タブで Strict を外す\
+                         ことです（入る辺は普通のモードになります）。\n{r}",
+                        edge.to
+                    ),
+                    None => r.to_string(),
+                }
+            })
+            .collect::<Vec<_>>(),
         Err(e) => vec![e.to_string()],
     };
     if rejected.is_empty() {
@@ -464,6 +488,10 @@ fn remove_edges(domain: &mut PolicyDomain, remove: &[EdgeRef]) -> (Vec<EdgeRef>,
 /// 遷移元のドメイン名と、そこに書かれている辺そのもの（[`RemovalPlan`]の指し方）。
 pub type DomainEdge = (String, TransitionEdge);
 
+/// [P5.5] Strict の印の付け替え1件（ドメイン名, 付けるなら真。決定66の追記）。宣言画面の遷移タブの`s`が予約し、
+/// 取り消しと同じ1回の保存で書く。
+pub type StrictChange = (String, bool);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovalPlan {
     /// 書き込む予定の内容（[`commit_removals`]がそのまま保存する）。
@@ -471,6 +499,13 @@ pub struct RemovalPlan {
     pub removed: Vec<DomainEdge>,
     /// 消そうとしたが`policy.json`に無かった（別の経路で消えていた）。**黙って落とさない**（`B-09`）。
     pub not_found: Vec<DomainEdge>,
+    /// [P5.5] 付け替える Strict の印（`policy.json`に在り、いまの印と違うものだけ）。
+    pub strict: Vec<StrictChange>,
+    /// [P5.5] 付け替えようとしたが`policy.json`に無かったドメイン（別の経路で消えていた）。黙って落とさない（`B-09`）。
+    pub strict_not_found: Vec<String>,
+    /// [P5.5] この確定で広がる遷移と、スキーマ版の上がり。**Strict の印を外すと、入る辺が呼び出し元へ渡す権限が
+    /// 増える**（閉包がその辺を辿るようになる）ので、取り消しだけだった頃と違い、この経路も広がり得る。
+    pub widening: crate::exposure_view::Widening,
 }
 
 /// 取り消しの内容を決める（**何も書かない**）。遷移元が違う辺も**1つの`PolicyFile`**に当てる——保存は
@@ -479,21 +514,85 @@ pub struct RemovalPlan {
 /// 読むのは[`policy_file::load_for_repair`]——**遷移の検査に落ちる宣言も直せるように**するためである
 /// （検査に落ちる辺を取り消せば、書いた後のファイルは検査に通る）。ここでは検査を掛けない。取り消しは
 /// 権限を減らす向きで、取り消した後もまだ検査に落ちるなら[`policy_file::save`]自身が断る。
+///
+/// [P5.5] `strict`（Strict の印の付け替え）も同じ1つの`PolicyFile`に当てる。印を付けて入る辺が検査に落ちる形は
+/// ここでは断らない（[`policy_file::save`]が断る）——画面は予約の時点で[`strict_rejections`]に聞いて理由を言う。
 pub fn plan_removals(
     workspace_root: &Path,
     removals: &[DomainEdge],
+    strict: &[StrictChange],
     now_unix_ms: u64,
 ) -> Result<RemovalPlan, TransitionApproveError> {
-    if removals.is_empty() {
+    if removals.is_empty() && strict.is_empty() {
         return Err(TransitionApproveError::NothingSelected);
     }
     let (mut file, _rejections) = policy_file::load_for_repair(workspace_root)?;
+    let before = file.clone();
     let (removed, not_found) = apply_removals(&mut file, removals, now_unix_ms);
+    let (strict, strict_not_found) = apply_strict(&mut file, strict, now_unix_ms);
+    let widening = crate::exposure_view::widening(&before, &file, workspace_root);
     Ok(RemovalPlan {
         file,
         removed,
         not_found,
+        strict,
+        strict_not_found,
+        widening,
     })
+}
+
+/// [P5.5] Strict の印を付け替える（**入出力なし・検査なし**）。いまの印と同じものは何もしない（書く理由が無い）。
+/// 付け替えたドメインは`provenance.updated_unix_ms`を進める。返すのは（付け替えたもの, `policy.json`に無かった名前）。
+fn apply_strict(
+    file: &mut PolicyFile,
+    changes: &[StrictChange],
+    now_unix_ms: u64,
+) -> (Vec<StrictChange>, Vec<String>) {
+    let mut applied = Vec::new();
+    let mut not_found = Vec::new();
+    for (name, strict) in changes {
+        match file.domains.iter_mut().find(|d| d.name == *name) {
+            Some(domain) if domain.strict != *strict => {
+                domain.strict = *strict;
+                domain.provenance.updated_unix_ms = now_unix_ms;
+                applied.push((name.clone(), *strict));
+            }
+            Some(_) => {}
+            None => not_found.push(name.clone()),
+        }
+    }
+    (applied, not_found)
+}
+
+/// [P5.5] 予約した取り消しと Strict の印の付け替えを当てると、**新しく**遷移の編集時検査に落ちる理由（落ちなければ空）。
+///
+/// 印を付けると、そのドメインへ入る辺に入力の固定（引数はリテラル・作業ディレクトリを宣言・それと固定したファイルを
+/// 呼び出し元が書けない場所）が掛かる（決定66の追記）。このエディタは入力を固定した辺を書かないので、エディタが書いた
+/// 辺が入るドメインには付けられない。比べる相手は「取り消しだけを当てた」宣言——元から落ちている辺の理由を、
+/// 印のせいにしない。判定は判定器（`transition::check_all`）が持つ（`B-13`）。
+pub fn strict_rejections(
+    workspace_root: &Path,
+    removals: &[DomainEdge],
+    strict: &[StrictChange],
+) -> Result<Vec<String>, TransitionApproveError> {
+    let (mut base, _) = policy_file::load_for_repair(workspace_root)?;
+    apply_removals(&mut base, removals, 0);
+    let before = rejections_of(&base, workspace_root);
+    let mut after = base;
+    apply_strict(&mut after, strict, 0);
+    Ok(rejections_of(&after, workspace_root)
+        .into_iter()
+        .filter(|reason| !before.contains(reason))
+        .collect())
+}
+
+/// 遷移の編集時検査に落ちる理由（`policy_file::save`が掛けるのと同じ入力。エディタは宣言の外の書ける場所を知らない）。
+fn rejections_of(file: &PolicyFile, workspace_root: &Path) -> Vec<String> {
+    let workspace = workspace_root.to_string_lossy();
+    match transition::check_all(&file.transition_graph_input(Some(workspace.as_ref()), &[])) {
+        Ok(rejections) => rejections.iter().map(|r| r.to_string()).collect(),
+        Err(e) => vec![e.to_string()],
+    }
 }
 
 /// `removals`の各辺を、その遷移元のドメインから取り除く（**入出力なし・検査なし**）。等しい辺（`==`）が2本
@@ -528,7 +627,7 @@ pub fn commit_removals(
     workspace_root: &Path,
     plan: &RemovalPlan,
 ) -> Result<bool, TransitionApproveError> {
-    if plan.removed.is_empty() {
+    if plan.removed.is_empty() && plan.strict.is_empty() {
         return Ok(false);
     }
     policy_file::save(workspace_root, &plan.file)?;

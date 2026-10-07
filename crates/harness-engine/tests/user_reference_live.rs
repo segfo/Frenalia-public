@@ -194,6 +194,7 @@ async fn the_command_that_reaches_the_tool_carries_the_users_value_verbatim() {
     // 提案も書き写しも1件も無ければ、この往復では何も測れていない（緑にしない）。
     assert!(
         !proposed.is_empty() || !transcriptions.is_empty(),
-        "モデルが run_shell を1度も呼ばず、値を書き写しもしなかった。         指示の出し方かモデルの問題で、走る値を測れていない"
+        "モデルが run_shell を1度も呼ばず、値を書き写しもしなかった。\
+         指示の出し方かモデルの問題で、走る値を測れていない"
     );
 }

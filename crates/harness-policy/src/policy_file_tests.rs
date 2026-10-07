@@ -208,54 +208,21 @@ fn a_hand_written_edge_that_fails_the_checks_is_refused_at_load_time() {
     }
 }
 
-/// ワークスペースは`policy.json`に宣言として現れないが、**呼び出し元が書ける場所**である。
-/// `load`はそれを判定器へ渡している——渡していなければ、この辺は通ってしまう。
-#[test]
-fn the_workspace_root_is_handed_to_the_checker_as_a_caller_writable_place() {
-    let ws = workspace();
-    let script = ws
-        .path()
-        .join("a.py")
-        .to_string_lossy()
-        .replace('\\', "\\\\");
-    let cwd = ws.path().to_string_lossy().replace('\\', "\\\\");
-    write_policy(
-        ws.path(),
-        &format!(
-            r#"{{
-              "schema_version": {POLICY_SCHEMA_VERSION},
-              "domains": [
-                {{
-                  "name": "shell",
-                  "process": {{
-                    "transitions": [
-                      {{
-                        "exe":  {{ "literal": "C:\\python\\python.exe" }},
-                        "argv": {{ "literal": "\"C:\\python\\python.exe\" {script}" }},
-                        "cwd":  "{cwd}",
-                        "to":   "shell"
-                      }}
-                    ]
-                  }}
-                }}
-              ]
-            }}"#
-        ),
-    );
-
-    let err = load(ws.path()).expect_err("a fixed value inside the workspace must not load");
-    match err {
-        PolicyFileError::RejectedTransitions { reason, .. } => assert!(
-            reason.contains("which this domain can write"),
-            "the reason should say the caller can rewrite it: {reason}"
-        ),
-        other => panic!("unexpected error: {other}"),
-    }
+/// `shell`から`sealed`へ、`exe`を引数と作業ディレクトリごと固定した辺を1本書く。`strict`なら`sealed`に
+/// Strict の印を付ける（決定66の追記。固定した値の書込可否＝規則(i)は印の付いたドメインへ入る辺にだけ掛かる——P5.4a）。
+///
+/// 作業ディレクトリは書けない場所（`C:\work`）に置く——P5.4d から作業ディレクトリも規則(i)の候補なので、
+/// ワークスペースに置くとプログラムの置き場を測る対が作業ディレクトリのせいで落ちる。**`write_fixed_edge_in`を
+/// `C:\work`で呼ぶ薄い包みである**（組み立てを2箇所に書かない、`docs/CODE-STRUCTURE-RULES.md`規則5）。
+fn write_fixed_edge(ws: &Path, exe: &str, strict: bool) {
+    write_fixed_edge_in(ws, exe, r"C:\work", strict)
 }
 
-/// ワークスペースの**外**にあるプログラムを、引数と作業ディレクトリごと固定した辺を1本書く。
-fn write_fixed_edge_outside_the_workspace(ws: &Path) {
-    let cwd = ws.to_string_lossy().replace('\\', "\\\\");
+/// [`write_fixed_edge`]の作業ディレクトリを選べる版。
+fn write_fixed_edge_in(ws: &Path, exe: &str, cwd: &str, strict: bool) {
+    let exe = exe.replace('\\', "\\\\");
+    let cwd = cwd.replace('\\', "\\\\");
+    let mark = if strict { r#", "strict": true"# } else { "" };
     write_policy(
         ws,
         &format!(
@@ -267,18 +234,37 @@ fn write_fixed_edge_outside_the_workspace(ws: &Path) {
                   "process": {{
                     "transitions": [
                       {{
-                        "exe":  {{ "literal": "C:\\tools\\gen.exe" }},
-                        "argv": {{ "literal": "\"C:\\tools\\gen.exe\" --check" }},
+                        "exe":  {{ "literal": "{exe}" }},
+                        "argv": {{ "literal": "\"{exe}\" --check" }},
                         "cwd":  "{cwd}",
-                        "to":   "shell"
+                        "to":   "sealed"
                       }}
                     ]
                   }}
-                }}
+                }},
+                {{ "name": "sealed"{mark} }}
               ]
             }}"#
         ),
     );
+}
+
+/// ワークスペースは`policy.json`に宣言として現れないが、**呼び出し元が書ける場所**である。
+/// `load`はそれを判定器へ渡している——渡していなければ、この辺は通ってしまう。
+#[test]
+fn the_workspace_root_is_handed_to_the_checker_as_a_caller_writable_place() {
+    let ws = workspace();
+    let program = ws.path().join("gen.exe").to_string_lossy().into_owned();
+    write_fixed_edge(ws.path(), &program, true);
+
+    let err = load(ws.path()).expect_err("a fixed value inside the workspace must not load");
+    match err {
+        PolicyFileError::RejectedTransitions { reason, .. } => assert!(
+            reason.contains("which this domain can write"),
+            "the reason should say the caller can rewrite it: {reason}"
+        ),
+        other => panic!("unexpected error: {other}"),
+    }
 }
 
 /// [残課題 サンドボックス周辺 #65] **`policy.json`の外で書込を許した場所**
@@ -288,7 +274,7 @@ fn write_fixed_edge_outside_the_workspace(ws: &Path) {
 #[test]
 fn a_fixed_value_under_a_place_made_writable_outside_the_policy_is_rejected() {
     let ws = workspace();
-    write_fixed_edge_outside_the_workspace(ws.path());
+    write_fixed_edge(ws.path(), r"C:\tools\gen.exe", true);
 
     let err = load_for_session(ws.path(), &[r"C:\tools".to_string()])
         .expect_err("a fixed program under a writable place must not load");
@@ -313,11 +299,50 @@ fn a_fixed_value_under_a_place_made_writable_outside_the_policy_is_rejected() {
 #[test]
 fn the_same_fixed_edge_loads_when_no_writable_place_covers_it() {
     let ws = workspace();
-    write_fixed_edge_outside_the_workspace(ws.path());
+    write_fixed_edge(ws.path(), r"C:\tools\gen.exe", true);
 
     load(ws.path()).expect("without places writable outside the policy, the edge is fine");
     load_for_session(ws.path(), &[r"C:\other".to_string()])
         .expect("a writable place elsewhere does not cover C:\\tools\\gen.exe");
+}
+
+/// [P5.4a] もう1つの対: **同じ書ける場所の下の固定した辺でも、遷移先に Strict の印が無ければ読める**
+/// （普通のモード。決定66——入力を固定しないので、固定した値が書き換えられるかを問わない）。ワークスペースの中の
+/// プログラムでも同じ。これが赤なら、規則(i)が印ではなく書き方の形で掛かっている。
+#[test]
+fn a_fixed_edge_into_a_domain_without_the_strict_mark_loads_under_a_writable_place() {
+    let ws = workspace();
+    write_fixed_edge(ws.path(), r"C:\tools\gen.exe", false);
+    load_for_session(ws.path(), &[r"C:\tools".to_string()])
+        .expect("an ordinary-mode edge is not judged by where its program lies");
+
+    let program = ws.path().join("gen.exe").to_string_lossy().into_owned();
+    write_fixed_edge(ws.path(), &program, false);
+    load(ws.path()).expect("an ordinary-mode edge may run a program inside the workspace");
+}
+
+/// [P5.4d] **Strict のドメインへ入る辺の作業ディレクトリがワークスペースなら読まない**（決定66の追記の束
+/// 「作業ディレクトリ: 呼び出し元が書ける場所なら断る」）。ワークスペースは`policy.json`に宣言として現れないので、
+/// `load`が判定器へ渡している根で捕まる。
+///
+/// 対: 同じ辺で遷移先の印を外すと読める（普通のモード）。作業ディレクトリが書けない場所なら印があっても読める
+/// （[`the_same_fixed_edge_loads_when_no_writable_place_covers_it`]）。
+#[test]
+fn a_strict_edge_whose_cwd_is_the_workspace_does_not_load() {
+    let ws = workspace();
+    let cwd = ws.path().to_string_lossy().into_owned();
+    write_fixed_edge_in(ws.path(), r"C:\tools\gen.exe", &cwd, true);
+    let err = load(ws.path()).expect_err("a strict edge must not run in a directory the caller can write");
+    match err {
+        PolicyFileError::RejectedTransitions { reason, .. } => assert!(
+            reason.contains("the declared cwd") && reason.contains("which this domain can write"),
+            "the reason should say the caller can write the cwd: {reason}"
+        ),
+        other => panic!("unexpected error: {other}"),
+    }
+
+    write_fixed_edge_in(ws.path(), r"C:\tools\gen.exe", &cwd, false);
+    load(ws.path()).expect("an ordinary-mode edge may run in the workspace");
 }
 
 /// 未来のスキーマ版は**解釈しようとしない**（知らないフィールドを落として書き戻すと、
@@ -757,4 +782,58 @@ fn a_strict_domain_under_schema_version_2_is_refused_by_this_reader() {
 
     write_policy(ws.path(), &text(3));
     assert!(load(ws.path()).expect("version 3 loads").domains[0].strict);
+}
+
+// ---------------------------------------------------------------------------
+// 辺ごとの出力の設定（決定66(4)。`plans/position-domains/P5.md` の P5.4b）
+// ---------------------------------------------------------------------------
+
+/// 子の出力を捨てる辺を1本だけ持つ`policy.json`（自己ループ）。
+fn policy_with_discarding_edge(version: u32) -> String {
+    format!(
+        r#"{{"schema_version":{version},"domains":[{{"name":"shell","process":{{"transitions":[{{"exe":{{"literal":"C:\\x\\git.exe"}},"argv":{{"any":true}},"to":"shell","output":"discard"}}]}}}}]}}"#
+    )
+}
+
+/// 捨てる辺が1本でもあれば版3（Strict の印と同じ版。決定66の追記）。返す辺だけなら2のまま（対）。
+///
+/// 捨てる設定を知らない古いバイナリは欄を黙って捨てるので、**捨てたつもりの子の出力が呼び出し元へ返る**。
+#[test]
+fn a_discarding_edge_requires_schema_version_3_while_returning_edges_stay_at_2() {
+    let mut file = PolicyFile::default();
+    let mut shell = PolicyDomain::new("shell");
+    shell.process = serde_json::from_str(
+        r#"{"transitions":[{"exe":{"literal":"C:\\x\\git.exe"},"argv":{"any":true},"to":"shell"}]}"#,
+    )
+    .unwrap();
+    file.domains.push(shell);
+    assert_eq!(file.required_schema_version(), 2, "returning edges keep version 2");
+
+    file.domains[0].process.transitions[0].output = crate::transition::ChildOutput::Discard;
+    assert_eq!(file.required_schema_version(), 3);
+}
+
+/// 読む側の対（`B-01`）: 手で捨てる辺を書いて版を2のままにしたファイルは、このバイナリが断る。版3は読め、
+/// 保存すると版3を名乗り、版2までしか知らない読み手（[`check_schema_version`]を`supported = 2`で通す）は断る。
+#[test]
+fn a_discarding_edge_needs_version_3_on_both_the_writing_and_the_reading_side() {
+    let ws = workspace();
+    write_policy(ws.path(), &policy_with_discarding_edge(SUPPORTED_BEFORE_THE_STRICT_MARK));
+    let err = load(ws.path()).expect_err("version 2 cannot carry the output setting");
+    assert!(
+        matches!(err, PolicyFileError::UnversionedTransitions { found: 2, required: 3, .. }),
+        "unexpected error: {err}"
+    );
+    assert!(err.to_string().contains("output"), "the message must name the setting: {err}");
+
+    write_policy(ws.path(), &policy_with_discarding_edge(3));
+    let file = load(ws.path()).expect("version 3 loads");
+    save(ws.path(), &file).expect("save");
+    let written: PolicyFile =
+        serde_json::from_str(&std::fs::read_to_string(path(ws.path())).unwrap()).unwrap();
+    assert_eq!(written.schema_version, 3);
+    assert!(matches!(
+        check_schema_version(&written, path(ws.path()), SUPPORTED_BEFORE_THE_STRICT_MARK),
+        Err(PolicyFileError::FutureSchema { found: 3, supported: 2, .. })
+    ));
 }

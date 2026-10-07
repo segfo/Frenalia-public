@@ -128,14 +128,49 @@ fn the_array_is_read_from_a_chatty_reply_and_bad_items_are_dropped() {
     );
 }
 
-/// 同じ文字列は1回だけ。取り出す数にも上限がある。
+/// 同じ文字列は1回だけ。取り出す数にも上限がある（解読する数より1つ多くまで——超えたことを解読の側へ伝えるため）。
 #[test]
 fn duplicates_are_dropped_and_the_count_is_capped() {
-    let line = "x 11111111 y 22222222 y 33333333 y 44444444 y 55555555";
+    let line = "x 11111111 y 22222222 y 22222222 y 33333333 y 44444444 y 55555555 y 66666666";
     let body = r#"[{"after": "y ", "encoding": "hex"}, {"after": "x ", "encoding": "hex"}]"#;
     let spans = extract_spans(body, line);
-    assert_eq!(spans.len(), MAX_SPANS);
+    assert_eq!(spans.len(), MAX_SPANS + 1, "{spans:?}");
     assert_eq!(spans[0].text, "22222222");
+    assert_eq!(spans[1].text, "33333333", "同じ文字列を2回取った");
+}
+
+/// **示された箇所が解読する数より多ければ、止めた印の段が残る**（黙って落とすと、全部解けた行と区別がつかない。
+/// D-126）。目印を1つずつ5つ示した形——目印の数の上限でも切らずに、超えたことを解読の側まで届ける。
+/// 対照: 4つなら印は無い。
+#[test]
+fn more_places_than_are_decoded_leave_a_count_limit_layer() {
+    let line = "p 68656c6c6f q 776f726c64 r 666f6f626172 s 62617a717578 t 4765742D44617465";
+    let body = |landmarks: &[&str]| {
+        let items: Vec<String> = landmarks
+            .iter()
+            .map(|l| format!(r#"{{"after": "{l} ", "encoding": "hex"}}"#))
+            .collect();
+        format!("[{}]", items.join(", "))
+    };
+    let is_marker = |l: &harness_core::DecodedLayer| {
+        matches!(l.outcome, harness_core::DecodeOutcome::CountLimit { .. })
+    };
+
+    let spans = extract_spans(&body(&["p", "q", "r", "s", "t"]), line);
+    assert_eq!(spans.len(), MAX_SPANS + 1, "{spans:?}");
+    let layers = harness_tools::encoded_payload::decode_located(line, &spans);
+    assert_eq!(
+        layers.last().map(|l| &l.outcome),
+        Some(&harness_core::DecodeOutcome::CountLimit {
+            max_layers: MAX_SPANS
+        }),
+        "{layers:?}"
+    );
+
+    let spans = extract_spans(&body(&["p", "q", "r", "s"]), line);
+    assert_eq!(spans.len(), MAX_SPANS);
+    let layers = harness_tools::encoded_payload::decode_located(line, &spans);
+    assert!(!layers.iter().any(is_marker), "{layers:?}");
 }
 
 /// 行は固定の指示（system）ではなく、**区切りで囲んだ材料**として送る。

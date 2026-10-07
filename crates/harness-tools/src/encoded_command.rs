@@ -218,10 +218,17 @@ fn decode_found(found: Vec<Found>) -> Vec<DecodedLayer> {
 }
 
 /// 既に解読した中身`text`の中をさらに読む（`depth`段目から）。LLM が場所を示して解読した中身の2段目以降
-/// （[`crate::encoded_payload`]）。`decoded_bytes`はそれまでに解読した量（上限の勘定を引き継ぐ）。
-pub(crate) fn decode_nested(text: &str, depth: u32, decoded_bytes: usize) -> Vec<DecodedLayer> {
+/// （[`crate::encoded_payload`]）。`decoded_bytes`・`earlier_layers`はそれまでに解読した量と残した段の数
+/// （上限の勘定を引き継ぐ。段の数を引き継がないと、呼び出し側で切るときに止めた印の段まで切り落とす）。
+pub(crate) fn decode_nested(
+    text: &str,
+    depth: u32,
+    decoded_bytes: usize,
+    earlier_layers: usize,
+) -> Vec<DecodedLayer> {
     let mut decoder = Decoder {
         decoded_bytes,
+        earlier_layers,
         ..Decoder::default()
     };
     decoder.walk(scan_text(text), depth);
@@ -233,6 +240,8 @@ pub(crate) fn decode_nested(text: &str, depth: u32, decoded_bytes: usize) -> Vec
 struct Decoder {
     layers: Vec<DecodedLayer>,
     decoded_bytes: usize,
+    /// この解読より前に残した段の数（段の数の上限を合わせて数える）。
+    earlier_layers: usize,
     /// 上限で止めた。これ以降は1段も解読しない（止めたことは最後の段に残っている）。
     stopped: bool,
 }
@@ -254,7 +263,7 @@ impl Decoder {
                 );
                 return;
             }
-            if self.layers.len() >= MAX_DECODED_LAYERS {
+            if self.earlier_layers + self.layers.len() >= MAX_DECODED_LAYERS {
                 self.stop(
                     depth,
                     f.source,

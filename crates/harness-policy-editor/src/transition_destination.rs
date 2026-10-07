@@ -12,15 +12,14 @@
 //! 用意できるかは`policy.json`と承認台帳から決まる（D-112、#30）ので、エディタも書く前に
 //! 「宣言の上では用意されない」ことを言える。ここがその見込みを作る。
 //!
-//! # 判定の材料は`harness.exe`と同じ関数を通す。写しているのは組み立て順だけ
+//! # 判定は`harness.exe`と同じ関数を通す
 //!
 //! - **宣言ごとに許可が付くか**: `policy_grants::GrantContext::domain_grants`——`harness.exe`の
-//!   付与の一覧（`harness-cli`の`startup::policy_fs::plan`）が呼ぶのと**同じ関数・同じ承認台帳**。
-//! - **組み立て順**（通信を宣言している→付かない宣言が1件でもある→宣言が無い）は、`policy_fs::plan`と
-//!   `harness-sandbox`の`domain_provision::capability_sids_for`の**写し**である。`harness-cli`は
-//!   バイナリのクレートでここから呼べない。**ずれたときに外れるのはこの画面の見込みだけ**で、
-//!   実際に起こせるかは`harness.exe`が決め、モデルへ見せる一覧も`harness.exe`が実際に用意した表から
-//!   作る（`transition_tool::facts_from_policy`）。
+//!   付与の一覧（`harness_sandbox::tier2a::policy_fs::plan`）が呼ぶのと**同じ関数・同じ承認台帳**。
+//! - **用意できるか**（通信を宣言している→付かない宣言が1件でもある→用意できる）は
+//!   `harness_sandbox::tier2a::policy_fs::domain_readiness`の1つ（2026-10-07、決定68の前例の(9)。それまではここに
+//!   判定順の写しがあった）。実際に起こせるかは`harness.exe`が決め、モデルへ見せる一覧も`harness.exe`が実際に
+//!   用意した表から作る（`transition_tool::facts_from_policy`）。
 //!
 //! # 見込みが言わないもの（限界）
 //!
@@ -35,6 +34,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use harness_policy::policy_file::{PolicyDomain, PolicyFile};
+use harness_sandbox::tier2a::policy_approval::DeclarationRef;
+use harness_sandbox::tier2a::policy_fs::DomainReadiness;
 use harness_sandbox::tier2a::policy_grants::{DomainGrants, SkipReason, SkippedDeclaration};
 
 /// 遷移先ドメインを`harness.exe`が用意する見込み。
@@ -50,6 +51,9 @@ pub enum Outlook {
         /// 遷移先のファイル宣言の件数。0なら共通の土台（ワークスペース等）だけで用意される。
         /// 1以上なら、`harness.exe`が起動時にそれらへ許可を付けてから用意する。
         declarations: usize,
+        /// [決定69] このマシンで承認済みの通信の宛先の件数。1以上なら、そのドメインには
+        /// 専用の中継プロキシ・`internetClient`・WFPの項目が付く。
+        net_destinations: usize,
     },
     /// 宣言の上で、用意されないことが分かっている。**この遷移は断られ続ける。**
     NotProvisioned(Blocker),
@@ -58,15 +62,12 @@ pub enum Outlook {
 /// 用意されない理由。**`harness.exe`の起動時の警告と同じ分け方**（`domain_provision`の`skipped`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocker {
-    /// 通信を宣言している。**【暫定】**ドメインごとの通信の出口制御（専用プロキシ＋WFPの欄）が
-    /// まだ無いので、`harness.exe`は通信を宣言するドメインを用意しない（`domain_provision`のdoc）。
+    /// [決定69] このマシンで**承認していない通信の宣言**がある。
     ///
-    /// # いつ消えるか
-    ///
-    /// ドメインごとの出口制御が入り、`harness.exe`が通信を宣言するドメインを用意するようになった日
-    /// （`plans/HANDOFF-POLICY-EDITOR.md`の「前提を待つもの」D、`docs/INDEX.md`の未実装機能
-    /// サンドボックス周辺 #55）。**この変種を消すと、文言を組む`match`がコンパイルできなくなる**。
-    DeclaresNetwork { count: usize },
+    /// 通信を宣言していること自体は用意を断る理由ではなくなった（決定65の暫定(b) を P7 で外した）——
+    /// 承認済みの宛先には専用の中継プロキシが付く。承認していない宛先は**出口に入らない**ので、
+    /// その宛先へ出るつもりの子は動かない。ファイルの宣言と同じ扱いで、宣言画面（F3）の`y`で承認する。
+    NetNotApproved { count: usize },
     /// 許可が付かないファイル宣言がある。**1件でもあればドメインごと用意されない**（fail-closed。
     /// 付いた分だけで用意すると、エディタで確かめたより狭い権限で黙って動く。D-112）。
     DeclarationsNotGranted { skipped: Vec<SkippedDeclaration> },
@@ -84,14 +85,24 @@ impl Outlook {
             Outlook::SameDomain => {
                 "呼び出し元と同じドメイン（自己ループ辺は凍結中で書けない）".to_string()
             }
-            Outlook::Provisioned { declarations: 0 } => {
-                "用意される見込み（ファイル宣言なし・共通の土台だけ）".to_string()
-            }
-            Outlook::Provisioned { declarations } => {
+            Outlook::Provisioned {
+                declarations: 0,
+                net_destinations: 0,
+            } => "用意される見込み（ファイル宣言なし・共通の土台だけ）".to_string(),
+            Outlook::Provisioned {
+                declarations,
+                net_destinations: 0,
+            } => {
                 format!("用意される見込み（承認済みのファイル宣言 {declarations}件に許可が付く）")
             }
-            Outlook::NotProvisioned(Blocker::DeclaresNetwork { count }) => {
-                format!("用意されない: 通信を宣言している（{count}件）")
+            Outlook::Provisioned {
+                declarations,
+                net_destinations,
+            } => format!(
+                "用意される見込み（承認済みのファイル宣言 {declarations}件・通信の宛先 {net_destinations}件に専用のプロキシ）"
+            ),
+            Outlook::NotProvisioned(Blocker::NetNotApproved { count }) => {
+                format!("用意される見込み: ただしこのマシンで未承認の通信の宣言 {count}件は出口に入らない")
             }
             Outlook::NotProvisioned(Blocker::DeclarationsNotGranted { skipped }) => {
                 let unapproved = unapproved_count(skipped);
@@ -115,12 +126,25 @@ impl Outlook {
                 "  自己ループ辺は凍結中のため書けません（決定65）。".to_string(),
                 "  Tab で遷移先の欄へ移って、別のドメイン名を入れてから確定してください。".to_string(),
             ],
-            Outlook::Provisioned { declarations: 0 } => vec![
+            Outlook::Provisioned {
+                declarations: 0,
+                net_destinations: 0,
+            } => vec![
                 format!("遷移先 {to_domain} はファイル宣言を持たないので、harness.exe は"),
                 "  共通の土台（ワークスペース・祖先の通り抜け・生成の依頼口）だけでこのドメインを用意します。"
                     .to_string(),
             ],
-            Outlook::Provisioned { declarations } => vec![
+            // [決定69] 通信だけを宣言したドメイン（ファイルの宣言は無い）。
+            Outlook::Provisioned {
+                declarations: 0,
+                net_destinations,
+            } => vec![
+                format!("遷移先 {to_domain} には承認済みの通信の宛先が {net_destinations}件あります。"),
+                "  harness.exe はこのドメインへ専用の中継プロキシを立て、その宛先だけを許します"
+                    .to_string(),
+                "  （ほかの宛先と、プロキシを通らない通信は断られます）。".to_string(),
+            ],
+            Outlook::Provisioned { declarations, .. } => vec![
                 format!(
                     "遷移先 {to_domain} の承認済みのファイル宣言 {declarations}件に、harness.exe が起動時に"
                 ),
@@ -129,11 +153,11 @@ impl Outlook {
                 "  付与に失敗するとそのドメインは用意されず、遷移は断られます（起動時に警告が出ます）。"
                     .to_string(),
             ],
-            Outlook::NotProvisioned(Blocker::DeclaresNetwork { count }) => vec![
-                format!("⚠ 遷移先 {to_domain} は通信を {count}件宣言しています。"),
-                "  ドメインごとの通信の出口制御がまだ無いので、harness.exe はこのドメインを用意せず、"
+            Outlook::NotProvisioned(Blocker::NetNotApproved { count }) => vec![
+                format!("⚠ 遷移先 {to_domain} の通信の宣言 {count}件が、このマシンで未承認です。"),
+                "  このドメインは用意されますが、未承認の宛先は中継プロキシの許可に入りません"
                     .to_string(),
-                "  この遷移は断られ続けます（書くことはできます。通信の宣言を外せば用意されます）。"
+                "  （その宛先へ出ようとする子は断られます）。宣言画面（F3）の y で承認すると入ります。"
                     .to_string(),
             ],
             Outlook::NotProvisioned(Blocker::DeclarationsNotGranted { skipped }) => {
@@ -183,37 +207,40 @@ fn unapproved_count(skipped: &[SkippedDeclaration]) -> usize {
 
 /// 遷移先`to_domain`を`harness.exe`が用意する見込み。
 ///
-/// `grants`はドメインの宣言から付ける一覧を作る関数で、製品では[`grants_on_this_machine`]を渡す
-/// （試験では承認台帳を介さずに渡せるよう、引数で受ける）。
+/// `checks`は承認の照合とファイルの一覧の作り方で、製品では[`MachineChecks`]を渡す
+/// （試験では承認台帳を介さずに渡せるよう、[`DomainChecks`]を引数で受ける）。
 ///
 /// **`policy.json`に無い名前は「宣言が空のドメイン」として答える**——確定すると
 /// [`crate::transition_approve::plan`]が宣言の無いドメインとして作るからである。
-pub fn outlook(
-    file: &PolicyFile,
-    from_domain: &str,
-    to_domain: &str,
-    grants: &dyn Fn(&PolicyDomain) -> DomainGrants,
-) -> Outlook {
+pub fn outlook(file: &PolicyFile, from_domain: &str, to_domain: &str, checks: &dyn DomainChecks) -> Outlook {
     if to_domain == from_domain {
         return Outlook::SameDomain;
     }
     let Some(domain) = file.domain(to_domain) else {
-        return Outlook::Provisioned { declarations: 0 };
+        return Outlook::Provisioned {
+            declarations: 0,
+            net_destinations: 0,
+        };
     };
-    // 順序は`policy_fs::plan`と同じ（モジュールdoc）。通信の宣言が先——付与の一覧を作る前に断る。
-    if !domain.net.allow_domains.is_empty() {
-        return Outlook::NotProvisioned(Blocker::DeclaresNetwork {
-            count: domain.net.allow_domains.len(),
-        });
-    }
-    let granted = grants(domain);
-    if !granted.skipped.is_empty() {
-        return Outlook::NotProvisioned(Blocker::DeclarationsNotGranted {
-            skipped: granted.skipped,
-        });
-    }
-    Outlook::Provisioned {
-        declarations: domain.fs.entries().len(),
+    // 判定は`harness.exe`の付与の一覧と同じ関数（`policy_fs::domain_readiness`。決定68の前例の(9)）。ここは写すだけ。
+    match harness_sandbox::tier2a::policy_fs::domain_readiness(
+        domain,
+        &|d| checks.approved(d),
+        |d| checks.grants(d),
+    ) {
+        DomainReadiness::NotGranted { skipped } => {
+            Outlook::NotProvisioned(Blocker::DeclarationsNotGranted { skipped })
+        }
+        // [決定69] 未承認の通信の宣言は**用意を断らない**が、その宛先は出口に入らないので名指しする。
+        DomainReadiness::Ready { net, .. } if !net.skipped.is_empty() => {
+            Outlook::NotProvisioned(Blocker::NetNotApproved {
+                count: net.skipped.len(),
+            })
+        }
+        DomainReadiness::Ready { net, .. } => Outlook::Provisioned {
+            declarations: domain.fs.entries().len(),
+            net_destinations: net.allow_domains.len(),
+        },
     }
 }
 
@@ -221,11 +248,11 @@ pub fn outlook(
 pub fn outlooks(
     file: &PolicyFile,
     from_domain: &str,
-    grants: &dyn Fn(&PolicyDomain) -> DomainGrants,
+    checks: &dyn DomainChecks,
 ) -> BTreeMap<String, Outlook> {
     file.domains
         .iter()
-        .map(|d| (d.name.clone(), outlook(file, from_domain, &d.name, grants)))
+        .map(|d| (d.name.clone(), outlook(file, from_domain, &d.name, checks)))
         .collect()
 }
 
@@ -241,17 +268,71 @@ pub fn provisioned_names(outlooks: &BTreeMap<String, Outlook>) -> BTreeSet<Strin
         .collect()
 }
 
-/// このマシンの承認台帳（D-112）で、ドメインの宣言から付ける一覧を作る。
+/// 用意の見込みを決めるのに要る2つの判定——**このマシンでの承認の照合**と、**ドメインの宣言から
+/// 付けるファイルの一覧**。
 ///
-/// **`harness.exe`と同じ関数・同じ台帳**（`policy_grants`・`approval_store`）を通す。
-/// 台帳は呼ぶたびに1回読む（呼び出し側は表を作り直すときに1回呼ぶこと）。
-pub fn grants_on_this_machine(workspace_root: &Path) -> impl Fn(&PolicyDomain) -> DomainGrants {
-    let approvals = crate::approval_store::approval_store().load();
-    let workspace_key =
-        harness_sandbox::tier2a::policy_approval::approval_workspace_key(workspace_root);
-    let context = harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(workspace_root);
-    move |domain: &PolicyDomain| {
-        context.domain_grants(domain, &|d| approvals.is_approved_for_key(&workspace_key, d))
+/// 2つを1つの引数にまとめてあるのは、`policy_fs::domain_readiness`が両方を要求するからである
+/// （通信の宣言の承認を見るようになった＝決定69(2)）。別々の引数にすると、片方だけ差し替えた
+/// 呼び出しが書けてしまう。
+pub trait DomainChecks {
+    /// この宣言はこのマシンで承認済みか（`harness.exe`と同じ台帳。D-112）。
+    fn approved(&self, declaration: DeclarationRef<'_>) -> bool;
+    /// このドメインの宣言から付けるファイルの一覧（`harness.exe`と同じ関数）。
+    fn grants(&self, domain: &PolicyDomain) -> DomainGrants;
+}
+
+/// 製品の[`DomainChecks`]——このマシンの承認台帳と`policy_grants`を通す。
+///
+/// **台帳は作るときに1回だけ読む**（呼び出し側は表を作り直すときに1回作ること）。
+pub struct MachineChecks {
+    approvals: harness_sandbox::tier2a::policy_approval::PolicyApprovalLedger,
+    workspace_key: String,
+    context: harness_sandbox::tier2a::policy_grants::GrantContext,
+}
+
+impl MachineChecks {
+    pub fn for_workspace(workspace_root: &Path) -> Self {
+        Self {
+            approvals: crate::approval_store::approval_store().load(),
+            workspace_key: harness_sandbox::tier2a::policy_approval::approval_workspace_key(
+                workspace_root,
+            ),
+            context: harness_sandbox::tier2a::policy_grants::GrantContext::for_workspace(
+                workspace_root,
+            ),
+        }
+    }
+}
+
+impl DomainChecks for MachineChecks {
+    fn approved(&self, declaration: DeclarationRef<'_>) -> bool {
+        self.approvals
+            .is_approved_for_key(&self.workspace_key, declaration)
+    }
+
+    fn grants(&self, domain: &PolicyDomain) -> DomainGrants {
+        self.context
+            .domain_grants(domain, &|d| self.approved(d))
+    }
+}
+
+/// 試験が2つの判定を関数で渡すための[`DomainChecks`]。**製品では使わない**（製品は[`MachineChecks`]）。
+pub struct FnChecks<A, G> {
+    pub approved: A,
+    pub grants: G,
+}
+
+impl<A, G> DomainChecks for FnChecks<A, G>
+where
+    A: Fn(DeclarationRef<'_>) -> bool,
+    G: Fn(&PolicyDomain) -> DomainGrants,
+{
+    fn approved(&self, declaration: DeclarationRef<'_>) -> bool {
+        (self.approved)(declaration)
+    }
+
+    fn grants(&self, domain: &PolicyDomain) -> DomainGrants {
+        (self.grants)(domain)
     }
 }
 

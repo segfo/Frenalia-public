@@ -56,15 +56,24 @@ pub mod client;
 /// windows専用。**Daemon側だけが使う**——harness本体はコンソールを借りない。
 #[cfg(windows)]
 pub mod console_holder;
-/// 固定辺の起動直前に、固定したファイルを呼び出し元が書き換えられないかを
+/// Strict の辺の起こす直前に、固定したファイルを呼び出し元が書き換えられないかを
 /// 呼び出し元のトークンでOSに聞く（`plans/DESIGN-MAC.md` §19.1）。
 #[cfg(windows)]
 pub(crate) mod fixed_inputs;
 /// 入れ子の子へ渡す入力（環境変数・要求受付パイプの名前）を組む関数。`server`から移した（P5.1）。
 #[cfg(windows)]
 mod nested_inputs;
+/// 子プロセスを作れるかの姿勢（[`ChildProcessPolicy`]）と、このプロセスが選んだ姿勢の宣言・読み口。
+/// `mod.rs`の本体が上限に達したのでそのまま移した（P6.4 の準備）。Win32を呼ばないのでwindows専用にしない。
+mod child_process_policy;
+pub use child_process_policy::{
+    child_process_policy_for_this_process, declare_child_process_policy, ChildProcessPolicy,
+};
 #[cfg(windows)]
 pub mod server;
+/// [決定68] Daemon が許可して起こした生成の記録（`spawn-audit.jsonl`）の書き手。
+#[cfg(windows)]
+mod spawn_audit;
 #[cfg(windows)]
 pub use client::{SharedSpawnDaemon, SpawnDaemonHandle, SpawnedChild, TopLevelSpawn};
 
@@ -140,7 +149,21 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// 古いDaemonのバイナリはこの欄を読まないので、**Daemonの遷移の検査だけがその場所を
 /// 「書けない」と見る**——固定した遷移の先を呼び出し元が書き換えられても通してしまう向きで、
 /// 検査が黙って緩くなるので版の一致で止める。
-pub const PROTOCOL_VERSION: u32 = 8;
+/// **9へ上げたのは P5.4b（決定66(3)(4)）である。** `Hello`が運ぶ`policy.json`の辺に**子の出力の設定**
+/// （`"output": "discard"`）が載るようになり、Daemonが子へ渡す標準入出力の決め方も変わった。古いDaemonは
+/// 欄を捨てて**捨てたつもりの出力を返し**、普通の辺の標準入力も断ったままになる——黙って意味が変わるので止める。
+/// **10へ上げたのは P5.4c（決定66(5)と追記）である。** ここだけは**電文の形が1バイトも変わっていない**——
+/// 変わったのは Daemon が同じ`policy.json`から組む環境変数の意味で、Strict の辺が
+/// 「harness の基準の値＋辺の差分」になった。版9の古い Daemon は同じ宣言を読んで**呼び出し元の環境変数を
+/// Strict の子へ渡す**ので、固定した操作の中身を呼び出し元が環境変数で選べる（黙って緩くなる向き）。
+/// **`harness-spawnd.exe`はテストのビルドで作り直されない**ので、版9の個体は実在し得る。
+/// **11へ上げたのは P5.4d である**（電文の形は不変）。Strict の辺の作業ディレクトリも起こす直前に検査するようになり、版10の Daemon は黙って通す。
+/// **12へ上げたのは P6.4（決定68）である。** `Hello`に記録の名前（`spawn_audit_record`）が載った。版11の Daemon は欄を捨て、許可した生成の記録を黙って書かない。
+/// **13へ上げたのは P7.5（決定69）である。** `Hello`の表（[`DomainSpec`]）に**遷移先のドメインの中継プロキシの宛先**
+/// （[`DomainSpec::proxy_env`]）が載った。版12の Daemon はこの欄を読まないので、**入れ子の子へ呼び出し元の
+/// プロキシの宛先をそのまま渡す**——別のドメインの出口を使える形（宛先を絞ったつもりで絞れていない）になり、
+/// 出口を持たないドメインの子も呼び出し元のプロキシへ出られる。黙って緩くなる向きなので版の一致で止める。
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// 相手が名乗った制御プロトコルの版を判定する。合わなければ理由の文面を返す。
 ///
@@ -209,8 +232,8 @@ pub struct DomainSpec {
     /// # 誰が何を入れるか
     ///
     /// 由来は経路ごとに違う（`plans/DESIGN-MAC-PROTOCOL.md` §12.1の表）。
-    /// `run_shell`は固定名（`harness_policy::policy_file::ENTRY_DOMAIN`）、
-    /// ポリシーエディタのパス2は記録中のドメイン名、MCPは宣言idである。
+    /// `run_shell`とポリシーエディタのパス2は入口の固定名（`harness_policy::policy_file::ENTRY_DOMAIN`。
+    /// パス2は決定68から常に入口で始める）、MCPは宣言idである。
     ///
     /// **`Option`にしない。** 既定を持たせると、4つ目の経路を足す人が選ばずに通れてしまい、
     /// **その経路だけが黙って別ドメイン扱いになる**（`DomainIdentitySpec`と同じ姿勢）。
@@ -221,6 +244,20 @@ pub struct DomainSpec {
     pub capability_sids: Vec<String>,
     /// 子のDACLに載せる宛先（上記）。
     pub identity: DomainIdentitySpec,
+    /// [決定69 の前例の(6)] **このドメインの中継プロキシの宛先**（`HTTP_PROXY`等の名前と値）。
+    ///
+    /// 空＝このドメインは出口を持たない。**そのときは入れ子の子から中継プロキシの名前を消す**
+    /// （呼び出し元の宛先を引き継がせない。`nested_inputs::force_domain_proxy`）。
+    ///
+    /// # なぜ表で運ぶのか
+    ///
+    /// 宛先はセッションごとに変わる（loopbackの空きポート）ので`policy.json`には書けない。
+    /// capability SIDと同じく**harnessが起動時に決めてHelloで渡す**ものである。名前の一覧は
+    /// `harness_core::is_proxy_env_name`が持つ（組む側＝`harness_tools::net_proxy::proxy_env_vars`と同じ）。
+    ///
+    /// **トップレベルの子には使わない**——あちらの環境はharnessが自分で組む（`win_appcontainer::spawn`）。
+    #[serde(default)]
+    pub proxy_env: Vec<(String, String)>,
 }
 
 /// Spawn Daemonがsuspended状態の子へ行うRedirector注入。
@@ -334,6 +371,9 @@ pub struct TransitionPolicy {
     /// **宣言と一緒に運ぶ。** 別々に渡すと、宣言だけ届いて表が届かない瞬間ができ、
     /// その窓の間に来た遷移だけが「用意されていない」として断られる。
     pub domains: Vec<DomainSpec>,
+    /// [決定68] 許可した生成の記録を書く**記録のディレクトリの名前**（パスの1要素）。`None`なら書かない
+    /// （`harness.exe`。量の上限と回転を決めていないので暫定。`ControlRequest::Hello::spawn_audit_record`のdoc）。
+    pub spawn_audit_record: Option<String>,
 }
 
 impl TransitionPolicy {
@@ -350,6 +390,8 @@ impl TransitionPolicy {
             // 宣言が無ければ遷移先も無い。**空は「用意できなかった」と同じ扱い**で、
             // Daemonは別ドメインへの遷移を断る（fail-closed）。
             domains: Vec::new(),
+            // 記録を頼まない（テストと、記録の無い呼び出しの出発点）。
+            spawn_audit_record: None,
         }
     }
 }
@@ -425,6 +467,12 @@ pub enum ControlRequest {
         /// 黙って空として受け付けると、その緩さが症状を出さずに成立する
         /// （[`RedirectorSpec::Cow`]の`diff_layer_capability_sid`と同じ姿勢）。
         writable_outside_policy: Vec<String>,
+        /// [決定68] 許可した生成の記録を書く**記録のディレクトリの名前**（`.harness/sandbox/`の下の1要素）。
+        ///
+        /// **パスではなく名前を運ぶ。** Daemon が`workspace_root`から置き場を組み立て、区切りや`.`で始まる名前を断り、
+        /// 在るファイルにしか追記しない（`spawnd::spawn_audit`。拒否の待ち行列が`workspace_root`から導くのと同じ作法、§10.2）。
+        /// `None`は「書かない」（`harness.exe`。暫定——決定68の前例の(4)）。**追加は必ず末尾へ**（`wire_tests`）。
+        spawn_audit_record: Option<String>,
     },
     /// トップレベルのプロセスを起こす（§12「harnessもSpawn Daemon経由でspawnを依頼する」）。
     ///
@@ -455,163 +503,6 @@ pub enum ControlRequest {
     FlushTransitionQueue,
     /// 畳んで終了する。**送らなくてもよい**——制御パイプが閉じれば同じ経路を通る。
     Shutdown,
-}
-
-/// 子プロセス自身が、さらに子プロセスを作れるか（設計書`plans/DESIGN-MAC-ENFORCEMENT.md`§7）。
-///
-/// # これは何を指定するものか
-///
-/// `CreateProcessW`へ渡す属性リストの1項目
-/// （`PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY`）である。`Restricted`で起こした
-/// プロセスは、**どんな方法でも子プロセスを作れなくなる**——`CreateProcessW`のフックを
-/// 迂回して`NtCreateUserProcess`を直接呼んでも、カーネルが`STATUS_CHILD_PROCESS_BLOCKED`で
-/// 拒否する（2026-08-13に6経路すべてで実測、`plans/mac-spike/RESULTS.md`§S1）。
-/// **起動の瞬間に1回決まり、後から付けることも外すこともできない。**
-///
-/// # 「どの子なら許すか」はここに入らない
-///
-/// この属性が持つのは「作れない」の1ビットだけで、許可の情報を1つも運ばない。
-/// 代わりに起こすのはSpawn Daemonで、Redirector DLLはサンドボックスの中の
-/// `CreateProcessW`呼び出しを**Daemonへの頼み方へ変換する**だけである（許可証ではない）。
-/// 何を許すかを判定するのは遷移ポリシーの評価で、**段階6b（2026-09-12）でDaemonがそれを
-/// 呼ぶようになった**——宣言した辺に一致する要求は実際に起こり、一致しないものは
-/// [`DenyReason::Transition`]で断られる。
-///
-/// # なぜ製品の既定が`Unrestricted`のままなのか（**理由が2回入れ替わった**）
-///
-/// **もう「判定が無いから」でも「フックが頼まないから」でもない。** 6bで判定が入り、
-/// **6f-2（2026-09-17）でフックがDaemonへの依頼へ変換するようになった**
-/// ——生成禁止を積んだ子の`CreateProcessW`は、いま実際に窓口を通って起きる。
-///
-/// **6f-3（2026-09-18）で、拒否がモデルへ届くようになった**——`run_shell`が、そのコマンドの
-/// 間に断られた遷移を出力末尾へ注記し、`can_run_program`の存在を教える（§19.3.8）。
-///
-/// **決め事はもう残っていない**（2026-09-18に残課題#50が決着した）。生成禁止を積む構成では、
-/// Tier2aシェルの候補から**アプリの仕組みを通る綴り**（ストアの実行エイリアス・MSIXの実体）を
-/// 外してWindows PowerShell 5.1へ落とす——どちらも遷移先にできないと測ってある
-/// （`plans/mac-spike/RESULTS.md` §S62）。切り替えは[`Self::PRODUCT_DEFAULT`]を読むので、
-/// **姿勢を変えた日に一緒に動く。**
-///
-/// 残っているのは**書くこと**である——既定の遷移宣言一式と、カーネル拒否の購読者
-/// （§10.2が「⑤を既定へ入れる回」と定めている）。
-///
-/// いま`Restricted`を選べるのは受入テストだけである。
-/// **この2択は「機構を作るか」ではなく「既定へ入れるか」の軸である**
-/// （`docs/guide/11a-mac-enforcement-map.md`§2）。
-///
-/// # 電文には載らない
-///
-/// Daemon1本につき1つで、要求ごとには切り替えられない（`server::serve`の引数として
-/// 起動時に決まる）。理由は[`SpawnTopLevelRequest`]の末尾のコメントにある
-/// ——**落とせる形の欄を置くと、いつか落とされる**。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChildProcessPolicy {
-    /// 子プロセスを作れる（**今日の製品の既定**）。
-    Unrestricted,
-    /// OSが子プロセス生成そのものを拒否する（段階⑤）。
-    Restricted,
-}
-
-/// このホストプロセスが選んだ姿勢（[`declare_child_process_policy`]が1回だけ書く）。
-static DECLARED_CHILD_PROCESS_POLICY: std::sync::OnceLock<ChildProcessPolicy> =
-    std::sync::OnceLock::new();
-
-/// **このプロセスの姿勢を宣言する**（最初の宣言が勝ち、勝ったときだけ`true`）。
-///
-/// # なぜプロセス単位なのか（2026-09-18、⑤'の前半）
-///
-/// 姿勢を読む場所が**2種類の時点**に分かれているためである。
-///
-/// | いつ読むか | 誰が | 何に使うか |
-/// |---|---|---|
-/// | **preflightの中**（セッションの準備） | [`crate::tier2a::win_appcontainer::shell_candidates`] | シェルの候補から「遷移先にできない綴り」を外すか（残課題#50・§S62） |
-/// | preflightの後 | Daemonを起こす2つのホスト | Daemonへ渡す姿勢 |
-///
-/// 前者へ引数で届けるには`preflight`の引数を増やすことになり、**呼び出しは68箇所**ある。
-/// したがって「このプロセスは何を選んだか」を1回だけ書いて、両方が同じものを読む形にする。
-///
-/// # 書いてよいのは製品の起動経路1箇所だけである
-///
-/// `OnceLock`はプロセス単位なので、**テストが書くと同じテストバイナリ内の他のテストへ漏れる**
-/// （`B-27`。同じ理由で`SELECTED_SHELL`のdocも書くのを禁じている）。
-/// テストは今までどおり**Daemonを起こすAPIへ姿勢を明示して渡す**こと——
-/// あちらは既定値を持たない形になっている。
-/// 宣言が1箇所であることは`launch.rs`の数え上げテストが固定している。
-pub fn declare_child_process_policy(policy: ChildProcessPolicy) -> bool {
-    DECLARED_CHILD_PROCESS_POLICY.set(policy).is_ok()
-}
-
-/// このプロセスが選んだ姿勢。**宣言が無ければ[`ChildProcessPolicy::PRODUCT_DEFAULT`]**。
-///
-/// **落ち先が既定値なのは、意味のある既定だからである**——宣言しないホスト
-/// （ポリシーエディタ・テスト・サブコマンド）は本当に生成禁止を積まない。
-/// 「選ばせずに黙って決める」形ではない。
-pub fn child_process_policy_for_this_process() -> ChildProcessPolicy {
-    DECLARED_CHILD_PROCESS_POLICY
-        .get()
-        .copied()
-        .unwrap_or(ChildProcessPolicy::PRODUCT_DEFAULT)
-}
-
-impl ChildProcessPolicy {
-    /// **製品が選んでいる姿勢。⑤を既定へ入れる回に、この1行だけを変える。**
-    ///
-    /// # なぜ定数にしたのか（2026-09-18、残課題#50の測定の後）
-    ///
-    /// **この値を読む場所が、Daemonを起こす2つのホスト以外にも増えたためである。**
-    /// 3つ目は**Tier2aのシェルの選び方**で、生成禁止を積むなら
-    /// 「呼び出し元の中から起こせる綴り」しか選べない
-    /// （[`win_appcontainer::shell_candidates`]。ストアの実行エイリアスとMSIXの実体は
-    /// どちらも起こせないことを実測した——`plans/mac-spike/RESULTS.md` §S62）。
-    ///
-    /// 綴りを3箇所に散らすと、**片方だけ直したときに「生成禁止は積んだのに、
-    /// シェルは遷移先にできない綴りのまま」**という状態が作れてしまう。
-    /// そのときサンドボックスの中のプログラムはシェルを1本も起こせない。
-    ///
-    /// # 変えた日に何が赤くなるか
-    ///
-    /// **綴りを`ChildProcessPolicy::Restricted`にすると、`launch.rs`の数え上げテストが
-    /// 火を噴く**（この定数が素のままであることを固定している）。
-    /// それが「既定へ入れる決定をした」印であり、畳み方はそのテストのdocが持つ。
-    pub const PRODUCT_DEFAULT: Self = ChildProcessPolicy::Unrestricted;
-
-    /// 生成禁止を積むか。
-    ///
-    /// **`== ChildProcessPolicy::Restricted`と書かないためにある。** 製品コードが
-    /// その綴りを使うのは「**姿勢を選んだ**とき」だけに保ちたい——
-    /// `launch.rs`の数え上げテストがその綴りの出現を0件で固定しており、
-    /// 比較のために書いた行まで「選んだ」と数えられてしまうからである。
-    /// **`Self::`で書くことで、選択と比較の綴りが分かれる。**
-    pub fn is_restricted(self) -> bool {
-        match self {
-            Self::Restricted => true,
-            Self::Unrestricted => false,
-        }
-    }
-
-    /// `harness-spawnd.exe`のコマンドライン引数へ書くときの綴り。
-    ///
-    /// **読む側（[`ChildProcessPolicy::from_arg`]）と対でここに置く。** 綴りを別々の
-    /// ファイルに書くと、片方だけ直したときに**Daemonが起動を断るのではなく、
-    /// 黙って違う姿勢で立ち上がる**形になり得る（`B-05`）。
-    pub fn as_arg(self) -> &'static str {
-        match self {
-            Self::Unrestricted => "unrestricted",
-            Self::Restricted => "restricted",
-        }
-    }
-
-    /// [`ChildProcessPolicy::as_arg`]の逆。**知らない綴りは`None`**で、呼び出し側は起動を断る。
-    ///
-    /// **既定へ倒さない。** 「読めなかったら`Unrestricted`」にすると、綴りを間違えた日に
-    /// 生成禁止が黙って外れる——強制が外れたことは症状として現れないので、誰も気付けない。
-    pub fn from_arg(arg: &str) -> Option<Self> {
-        match arg {
-            "unrestricted" => Some(Self::Unrestricted),
-            "restricted" => Some(Self::Restricted),
-            _ => None,
-        }
-    }
 }
 
 /// 起こす子プログラムがコンソールを必要とするか（設計書§7.1の実測表）。
@@ -733,13 +624,12 @@ pub enum ControlResponse {
 ///
 /// # ただし**渡してよい辺かどうかは別の話**である（BUG-161、2026-09-20）
 ///
-/// 増えないのは**呼び出し元の**権限で、**子の**側は増える——狭いドメインへ移したはずの子へ、
-/// 呼び出し元が自分の持ち物を手渡せる。§19.1は固定辺（広げる／完全に固定した辺）について
-/// **stdinと継承ハンドル全体を断つ**ことを要求しており、判定器が辺ごとに
-/// `harness_policy::transition::Allowed::inherit_handles`で答えを出している。
+/// 増えないのは**呼び出し元の**権限で、**子の**側は増える——遷移先の子へ呼び出し元が自分の持ち物を手渡せる。
+/// 判定器が辺ごとに答える（P5.4b）: 標準入力は Strict の辺で断ち（`Allowed::strict`。固定argvのシェルは
+/// stdinからコマンドを読む）、標準出力・標準エラーは辺の出力の設定（`Allowed::output`）に従う。
 ///
-/// **この欄を読むのは`server::serve_spawn_request`ただ1箇所である。** 断つと決めた辺では、
-/// ここに何が載っていても`CallerHandles::default()`に差し替えてから`spawn_nested`へ渡す。
+/// **この欄を読むのは`server::serve_spawn_request`ただ1箇所である。** 渡さないと決めたものは、ここに何が
+/// 載っていても`nested_inputs::caller_handles_for`で`None`に差し替えてから`spawn_nested`へ渡す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct CallerHandles {
     /// 子の標準入力にしたいハンドル（**呼び出し元の中の値**）。`None`なら標準入力を持たない。
@@ -955,13 +845,13 @@ pub enum DenyReason {
     /// **待ち行列を読んでも理由は出てこない。** 2026-09-19の測定（`plans/mac-spike/RESULTS.md`
     /// §S67）はここを取り違えて、待ち行列に理由が在るつもりで1往復を失った。
     SpawnFailed,
-    /// **固定辺は許可だったが、固定したファイルを呼び出し元が書き換えられる**
+    /// **Strict の辺（P5.4a）は許可だったが、固定したファイルか作業ディレクトリ（P5.4d）を呼び出し元が書き換えられる**
     /// （`plans/DESIGN-MAC.md` §19.1）。起こす直前に、呼び出し元のトークンで実体の
     /// アクセス制御リストを評価して分かった（[`fixed_inputs`]）。判定できなかったときもこれで断る。
     ///
     /// # 宣言を直しても通らない
     ///
-    /// 辺そのものは宣言どおりである。直し方は、固定したプログラムを呼び出し元が書けない場所へ
+    /// 辺そのものは宣言どおりである。直し方は、固定したプログラム・作業ディレクトリを呼び出し元が書けない場所へ
     /// 移すか、その場所への書込許可を外すことで、**`policy.json`の側ではない**
     /// （[`transitions::Remedy::FixTheEnvironment`]）。
     ///
@@ -984,7 +874,7 @@ impl DenyReason {
             DenyReason::MalformedRequest => "malformed request",
             DenyReason::SpawnFailed => "the transition was allowed but the process could not be started",
             DenyReason::FixedInputWritable => {
-                "the transition fixes a file that the caller can modify (or that could not be verified)"
+                "the transition fixes a file or working directory that the caller can modify (or that could not be verified)"
             }
         }
     }

@@ -224,7 +224,7 @@ impl GrantContext {
             let declaration = crate::tier2a::policy_approval::DeclarationRef {
                 domain: &domain.name,
                 value,
-                access,
+                key: harness_policy::generalize::SettingsKey::from_access(access),
             };
             if !approved(declaration) {
                 skip(&mut out, SkipReason::NotApprovedOnThisMachine);

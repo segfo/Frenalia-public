@@ -71,6 +71,51 @@ pub fn open_inheritable(path: Option<&str>) -> Stdout {
     }
 }
 
+/// [P5.4b] **子の標準入力にするファイル**を、読み取り用に継承可で開く（入れ物は[`Stdout`]を使い回す——
+/// 持つのはハンドルと開けなかった理由だけで、向きの違いは開き方にしか無い）。`None`なら何も開かない。
+///
+/// 標準入力が子へ届いたかは「子が何を読んだか」でしか分からないので、呼び出し側は目印を書いたファイルを渡し、
+/// 子にそれを標準出力へ写させて確かめる（`harness-sandbox`の`spawnd_e2e_tests`の P5.4b の腕）。
+#[cfg(windows)]
+pub fn open_inheritable_for_read(path: Option<&str>) -> Stdout {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::GENERIC_READ;
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let Some(path) = path else {
+        return Stdout::default();
+    };
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: true.into(),
+    };
+    match unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            Some(&sa as *const _),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    } {
+        Ok(handle) => Stdout {
+            handle: Some(handle),
+            open_error: None,
+        },
+        Err(e) => Stdout {
+            handle: None,
+            open_error: Some(format!("CreateFileW({path}, read): {e}")),
+        },
+    }
+}
+
 #[cfg(windows)]
 impl Stdout {
     /// 子側の端を閉じる。**閉じないと、子が終わってもファイルが掴まれたままになる。**

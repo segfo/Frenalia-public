@@ -69,19 +69,30 @@ pub struct NetAuditEntry {
     /// **ポリシー判定の結果ではなく、なぜ通信が成立しなかったかの診断情報**を載せる。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// [決定69 の前例の(7)] **この行を書いたプロキシが持ち主のドメインの名前**（`policy.json`の
+    /// `domains[].name`）。`None`はセッションの中継プロキシ＝入口のドメインである。
+    ///
+    /// 読む側（ポリシーエディタ）は、この印でパス2の通信の候補をドメインへ振り分ける。
+    /// **行ごとに持つ**——1つの`net-audit.jsonl`へ複数のプロキシが追記するので、ファイル単位では分けられない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 #[derive(Debug, Default)]
 pub struct NetAuditLog {
     entries: Mutex<Vec<NetAuditEntry>>,
     jsonl_path: Option<PathBuf>,
+    /// [決定69] この監査を書くプロキシの持ち主のドメイン（`None`＝セッションの中継プロキシ＝入口）。
+    domain: Option<String>,
 }
 
 impl NetAuditLog {
-    fn new(jsonl_path: Option<PathBuf>) -> Self {
+    /// 持ち主のドメインの印を持つ監査（`None`＝セッションの中継プロキシ＝入口のドメイン）。
+    fn new_for_domain(jsonl_path: Option<PathBuf>, domain: Option<String>) -> Self {
         Self {
             entries: Mutex::new(Vec::new()),
             jsonl_path,
+            domain,
         }
     }
 
@@ -130,6 +141,7 @@ impl NetAuditLog {
             connect_host: None,
             alpn: None,
             detail: None,
+            domain: self.domain.clone(),
         });
     }
 
@@ -158,6 +170,7 @@ impl NetAuditLog {
             connect_host: None,
             alpn: None,
             detail: Some(format!("{:?}: {error}", error.kind())),
+            domain: self.domain.clone(),
         });
     }
 
@@ -185,6 +198,7 @@ impl NetAuditLog {
             connect_host,
             alpn,
             detail: None,
+            domain: self.domain.clone(),
         });
     }
 
@@ -271,6 +285,9 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 /// `proxy_addr`があれば`ALL_PROXY`/`all_proxy`（`socks5h://`、SOCKS5 remote DNSが主経路）と
 /// `HTTP_PROXY`/`HTTPS_PROXY`/`http_proxy`/`https_proxy`（`http://`、既存CLI互換）を返す。
 /// `fake_dns_addr`があれば`HARNESS_FAKE_DNS_ADDR`（診断用）を加える。どちらも無ければ空。
+/// **名前の一覧は`harness_core`が持つ**（`SOCKS_PROXY_ENV_NAMES`・`HTTP_PROXY_ENV_NAMES`・
+/// `FAKE_DNS_ENV_NAME`）。Spawn Daemonが遷移先のドメインの値へ差し替えるとき（決定69 の前例の(6)）に
+/// 同じ一覧を読むので、ここに綴りを書かない（`B-05`）。
 pub fn proxy_env_vars(
     proxy_addr: Option<SocketAddr>,
     fake_dns_addr: Option<SocketAddr>,
@@ -279,15 +296,15 @@ pub fn proxy_env_vars(
     if let Some(addr) = proxy_addr {
         let http_proxy_url = format!("http://{addr}");
         let socks_proxy_url = format!("socks5h://{addr}");
-        for key in ["ALL_PROXY", "all_proxy"] {
+        for key in harness_core::SOCKS_PROXY_ENV_NAMES {
             env.push((key.to_string(), socks_proxy_url.clone()));
         }
-        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+        for key in harness_core::HTTP_PROXY_ENV_NAMES {
             env.push((key.to_string(), http_proxy_url.clone()));
         }
     }
     if let Some(addr) = fake_dns_addr {
-        env.push(("HARNESS_FAKE_DNS_ADDR".to_string(), addr.to_string()));
+        env.push((harness_core::FAKE_DNS_ENV_NAME.to_string(), addr.to_string()));
     }
     env
 }
@@ -357,12 +374,28 @@ pub async fn spawn_local_proxy_with_policy(
     config: &NetProxyConfig,
     policy: DomainPolicy,
 ) -> std::io::Result<Option<LocalProxy>> {
+    spawn_local_proxy_for_domain(config, policy, None).await
+}
+
+/// [決定69] **持ち主のドメインの印を付ける版**（ドメインごとの中継プロキシ。`domain_egress`が呼ぶ）。
+///
+/// `domain`が`Some`なら、このプロキシが書く監査の行に`domain`が載る（前例の(7)）——1つの
+/// `net-audit.jsonl`へ入口とドメインのプロキシが追記するので、**行ごとに持ち主が分かる**必要がある。
+/// `None`はセッションの中継プロキシ（入口のドメイン）で、印を付けない（古い記録と同じ形のまま）。
+pub async fn spawn_local_proxy_for_domain(
+    config: &NetProxyConfig,
+    policy: DomainPolicy,
+    domain: Option<String>,
+) -> std::io::Result<Option<LocalProxy>> {
     if !config.domain_policy_enabled {
         return Ok(None);
     }
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
-    let audit = Arc::new(NetAuditLog::new(config.audit_log_path.clone()));
+    let audit = Arc::new(NetAuditLog::new_for_domain(
+        config.audit_log_path.clone(),
+        domain,
+    ));
     let policy = Arc::new(policy);
     let tunnel_handler: Arc<dyn TunnelHandler> = match config.tls_inspection {
         harness_core::TlsInspection::Sni => Arc::new(SniTunnelHandler::default()),
@@ -1492,7 +1525,7 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let audit = Arc::new(NetAuditLog::new(None));
+        let audit = Arc::new(NetAuditLog::new_for_domain(None, None));
         let policy = Arc::new(DomainPolicy::new(vec!["localhost".to_string()]));
         let invoked = Arc::new(AtomicUsize::new(0));
         let handler: Arc<dyn TunnelHandler> = Arc::new(FlagHandler(invoked.clone()));

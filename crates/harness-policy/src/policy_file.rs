@@ -87,9 +87,11 @@ pub const ENTRY_DOMAIN: &str = "workspace-shell";
 /// **3へ上げたのは P5.3**（ドメインの Strict の印＝[`PolicyDomain::strict`]を足した回。決定66の追記）。
 /// 印を知らないバイナリは欄を黙って捨てるので、Strict のつもりのドメインが**入力を固定しない普通のモード**で
 /// 効いてしまう。印を持つファイルだけが3を名乗る（[`PolicyFile::required_schema_version`]）。
+/// **P5.4b の辺ごとの出力の設定（`"output": "discard"`）も同じ版3に入れた**——設定を知らないバイナリは欄を捨てて、
+/// 捨てたつもりの子の出力を呼び出し元へ返す（同じ「黙って無視して読む」穴）。
 pub const POLICY_SCHEMA_VERSION: u32 = 3;
 
-/// 遷移の宣言（`process`）を持ち、Strict の印を1つも持たないファイルが名乗る版。
+/// 遷移の宣言（`process`）を持ち、Strict の印も出力を捨てる辺も1つも持たないファイルが名乗る版。
 const SCHEMA_VERSION_WITH_TRANSITIONS: u32 = 2;
 
 /// `process`を1件も持たないファイルが名乗る版。
@@ -124,11 +126,11 @@ pub enum PolicyFileError {
         path: PathBuf,
         source: std::io::Error,
     },
-    /// 版が内容に追いついていない。**遷移の宣言（版2）と Strict の印（版3）の両方がここへ来る**——
-    /// どちらも「それを知らない古いバイナリが黙って無視して読む」という同じ穴なので、変種を分けない。
+    /// 版が内容に追いついていない。**遷移の宣言（版2）と Strict の印・出力を捨てる辺（版3）がここへ来る**——
+    /// どれも「それを知らない古いバイナリが黙って無視して読む」という同じ穴なので、変種を分けない。
     #[error(
         "policy.json のスキーマ版が {found} なのに、版 {required} が要る内容（遷移の宣言 process、\
-         またはドメインの strict の印）が入っています（{path}）。この形のファイルは、それを知らない\
+         ドメインの strict の印、または辺の output の設定）が入っています（{path}）。この形のファイルは、それを知らない\
          古い harness が**黙って無視して**読みます。schema_version を {required} にしてください"
     )]
     UnversionedTransitions {
@@ -474,9 +476,11 @@ impl PolicyFile {
     /// **版の正本は内容そのもの**にしてある——[`save`]はこの値を書くので、
     /// ファイルの中の`schema_version`と中身が食い違う状態を作れない（`B-13`: 正本を2つ持たない）。
     ///
-    /// Strict の印（[`PolicyDomain::strict`]）が1つでもあれば3、遷移だけなら2、どちらも無ければ1。
+    /// Strict の印（[`PolicyDomain::strict`]）か、子の出力を捨てる辺（[`transition::ChildOutput::Discard`]。P5.4b）が
+    /// 1つでもあれば3、遷移だけなら2、どちらも無ければ1。
     pub fn required_schema_version(&self) -> u32 {
-        if self.domains.iter().any(|d| d.strict) {
+        let discards = |d: &PolicyDomain| d.process.transitions.iter().any(|e| !e.output.is_return());
+        if self.domains.iter().any(|d| d.strict || discards(d)) {
             POLICY_SCHEMA_VERSION
         } else if self.domains.iter().any(|d| !d.process.is_empty()) {
             SCHEMA_VERSION_WITH_TRANSITIONS

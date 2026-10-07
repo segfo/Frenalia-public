@@ -63,7 +63,7 @@ fn approve(ws: &Path, key: SettingsKey, value: &str) {
     let declaration = DeclarationRef {
         domain: "cargo",
         value,
-        access: key.fs_access().expect("fs key"),
+        key,
     };
     let left = crate::approval_store::approval_store().approve(ws, &[declaration]);
     assert!(left.is_empty(), "the test setup could not approve {value}");
@@ -75,7 +75,7 @@ fn approved(ws: &Path, access: FsAccess, value: &str) -> bool {
         DeclarationRef {
             domain: "cargo",
             value,
-            access,
+            key: harness_policy::generalize::SettingsKey::from_access(access),
         },
     )
 }

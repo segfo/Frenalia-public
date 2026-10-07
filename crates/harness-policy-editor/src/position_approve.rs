@@ -14,7 +14,8 @@
 //! 1件でも書けなければ何も書かない（`crate::approve`・`crate::transition_approve`と同じ判断）。**広がる辺は書ける**
 //! （決定66。守る線は子のドメインの権限）——決定65(6) の暫定「広がる辺が1本でもあれば全体を断る」は P5.3 で外した。
 //! 代わりに確認の明細に「広がる遷移」と、呼び出し元が子を通して使えるようになる権限を出す（[`PositionPlan::widening`]）。
-//! いま書けない辺を作るのは Strict の印（入る辺に入力の固定が要り、このエディタは作業ディレクトリを宣言しない）などで、
+//! いま書けない辺を作るのは Strict の印（入る辺は引数のリテラルと作業ディレクトリを固定し、それらを呼び出し元が書けない
+//! 場所に置く。決定67で位置の木の`s`がその形の辺と印を書くようになった）や相対パスの引数（作業ディレクトリが要る）などで、
 //! それが1本でもあれば全体を断る。
 //!
 //! # 判定は写さない（`B-13`）
@@ -102,13 +103,16 @@ pub struct EdgeWrite {
     /// 遷移元の自己ループ辺（リテラルの exe が同じもの）を取り除いてから足す
     /// （`harness_policy::position_domains::PositionSource::ReplacesSelfLoop`）。
     pub replaces_self_loop: bool,
+    /// 遷移先のドメインに Strict の印を付ける（決定67。位置の木の`s`の行）。辺は引数のリテラルと作業ディレクトリを
+    /// 持つ形で来る——満たさなければ書いた後の検査（規則(e)(i)）が全体を断る。
+    pub strict: bool,
 }
 
 /// 1回の確定の要求。
 pub struct PositionRequest<'a> {
     pub workspace_root: &'a Path,
     pub require_sandbox: RequireSandbox,
-    /// 記録したコマンド・作業ディレクトリ・記録セッション（ファイルの宣言を書く各ドメインの由来に残す）。
+    /// 記録したコマンド・作業ディレクトリ（入口のドメインにだけ残す。決定68 の前例の(12)）・記録セッション（書く各ドメインの由来）。
     pub command: Option<&'a str>,
     pub cwd: Option<&'a Path>,
     pub record_session: Option<&'a str>,
@@ -159,6 +163,8 @@ pub struct PositionPlan {
     pub unapprove_not_found: Vec<UnapproveTarget>,
     /// `policy.json`に無かったので宣言の無いドメインとして作るもの（名前の順）。
     pub created_domains: Vec<String>,
+    /// Strict の印を付けるドメイン（名前の順。決定67）。
+    pub strict_marked: Vec<String>,
     /// この確定で広がる遷移（足す辺と、ファイルの宣言の承認・取り消しで渡す権限が増える既存の辺。決定66）。
     /// [`confirmation_lines`]が[`crate::exposure_view::lines`]で並べる。
     pub widening: crate::exposure_view::Widening,
@@ -172,20 +178,22 @@ impl PositionPlan {
             && self.self_loops_replaced.is_empty()
             && self.edges_removed.is_empty()
             && self.unapproved.is_empty()
+            && self.strict_marked.is_empty()
     }
 
-    /// 保存の後に承認台帳へ記録するファイルの宣言（受理した値をドメインごとに。通信の宣言は台帳の対象外）。
+    /// 保存の後に承認台帳へ記録する宣言（受理した値をドメインごとに。**通信も対象**＝決定69(2)）。
     pub fn declarations(&self) -> Vec<DeclarationRef<'_>> {
         self.fs
             .iter()
             .flat_map(|d| {
-                d.accepted.iter().filter_map(move |a| {
-                    a.key.fs_access().map(|access| DeclarationRef {
+                d.accepted
+                    .iter()
+                    // [決定69(2)] 通信の宣言も台帳へ記録する（`approve::accepted_declarations`と同じ）。
+                    .map(move |a| DeclarationRef {
                         domain: &d.domain,
                         value: &a.value,
-                        access,
+                        key: a.key,
                     })
-                })
             })
             .collect()
     }
@@ -376,6 +384,18 @@ pub fn plan(req: &PositionRequest<'_>) -> Result<PositionPlan, PositionApproveEr
         }
         created_domains.extend(report.created_domains);
     }
+    // (6b) Strict の印（決定67。位置の木の`s`）。遷移先のドメインは辺を足したときに作られるので、その後で付ける。
+    // 印の付いたドメインへ入る辺の検査（規則(e)(i)）は (9) の1回の検査が掛ける。
+    let mut strict_marked: Vec<String> = Vec::new();
+    for write in req.edges.iter().filter(|w| w.strict) {
+        if let Some(domain) = file.domains.iter_mut().find(|d| d.name == write.edge.to) {
+            if !domain.strict {
+                domain.strict = true;
+                strict_marked.push(domain.name.clone());
+            }
+        }
+    }
+    strict_marked.sort();
 
     // (7) ファイルの宣言をドメインごとに。**届く辺の無いドメインには書かない**——入口のドメイン・元からあるドメイン・
     // この確定の後に辺の遷移先になっているドメインだけ。
@@ -394,12 +414,13 @@ pub fn plan(req: &PositionRequest<'_>) -> Result<PositionPlan, PositionApproveEr
                 domain: domain.to_string(),
             });
         }
+        // [決定68 の前例の(12)] `commands`・`cwd`はここでは書かない（入口のドメインへだけ、下の(7b)で書く）。
         let report = file.merge_approved(
             &checked.accepted,
             &ApprovalContext {
                 domain,
-                command: req.command,
-                cwd: req.cwd,
+                command: None,
+                cwd: None,
                 record_session: req.record_session,
                 now_unix_ms: req.now_unix_ms,
             },
@@ -428,6 +449,22 @@ pub fn plan(req: &PositionRequest<'_>) -> Result<PositionPlan, PositionApproveEr
                 })
                 .collect(),
         });
+    }
+
+    // (7b) [決定68 の前例の(12)] 記録したコマンドと作業ディレクトリは**入口のドメインにだけ**由来として書く（パス2は常に
+    // 入口から始め、`record-net`はコマンドを省くと入口の`commands`を使う）。入口が確定の後に在るとき（宣言か辺で）だけで、
+    // **入口を`commands`のためだけに作らない**。提案は渡さないので、増えるのは`commands`・`cwd`・由来の記録だけ。
+    if file.domain(ENTRY_DOMAIN).is_some() {
+        file.merge_approved(
+            &[],
+            &ApprovalContext {
+                domain: ENTRY_DOMAIN,
+                command: req.command,
+                cwd: req.cwd,
+                record_session: req.record_session,
+                now_unix_ms: req.now_unix_ms,
+            },
+        );
     }
 
     // (8) 宣言の取り消し（承認の後——逆順だと、今回外したものを承認が書き戻しうる。`tui::edit_commit`と同じ順）。
@@ -482,6 +519,7 @@ pub fn plan(req: &PositionRequest<'_>) -> Result<PositionPlan, PositionApproveEr
         unapproved,
         unapprove_not_found,
         created_domains,
+        strict_marked,
     })
 }
 
@@ -508,7 +546,7 @@ pub fn commit(
     let revoked: Vec<DeclarationRef<'_>> = plan
         .unapproved
         .iter()
-        .filter_map(UnapproveTarget::declaration)
+        .map(UnapproveTarget::declaration)
         .collect();
     let left = if revoked.is_empty() {
         Vec::new()
@@ -654,6 +692,15 @@ pub fn confirmation_lines(
             plan.created_domains.join(", ")
         ));
     }
+    if !plan.strict_marked.is_empty() {
+        lines.push(String::new());
+        lines.push(format!(
+            "Strict の印を付けるドメイン {}個（入る辺は引数・作業ディレクトリを固定し、標準入力を断ち、環境変数は harness の\
+             基準の値から始めます——決定66の追記）: {}",
+            plan.strict_marked.len(),
+            plan.strict_marked.join(", ")
+        ));
+    }
     if !plan.self_loops_replaced.is_empty() {
         lines.push(String::new());
         lines.push(format!(
@@ -688,6 +735,10 @@ pub fn confirmation_lines(
             // **書く直前に、その綴りが起こせないことを言う**（取り消しの効かない操作の直前）。
             if let Some(note) = Startable::of(matcher_text(&edge.exe)).note() {
                 lines.push(format!("      ⚠ {note}"));
+            }
+            // [P5.10.2] 作業ディレクトリを宣言した辺は、呼び出し元がその場所から呼ばないと断られる（決定67(4)）。
+            if let Some(cwd) = &edge.cwd {
+                lines.push(format!("      {}", cwd_notice(cwd)));
             }
         }
     }
@@ -744,13 +795,26 @@ pub fn confirmation_lines(
     lines
 }
 
+/// 作業ディレクトリを宣言した辺の注意（確認の明細。決定67(4)・`plans/DESIGN-MAC-ENFORCEMENT.md` §8.3）。
+pub(crate) fn cwd_notice(cwd: &str) -> String {
+    format!(
+        "作業ディレクトリ {cwd} を宣言します——呼び出し元はこの場所へ移ってから呼ぶ必要があります\
+         （違う場所からの呼び出しは cwd_mismatch で断られます）"
+    )
+}
+
 /// 辺1本の綴り（`<exe> <引数> → <遷移先>`）。
 fn edge_label(edge: &TransitionEdge) -> String {
     let argv = match &edge.argv {
         ArgvMatcher::Any(_) => harness_policy::transition_listing::ANY_ARGV,
         ArgvMatcher::Literal(value) | ArgvMatcher::Pattern(value) => value.as_str(),
     };
-    format!("{} {argv} → {}", matcher_text(&edge.exe), edge.to)
+    format!(
+        "{} {argv} → {}{}",
+        matcher_text(&edge.exe),
+        edge.to,
+        crate::exposure_view::output_suffix(edge.output)
+    )
 }
 
 fn matcher_text(exe: &ExeMatcher) -> &str {
@@ -784,7 +848,7 @@ fn distinct<'a>(names: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
 fn describe(declarations: &[DeclarationRef<'_>]) -> String {
     declarations
         .iter()
-        .map(|d| format!("{} ({}) in {}", d.value, d.access.settings_key(), d.domain))
+        .map(|d| format!("{} ({}) in {}", d.value, d.key_label(), d.domain))
         .collect::<Vec<_>>()
         .join(", ")
 }

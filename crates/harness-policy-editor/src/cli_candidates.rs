@@ -9,12 +9,13 @@
 //! 候補は画面（承認待ちの FS/ネットのタブ）と同じ`position_candidates::load`で作るので、同じ記録の`fs-N`が画面と
 //! 同じ候補を指す。`show`は各行に書く先のドメインを添え、`approve`は候補ごとのドメインへファイルの宣言だけを書く
 //! （辺は書かない。辺が要る候補と`--domain`は断る——`position_approve::cli_plan`）。位置の情報は windows 専用の
-//! 部品から読むので、非windowsでは今までの1つの一覧のまま。
+//! 部品から読むので、非windowsでは今までの1つの一覧のまま。許可した生成の記録（`spawn-audit.jsonl`）を持つパス2の記録も
+//! 同じ入口で拒否を起こしたドメインごとに分かれ、`show`・`approve`の扱いは同じ（P6.6。決定68の前例の(1)）。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use super::{confirm_write, resolve_limit, resolve_require_sandbox, resolve_workspace};
+use super::{confirm_write, resolve_limit, resolve_require_sandbox, resolve_workspace, Consent};
 
 pub(super) fn run_show(
     session: Option<&str>,
@@ -85,7 +86,14 @@ pub(super) fn run_show(
         if net {
             return ExitCode::SUCCESS;
         }
-        let fs = harness_policy_editor::aggregate::from_session(&dir, &manifest);
+        // ファイルの候補は画面・`approve`と同じ入口で作る（P6.6: 許可した生成の記録があれば拒否を起こしたドメインごと。
+        // 番号が`approve --accept fs-N`と同じになる）。
+        let candidates = harness_policy_editor::position_candidates::load(
+            &dir,
+            &manifest,
+            &workspace_root,
+            &harness_policy::position_domains::SplitPositions::new(),
+        );
         // **収集器が起きなかったときこそ出す。** 「観測していません」と「拒否は0件でした」は
         // 別の事実で、区別できなければfail-openは単なる隠蔽になる（D-43）。
         // `collector_started`で囲むと、起きなかったときだけ何も出ない正反対の挙動になる
@@ -93,7 +101,7 @@ pub(super) fn run_show(
         print!(
             "{}",
             harness_policy_editor::record_net::render_fs_denials(
-                &fs,
+                &candidates.fs,
                 manifest.collector_started,
                 manifest.etw_available,
                 manifest.net_mode(),
@@ -103,12 +111,15 @@ pub(super) fn run_show(
         // FS候補は観測だけから作られるものではない——実行前診断が名指しした実行ファイルは
         // 収集器がまったく起きなくても候補になる（`aggregate`のモジュールdoc）。囲んだままだと
         // **起動できなかった当のexeが、いちばん知りたい場面でだけ画面から消える**。
-        // 何も観測できていないことは`render_notes`が別に言う（D-43）。
-        print!("{}", harness_policy_editor::aggregate::render(&fs, limit));
+        // 何も観測できていないことは`render_notes`が別に言う（D-43）。1つの一覧の記録は今までの`aggregate::render`と同じ綴り。
+        print!(
+            "{}",
+            harness_policy_editor::position_candidates::render(&candidates, limit)
+        );
         if tree {
             print!(
                 "{}",
-                harness_policy_editor::aggregate::render_process_tree(&fs)
+                harness_policy_editor::aggregate::render_process_tree(&candidates.fs)
             );
         }
         return ExitCode::SUCCESS;
@@ -123,8 +134,13 @@ pub(super) fn run_show(
     // 位置の情報がある記録は候補をドメインごとに作る（画面と同じ入口・同じ番号。P4.5）。
     #[cfg(windows)]
     {
-        let candidates =
-            harness_policy_editor::position_candidates::load(&dir, &manifest, &workspace_root);
+        let candidates = harness_policy_editor::position_candidates::load(
+            &dir,
+            &manifest,
+            &workspace_root,
+            // CLI は位置を分けない（辺を書かないので分けた位置を作れない。決定67の検問2）。
+            &harness_policy::position_domains::SplitPositions::new(),
+        );
         print!(
             "{}",
             harness_policy_editor::position_candidates::render(&candidates, limit)
@@ -162,7 +178,7 @@ pub(super) fn run_approve(
     domain: Option<&str>,
     accept: &[String],
     require_sandbox: Option<&str>,
-    yes: bool,
+    consent: Consent,
 ) -> ExitCode {
     use harness_policy_editor::approve::{self, ApproveRequest, PathClass};
     use harness_policy_editor::session_dir;
@@ -197,8 +213,13 @@ pub(super) fn run_approve(
     // 書く別の経路（P4.5）。
     #[cfg(windows)]
     let proposals = {
-        let candidates =
-            harness_policy_editor::position_candidates::load(&dir, &manifest, &workspace_root);
+        let candidates = harness_policy_editor::position_candidates::load(
+            &dir,
+            &manifest,
+            &workspace_root,
+            // CLI は位置を分けない（辺を書かないので分けた位置を作れない。決定67の検問2）。
+            &harness_policy::position_domains::SplitPositions::new(),
+        );
         if candidates.by_position() {
             return approve_by_position(
                 &workspace_root,
@@ -207,7 +228,7 @@ pub(super) fn run_approve(
                 domain,
                 &accept_ids,
                 require_sandbox,
-                yes,
+                consent,
             );
         }
         candidates.proposals
@@ -215,10 +236,10 @@ pub(super) fn run_approve(
     #[cfg(not(windows))]
     let proposals = harness_policy_editor::aggregate::from_session(&dir, &manifest).proposals();
 
-    // ドメイン名の既定はコマンドの先頭トークン（`cargo build` → `cargo`）。
-    let domain = domain.map(|d| d.to_string()).unwrap_or_else(|| {
-        harness_policy_editor::policy_file::default_domain_name(&manifest.command)
-    });
+    // ドメイン名の既定は画面のドメイン欄と同じ（パス2は記録したドメイン、パス1はコマンドの先頭トークン）。
+    let domain = domain
+        .map(|d| d.to_string())
+        .unwrap_or_else(|| manifest.default_approval_domain());
     if domain.is_empty() {
         eprintln!("ドメイン名を決められませんでした。--domain <name> を指定してください。");
         return ExitCode::FAILURE;
@@ -307,7 +328,7 @@ pub(super) fn run_approve(
         return ExitCode::SUCCESS;
     }
 
-    if !confirm_write(yes) {
+    if !confirm_write(consent, &plan.widening) {
         eprintln!("中止しました。何も書いていません。");
         return ExitCode::FAILURE;
     }
@@ -321,9 +342,10 @@ pub(super) fn run_approve(
         "書きました: {}",
         harness_policy_editor::policy_file::path(&workspace_root).display()
     );
+    // [決定68(2)] パス2は`--domain`を取らない（常に入口のドメインから始め、遷移を強制する）。
     println!(
-        "次: harness-policy-editor record-net --domain {domain}\n\
-         （Tier2aで実行し、接続したドメインを記録します。ここで初めてACEが付きます）"
+        "次: harness-policy-editor record-net -- <コマンド>\n\
+         （入口のドメインから遷移を強制してTier2aで実行し、接続したドメインを記録します。ここで初めてACEが付きます）"
     );
     ExitCode::SUCCESS
 }
@@ -339,7 +361,7 @@ fn approve_by_position(
     domain_flag: Option<&str>,
     accept_ids: &[String],
     require_sandbox: harness_core::RequireSandbox,
-    yes: bool,
+    consent: Consent,
 ) -> ExitCode {
     use harness_policy_editor::position_approve;
 
@@ -368,7 +390,7 @@ fn approve_by_position(
         println!("（承認済みの内容に変化はありません。何も書きませんでした）");
         return ExitCode::SUCCESS;
     }
-    if !confirm_write(yes) {
+    if !confirm_write(consent, &plan.widening) {
         eprintln!("中止しました。何も書いていません。");
         return ExitCode::FAILURE;
     }
