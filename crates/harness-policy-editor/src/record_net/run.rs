@@ -138,9 +138,9 @@ pub(super) fn run_pass2<'a>(
     // 相乗りを依頼するのは「netfilterdをこれから起こす」場合だけ（上の表）。
     let ride_learn_on_apply = !request.wfp.is_live();
 
-    // preflightはここで`begin_session`を呼ぶ——**この行より後の全経路が`end_session`を
-    // 通らなければならない**（`teardown`が担当）。
-    state.session_started = true;
+    // preflightはここで`begin_session`を呼ぶ（セッションのプロファイルを作る）。**撤収は実行1回ごとではなく
+    // プロセスの終わりに`SessionGrants`が`end_session`で行う**（`teardown`の末尾のコメント。落ちた場合は次の起動の
+    // `gc_dead_sessions`が回収する）。
     // D-60: **2回目以降の記録では、privhelperを常駐netfilterdから起こす**（UACは出ない）。
     // 1回目はdaemonがまだ居ないので`chain_launch_privhelper`が`Err`を返し、`preflight`が
     // `runas`へ落ちる（UAC 1回）——これが「セッション全体でUAC 1回」の内訳である。

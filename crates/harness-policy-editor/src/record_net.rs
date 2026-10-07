@@ -602,9 +602,6 @@ pub fn record_net(
 /// 撤収が要る資源。**取得した順の逆で畳む。**
 #[derive(Default)]
 struct TeardownState<'a> {
-    /// `preflight`が`begin_session`でセッションプロファイルを作ったか
-    /// （作った以上、`end_session`を通さないとプロファイルとACEが残る）。
-    session_started: bool,
     /// この実行でWFPフィルタを張ったか。真なら撤収で`ClearRules`を送る。
     /// **daemon自体は畳まない**（次の実行で再利用する、D-56）。
     wfp_applied: Option<&'a SharedNetfilter>,
@@ -664,7 +661,6 @@ fn teardown(state: &mut TeardownState<'_>, on_event: &mut dyn FnMut(NetRecordEve
     // 開始時に「もう宣言されていないルート」だけを剥がす。ここで警戒しているコスト
     // （同一プロセスの2回目で付け直す無駄）は起きない——剥がすのは次の実行で要求されない
     // ものだけなので、付け直す対象にならない。
-    state.session_started = false;
 }
 
 /// 伝える価値のある事実を、**その場で見せる**と同時に**マニフェストへも残す**。

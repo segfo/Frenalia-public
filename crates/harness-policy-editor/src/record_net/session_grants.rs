@@ -46,9 +46,9 @@ impl SessionGrants {
         // 差分層しか付けていないセッションで撤収が丸ごと飛ぶ（`end_session`を呼ばずに戻る）。
         // 足し算は`session_profile`側の唯一の場所が持つ（`B-05`: 2箇所で別々に足さない）。
         let total = harness_sandbox::tier2a::session_profile::pending_revocation_count();
-        if total == 0 {
-            return 0;
-        }
+        // [P6.3・決定68 の前例の(14)] **付与が0件でも`end_session`を呼ぶ。** 件数は付与だけを数え、入れ物（セッション・
+        // 遷移先のドメイン・MCP）を数えない。パス2が遷移先を用意すると「付与0件・入れ物あり」が普通に起き、ここで
+        // 戻ると入れ物が次の起動の`gc_dead_sessions`まで残る。撤収済みなら台帳のエントリが無く、対象0件で戻る（冪等）。
         // `end_session`が受けるのは`&dyn Fn`（＝不変借用）なので、進捗コールバックは
         // `RefCell`越しに借りる。**単一スレッドで、同時に2回借りる経路は無い**
         // （`end_session`はこのクロージャを直列に呼ぶだけ）。
@@ -95,9 +95,7 @@ impl Drop for SessionGrants {
         // 差分層しか付けていないセッションで撤収が丸ごと飛ぶ（`end_session`を呼ばずに戻る）。
         // 足し算は`session_profile`側の唯一の場所が持つ（`B-05`: 2箇所で別々に足さない）。
         let total = harness_sandbox::tier2a::session_profile::pending_revocation_count();
-        if total == 0 {
-            return;
-        }
+        // [P6.3] `release`と同じく、付与が0件でも`end_session`を呼ぶ（入れ物だけのセッションを残さない）。
         let done = std::cell::Cell::new(0usize);
         let outcome = harness_sandbox::tier2a::session_profile::end_session(&|path, profile| {
             let leftovers =
@@ -110,21 +108,32 @@ impl Drop for SessionGrants {
             eprintln!("note: {summary}");
         }
         // **撤収したことは1行で必ず言う**（B-01: 付けたのが見えて剥がしたのが見えない状態にしない）。
-        eprintln!(
-            "撤収: AppContainerプロファイルとACE（{}/{total}件）",
-            done.get()
-        );
-        // 台帳に無いパス（＝`record_granted_path`の記録漏れ）があると件数がずれる。
-        // **ずれたら黙らない**（B-09。BUG-057・BUG-059はどちらも「付与したのに記録しなかった」
-        // 欠陥で、記録漏れは撤収漏れに直結する）。
-        if done.get() != total {
-            eprintln!(
-                "警告: 撤収した件数 {} が台帳の {total} 件と一致しません\
-                 （台帳に記録されていない付与があった可能性があります）",
-                done.get()
-            );
+        // 何も撤収しなかったら黙る（文面と件数のずれの警告は`drop_report`が持つ）。
+        for line in drop_report(done.get(), total, outcome.deleted_profiles) {
+            eprintln!("{line}");
         }
     }
+}
+
+/// [P6.3・決定68 の前例の(14)] 保険の`Drop`が出す行。**撤収したもの（剥がした付与・消した入れ物）が何も無ければ空**
+/// ——`release`の後の`Drop`で「撤収しました」が2回出ると、2回撤収したように読める。
+///
+/// 剥がした件数が台帳の件数とずれたら黙らない——台帳に無いパス（＝`record_granted_path`の記録漏れ）があると
+/// 件数がずれる（B-09。BUG-057・BUG-059はどちらも「付与したのに記録しなかった」欠陥で、記録漏れは撤収漏れに直結する）。
+fn drop_report(done: usize, total: usize, deleted_profiles: usize) -> Vec<String> {
+    if done == 0 && total == 0 && deleted_profiles == 0 {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "撤収: AppContainerプロファイル {deleted_profiles}個とACE（{done}/{total}件）"
+    )];
+    if done != total {
+        lines.push(format!(
+            "警告: 撤収した件数 {done} が台帳の {total} 件と一致しません\
+             （台帳に記録されていない付与があった可能性があります）"
+        ));
+    }
+    lines
 }
 
 /// 「このworkspaceが宛先SIDを発行済みのルート」のうち、**今回の宣言がもう要求していない**ものを返す。

@@ -137,3 +137,29 @@ fn every_held_root_is_stale_when_all_declarations_were_unapproved() {
     );
     assert_eq!(stale.len(), 2);
 }
+
+// --- [P6.3・決定68 の前例の(14)] プロファイルだけ作った回の後始末（`drop_report`） ---
+
+/// 撤収したものが何も無ければ黙る——`release`の後の保険の`Drop`で「撤収しました」が2回出ると、2回撤収したように読める。
+#[test]
+fn nothing_is_reported_when_nothing_was_reclaimed() {
+    assert!(drop_report(0, 0, 0).is_empty());
+}
+
+/// **付与が0件でも、入れ物（セッション・遷移先のドメイン）を消したなら言う**。P6 でパス2が遷移先を用意するので、
+/// 「付与0件・入れ物あり」が普通に起きる（以前は件数0で`end_session`ごと飛ばしていた）。
+#[test]
+fn a_reclaimed_profile_is_reported_even_without_grants() {
+    let lines = drop_report(0, 0, 2);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("2個"), "{lines:?}");
+}
+
+/// 剥がした件数が台帳の件数とずれたら、今までどおり黙らない（記録漏れは撤収漏れに直結する。BUG-057・BUG-059）。
+#[test]
+fn a_count_mismatch_is_still_reported() {
+    let lines = drop_report(1, 3, 1);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].contains("1/3"), "{lines:?}");
+    assert!(lines[1].contains("一致しません"), "{lines:?}");
+}
