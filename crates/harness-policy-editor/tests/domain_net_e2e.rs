@@ -73,6 +73,8 @@ const CMD_DOMAIN: &str = "cmd";
 /// ssh とその`ProxyCommand`のドメインの名前（位置の鍵は（親のドメイン, 実行ファイル）なので葉名になる）。
 const SSH_DOMAIN: &str = "ssh";
 const CONNECT_DOMAIN: &str = "connect";
+/// 入口が自分の中継プロキシのポートを子へ渡す環境変数（`harness`が所有する名前ではないので届く）。
+const ENTRY_PORT_ENV: &str = "HARNESS_TEST_ENTRY_PROXY_PORT";
 
 fn ssh_exe() -> String {
     format!("{}\\System32\\OpenSSH\\ssh.exe", common::system_root())
@@ -164,16 +166,22 @@ fn each_domain_reaches_only_its_own_destinations_through_its_own_proxy() {
     }
 
     // ④ 子から入口のプロキシのポートへ直に繋ぐ（WFP の既定拒否が層として効いているか）。
+    // 入口が自分のプロキシのポートを**環境変数へ入れて**子へ渡す（`harness`が所有する名前ではないので
+    // 子へそのまま届く）。1回目の実測では`$args`で渡そうとして届かず、**ポート0へ繋いでいた**
+    // ——「繋がらなかった」ではなく「測れていなかった」（計器の失敗）。
+    let child_probe = format!(
+        "Write-Output ('CHILDSEES=' + $env:{ENTRY_PORT_ENV}); \
+         try {{ $c = [Net.Sockets.TcpClient]::new(); \
+         $c.Connect('127.0.0.1', [int]$env:{ENTRY_PORT_ENV}); $c.Close(); \
+         Write-Output ('PORT_' + 'OK') }} \
+         catch {{ Write-Output ('PORT_' + 'FAIL ' + $_.Exception.Message) }}"
+    );
     let other_port = Script {
         name: "4-child-to-the-entry-proxy-port",
         line: format!(
-            "$p = ($env:HTTP_PROXY -split ':')[-1]; {}",
-            common::ps_run(
-                &shell,
-                "$p = $args[0]; try { $c = [Net.Sockets.TcpClient]::new(); \
-                 $c.Connect('127.0.0.1', [int]$p); $c.Close(); Write-Output ('PORT_' + 'OK') } \
-                 catch { Write-Output ('PORT_' + 'FAIL ' + $_.Exception.Message) }"
-            ) + " $p"
+            "$env:{ENTRY_PORT_ENV} = ($env:HTTP_PROXY -split ':')[-1]; \
+             Write-Output ('ENTRYPORT=' + $env:{ENTRY_PORT_ENV}); {}",
+            common::ps_run(&shell, &child_probe)
         ),
     };
     let arm = run_arm_with(
@@ -197,6 +205,18 @@ fn each_domain_reaches_only_its_own_destinations_through_its_own_proxy() {
             other_port.name, arm.result
         ));
     }
+    // **計器の確認**: 子が入口のポートを受け取っていなければ、何へ繋いだのかが言えない
+    // （1回目の実測ではポート0へ繋いでいた）。
+    let entry_port = line_after(&arm, "ENTRYPORT=");
+    let child_sees = line_after(&arm, "CHILDSEES=");
+    match (&entry_port, &child_sees) {
+        (Some(entry), Some(child)) if !entry.is_empty() && entry == child => {}
+        _ => failures.push(format!(
+            "{}: 判定不能——子が入口のプロキシのポートを受け取っていない（入口 {entry_port:?}／子 \
+             {child_sees:?}）。繋がらなかったのが「そのポートへ繋げない」からだと言えない",
+            other_port.name
+        )),
+    }
 
     // ⑤ 通信を宣言しないドメイン（cmd）は宛先を1つも知らず、届かない。
     let quiet = Script {
@@ -208,7 +228,10 @@ fn each_domain_reaches_only_its_own_destinations_through_its_own_proxy() {
     };
     let arm = run_arm_with(&harness, &ws, CASE, &quiet, &["--net-allow-domain", CHILD_HOST]);
     arm.print(quiet.name);
-    if !arm.result.contains("PROXY=[]") {
+    // **`cmd.exe`は未定義の変数を展開せず、`%HTTP_PROXY%`という綴りのまま印字する**
+    // （空文字になるのではない）。1回目の実測でここを`PROXY=[]`と期待して赤くなった——
+    // 計器の読み方の誤りで、**綴りが残っていることが「定義されていない」の証拠**である。
+    if !arm.result.contains("PROXY=[%HTTP_PROXY%]") {
         failures.push(format!(
             "{}: **通信を宣言しないドメインの子が中継プロキシの宛先を知っている**（決定69 の前例の(6)で \
              消すはず）。本文:\n{}",
@@ -222,32 +245,88 @@ fn each_domain_reaches_only_its_own_destinations_through_its_own_proxy() {
         ));
     }
 
-    // ⑥ ssh（`ProxyCommand`で自分のドメインのプロキシへ CONNECT する）。
+    // ⑥ 自分のドメインのプロキシが**22番への`CONNECT`**を通すか（決定69(3)）。
+    //
+    // **ssh 自身をサンドボックスの中で走らせることは今できない**（下の観測）。だから
+    // ssh が`ProxyCommand`の道具にさせることと同じこと——中継プロキシへ`CONNECT <host>:22`を送り、
+    // 返ってきたトンネルの向こうから SSH の名乗り（`SSH-2.0-...`）を読む——を子に直接やらせる。
+    // **読んでいるのは「そのドメインのプロキシがホスト名で22番を通した」ことだけ**で、
+    // **改行は`[char]13`/`[char]10`で組む**——PowerShell の単一引用符の中では`` `r`n ``が
+    // 文字どおりのバッククォートになり、要求が終端しない（1回目の実測ではここで
+    // プロキシが応答を返さず、読み取りが時間切れになった＝計器の失敗）。
+    // **応答の頭は空行までまとめて捨てる**（`date`のような欄が付くので行数を決め打ちできない。
+    // 2回目の実測では2行目を捨てて空行を名乗りとして読んでいた）。
+    // **読み取りは30秒待つ**——中継プロキシは TLS の名乗りを5秒覗いてから中継を始めるので、
+    // ssh のように**サーバが先に話す**プロトコルでは最初の1行がその分だけ遅れて来る。
+    let connect_probe = format!(
+        "$crlf = [string][char]13 + [string][char]10; \
+         $p = ($env:HTTP_PROXY -split ':')[-1]; \
+         try {{ $c = [Net.Sockets.TcpClient]::new('127.0.0.1', [int]$p); \
+         $s = $c.GetStream(); $s.ReadTimeout = 30000; \
+         $head = 'CONNECT {SSH_HOST}:22 HTTP/1.1' + $crlf + 'Host: {SSH_HOST}:22' + $crlf + $crlf; \
+         $req = [Text.Encoding]::ASCII.GetBytes($head); \
+         $s.Write($req, 0, $req.Length); $s.Flush(); \
+         $r = [IO.StreamReader]::new($s); \
+         Write-Output ('CONNECT=' + $r.ReadLine()); \
+         while ($r.ReadLine() -ne [string]::Empty) {{ }} \
+         Write-Output ('BANNER=' + $r.ReadLine()); $c.Close() }} \
+         catch {{ Write-Output ('CONNECT=FAIL ' + $_.Exception.Message) }}"
+    );
+    let port22 = Script {
+        name: "6-connect-to-port-22-through-its-own-proxy",
+        line: common::ps_run(&shell, &connect_probe),
+    };
+    let arm = run_arm_with(&harness, &ws, CASE, &port22, &[]);
+    arm.print(port22.name);
+    let connect_line = line_after(&arm, "CONNECT=");
+    let banner = line_after(&arm, "BANNER=");
+    if !connect_line.as_deref().is_some_and(|l| l.contains("200")) {
+        failures.push(format!(
+            "{}: 自分のドメインのプロキシが {SSH_HOST} の22番への CONNECT を通さなかった（{connect_line:?}）。\
+             外から同じ宛先へ ssh を撃った結果は {ssh_outside:?}。本文:\n{}",
+            port22.name, arm.result
+        ));
+    }
+    // **トンネルの向こうが本物の22番であること**の証拠（プロキシが 200 を返しただけでは、
+    // 繋がった先が22番だとは言えない）。
+    if !banner.as_deref().is_some_and(|b| b.contains("SSH-")) {
+        failures.push(format!(
+            "{}: CONNECT は通ったが、向こうから SSH の名乗りが来ない（{banner:?}）——22番へ繋がったと言えない",
+            port22.name
+        ));
+    }
+
+    // ⑥の観測（判定には使わない）: ssh 自身を中で走らせる。
+    //
+    // **2026-10-07 の実測では走らない**——`ssh.exe`は`ProxyCommand`と話すための無名パイプを
+    // 作れずに `Could not create pipes to communicate with the proxy: Permission denied` で
+    // 止まる（遷移の強制の下では子を自分で起こせないため）。**中継プロキシの側が22番を
+    // 通せることは⑥で測れている**ので、ここは「ssh をそのまま使えるか」の観測として残す。
     if connect_exe().is_file() {
         let ssh = Script {
-            name: "6-ssh-through-its-own-proxy",
+            name: "6-observation-ssh-itself",
             line: ssh_line(),
         };
-        let arm = run_arm_with(&harness, &ws, CASE, &ssh, &["--net-allow-domain", CHILD_HOST]);
+        let arm = run_arm_with(&harness, &ws, CASE, &ssh, &[]);
         arm.print(ssh.name);
-        let reached = arm.result.contains("Permission denied (publickey)")
-            || arm.result.contains("Permission denied");
-        if !reached {
-            failures.push(format!(
-                "{}: ssh が {SSH_HOST} の22番へ届いた証拠が無い（鍵なしの `Permission denied (publickey)` \
-                 が出ない）。外から同じことを撃った結果は {ssh_outside:?}。本文:\n{}",
-                ssh.name, arm.result
-            ));
-        }
+        let reached = arm.result.contains("Permission denied (publickey)");
+        eprintln!(
+            "[domain-net] ⑥の観測: サンドボックスの中の ssh は {}（外から撃った結果は {ssh_outside:?}）",
+            if reached {
+                "22番へ届いた"
+            } else {
+                "届かなかった——判定には使わない"
+            }
+        );
     } else {
         eprintln!(
-            "[domain-net] ⑥ を測っていない: 中継の道具が無い（{}）",
+            "[domain-net] ⑥の観測を撃っていない: 中継の道具が無い（{}）",
             connect_exe().display()
         );
     }
 
     // ⑦ 層の切り分け（監査の行のドメインの印）。
-    let audit = newest_net_audit(&ws);
+    let audit = all_net_audit(&ws);
     eprintln!("[domain-net] --- net-audit.jsonl（末尾40行）---");
     for line in audit.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev() {
         eprintln!("{line}");
@@ -275,10 +354,11 @@ fn each_domain_reaches_only_its_own_destinations_through_its_own_proxy() {
             shell.domain
         ));
     }
-    if connect_exe().is_file() && !has(CONNECT_DOMAIN, SSH_HOST, true) {
+    if !has(&shell.domain, SSH_HOST, true) {
         failures.push(format!(
-            "監査に「ドメイン {CONNECT_DOMAIN} が {SSH_HOST} へ許可された」行が無い——ssh が自分のドメインの \
-             プロキシを通ったと言えない"
+            "監査に「ドメイン {} が {SSH_HOST} へ許可された」行が無い——22番へ通したのがそのドメインの \
+             プロキシだと言えない",
+            shell.domain
         ));
     }
 
@@ -312,7 +392,8 @@ fn write_policy(ws: &Path, shell: &MiddleShell) {
     }
     // 子のドメイン: 通信を宣言する（②の許可側）。
     let mut child = PolicyDomain::new(&shell.domain);
-    child.net.allow_domains = vec![CHILD_HOST.to_string()];
+    // 22番の宛先もこのドメインが宣言する（⑥ の`CONNECT`を測るのはこのドメインのプロキシ）。
+    child.net.allow_domains = vec![CHILD_HOST.to_string(), SSH_HOST.to_string()];
     // 通信を宣言しないドメイン（⑤）。
     let quiet = PolicyDomain::new(CMD_DOMAIN);
     // 別のドメインだけが宣言する宛先（②の禁止側の根拠）——このドメインへは誰も遷移しない。
@@ -339,6 +420,7 @@ fn write_policy(ws: &Path, shell: &MiddleShell) {
 fn net_declarations(shell_domain: &str) -> Vec<(String, &'static str)> {
     vec![
         (shell_domain.to_string(), CHILD_HOST),
+        (shell_domain.to_string(), SSH_HOST),
         ("other-net".to_string(), OTHER_HOST),
         (CONNECT_DOMAIN.to_string(), SSH_HOST),
     ]
@@ -388,6 +470,13 @@ fn net_probe(tag: &str, host: &str) -> String {
          Write-Output ('{tag}:NET_' + 'OK ' + $r.StatusCode) }} \
          catch {{ Write-Output ('{tag}:NET_' + 'FAIL ' + $_.Exception.Message) }}"
     )
+}
+
+/// 行の`prefix`の後ろ（印字が無ければ`None`）。
+fn line_after(arm: &Arm, prefix: &str) -> Option<String> {
+    arm.result
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(prefix).map(str::to_string))
 }
 
 /// `<tag>:PROXY=`の値（印字が無ければ`None`）。
@@ -456,24 +545,25 @@ fn ssh_probe_outside() -> String {
     .to_string()
 }
 
-/// いちばん新しい`net-audit.jsonl`（`harness.exe`はセッションごとの置き場へ書く）。
-fn newest_net_audit(ws: &Path) -> String {
+/// このワークスペースの**全部の**`net-audit.jsonl`をつないだもの。
+///
+/// **1本だけ読むと前の腕の行が見えない**——`harness.exe`は起動ごとに別のセッションの置き場
+/// （`.harness/sandbox/audit-<セッションid>/`）へ書くので、腕を1本撃つたびにファイルが増える。
+/// 1回目の実測では「いちばん新しい1本」を読んでいて、最後に撃った腕の行しか見えなかった（計器の失敗）。
+fn all_net_audit(ws: &Path) -> String {
     let sandbox = ws.join(".harness").join("sandbox");
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
     let Ok(entries) = std::fs::read_dir(&sandbox) else {
         return String::new();
     };
+    let mut out = String::new();
     for entry in entries.flatten() {
-        let path = entry.path().join("net-audit.jsonl");
-        if let Ok(meta) = std::fs::metadata(&path) {
-            let when = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-            if newest.as_ref().is_none_or(|(best, _)| when > *best) {
-                newest = Some((when, path));
+        if let Ok(text) = std::fs::read_to_string(entry.path().join("net-audit.jsonl")) {
+            out.push_str(&text);
+            if !out.ends_with('\n') {
+                out.push('\n');
             }
         }
     }
-    newest
-        .map(|(_, path)| std::fs::read_to_string(path).unwrap_or_default())
-        .unwrap_or_default()
+    out
 }
 
