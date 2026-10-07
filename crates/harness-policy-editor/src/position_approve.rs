@@ -186,13 +186,15 @@ impl PositionPlan {
         self.fs
             .iter()
             .flat_map(|d| {
-                d.accepted.iter().filter_map(move |a| {
-                    a.key.fs_access().map(|access| DeclarationRef {
+                d.accepted
+                    .iter()
+                    // [P7.7] 通信の候補の承認はまだ台帳へ記録しない（`approve::accepted_declarations`と同じ）。
+                    .filter(|a| a.key != SettingsKey::NetAllowDomains)
+                    .map(move |a| DeclarationRef {
                         domain: &d.domain,
                         value: &a.value,
-                        access,
+                        key: a.key,
                     })
-                })
             })
             .collect()
     }
@@ -545,7 +547,7 @@ pub fn commit(
     let revoked: Vec<DeclarationRef<'_>> = plan
         .unapproved
         .iter()
-        .filter_map(UnapproveTarget::declaration)
+        .map(UnapproveTarget::declaration)
         .collect();
     let left = if revoked.is_empty() {
         Vec::new()
@@ -847,7 +849,7 @@ fn distinct<'a>(names: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
 fn describe(declarations: &[DeclarationRef<'_>]) -> String {
     declarations
         .iter()
-        .map(|d| format!("{} ({}) in {}", d.value, d.access.settings_key(), d.domain))
+        .map(|d| format!("{} ({}) in {}", d.value, d.key_label(), d.domain))
         .collect::<Vec<_>>()
         .join(", ")
 }

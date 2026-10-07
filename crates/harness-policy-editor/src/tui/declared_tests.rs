@@ -50,7 +50,7 @@ fn is_approved(ws: &tempfile::TempDir) -> bool {
         DeclarationRef {
             domain: "cargo",
             value: "C:/Users/x/.cargo/registry/**",
-            access: harness_config::FsAccess::Read,
+            key: harness_policy::generalize::SettingsKey::FsRead,
         },
     )
 }

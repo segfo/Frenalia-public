@@ -17,7 +17,9 @@
 //!
 //! # 1件の鍵
 //!
-//! `(ワークスペース, ドメイン, 種類, 値)`の**完全一致**で照合する。
+//! `(ワークスペース, ドメイン, 種類, 値)`の**完全一致**で照合する。種類は`policy.json`の設定キー
+//! （`fs.read`・`fs.read_write`・`fs.read_exec`・`net.allow_domains`）そのもの
+//! （[`harness_policy::generalize::SettingsKey`]）で、**通信の宣言も鍵を持つ**（決定69(2)）。
 //!
 //! - **ドメインを鍵に入れる**のは、同じパスを別のドメインへ移されたときに承認を引き継がせないため
 //!   （ドメインが違えば、その許可を持つ子が違う）。
@@ -31,13 +33,15 @@
 //!
 //! - **隔離せずに走ったコードは書き換えられる**（Tier0。ポリシーエディタのパス1を含む）。
 //!   ユーザーと同じ権限で動くので、原理的に防げない（D-39の台帳と同じ限界）。
-//! - **ファイル宣言しか見ない。** `policy.json`の遷移の宣言（`process`）と、同梱された
-//!   `settings.json`の`fs.*`は、この台帳の対象外である。
+//! - **ファイルと通信の宣言しか見ない。** `policy.json`の遷移の宣言（`process`）と、同梱された
+//!   `settings.json`の`fs.*`・`net.*`は、この台帳の対象外である（通信の宣言が対象に入ったのは
+//!   決定69(2)。`settings.json`の扱いは作業の一覧の P8）。
 //! - **ワークスペースを移動・改名すると承認は引き継がれない**（鍵がワークスペースのパスのため）。
 
 use std::path::Path;
 
 use harness_grant_ledger::{now_unix_secs, Ledger};
+use harness_policy::generalize::SettingsKey;
 use serde::{Deserialize, Serialize};
 
 const LEDGER_FILE: &str = "policy-approval-ledger.json";
@@ -47,22 +51,30 @@ const LEDGER_LOCK: &str = r"Local\harness-policy-approval-ledger";
 ///
 /// 古い版の承認は「無かったもの」として扱う（`harness_mcp::approval`と同じ理由。ハッシュや
 /// 文字列が偶然一致しても、意味が変わった後の照合で古い承認を通さない）。
-pub const APPROVAL_FORMAT_VERSION: u32 = 1;
+///
+/// **2へ上げたのは決定69(2)である**——鍵の「種類」がファイルの3値（`FsAccess`）から設定キー
+/// （[`SettingsKey`]。通信の`net.allow_domains`を含む）へ広がった。版1の承認は**ファイルの宣言の分も
+/// 含めて**通らないので、1回だけ承認し直すことになる（D-112(g) と同じ扱い。実運用の前なので影響は小さい）。
+pub const APPROVAL_FORMAT_VERSION: u32 = 2;
 
 /// 台帳のペイロード。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyApprovalLedger {
     #[serde(default)]
-    pub approvals: Vec<FsDeclarationApproval>,
+    pub approvals: Vec<DeclarationApproval>,
 }
 
 /// 承認1件。「このワークスペースのこのドメインで、この値にこの種類の許可を付けてよい」の記録。
+///
+/// **2026-10-07に`FsDeclarationApproval`から改名した**（決定69(2)。ファイルの宣言だけでなく通信の宣言も
+/// 載るので、名前が嘘になっていた）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FsDeclarationApproval {
+pub struct DeclarationApproval {
     /// `canonicalize`して`workspace_key`で畳んだワークスペース。
     pub workspace: String,
     pub domain: String,
-    pub access: harness_config::FsAccess,
+    /// 宣言の種類（`policy.json`の設定キー。ファイルの3値と`net.allow_domains`）。
+    pub key: SettingsKey,
     /// `policy.json`に書いてあるとおりの値。
     pub value: String,
     pub approved_at_unix_secs: u64,
@@ -76,7 +88,16 @@ pub struct FsDeclarationApproval {
 pub struct DeclarationRef<'a> {
     pub domain: &'a str,
     pub value: &'a str,
-    pub access: harness_config::FsAccess,
+    /// 宣言の種類。**通信（[`SettingsKey::NetAllowDomains`]）もここへ入る**（決定69(2)）。
+    pub key: SettingsKey,
+}
+
+impl DeclarationRef<'_> {
+    /// 人へ見せる種類の綴り（`fs.read`・`net.allow_domains`等）。**エラーの文面を組む場所で
+    /// 綴りを書かない**ために置く（`B-05`: 同じ対応表を2か所に持たない）。
+    pub fn key_label(&self) -> &'static str {
+        self.key.dotted()
+    }
 }
 
 /// 台帳を引くときのワークスペースの鍵（モジュールdocの「1件の鍵」）。
@@ -87,11 +108,11 @@ pub fn approval_workspace_key(workspace: &Path) -> String {
     crate::tier2a::workspace_capability::workspace_key(&canonical)
 }
 
-impl FsDeclarationApproval {
+impl DeclarationApproval {
     fn matches(&self, workspace_key: &str, declaration: DeclarationRef<'_>) -> bool {
         self.workspace == workspace_key
             && self.domain == declaration.domain
-            && self.access == declaration.access
+            && self.key == declaration.key
             && self.value == declaration.value
             && self.format_version == Some(APPROVAL_FORMAT_VERSION)
     }
@@ -154,13 +175,13 @@ impl PolicyApprovalStore {
                 ledger.approvals.retain(|a| {
                     !(a.workspace == key
                         && a.domain == declaration.domain
-                        && a.access == declaration.access
+                        && a.key == declaration.key
                         && a.value == declaration.value)
                 });
-                ledger.approvals.push(FsDeclarationApproval {
+                ledger.approvals.push(DeclarationApproval {
                     workspace: key.clone(),
                     domain: declaration.domain.to_string(),
-                    access: declaration.access,
+                    key: declaration.key,
                     value: declaration.value.to_string(),
                     approved_at_unix_secs: now,
                     format_version: Some(APPROVAL_FORMAT_VERSION),
@@ -188,10 +209,10 @@ impl PolicyApprovalStore {
         declarations: &[DeclarationRef<'a>],
     ) -> Vec<DeclarationRef<'a>> {
         let key = approval_workspace_key(workspace);
-        let covers = |a: &FsDeclarationApproval, d: &DeclarationRef<'_>| {
+        let covers = |a: &DeclarationApproval, d: &DeclarationRef<'_>| {
             a.workspace == key
                 && a.domain == d.domain
-                && a.access == d.access
+                && a.key == d.key
                 && a.value.eq_ignore_ascii_case(d.value)
         };
         self.ledger.update(|ledger| {

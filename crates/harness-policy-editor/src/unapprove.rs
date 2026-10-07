@@ -58,15 +58,15 @@ pub struct UnapproveTarget {
 }
 
 impl UnapproveTarget {
-    /// 承認台帳（D-112）を引く鍵の形。**ネットワークの宣言は台帳の対象外なので`None`**。
+    /// 承認台帳（D-112）を引く鍵の形。**通信の宣言も鍵を持つ**（決定69(2)。以前は`None`だった）。
     ///
     /// 取り消し・宣言の承認・付け替えの3つが台帳を引くので、変換を1箇所に置く（規則5.0）。
-    pub fn declaration(&self) -> Option<DeclarationRef<'_>> {
-        self.key.fs_access().map(|access| DeclarationRef {
+    pub fn declaration(&self) -> DeclarationRef<'_> {
+        DeclarationRef {
             domain: &self.domain,
             value: &self.value,
-            access,
-        })
+            key: self.key,
+        }
     }
 }
 
@@ -160,17 +160,18 @@ pub fn commit(workspace_root: &Path, plan: &UnapprovePlan) -> Result<bool, Unapp
         return Ok(false);
     }
     policy_file::save(workspace_root, &plan.file)?;
+    // [決定69(2)] 通信の宣言の承認も消す（鍵を持つようになったので、ファイルの分と同じ経路で消える）。
     let declarations: Vec<DeclarationRef<'_>> = plan
         .removed
         .iter()
-        .filter_map(UnapproveTarget::declaration)
+        .map(UnapproveTarget::declaration)
         .collect();
     if !declarations.is_empty() {
         let left = crate::approval_store::approval_store().revoke(workspace_root, &declarations);
         if !left.is_empty() {
             return Err(UnapproveError::ApprovalNotRevoked(
                 left.iter()
-                    .map(|d| format!("{} ({}) in {}", d.value, d.access.settings_key(), d.domain))
+                    .map(|d| format!("{} ({}) in {}", d.value, d.key_label(), d.domain))
                     .collect::<Vec<_>>()
                     .join(", "),
             ));

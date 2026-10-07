@@ -171,7 +171,7 @@ fn approving_on_this_machine_turns_the_outlook_into_provisioned() {
     let declaration = harness_sandbox::tier2a::policy_approval::DeclarationRef {
         domain: "iso",
         value: "C:/approved-for-test/**",
-        access: FsAccess::Read,
+        key: harness_policy::generalize::SettingsKey::FsRead,
     };
     assert!(
         crate::approval_store::approval_store()

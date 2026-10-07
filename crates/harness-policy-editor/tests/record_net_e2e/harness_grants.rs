@@ -107,7 +107,7 @@ fn entry_declaration(value: &str) -> DeclarationRef<'_> {
     DeclarationRef {
         domain: ENTRY_DOMAIN,
         value,
-        access: harness_config::FsAccess::ReadExec,
+        key: harness_policy::generalize::SettingsKey::FsReadExec,
     }
 }
 

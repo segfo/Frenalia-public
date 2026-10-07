@@ -183,9 +183,9 @@ pub fn plan(
             key: reassignment.key,
             value: reassignment.value.clone(),
         };
-        let carries_approval = from.declaration().is_some_and(|declaration| {
-            approvals.is_approved_for_key(&workspace_key, declaration)
-        }) || approved_in_same_commit
+        let carries_approval = approvals
+            .is_approved_for_key(&workspace_key, from.declaration())
+            || approved_in_same_commit
             .iter()
             .any(|approved| same_declaration(approved, &from));
 
@@ -244,7 +244,7 @@ pub fn commit(workspace_root: &Path, plan: &ReassignPlan) -> Result<usize, Reass
         .changes
         .iter()
         .filter(|change| change.carries_approval)
-        .filter_map(|change| change.to.declaration())
+        .map(|change| change.to.declaration())
         .collect();
     let not_recorded = if carried.is_empty() {
         Vec::new()
@@ -256,7 +256,7 @@ pub fn commit(workspace_root: &Path, plan: &ReassignPlan) -> Result<usize, Reass
     let previous: Vec<DeclarationRef<'_>> = plan
         .changes
         .iter()
-        .filter_map(|change| change.from.declaration())
+        .map(|change| change.from.declaration())
         .collect();
     let not_revoked = store.revoke(workspace_root, &previous);
 
@@ -266,7 +266,7 @@ pub fn commit(workspace_root: &Path, plan: &ReassignPlan) -> Result<usize, Reass
     let describe = |declarations: &[DeclarationRef<'_>]| {
         declarations
             .iter()
-            .map(|d| format!("{} ({}) in {}", d.value, d.access.settings_key(), d.domain))
+            .map(|d| format!("{} ({}) in {}", d.value, d.key_label(), d.domain))
             .collect::<Vec<_>>()
             .join(", ")
     };

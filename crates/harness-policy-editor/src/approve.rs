@@ -265,7 +265,7 @@ pub(crate) fn grant_root_warnings(
             || (d.domain == domain
                 && accepted
                     .iter()
-                    .any(|p| p.value == d.value && p.key.fs_access() == Some(d.access)))
+                    .any(|p| p.value == d.value && p.key == d.key))
     };
     let grant_roots = file
         .domain(domain)
@@ -311,7 +311,7 @@ pub fn commit(workspace_root: &Path, plan: &ApprovePlan<'_>) -> Result<(), Appro
         return Err(ApproveError::ApprovalNotRecorded(
             not_recorded
                 .iter()
-                .map(|d| format!("{} ({}) in {}", d.value, d.access.settings_key(), d.domain))
+                .map(|d| format!("{} ({}) in {}", d.value, d.key_label(), d.domain))
                 .collect::<Vec<_>>()
                 .join(", "),
         ));
@@ -329,14 +329,15 @@ fn accepted_declarations<'p>(
 ) -> Vec<harness_sandbox::tier2a::policy_approval::DeclarationRef<'p>> {
     plan.accepted
         .iter()
-        .filter_map(|proposal| {
-            proposal.key.fs_access().map(|access| {
-                harness_sandbox::tier2a::policy_approval::DeclarationRef {
-                    domain: plan.domain,
-                    value: &proposal.value,
-                    access,
-                }
-            })
+        .filter(|proposal| {
+            // [P7.7] 通信の候補の承認はまだ台帳へ記録しない（鍵は決定69(2)で持つようになったが、
+            // 画面と CLI の配線は P7.7）。
+            proposal.key != harness_policy::generalize::SettingsKey::NetAllowDomains
+        })
+        .map(|proposal| harness_sandbox::tier2a::policy_approval::DeclarationRef {
+            domain: plan.domain,
+            value: &proposal.value,
+            key: proposal.key,
         })
         .collect()
 }

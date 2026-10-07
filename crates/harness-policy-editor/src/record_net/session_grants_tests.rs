@@ -11,7 +11,7 @@ fn wanted(paths: &[&str]) -> Vec<String> {
 #[test]
 fn the_kept_set_covers_every_domain_and_the_settings_file() {
     use harness_sandbox::tier2a::policy_approval::{
-        approval_workspace_key, FsDeclarationApproval, PolicyApprovalLedger,
+        approval_workspace_key, DeclarationApproval, PolicyApprovalLedger,
         APPROVAL_FORMAT_VERSION,
     };
     let ws = tempfile::tempdir().expect("tempdir");
@@ -24,10 +24,10 @@ fn the_kept_set_covers_every_domain_and_the_settings_file() {
         domains: vec![cargo, npm],
         ..Default::default()
     };
-    let approve = |domain: &str, value: &str| FsDeclarationApproval {
+    let approve = |domain: &str, value: &str| DeclarationApproval {
         workspace: approval_workspace_key(ws.path()),
         domain: domain.to_string(),
-        access: harness_config::FsAccess::Read,
+        key: harness_policy::generalize::SettingsKey::FsRead,
         value: value.to_string(),
         approved_at_unix_secs: 0,
         format_version: Some(APPROVAL_FORMAT_VERSION),

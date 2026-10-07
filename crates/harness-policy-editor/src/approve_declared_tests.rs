@@ -51,7 +51,7 @@ fn approved(ws: &Path, value: &str, access: harness_config::FsAccess) -> bool {
         DeclarationRef {
             domain: "cargo",
             value,
-            access,
+            key: harness_policy::generalize::SettingsKey::from_access(access),
         },
     )
 }

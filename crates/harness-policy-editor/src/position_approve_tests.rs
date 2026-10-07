@@ -12,7 +12,6 @@ use harness_policy::transition::ChildOutput;
 use std::cell::Cell;
 use std::path::Path;
 
-use harness_config::FsAccess;
 use harness_policy::generalize::SettingsKey;
 use harness_policy::policy_file::{self, PolicyDomain, PolicyFile, ENTRY_DOMAIN};
 use harness_policy::transition::{editor_edge, AnyMarker, ArgvMatcher, ExeMatcher, TransitionEdge};
@@ -99,7 +98,7 @@ fn approved(ws: &Path, domain: &str, value: &str) -> bool {
         DeclarationRef {
             domain,
             value,
-            access: FsAccess::Read,
+            key: harness_policy::generalize::SettingsKey::FsRead,
         },
     )
 }

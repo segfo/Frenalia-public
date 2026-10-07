@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use harness_config::FsAccess;
+use harness_policy::generalize::SettingsKey;
 
 use super::*;
 
@@ -19,7 +20,16 @@ fn decl<'a>(domain: &'a str, value: &'a str, access: FsAccess) -> DeclarationRef
     DeclarationRef {
         domain,
         value,
-        access,
+        key: SettingsKey::from_access(access),
+    }
+}
+
+/// [決定69(2)] 通信の宣言の鍵（`net.allow_domains`の値）。
+fn net_decl<'a>(domain: &'a str, value: &'a str) -> DeclarationRef<'a> {
+    DeclarationRef {
+        domain,
+        value,
+        key: SettingsKey::NetAllowDomains,
     }
 }
 
@@ -128,10 +138,10 @@ fn an_approval_from_another_format_is_ignored() {
     let d = decl("cargo", "C:/x/**", FsAccess::Read);
     for stale in [None, Some(APPROVAL_FORMAT_VERSION + 1)] {
         let ledger = PolicyApprovalLedger {
-            approvals: vec![FsDeclarationApproval {
+            approvals: vec![DeclarationApproval {
                 workspace: approval_workspace_key(Path::new(WS)),
                 domain: "cargo".to_string(),
-                access: FsAccess::Read,
+                key: SettingsKey::FsRead,
                 value: "C:/x/**".to_string(),
                 approved_at_unix_secs: 0,
                 format_version: stale,
@@ -149,10 +159,10 @@ fn an_approval_from_another_format_is_ignored() {
 fn an_approval_in_the_current_format_is_accepted() {
     let d = decl("cargo", "C:/x/**", FsAccess::Read);
     let ledger = PolicyApprovalLedger {
-        approvals: vec![FsDeclarationApproval {
+        approvals: vec![DeclarationApproval {
             workspace: approval_workspace_key(Path::new(WS)),
             domain: "cargo".to_string(),
-            access: FsAccess::Read,
+            key: SettingsKey::FsRead,
             value: "C:/x/**".to_string(),
             approved_at_unix_secs: 0,
             format_version: Some(APPROVAL_FORMAT_VERSION),
@@ -192,4 +202,75 @@ fn the_ledger_is_registered_in_the_config_dir_list() {
     assert!(harness_grant_ledger::is_registered_config_dir_ledger(
         "policy-approval-ledger.json"
     ));
+}
+
+/// [決定69(2)] **通信の宣言も承認の対象である。** 台帳に無い通信の宣言は効かない
+/// ——`policy.json`はリポジトリに同梱され得るので、ファイルの宣言と同じ理由で承認が要る。
+#[test]
+fn a_net_declaration_can_be_approved_and_matched() {
+    let (_dir, store) = store();
+    let d = net_decl("ssh", "example.com");
+    assert!(
+        !store.load().is_approved(Path::new(WS), d),
+        "まだ承認していない通信の宣言が通ってはならない"
+    );
+    let not_recorded = store.approve(Path::new(WS), &[d]);
+    assert!(not_recorded.is_empty(), "{not_recorded:?}");
+    assert!(store.load().is_approved(Path::new(WS), d));
+}
+
+/// **禁止側の対**: 別のドメインは通信の承認を引き継がない（その宛先へ出られる子が違う）。
+#[test]
+fn a_net_declaration_of_another_domain_is_not_approved() {
+    let (_dir, store) = store();
+    store.approve(Path::new(WS), &[net_decl("ssh", "example.com")]);
+    let ledger = store.load();
+    assert!(!ledger.is_approved(Path::new(WS), net_decl("curl", "example.com")));
+    assert!(!ledger.is_approved(Path::new(WS), net_decl("ssh", "other.example.net")));
+}
+
+/// **種類も鍵である。** 同じ値をファイルの宣言として承認しても、通信の宣言は未承認のまま
+/// （逆も同じ）。混ざると、パスとして承認した値で外へ出られる。
+#[test]
+fn the_same_value_approved_as_a_file_declaration_does_not_approve_the_net_declaration() {
+    let (_dir, fs_store) = store();
+    fs_store.approve(Path::new(WS), &[decl("ssh", "example.com", FsAccess::Read)]);
+    assert!(!fs_store
+        .load()
+        .is_approved(Path::new(WS), net_decl("ssh", "example.com")));
+
+    let (_dir2, store2) = store();
+    store2.approve(Path::new(WS), &[net_decl("ssh", "example.com")]);
+    assert!(!store2
+        .load()
+        .is_approved(Path::new(WS), decl("ssh", "example.com", FsAccess::Read)));
+}
+
+/// 通信の宣言の承認も取り消せる（付与と撤収の対。`B-01`）。
+#[test]
+fn a_net_approval_can_be_revoked() {
+    let (_dir, store) = store();
+    let d = net_decl("ssh", "example.com");
+    store.approve(Path::new(WS), &[d]);
+    let left = store.revoke(Path::new(WS), &[d]);
+    assert!(left.is_empty(), "{left:?}");
+    assert!(!store.load().is_approved(Path::new(WS), d));
+}
+
+/// [決定69(2)] **形式の版は2である**（通信の宣言を鍵に入れたので上げた）。版1で記録した承認は、
+/// ファイルの宣言のものも含めて通らない——D-112(g) と同じ扱いで、1回承認し直す。
+#[test]
+fn approvals_recorded_with_format_version_one_are_not_matched() {
+    assert_eq!(APPROVAL_FORMAT_VERSION, 2);
+    let ledger = PolicyApprovalLedger {
+        approvals: vec![DeclarationApproval {
+            workspace: approval_workspace_key(Path::new(WS)),
+            domain: "cargo".to_string(),
+            key: SettingsKey::FsRead,
+            value: "C:/x/**".to_string(),
+            approved_at_unix_secs: 0,
+            format_version: Some(1),
+        }],
+    };
+    assert!(!ledger.is_approved(Path::new(WS), decl("cargo", "C:/x/**", FsAccess::Read)));
 }

@@ -413,12 +413,12 @@ fn removing_a_declaration_also_revokes_its_approval_but_keeps_the_others() {
     let removed = DeclarationRef {
         domain: "cargo",
         value: "C:/Users/segfo/.cargo/bin/cargo.exe",
-        access: harness_config::FsAccess::ReadExec,
+        key: harness_policy::generalize::SettingsKey::FsReadExec,
     };
     let kept = DeclarationRef {
         domain: "cargo",
         value: "C:/Users/segfo/.cargo/registry",
-        access: harness_config::FsAccess::Read,
+        key: harness_policy::generalize::SettingsKey::FsRead,
     };
     let store = crate::approval_store::approval_store();
     assert!(store.approve(ws.path(), &[removed, kept]).is_empty());

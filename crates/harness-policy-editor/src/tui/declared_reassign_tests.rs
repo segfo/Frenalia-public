@@ -62,7 +62,7 @@ fn approved(ws: &tempfile::TempDir, access: FsAccess, value: &str) -> bool {
         DeclarationRef {
             domain: "cargo",
             value,
-            access,
+            key: harness_policy::generalize::SettingsKey::from_access(access),
         },
     )
 }
@@ -73,7 +73,7 @@ fn approve_on_this_machine(ws: &tempfile::TempDir, access: FsAccess, value: &str
         &[DeclarationRef {
             domain: "cargo",
             value,
-            access,
+            key: harness_policy::generalize::SettingsKey::from_access(access),
         }],
     );
     assert!(left.is_empty());

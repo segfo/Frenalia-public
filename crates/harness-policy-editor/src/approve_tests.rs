@@ -312,7 +312,7 @@ fn committing_records_the_accepted_values_as_approved_on_this_machine() {
         harness_sandbox::tier2a::policy_approval::DeclarationRef {
             domain: "cargo",
             value: "C:/Users/x/.cargo/**",
-            access: harness_config::FsAccess::Read,
+            key: harness_policy::generalize::SettingsKey::FsRead,
         }
     ));
 }
@@ -348,7 +348,7 @@ fn approving_one_candidate_does_not_approve_a_shipped_declaration_in_the_same_do
     let declaration = |value| harness_sandbox::tier2a::policy_approval::DeclarationRef {
         domain: "cargo",
         value,
-        access: harness_config::FsAccess::Read,
+        key: harness_policy::generalize::SettingsKey::FsRead,
     };
     assert!(approvals.is_approved(ws.path(), declaration("C:/Users/x/.cargo/**")));
     assert!(

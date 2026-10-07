@@ -106,14 +106,17 @@ pub fn plan(
 
     let mut out = DeclaredApprovalPlan::default();
     for target in targets {
-        let Some(access) = target.key.fs_access() else {
+        // [P7.7] 通信の宣言は**台帳の鍵を持つようになった**（決定69(2)・P7.2）が、この入口（`approve-declared`・
+        // 宣言画面の`y`）が通す検査はまだファイルの値のものだけである（`grant_root`が通信の値を相対パスとして断る）。
+        // P7.7 で通信の検査を足して、この断りを外す。
+        if target.key == SettingsKey::NetAllowDomains {
             out.refused.push((
                 target.clone(),
-                "ネットワークの宣言は、このマシンでの承認の対象外です（承認台帳はファイル宣言だけを持つ）"
+                "ネットワークの宣言の承認は P7.7 で入ります（承認台帳の鍵は決定69(2)で持つようになった）"
                     .to_string(),
             ));
             continue;
-        };
+        }
         let Some(target) = stored_spelling(&file, target) else {
             out.not_found.push(target.clone());
             continue;
@@ -125,7 +128,7 @@ pub fn plan(
         let declaration = DeclarationRef {
             domain: &target.domain,
             value: &target.value,
-            access,
+            key: target.key,
         };
         if approvals.is_approved_for_key(&workspace_key, declaration) {
             out.already.push(target);
@@ -211,7 +214,7 @@ pub fn commit(
     let declarations: Vec<DeclarationRef<'_>> = plan
         .approve
         .iter()
-        .filter_map(UnapproveTarget::declaration)
+        .map(UnapproveTarget::declaration)
         .collect();
     if declarations.is_empty() {
         return Ok(0);
@@ -222,7 +225,7 @@ pub fn commit(
         return Err(ApproveDeclaredError::NotRecorded(
             not_recorded
                 .iter()
-                .map(|d| format!("{} ({}) in {}", d.value, d.access.settings_key(), d.domain))
+                .map(|d| format!("{} ({}) in {}", d.value, d.key_label(), d.domain))
                 .collect::<Vec<_>>()
                 .join(", "),
         ));

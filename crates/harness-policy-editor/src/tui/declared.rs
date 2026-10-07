@@ -90,18 +90,8 @@ impl App {
         self.declared_approval.not_approved = self
             .declared
             .iter()
-            .filter(|target| {
-                target.key.fs_access().is_some_and(|access| {
-                    !approvals.is_approved_for_key(
-                        &workspace_key,
-                        harness_sandbox::tier2a::policy_approval::DeclarationRef {
-                            domain: &target.domain,
-                            value: &target.value,
-                            access,
-                        },
-                    )
-                })
-            })
+            // [決定69(2)] 通信の宣言も未承認として数える（鍵を持つようになった）。
+            .filter(|target| !approvals.is_approved_for_key(&workspace_key, target.declaration()))
             .cloned()
             .collect();
         let not_approved = &self.declared_approval.not_approved;

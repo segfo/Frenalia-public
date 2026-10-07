@@ -279,7 +279,7 @@ pub fn approved_fs_values(
             if approved(DeclarationRef {
                 domain: &domain.name,
                 value,
-                access,
+                key: harness_policy::generalize::SettingsKey::from_access(access),
             }) {
                 out.insert((value.to_string(), access.settings_key()));
             }

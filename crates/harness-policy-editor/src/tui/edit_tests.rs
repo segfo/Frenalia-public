@@ -2119,7 +2119,7 @@ fn a_on_the_fs_tab_of_a_position_record_writes_files_and_edges_together() {
         DeclarationRef {
             domain: "pwsh",
             value: "C:/Users/x/b.txt",
-            access: harness_config::FsAccess::Read,
+            key: harness_policy::generalize::SettingsKey::FsRead,
         },
     ));
     assert!(app.accepted.is_empty(), "書いた予約が残っている");
