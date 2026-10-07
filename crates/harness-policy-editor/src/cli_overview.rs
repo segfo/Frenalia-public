@@ -37,7 +37,9 @@ pub(super) fn print_overview() {
     println!("ドメインに分かれます（show は各候補に書く先のドメインを添えます）。approve はそれぞれの");
     println!("ドメインへファイルの宣言だけを書き、--domain は使えません。policy.json にまだ無い");
     println!("ドメインの候補はそこへ届く遷移の辺も要るので、TUI の承認待ち（F2）で遷移と一緒に");
-    println!("承認してください（遷移の辺を書くのは TUI だけです）。");
+    println!("承認してください（遷移の辺を書くのは TUI だけです）。パス2の記録も、Spawn Daemon が書く");
+    println!("許可した生成の記録（spawn-audit.jsonl）を持つと、拒否を起こしたドメインに分かれます（同じく");
+    println!("--domain は使えません。どのドメインにも引けない拒否は件数だけ出ます）。");
     println!();
     println!("approve は policy.json へ宣言を書き、このマシンの承認台帳へ承認を記録するだけで、");
     println!("ACLは触りません。ACEが付くのは、承認済みのファイル宣言を record-net（パス2）か");

@@ -148,8 +148,8 @@ enum Command {
         session: Option<String>,
         #[arg(long)]
         workspace: Option<PathBuf>,
-        /// ドメイン名（「このコマンドに何を許すか」の単位、既定: コマンドの先頭トークン）。
-        /// 位置の情報がある記録（パス1のプロセスの木を持つ記録）では使えない——候補ごとに書く先のドメインが決まっている。
+        /// ドメイン名（「このコマンドに何を許すか」の単位、既定: パス2は記録したドメイン・パス1はコマンドの先頭トークン）。
+        /// 位置の情報がある記録（パス1のプロセスの木・パス2の許可した生成の記録を持つ記録）では使えない——候補ごとに書く先が決まっている。
         #[arg(long)]
         domain: Option<String>,
         /// 承認する提案id（カンマ区切り可）。**全件受理のショートハンドは無い**（D-42）。
@@ -751,11 +751,11 @@ fn run_record_net(
         }
     }
     println!(
-        "この記録を見直す: harness-policy-editor show {} --net",
+        "この記録を見直す: harness-policy-editor show {}",
         outcome.session_id
     );
     println!(
-        "候補を承認する: harness-policy-editor approve {} --domain {entry_name} --accept <id>...",
+        "候補を承認する: harness-policy-editor approve {} --accept <id>...",
         outcome.session_id
     );
     ExitCode::SUCCESS

@@ -238,6 +238,14 @@ impl RecordManifest {
         self.net_mode.unwrap_or_default()
     }
 
+    /// 承認の書く先の既定（候補ごとにドメインが決まらない1つの一覧のとき）。パス2は記録したドメイン（決定68 からは入口）、
+    /// パス1はコマンドの先頭トークン（`cargo build` → `cargo`）。**画面のドメイン欄と CLI の`approve`が同じこれを通す**。
+    pub fn default_approval_domain(&self) -> String {
+        self.domain
+            .clone()
+            .unwrap_or_else(|| harness_policy::policy_file::default_domain_name(&self.command))
+    }
+
     /// 記録を**失敗として閉じる**。`status`・`finished_unix_ms`・`error`・`error_kind`を
     /// まとめて立てる。
     ///
@@ -809,6 +817,22 @@ mod tests {
             .join(harness_policy::spawn_audit::SPAWN_AUDIT_FILE);
         assert_eq!(dir.spawn_audit_path(), daemon_side);
         assert_eq!(dir.spawn_audit_path().parent(), Some(dir.path()));
+    }
+
+    /// **承認の書く先の既定は、パス2は記録したドメイン、パス1はコマンドの先頭トークン**（画面のドメイン欄と CLI の`approve`が
+    /// 同じこれを通す。P6.6 で CLI がコマンドの先頭トークンだけを見ていたのを揃えた——入口から始めたパス2の候補を`cargo`へ
+    /// 書きに行っていた）。
+    #[test]
+    fn the_default_approval_domain_is_the_recorded_domain_or_the_command() {
+        let ws = workspace();
+        let mut manifest = RecordManifest::new("m", "cargo build", ws.path(), ws.path(), 1);
+        assert_eq!(manifest.default_approval_domain(), "cargo");
+        manifest.pass = 2;
+        manifest.domain = Some(harness_policy::policy_file::ENTRY_DOMAIN.to_string());
+        assert_eq!(
+            manifest.default_approval_domain(),
+            harness_policy::policy_file::ENTRY_DOMAIN
+        );
     }
 
     /// `open`は作らない（`show`が存在しないidを指定したときに空のディレクトリを

@@ -66,6 +66,68 @@ pub(super) fn pass1_view(
     SessionView::new(data, notes, tree, candidates.proposals, candidates.domains)
 }
 
+/// パス2の記録の候補一覧。**ネットワークとFSの両方**を見せ、**FSを先、ネットワークを後**に並べる（強制が効いているのは
+/// FSだけなので、「宣言を直せば直る」情報はこちらにしか無い。idは衝突しない——FSは`fs-N`、通信は`net-N`）。
+///
+/// 以前はネットワークだけだった（当時のパス2は`fs-audit.jsonl`を書かなかった）。段階4でdeny-only収集器を配線してからは、
+/// **「なぜコマンドが失敗したか」の答えはFS側にある**——`cargo test`が`Access is denied`で落ちたとき、次に何を許可すればいいのかを
+/// 見る場所が1つも無かった。ファイルの候補は CLI の`show`・`approve`と同じ[`crate::position_candidates::load`]で作る——
+/// 許可した生成の記録（決定68）があれば、拒否を起こしたドメインごとに分かれる（P6.6）。そのときの通信の候補の書く先は
+/// 入口のドメイン（中継プロキシへ渡す通信の宣言は入口のもの。ドメインごとの通信は P7）、分かれていなければ`None`
+/// （ドメイン欄。今までどおり）。
+pub(super) fn pass2_view(
+    dir: &crate::session_dir::RecordSessionDir,
+    manifest: &crate::session_dir::RecordManifest,
+    workspace_root: &std::path::Path,
+) -> SessionView {
+    // 候補の取り込み口は**その記録を走らせたモード**で決まる（決定64）。欄が無い古い記録は記録モード。
+    let net = crate::net_aggregate::from_log(&dir.net_audit_log_path(), manifest.net_mode());
+    let candidates = crate::position_candidates::load(
+        dir,
+        manifest,
+        workspace_root,
+        &harness_policy::position_domains::SplitPositions::new(),
+    );
+    let net_domain = candidates
+        .by_position()
+        .then(|| policy_file::ENTRY_DOMAIN.to_string());
+    let fs = candidates.fs;
+
+    // **FS欄は収集器が起きなかったときこそ出す。** 「観測していません（収集器を起動できませんでした）」と「拒否は0件でした」は
+    // 別の事実で、区別できなければfail-openは単なる隠蔽になる（D-43）——`render_fs_denials`はその書き分けを持っているのに、
+    // **呼び出しを`collector_started`で囲んでいたせいで、起きなかったときだけ何も出ない**という正反対の挙動になっていた（BUG-093）。
+    let mut notes = failure_note_block(manifest);
+    notes.push_str(&crate::record_net::render_fs_denials(
+        &fs,
+        manifest.collector_started,
+        manifest.etw_available,
+        manifest.net_mode(),
+    ));
+    notes.push('\n');
+    for note in &candidates.notes {
+        notes.push_str(note);
+        notes.push('\n');
+    }
+    // **注記も収集器の生死で隠さない。** 実行前診断が名指しした実行ファイルは収集器が起きなくても候補になる。囲んだままだと、
+    // その候補が**なぜそこに在るのか**の説明だけが消える（D-43・B-09）。何も観測できていないことは`render_notes`自身が言う。
+    notes.push_str(&crate::aggregate::render_notes(&fs));
+    notes.push('\n');
+    notes.push_str(&crate::net_aggregate::render_notes(&net));
+
+    let tree = crate::aggregate::render_process_tree(&fs);
+    let (mut proposals, mut domains) = (candidates.proposals, candidates.domains);
+    for proposal in net.proposals() {
+        proposals.push(proposal);
+        domains.push(net_domain.clone());
+    }
+    // **両方を保持する**（`SessionData`のdoc）。
+    let data = SessionData {
+        fs: Some(Box::new(fs)),
+        net: Some(Box::new(net)),
+    };
+    SessionView::new(data, notes, tree, proposals, domains)
+}
+
 impl App {
     /// 選択中のセッションを開いて候補を作る。**保存済みの集計値は使わず**、監査JSONLから
     /// 毎回計算し直す（正本はJSONLだけ、B-13）。
@@ -87,57 +149,9 @@ impl App {
         };
         let manifest = entry.manifest.clone();
 
-        // パス2の記録は**ネットワークとFSの両方**を見せる。
-        //
-        // 以前はネットワークだけだった（当時のパス2は`fs-audit.jsonl`を書かなかったので、
-        // FSの候補一覧を出しても常に0件だった）。段階4でdeny-only収集器を配線してからは、
-        // **「なぜコマンドが失敗したか」の答えはFS側にある**——実際、`cargo test`が
-        // `Access is denied`で落ちたとき、ユーザーには「次に何を許可すればいいのか」を
-        // 見る場所が1つも無かった。FSを**先**に並べるのはそのためである。
-        //
-        // idは衝突しない（`generalize`はFS候補へ`fs-N`、ドメイン候補へ`net-N`を振る）。
-        // 収集器が動いていない古い記録では`from_log`が空を返すので、従来どおりの表示になる。
+        // パス2はネットワークとFSの両方（`pass2_view`）、パス1はファイルだけ（`pass1_view`）。
         let view = if manifest.pass == 2 {
-            // 候補の取り込み口は**その記録を走らせたモード**で決まる（決定64）。欄が無い古い記録は記録モード。
-            let net = crate::net_aggregate::from_log(
-                &entry.dir.net_audit_log_path(),
-                manifest.net_mode(),
-            );
-            let fs = crate::aggregate::from_session(&entry.dir, &manifest);
-
-            // **FS欄は収集器が起きなかったときこそ出す。** 「観測していません（収集器を
-            // 起動できませんでした）」と「拒否は0件でした」は別の事実で、区別できなければ
-            // fail-openは単なる隠蔽になる（D-43）——`render_fs_denials`はその書き分けを
-            // 持っているのに、**呼び出しを`collector_started`で囲んでいたせいで、
-            // 起きなかったときだけ何も出ない**という正反対の挙動になっていた。
-            // 実運用（BUG-093）で「編集画面に拒否の一覧が出てこない」として現れた。
-            let mut notes = failure_note_block(&manifest);
-            notes.push_str(&crate::record_net::render_fs_denials(
-                &fs,
-                manifest.collector_started,
-                manifest.etw_available,
-                manifest.net_mode(),
-            ));
-            notes.push('\n');
-            // **注記も収集器の生死で隠さない。** FS候補は観測だけから作られるものではなく、
-            // 実行前診断が名指しした実行ファイルは収集器が起きなくても候補になる。
-            // 囲んだままだと、その候補が**なぜそこに在るのか**の説明だけが消える（D-43・B-09）。
-            // 何も観測できていないことは`render_notes`自身が言う。
-            notes.push_str(&crate::aggregate::render_notes(&fs));
-            notes.push('\n');
-            notes.push_str(&crate::net_aggregate::render_notes(&net));
-
-            let tree = crate::aggregate::render_process_tree(&fs);
-            // **両方を保持する。** 片方だけ持つと、`g`で作り直したときにもう片方の候補が
-            // 消える（`SessionData`のdoc）。並び（FSが先）も同じ関数が1つだけ持つ。
-            let data = SessionData {
-                fs: Some(Box::new(fs)),
-                net: Some(Box::new(net)),
-            };
-            let proposals = data.proposals();
-            // パス2は位置を読まない（process-audit.jsonl を書かない。ドメインごとにするのは作業の一覧の P6）。全部`None`。
-            let domains = vec![None; proposals.len()];
-            SessionView::new(data, notes, tree, proposals, domains)
+            pass2_view(&entry.dir, &manifest, &self.workspace_root)
         } else {
             // 分ける位置（決定67）は位置の木と同じ集合（同じ記録のときだけ。`tui::position_split`）。
             let split = self.position_split_for(&manifest.id);
@@ -147,12 +161,8 @@ impl App {
         self.rebuild_tree();
 
         // ドメイン名の既定値。パス2の記録なら記録時のドメイン、パス1ならコマンドから決める
-        // （規則はCLIと同じ関数を通す）。
-        let default = manifest
-            .domain
-            .clone()
-            .unwrap_or_else(|| policy_file::default_domain_name(&manifest.command));
-        self.domain.set_text(default);
+        // （規則はCLIの`approve`と同じ関数を通す）。
+        self.domain.set_text(manifest.default_approval_domain());
         // ドメインが決まったので、`[x]`として重ねる宣言を読む。**候補を作り直す経路の全部で
         // 呼ぶ**（ここ・ドメイン名の打ち替え・確定後・画面へ入ったとき）——1つ漏れると
         // その経路だけ古い宣言で判定することになる。
@@ -794,3 +804,7 @@ impl App {
 #[cfg(test)]
 #[path = "edit_tests.rs"]
 mod edit_tests;
+
+#[cfg(test)]
+#[path = "pass2_domains_tests.rs"]
+pub(crate) mod pass2_domains_tests;

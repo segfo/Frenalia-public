@@ -17,26 +17,13 @@ use crate::tui::proposal_tree::TreeItem;
 /// 保持していたのは片方だけだったので、**`g`（一般化の度合い）を押した瞬間にFSの候補が
 /// 全部消えていた**（`recompute_proposals`が保持している側からしか作り直せない）。
 /// 「一覧に出したもの」と「作り直せるもの」がずれない形にしてある。
+///
+/// パス2の候補の並び（FSを先、ネットワークを後）と書く先のドメインは`tui::edit::pass2_view`が1か所で持つ
+/// （2026-10-07、P6.6。ファイルの候補が許可した生成の記録でドメインごとに分かれ、`fs`の集計からは作り直せなくなった）。
 #[derive(Default)]
 pub struct SessionData {
     pub fs: Option<Box<crate::aggregate::Aggregate>>,
     pub net: Option<Box<crate::net_aggregate::NetAggregate>>,
-}
-
-impl SessionData {
-    /// **FSを先、ネットワークを後**（強制が効いているのはFSだけなので、「宣言を直せば直る」
-    /// 情報はこちらにしか無い）。idは衝突しない（`generalize`がFSへ`fs-N`・netへ`net-N`を振る）。
-    pub fn proposals(&self) -> Vec<RuleProposal> {
-        let mut proposals = self
-            .fs
-            .as_ref()
-            .map(|fs| fs.proposals())
-            .unwrap_or_default();
-        if let Some(net) = self.net.as_ref() {
-            proposals.extend(net.proposals());
-        }
-        proposals
-    }
 }
 
 /// 候補一覧に何を出すか。

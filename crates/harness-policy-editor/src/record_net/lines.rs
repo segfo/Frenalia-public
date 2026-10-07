@@ -49,7 +49,7 @@ pub fn render_fs_denials(
     etw_available: bool,
     net_mode: NetMode,
 ) -> String {
-    let mut out = String::from("\n観測されたFS拒否（このドメインの宣言で強制した結果）:\n");
+    let mut out = String::from("\n観測されたFS拒否（policy.json の宣言で強制した結果）:\n");
     if !collector_started {
         out.push_str(
             "  （観測していません——収集器を起動できませんでした。\n\
