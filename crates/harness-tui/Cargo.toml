@@ -40,6 +40,16 @@ tracing-subscriber = "0.3"
 unicode-segmentation = { version = "1.13.3", optional = true }
 unicode-width = "0.2.2"
 
+[target.'cfg(windows)'.dependencies]
+# transcriptのリンクを既定のブラウザで開く（`src/open_url.rs`。`Shell`が`ShellExecuteW`、`WindowsAndMessaging`がその
+# 表示の仕方の引数、`Com`が呼ぶ前のCOMの初期化）。版は`harness-term`と同じ。
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [dev-dependencies]
 # 写す前の描画部品そのもの（`markdown_ratatui`）。**試験だけが使う**——写した描画部品
 # （`src/markdown/codewandler/render.rs`）が元と同じ出力を返すことを比べる相手（`codewandler/equivalence_tests.rs`）。

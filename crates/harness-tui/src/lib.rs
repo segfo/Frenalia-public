@@ -6,6 +6,8 @@ mod approvals;
 mod engine;
 mod gate;
 mod markdown;
+/// transcriptのリンクを既定のブラウザで開く（`Action::OpenUrl`。計画書のT11b）。
+mod open_url;
 mod picker;
 #[cfg(windows)]
 mod sandbox_prep;
@@ -913,6 +915,8 @@ pub async fn run(
                             .unwrap_or_else(|e| Err(format!("書き込みのスレッドが止まりました: {e}")));
                             app.note_copied(&text, result);
                         }
+                        // ブラウザを起こす呼び出しも待ち得るので、同じくブロッキング用のスレッドで（`open_url`）。
+                        Action::OpenUrl(url) => open_url::open_and_note(&mut app, url).await,
                         Action::Slash(cmd) => match cmd {
                             SlashCommand::Model(m) => engine.set_model(m),
                             SlashCommand::Mode(mode) => {

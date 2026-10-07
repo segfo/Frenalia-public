@@ -1,6 +1,15 @@
 //! transcriptのリンクを指している間、リンクの直後に`(URL)`の吹き出しを重ねて描く（計画書
-//! `plans/PLAN-TUI-IMPROVEMENTS.md`§3・§0のT11a）。どのリンクを指しているかは`crate::app`の`link_hover`が決める。
-//! ここが持つのは置き場所・切り方・見た目と、描いた場所の登録。
+//! `plans/PLAN-TUI-IMPROVEMENTS.md`§3・§0のT11a・T11b）。どのリンクを指しているかは`crate::app`の`link_hover`、押した
+//! リンクを開いてよいかは`crate::app`の`link_open`が決める。ここが持つのは出す文字・置き場所・切り方・見た目と、描いた
+//! 場所と押す場所の登録。
+//!
+//! # 出す文字
+//!
+//! - 開ける形式（http/https）のリンクは、**ブラウザへ渡すのと同じ正規化した形**のURL（`crate::open_url::OpenableUrl`。
+//!   スキームとホストは小文字・空白などは`%`で符号化）。書かれたままの形を見せて別の形を開くと、見て確かめたものと
+//!   開くものが食い違う（B-21）
+//! - 開けない形式のリンク（http/https以外・スキームの無い相対URL）は、書かれたままのリンク先の頭に
+//!   `開けない形式: `を付ける（`(開けない形式: javascript:…)`）
 //!
 //! # 置き場所
 //!
@@ -14,19 +23,21 @@
 //!
 //! 枠の内側の幅より長い`(URL)`は、URLの**頭を残して末尾を`…`で切り**、閉じ括弧は残す。transcriptの上辺の知らせ
 //! （`super::fit_width`）と同じ切り方で、頭（スキームとホスト——どこへ飛ぶか）が必ず見える（計画書§3.5の「開く前に
-//! 本当のURLが見える」）。
+//! 本当のURLが見える」）。開けない形式の印は頭にあるので、切られても残る。
 //!
 //! # 見た目
 //!
 //! ステータスバーと同じ灰色の地に黒い文字（`super::STATUS_STYLE`）。文章の上に重なったことが分かり、リンクの青とも
-//! 範囲選択の白地に青（`harness_term::select::SELECTED`）とも見分けが付く。押せる見た目（下線）はまだ付けない——押して
-//! 開くのは計画書のT11bで、押せないうちから押せそうに見せない（押せない案内をただの文字にした計画書§4.2と同じ）。
+//! 範囲選択の白地に青（`harness_term::select::SELECTED`）とも見分けが付く。開ける形式のときは、括弧の内側のURLに
+//! **押せる見た目（下線）**を付ける。開けない形式には付けない——押せないものを押せそうに見せない（押せない案内を
+//! ただの文字にした計画書§4.2と同じ）。
 //!
 //! # 重ねるだけで、ほかのセルを変えない
 //!
 //! 描く前に`harness_term::overlay::clear`で矩形を空ける。文章の並びも、文字の地図（範囲選択・マウスの当たり判定）も
 //! 変えない。描いた矩形は覆った場所として登録する（`Targets::cover`）——吹き出しの上のクリックは下の文字へ届かない
-//! （範囲選択も始めない）。
+//! （範囲選択も始めない）。そのうえで、開ける形式なら**下線を付けたURLの部分だけ**を押せる場所として登録する
+//! （`Click::OpenLink`。押すと開く）。括弧と、開けない形式の吹き出しは押しても何も起きない。
 //!
 //! # 限界
 //!
@@ -36,16 +47,18 @@
 
 use harness_term::select::Pos;
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::text::Span;
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{AppState, HoveredLink, LinkFrame, Targets, Wheel};
+use crate::app::{AppState, Click, HoveredLink, LinkFrame, Targets, Wheel};
 use crate::markdown::LinkSpan;
+use crate::open_url::{OpenableUrl, REFUSED_MARK};
 
 /// 指しているリンクがあれば吹き出しを描き、この描画のリンクのことを返す（`DrawFeedback::links`）。`overlaid`はこの描画で
 /// 重ねる枠を描いたか（描いたなら出さない）、`inner`はtranscriptの枠の内側、`links`はこの描画のtranscriptのリンクの区間。
-/// `targets`はこの描画で登録したもの（文字の地図を引き、吹き出しを覆った場所として足す）。
+/// `targets`はこの描画で登録したもの（文字の地図を引き、吹き出しを覆った場所・押す場所として足す）。
 pub(super) fn draw(
     f: &mut Frame,
     app: &AppState,
@@ -57,13 +70,37 @@ pub(super) fn draw(
     let hovered = app.hovered_link(overlaid, targets, &links);
     let tooltip = hovered.as_ref().and_then(|link| {
         let anchor = last_drawn_cell(targets, link)?;
-        let text = label(link.url(), inner.width)?;
+        let openable = OpenableUrl::parse(link.url()).ok();
+        let shown = match &openable {
+            Some(url) => url.as_str().to_string(),
+            None => format!("{REFUSED_MARK}: {}", link.url()),
+        };
+        let text = label(&shown, inner.width)?;
         let rect = place(anchor, inner, u16::try_from(text.width()).ok()?)?;
+        // 括弧の内側（`label`が付ける括弧はどちらも1バイト）。開けるURLなら押せる見た目（下線）にする。
+        let inside = &text[1..text.len() - 1];
+        let inside_style = if openable.is_some() {
+            super::STATUS_STYLE.add_modifier(Modifier::UNDERLINED)
+        } else {
+            super::STATUS_STYLE
+        };
         harness_term::overlay::clear(f, rect);
-        harness_term::row::draw(f, rect, &[Span::styled(text, super::STATUS_STYLE)]);
+        harness_term::row::draw(
+            f,
+            rect,
+            &[
+                Span::styled("(", super::STATUS_STYLE),
+                Span::styled(inside, inside_style),
+                Span::styled(")", super::STATUS_STYLE),
+            ],
+        );
         targets.cover(rect);
-        // 計画書のT11b: 吹き出しのURLを押すと開く。押す場所はここで、覆った後に`targets.click(rect, …)`で登録する
-        // （覆う前に登録すると覆いの下になる）。押せる見た目（下線）もそのとき足す。
+        // 押せるのは下線を付けたURLだけ（押せる見た目と押せる場所を揃える）。覆った後に登録する（覆う前に登録すると
+        // 覆いの下になる）。開いてよいかは押したときにもう一度決める（`crate::app`の`link_open`）。
+        if openable.is_some() {
+            let url_rect = Rect::new(rect.x + 1, rect.y, rect.width.saturating_sub(2), 1);
+            targets.click(url_rect, Click::OpenLink(link.url().to_string()));
+        }
         Some(rect)
     });
     LinkFrame {
@@ -89,10 +126,11 @@ fn last_drawn_cell(targets: &Targets, link: &HoveredLink) -> Option<Rect> {
     })
 }
 
-/// 幅`width`桁に収めた`(URL)`（モジュールdoc「切り方」）。括弧と`…`も入らない幅（3桁未満）なら`None`。
-fn label(url: &str, width: u16) -> Option<String> {
+/// 幅`width`桁に収めた`(…)`（括弧の内側は`inside`。モジュールdoc「出す文字」「切り方」）。括弧と`…`も入らない幅
+/// （3桁未満）なら`None`。
+fn label(inside: &str, width: u16) -> Option<String> {
     let width = usize::from(width);
-    (width >= 3).then(|| format!("({})", super::fit_width(url, width - 2)))
+    (width >= 3).then(|| format!("({})", super::fit_width(inside, width - 2)))
 }
 
 /// 幅`width`桁の吹き出しを置く1行の矩形（モジュールdoc「置き場所」）。`anchor`はリンクの最後の文字のセル、`area`は

@@ -116,7 +116,8 @@ pub(crate) struct LinkSpan {
     pub line: usize,
     pub start: usize,
     pub end: usize,
-    /// リンク先（吹き出しに出す。`crate::app::link_hover`）。
+    /// リンク先（書かれたまま）。吹き出しに出し（開ける形式は正規化した形で。`crate::ui`の`link_tooltip`）、押すと開く
+    /// （開いてよい形式かはそのときに確かめる。`crate::app::link_open`）。
     pub url: String,
     /// この区間が、**すぐ前の区間と同じリンクの続き**か（リンクが折り返しをまたいで、前の行から続いている）。
     /// 分かれた区間を1つのリンクにまとめるのに使う（どちらの区間を指しても、吹き出しはリンクの最後の文字の後ろに

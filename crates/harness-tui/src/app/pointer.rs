@@ -24,6 +24,9 @@
 //!   カーソル）と、transcriptの「さかのぼり中」の案内（`Ctrl+O`・`/clear`が呼ぶのと同じ`Scrollback::reset`）。
 //!   ハンクの見出しを`↑↓`で辿らないのは、`↑↓`がカーソルの見出しを枠の一番上まで送る（`follow_hunk_cursor`）
 //!   からである——押せた見出しは見えているので、送ると押した場所の下にあるものが動く。
+//! - **リンクを開く**（[`Click::OpenLink`]）——吹き出しのURLと、リンクの文字の`Ctrl`＋クリック。これだけはキーに当たる
+//!   操作が無い（リンクはマウスでしか指せない）。開いてよいかは`app::link_open`が決める。`Ctrl`を見るのは
+//!   [`AppState::on_mouse`]だけ（地図の`harness_term::pointer::Targets::resolve`は修飾キーを見ない）。
 //!
 //! # 承認ダイアログ・レビューパネルが開いている間も、外に見えているtranscriptはホイールで送れる
 //!
@@ -142,6 +145,9 @@ pub enum Click {
     Hunk(usize),
     /// 差分のハンクの見出しの印（`[x]`/`[ ]`）。そのハンクを選んで`Enter`。
     HunkMark(usize),
+    /// transcriptのリンクを開く（吹き出しのURL・リンクの文字の`Ctrl`＋クリック）。中身は書かれたままのリンク先で、
+    /// 開いてよい形式かは押したときに確かめる（`app::link_open`）。
+    OpenLink(String),
 }
 
 /// ホイールで送る枠。
@@ -325,11 +331,15 @@ impl AppState {
     /// マウスのイベント（左クリックとホイール）。直前に描いた画面の登録で引く。押せる場所・送れる枠の外では
     /// **何もしない**——外した位置で別のものが動くほうが混乱する。`now`は押したボタンを押されている形にした時刻。
     ///
-    /// 文章の上（押せる場所ではない所）で押したら、文章を選び始める（`app::select`）。それ以外の場所を押したら、
-    /// 押した場所の動きを起こしてから、選んでいた文章を外す（押す場所を狙った手は、選んだ文章を見ていない）。
+    /// 文章の上（押せる場所ではない所）で押したら、文章を選び始める（`app::select`）。ただしtranscriptのリンクの文字を
+    /// `Ctrl`を押したまま押したときは、選ばずにリンクを開く（押せる場所を押したのと同じ扱い。`app::link_open`）。
+    /// それ以外の場所を押したら、押した場所の動きを起こしてから、選んでいた文章を外す（押す場所を狙った手は、選んだ
+    /// 文章を見ていない）。
     pub fn on_mouse(&mut self, event: MouseEvent, now: Instant) -> Option<Action> {
         let pressed = event.kind == MouseEventKind::Down(MouseButton::Left);
-        let action = match self.pointer.resolve(&event) {
+        // `Ctrl`＋クリックがリンクの文字の上なら、範囲選択ではなくリンクを開く（`app::link_open`。修飾キーが見えるのはここだけ）。
+        let pointed = self.ctrl_press_on_link(&event, self.pointer.resolve(&event));
+        let action = match pointed {
             Some(Pointer::Wheel { target, up }) => {
                 self.on_wheel(target, up);
                 return None;
@@ -439,6 +449,7 @@ impl AppState {
                 self.review_panel.as_mut()?.pick_hunk(hunk);
                 self.on_key(plain(KeyCode::Enter))
             }
+            Click::OpenLink(raw) => self.open_link(&raw),
         }
     }
 

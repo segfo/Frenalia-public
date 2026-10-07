@@ -16,7 +16,8 @@
 //! - 文章の上で左ボタンを押してずらすと、押した文字から今の文字までを選ぶ（選んだ文字は背景を青にする）。
 //!   ずらさずに離したら今までどおりのクリック（押した瞬間に効いている）。押せる行（承認ダイアログの候補・差分の
 //!   ハンクの見出し）やボタンの上で押してずらしても選び始めない。差分ペインの文章を押したときは、今までどおり
-//!   差分ペインへフォーカスも移る。
+//!   差分ペインへフォーカスも移る。transcriptのリンクの文字も普通に押せば選び始め、`Ctrl`を押したまま押したときだけ
+//!   選ばずにリンクを開く（`app::link_open`）。
 //! - 枠の上下の外までずらすとその向きへ送る（ホイールと同じ送り方。止めていても100msごとに送り続ける）。
 //!   ドラッグ中のホイールも効く。
 //! - **選んでいるときの`Ctrl+C`と右クリックは写す**（VS Codeの統合ターミナルの既定と同じ。ただし VS Code の
@@ -53,7 +54,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use super::{Action, AppState, EdgeNotice, NoticeTone, ReviewFocus, Step, Wheel};
+use super::{Action, AppState, EdgeNotice, ReviewFocus, Step, Wheel};
 
 /// 写すキー（`Ctrl+C`。選んでいないときは終了の仕方を知らせるだけ——[`AppState::on_selection_key`]）。
 pub(crate) fn is_copy_key(key: &KeyEvent) -> bool {
@@ -80,14 +81,10 @@ impl AppState {
 
     /// 写した結果（イベントループがクリップボードへ書いた後に呼ぶ。`text`は写した文章）。
     pub fn note_copied(&mut self, text: &str, result: Result<(), String>) {
-        self.edge_notice = Some(EdgeNotice {
-            text: harness_term::clipboard::notice(text, &result),
-            tone: if result.is_ok() {
-                NoticeTone::Done
-            } else {
-                NoticeTone::Failed
-            },
-        });
+        self.edge_notice = Some(EdgeNotice::outcome(
+            harness_term::clipboard::notice(text, &result),
+            &result,
+        ));
     }
 
     /// キーの前に、選択が先に受けるもの（`Ctrl+C`・`Esc`で外す）。受けたら`Some`（中身はキーの結果）。

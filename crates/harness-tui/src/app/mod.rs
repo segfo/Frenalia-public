@@ -76,6 +76,8 @@ mod events;
 mod input;
 /// transcriptのリンクを指したときの吹き出し——どのリンクを指しているかを決める（2026-10-07。計画書のT11a）。
 mod link_hover;
+/// transcriptのリンクを開く——押したリンクを開いてよいかを決め、開いた結果を知らせる（2026-10-07。計画書のT11b）。
+mod link_open;
 mod pointer;
 /// `Esc`の二度押しで閉じる（2026-10-03。判定は`harness_term::double_esc`）。`Ctrl+C`は終了に使わない。
 mod quit;
@@ -130,6 +132,19 @@ impl EdgeNotice {
         Self {
             text: text.into(),
             tone: NoticeTone::Hint,
+        }
+    }
+
+    /// 操作の結果（`result`ができたなら[`NoticeTone::Done`]、できなかったなら[`NoticeTone::Failed`]）。写した結果
+    /// （`app::select`）と開いた結果（`app::link_open`）が同じこれを通る。
+    pub(crate) fn outcome<T, E>(text: String, result: &Result<T, E>) -> Self {
+        Self {
+            text,
+            tone: if result.is_ok() {
+                NoticeTone::Done
+            } else {
+                NoticeTone::Failed
+            },
         }
     }
 }

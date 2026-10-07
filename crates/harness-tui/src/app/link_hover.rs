@@ -28,7 +28,7 @@
 //!
 //! # 吹き出しの上にマウスがある間は、出したまま
 //!
-//! 吹き出しのURLは計画書のT11bで押せる場所になる（押すと開く）。リンクの文字から吹き出しへ動かす間に消えないよう、
+//! 吹き出しのURLは押せる場所（押すと開く。`app::link_open`）。リンクの文字から吹き出しへ動かす間に消えないよう、
 //! **直前に描いた吹き出しの矩形の上なら、同じリンクを指している**とみなす（そのリンクがまだ画面にある間）。
 //!
 //! # 出さないとき
@@ -93,10 +93,21 @@ impl AppState {
         targets: &Targets,
         links: &[LinkSpan],
     ) -> Option<HoveredLink> {
+        self.link_at_cell(self.mouse_cell?, overlaid, targets, links)
+    }
+
+    /// セル`(column, row)`が指すリンク（[`Self::hovered_link`]の本体。引数の意味も同じ）。リンクの文字の`Ctrl`＋クリックは、
+    /// 押したセルでこれを引く（`app::link_open`）——吹き出しを出すのと同じ決め方で、開くリンクを決める。
+    pub(crate) fn link_at_cell(
+        &self,
+        (column, row): (u16, u16),
+        overlaid: bool,
+        targets: &Targets,
+        links: &[LinkSpan],
+    ) -> Option<HoveredLink> {
         if overlaid || self.selection.is_held() {
             return None;
         }
-        let (column, row) = self.mouse_cell?;
         if let (Some(shown), Some(rect)) = (&self.links.hovered, self.links.tooltip) {
             if rect.contains(Position::new(column, row)) {
                 let first = &shown.parts()[0];

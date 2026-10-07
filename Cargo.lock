@@ -1483,6 +1483,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "unicode-width",
+ "windows",
 ]
 
 [[package]]

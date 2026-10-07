@@ -5,6 +5,9 @@
 //! 親（`select_tests`）と同じく**製品の入口を通す**——製品の描画で描いて書き戻し、マウスは`AppState::handle_event`へ
 //! 入れ、指す位置は描いた画面のセルの文字から取る。吹き出しに出るはずの文字は**元のURL**から作る（描いた結果から
 //! 期待値を作らない）。イベントのたびに描き直す（製品のイベントループと同じ）。
+//!
+//! リンク先は**正規化した形**（パスの無いURLにも末尾の`/`を書く）で書く——開けるURLは吹き出しに正規化した形で出す
+//! （T11b。正規化そのものは子の`link_open_tests`が確かめる）。
 
 use unicode_width::UnicodeWidthStr;
 
@@ -108,7 +111,7 @@ fn hovering_a_link_shows_its_url_right_after_it_and_moving_off_removes_it() {
     );
 }
 
-/// **吹き出しの上へ動いても出たまま**（T11bでURLを押す場所になる。リンクから吹き出しへ動く間に消えないように）。
+/// **吹き出しの上へ動いても出たまま**（URLを押す場所なので、リンクから吹き出しへ動く間に消えないように）。
 /// 吹き出しからも外れると消える。
 #[test]
 fn the_tooltip_stays_while_the_pointer_is_on_it() {
@@ -131,7 +134,7 @@ fn the_tooltip_stays_while_the_pointer_is_on_it() {
 
 /// **再描画の合図は、指しているリンクが変わったときだけ**（計画書§3.3。`only_events_that_can_change_something_are_redrawn`の
 /// リンクの側）。同じリンクの中を動く・リンクの無い所を動くのは描き直さない（マウスを動かすたびに描き続けない）。
-/// Ctrlを押したままの移動も同じ（T11bのCtrl＋クリックの前に、指しているリンクを見せる）。
+/// Ctrlを押したままの移動も同じ（Ctrl＋クリックで開く前に、指しているリンクを見せる）。
 #[test]
 fn moving_redraws_only_when_the_hovered_link_changes() {
     for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
@@ -161,7 +164,7 @@ fn moving_redraws_only_when_the_hovered_link_changes() {
 /// 1行目から2行目へ動いても同じリンクなので描き直さない。
 #[test]
 fn a_wrapped_link_shows_the_tooltip_after_its_last_part_from_either_part() {
-    let url = "https://b.x";
+    let url = "https://b.x/";
     let mut app = app_with_items(&[&format!(
         "{} [二つ目のとても長いリンク]({url}) 後",
         "あ".repeat(46)
@@ -312,13 +315,13 @@ fn streaming_text_under_a_still_pointer_re_resolves_the_link() {
         estimated_input_tokens: 0,
     });
     app.apply(AgentEvent::TextDelta {
-        text: "前 [一つ目](https://a.x) 後\n\n空き\n\n前 [二つ目](https://b.x) 後".to_string(),
+        text: "前 [一つ目](https://a.x/) 後\n\n空き\n\n前 [二つ目](https://b.x/) 後".to_string(),
     });
     let screen = draw(&mut app);
     let (x, y) = screen.find("一つ目");
     moved(&mut app, (x + 2, y));
     assert_eq!(
-        draw(&mut app).find("(https://a.x)"),
+        draw(&mut app).find("(https://a.x/)"),
         right_after(&screen, "一つ目")
     );
 
@@ -332,9 +335,9 @@ fn streaming_text_under_a_still_pointer_re_resolves_the_link() {
         (x, y),
         "文章が4行ずれていない（試験の前提）"
     );
-    assert_eq!(moved_up.try_find("(https://a.x)"), None);
+    assert_eq!(moved_up.try_find("(https://a.x/)"), None);
     assert_eq!(
-        moved_up.find("(https://b.x)"),
+        moved_up.find("(https://b.x/)"),
         right_after(&moved_up, "二つ目")
     );
 
@@ -358,3 +361,7 @@ fn an_image_alt_text_shows_the_image_url() {
         right_after(&screen, "図の説明")
     );
 }
+
+/// リンクを開く試験（T11b）。ここの道具（吹き出しを出す・探す）を使うので、ここの子にする。
+#[path = "link_open_tests.rs"]
+mod link_open_tests;

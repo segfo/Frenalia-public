@@ -154,4 +154,9 @@ pub enum Action {
     /// （`harness-tui::run`）が`harness_term::clipboard::write`で書き、結果を`AppState::note_copied`へ渡す
     /// （`AppState`自体はクリップボードへ触らない。`app::select`のモジュールdoc）。
     Copy(String),
+    /// transcriptのリンクを既定のブラウザで開く（リンクの文字の`Ctrl`＋クリック・吹き出しのURLのクリック）。中身はhttp/https
+    /// だと確かめて正規化したURL（`crate::open_url::OpenableUrl`。検査を通らずには作れない）。呼び出し側
+    /// （`harness-tui::run`）が`crate::open_url::open_and_note`で開いて結果を知らせる（`AppState`自体はブラウザを
+    /// 起こさない。`app::link_open`のモジュールdoc）。
+    OpenUrl(crate::open_url::OpenableUrl),
 }
