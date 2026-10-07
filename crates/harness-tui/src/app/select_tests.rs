@@ -598,4 +598,7 @@ crate::markdown::plain_only! {
 crate::markdown::formatting_only! {
     #[path = "markdown_screen_tests.rs"]
     mod markdown_screen_tests;
+    /// リンクの吹き出しの試験（`app::link_hover`）。この試験の描き方・押し方の道具を使うので、ここの子にする。
+    #[path = "link_hover_tests.rs"]
+    mod link_hover_tests;
 }

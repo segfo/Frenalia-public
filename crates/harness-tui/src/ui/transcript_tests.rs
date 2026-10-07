@@ -120,7 +120,7 @@ fn every_line_gets_exactly_one_join() {
     app.thinking_progress = Some(Instant::now());
     assert!(app.begin_busy("Compacting context"));
     for collapsed in [true, false] {
-        let (lines, joins) = transcript_lines(&app, collapsed, 98);
+        let TranscriptLines { lines, joins, .. } = transcript_lines(&app, collapsed, 98);
         assert_eq!(joins.len(), lines.len(), "畳んでいる={collapsed}");
         assert!(
             joins.iter().all(|join| *join == LineJoin::Break),
@@ -137,7 +137,7 @@ fn an_empty_assistant_reply_takes_one_empty_line() {
     app.transcript
         .push(TranscriptItem::Assistant(AssistantText::new("")));
     app.transcript.push(TranscriptItem::Info("後".to_string()));
-    let (lines, joins) = transcript_lines(&app, false, 98);
+    let TranscriptLines { lines, joins, .. } = transcript_lines(&app, false, 98);
     assert_eq!(texts(&lines), ["前", "", "後"]);
     assert_eq!(joins, vec![LineJoin::Break; 3]);
 }
@@ -163,7 +163,7 @@ fn markdown_marks_outside_assistant_replies_stay_raw() {
         .push(TranscriptItem::Info("**知らせ**".to_string()));
     app.transcript
         .push(TranscriptItem::Error("**エラー**".to_string()));
-    let (lines, _) = transcript_lines(&app, false, 98);
+    let lines = transcript_lines(&app, false, 98).lines;
     assert_eq!(
         texts(&lines),
         [
@@ -191,14 +191,14 @@ fn streamed(on_frame: &mut impl FnMut(usize, &[Line<'static>])) -> Vec<Line<'sta
     for (k, delta) in DELTAS.iter().enumerate() {
         app.apply(text(delta));
         draw(&app);
-        on_frame(k, &transcript_lines(&app, false, 98).0);
+        on_frame(k, &transcript_lines(&app, false, 98).lines);
     }
     app.apply(AgentEvent::TurnCompleted {
         stop_reason: StopReason::EndTurn,
         usage: Usage::default(),
     });
     draw(&app);
-    transcript_lines(&app, false, 98).0
+    transcript_lines(&app, false, 98).lines
 }
 
 /// **流れ込む返答は届いた分だけその都度描かれ、終えた後の画面は、全文を一度に渡したのと同じ**（どの実装でも同じ）。
@@ -221,7 +221,7 @@ fn a_streamed_reply_is_drawn_as_it_arrives_and_ends_like_the_whole_reply_at_once
             DELTAS.concat(),
         )));
     draw(&whole);
-    assert_eq!(last, transcript_lines(&whole, false, 98).0);
+    assert_eq!(last, transcript_lines(&whole, false, 98).lines);
 }
 
 crate::markdown::formatting_only! {
@@ -276,7 +276,7 @@ crate::markdown::formatting_only! {
         for width in [100u16, 60, 100] {
             draw_at(&app, width);
             let inner = width - 2;
-            let (lines, joins) = transcript_lines(&app, false, inner);
+            let TranscriptLines { lines, joins, .. } = transcript_lines(&app, false, inner);
             assert!(
                 joins.iter().any(|join| matches!(join, LineJoin::Continues { .. })),
                 "幅{width}で1行も分けていない（試験の前提）"
@@ -293,5 +293,60 @@ crate::markdown::formatting_only! {
                 Some(_) => {}
             }
         }
+    }
+
+    /// 区間`link`に描かれた文字（`Line::styled_graphemes`で数えた書記素）。
+    fn link_text(lines: &[Line<'_>], link: &LinkSpan) -> String {
+        lines[link.line]
+            .styled_graphemes(ratatui::style::Style::default())
+            .skip(link.start)
+            .take(link.end - link.start)
+            .map(|grapheme| grapheme.symbol)
+            .collect()
+    }
+
+    /// **[整形する実装] リンクの区間はtranscriptの行で数える**——返答ごとに描画部品が返した区間を、その返答の最初の
+    /// 行の位置だけずらす（区間の行の文字がリンクの文字になる）。ほかの項目（ユーザーの入力・thinking・ツールの出力）は
+    /// Markdownの記号のまま描くので区間を返さない。折り返しで分かれたリンクは、2つ目の区間が続きの印を持つ。
+    #[test]
+    fn link_spans_are_counted_in_transcript_lines() {
+        let mut app = AppState::new("mock".into(), "mock-model".into());
+        app.push_user_prompt("[入力](https://u.x)".to_string());
+        app.transcript
+            .push(TranscriptItem::Assistant(AssistantText::new("前 [一つ目](https://a.x) 後")));
+        app.transcript
+            .push(TranscriptItem::Thinking("[考え](https://t.x)\n続き".to_string()));
+        app.transcript.push(TranscriptItem::ToolCard {
+            id: "t1".to_string(),
+            name: "run_shell".to_string(),
+            input: "{}".to_string(),
+            status: ToolCardStatus::Done {
+                is_error: false,
+                output: "[出力](https://o.x)".to_string(),
+            },
+        });
+        let long = format!("段落\n\n{} [二つ目のとても長いリンク](https://b.x)", "あ".repeat(46));
+        app.transcript
+            .push(TranscriptItem::Assistant(AssistantText::new(long)));
+        let drawn = transcript_lines(&app, false, 100);
+        let shown = texts(&drawn.lines);
+        let found: Vec<(&str, bool)> = drawn
+            .links
+            .iter()
+            .map(|link| (link.url.as_str(), link.continues))
+            .collect();
+        assert_eq!(
+            found,
+            [("https://a.x", false), ("https://b.x", false), ("https://b.x", true)],
+            "{shown:?}"
+        );
+        let parts: Vec<String> = drawn
+            .links
+            .iter()
+            .map(|link| link_text(&drawn.lines, link))
+            .collect();
+        assert_eq!(parts[0], "一つ目", "{shown:?}");
+        assert_eq!(parts[1].clone() + &parts[2], "二つ目のとても長いリンク", "{shown:?}");
+        assert_eq!(drawn.links[2].line, drawn.links[1].line + 1);
     }
 }

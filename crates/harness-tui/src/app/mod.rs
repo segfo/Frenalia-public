@@ -74,6 +74,8 @@ mod assistant_text;
 mod commands;
 mod events;
 mod input;
+/// transcriptのリンクを指したときの吹き出し——どのリンクを指しているかを決める（2026-10-07。計画書のT11a）。
+mod link_hover;
 mod pointer;
 /// `Esc`の二度押しで閉じる（2026-10-03。判定は`harness_term::double_esc`）。`Ctrl+C`は終了に使わない。
 mod quit;
@@ -92,6 +94,7 @@ pub use approval::{
 pub(crate) use assistant_text::AssistantText;
 use commands::parse_slash_command;
 pub use commands::{Action, FsStageCommand, MemoryCommand, SlashCommand};
+pub(crate) use link_hover::{HoveredLink, LinkFrame};
 pub use pointer::{Click, DrawFeedback, InputButton, KeyHint, ReviewDrawn, Step, Targets, Wheel};
 pub use review::{
     commit_selection, CommitSelection, PartialFile, ReviewCommand, ReviewDiffLine, ReviewFocus,
@@ -305,6 +308,12 @@ pub struct AppState {
     pub(crate) pointer: Targets,
     /// 直前に描いた画面の、入力欄の右のボタン（文言と矩形）。次に描いた画面と比べる（`app::pointer`のモジュールdoc）。
     input_buttons_drawn: Vec<(&'static str, ratatui::layout::Rect)>,
+    /// 最後に届いたマウスの事象のセル（どの種類の事象でも覚える）。リンクの吹き出しは、描くたびにこのセルで指している
+    /// リンクを引き直す（`app::link_hover`）。端末の外へ出たことは届かないので、消さない。
+    mouse_cell: Option<(u16, u16)>,
+    /// 直前に描いた画面のリンクのこと（リンクの区間・重ねる枠を描いたか・指していたリンク・吹き出しの矩形）。マウスの
+    /// 事象で、指しているリンクが変わったかを見る（`app::link_hover`）。描くたびに[`Self::apply_draw_feedback`]が差し替える。
+    links: LinkFrame,
     /// 入力欄の右のボタンが、別のボタンの居た場所へ最後に動いた時刻。そこから`pointer::BUTTON_SHIFT_GRACE`の間は
     /// そのボタンのクリックを捨てる。
     input_buttons_moved_at: Option<Instant>,
@@ -367,6 +376,8 @@ impl AppState {
             conversation_session_id: String::new(),
             pointer: Targets::default(),
             input_buttons_drawn: Vec::new(),
+            mouse_cell: None,
+            links: LinkFrame::default(),
             input_buttons_moved_at: None,
             press: Default::default(),
             selection: Default::default(),

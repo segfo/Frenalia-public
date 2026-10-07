@@ -4,8 +4,10 @@
 //! （`docs/CODE-STRUCTURE-RULES.md`規則3）。
 //!
 //! 描くついでに、押せる場所とホイールで送れる枠を**描いたその矩形で**登録して返す（`crate::app::pointer`）。
+//! transcriptのリンクを指している間の吹き出しは[`link_tooltip`]が描く。
 
 mod approval;
+mod link_tooltip;
 mod review;
 #[cfg(test)]
 #[path = "transcript_tests.rs"]
@@ -27,6 +29,7 @@ use crate::app::{
     spinner_glyph, wait_figures, AppState, Click, DrawFeedback, InputButton, KeyHint, NoticeTone,
     Targets, ToolCardStatus, TranscriptItem, WaitClock, Wheel, SPINNER_FRAMES,
 };
+use crate::markdown::LinkSpan;
 
 /// 入力欄が自動で伸びる最大行数。これを超えると内部スクロールする（カーソル行が
 /// 常に見えるよう毎フレーム再計算する。transcriptの`scroll_offset`のような永続的な
@@ -55,8 +58,9 @@ pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
 
     // 押せる場所と送れる枠は描いた順に登録する（後から登録したものが上。重ねる枠は最後）。
     let mut targets = Targets::default();
+    let transcript = render_transcript(f, root[0], app, &mut targets);
     let mut feedback = DrawFeedback {
-        transcript: render_transcript(f, root[0], app, &mut targets),
+        transcript: transcript.max,
         ..DrawFeedback::default()
     };
     render_status(f, root[1], app);
@@ -69,7 +73,8 @@ pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
         &mut feedback.input_buttons,
     );
 
-    if let Some(pending) = &app.pending_permission {
+    // 重ねる枠を描いたか（描いたらリンクの吹き出しは出さない。下の`link_tooltip::draw`）。
+    let overlaid = if let Some(pending) = &app.pending_permission {
         behind_overlay(&mut targets, f.area(), root[0]);
         feedback.approval = Some(approval::render_permission_modal(
             f,
@@ -84,6 +89,7 @@ pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
                 now: std::time::Instant::now(),
             },
         ));
+        true
     } else if let Some(panel) = &app.review_panel {
         behind_overlay(&mut targets, f.area(), root[0]);
         feedback.review = Some(review::render_review_panel(
@@ -93,22 +99,38 @@ pub fn render(f: &mut Frame, app: &AppState) -> DrawFeedback {
             &mut targets,
             &app.selection,
         ));
-    } else if app.selection_range().is_none() {
-        // 端末の実カーソルを入力欄の入力末尾へ明示的に置く。ratatuiは`set_cursor_position`を
-        // 呼ばない限りカーソルを隠したままにするため、これを怠るとOS/端末のIME（日本語等の
-        // 変換候補ウィンドウ）が「前回カーソルがあった場所」（起動直後は画面右下等）に出てしまい、
-        // 入力ボックスと無関係な位置に文字が表示されるように見える不具合が起きる。
-        //
-        // 選択中はあえて呼ばない: 端末のブロックカーソルは選択終端の直後の文字セルに重なって
-        // 描画されるため、選択ハイライト（背景色）と隣接して見分けが付きにくく、選択範囲外の
-        // 1文字まで選択されているかのような「幽霊」誤認を招く（実際にBackspace/Deleteしても
-        // その文字は削除されず取り残される）。選択中はIMEの変換候補位置よりも選択範囲の
-        // 視認性を優先する。
-        //
-        // 置くのは入力欄の枠の中（右のボタンを除いた幅）。行全体で数えると、長い行のカーソルがボタンの上へ出る。
-        set_input_cursor(f, input, app, &input_rows);
-    }
+        true
+    } else {
+        if app.selection_range().is_none() {
+            // 端末の実カーソルを入力欄の入力末尾へ明示的に置く。ratatuiは`set_cursor_position`を
+            // 呼ばない限りカーソルを隠したままにするため、これを怠るとOS/端末のIME（日本語等の
+            // 変換候補ウィンドウ）が「前回カーソルがあった場所」（起動直後は画面右下等）に出てしまい、
+            // 入力ボックスと無関係な位置に文字が表示されるように見える不具合が起きる。
+            //
+            // 選択中はあえて呼ばない: 端末のブロックカーソルは選択終端の直後の文字セルに重なって
+            // 描画されるため、選択ハイライト（背景色）と隣接して見分けが付きにくく、選択範囲外の
+            // 1文字まで選択されているかのような「幽霊」誤認を招く（実際にBackspace/Deleteしても
+            // その文字は削除されず取り残される）。選択中はIMEの変換候補位置よりも選択範囲の
+            // 視認性を優先する。
+            //
+            // 置くのは入力欄の枠の中（右のボタンを除いた幅）。行全体で数えると、長い行のカーソルがボタンの上へ出る。
+            set_input_cursor(f, input, app, &input_rows);
+        }
+        false
+    };
 
+    // リンクを指している間の吹き出し。transcriptの上に重ね、重ねる枠を描いた画面では出さない——描くのは重ねる枠の
+    // 分岐の後だが、吹き出しと重ねる枠は同じ画面に出ないので、重なりの順は「transcriptの上、重ねる枠の下」と同じ。
+    // 重ねる枠を描いたかを分岐そのものから受け取るのは、枠を1つ足したときに条件を書き足し忘れないため（分岐が値を
+    // 返すので、`true`を返さない枝はビルドが通らない）。
+    feedback.links = link_tooltip::draw(
+        f,
+        app,
+        overlaid,
+        transcript.inner,
+        transcript.links,
+        &mut targets,
+    );
     feedback.targets = targets;
     feedback
 }
@@ -395,17 +417,14 @@ fn set_input_cursor(f: &mut Frame, area: Rect, app: &AppState, rows: &[InputRow]
 /// `collapsed`が`true`のとき、ツールカードの入力/出力本文とthinkingブロックの全文を
 /// ヘッダ/要約1行だけに畳む（`Ctrl+O`トグル、Claude Code CLI相当の折り畳み表示）。
 ///
-/// 戻り値は描く行と、行ごとの前の行とのつながり（`LineJoin`。行と同じ数。`harness_term::select::Selectable::joined`へ
-/// 渡す）。assistantの返答は`inner_width`（transcriptの枠の内側の幅）で`AssistantText::render`が描き、返った印を
-/// そのまま並べる。ほかの行は全部`Break`。**流入中でない返答は描く前に終える**（`AppState::streaming_item`。
-/// このあと文章が足されることは無い）。
-fn transcript_lines(
-    app: &AppState,
-    collapsed: bool,
-    inner_width: u16,
-) -> (Vec<Line<'static>>, Vec<LineJoin>) {
+/// 戻り値は[`TranscriptLines`]（描く行・行ごとの前の行とのつながり・リンクの区間）。assistantの返答は
+/// `inner_width`（transcriptの枠の内側の幅）で`AssistantText::render`が描き、返った印とリンクの区間をそのまま
+/// 並べる。ほかの行は全部`Break`で、リンクの区間も無い。**流入中でない返答は描く前に終える**
+/// （`AppState::streaming_item`。このあと文章が足されることは無い）。
+fn transcript_lines(app: &AppState, collapsed: bool, inner_width: u16) -> TranscriptLines {
     let mut lines = Vec::new();
     let mut joins = Vec::new();
+    let mut links = Vec::new();
     let streaming = app.streaming_item();
     for (i, item) in app.transcript.iter().enumerate() {
         match item {
@@ -423,6 +442,11 @@ fn transcript_lines(
                 }
                 let rendered = text.render(inner_width);
                 joins.resize(lines.len(), LineJoin::Break); // ここまでのほかの行
+                let first = lines.len();
+                links.extend(rendered.links.into_iter().map(|link| LinkSpan {
+                    line: first + link.line,
+                    ..link
+                }));
                 lines.extend(rendered.lines);
                 joins.extend(rendered.joins);
             }
@@ -567,20 +591,54 @@ fn transcript_lines(
     }
 
     joins.resize(lines.len(), LineJoin::Break);
-    (lines, joins)
+    TranscriptLines {
+        lines,
+        joins,
+        links,
+    }
 }
 
-/// 戻り値は`scroll_offset`の上限（[`render`]がそのまま返す）。
+/// transcriptを描く行（[`transcript_lines`]の戻り値）。
+struct TranscriptLines {
+    lines: Vec<Line<'static>>,
+    /// `lines`と同じ数。行ごとの前の行とのつながり（`harness_term::select::Selectable::joined`へ渡す）。
+    joins: Vec<LineJoin>,
+    /// リンクの文字が描かれた場所（`crate::markdown::LinkSpan`）。**行はtranscriptの行**（`lines`の添字）——
+    /// 返答ごとに描画部品が返した区間を、その返答の最初の行の位置だけずらしたもの。行の順。
+    links: Vec<LinkSpan>,
+}
+
+/// transcriptを描いて分かったこと（[`render_transcript`]の戻り値）。
+struct DrawnTranscript {
+    /// `scroll_offset`の上限（[`render`]が`DrawFeedback::transcript`へ入れる）。
+    max: u16,
+    /// 枠の内側（リンクの吹き出しを置ける範囲）。
+    inner: Rect,
+    /// リンクの区間（transcriptの行。[`TranscriptLines::links`]）。
+    links: Vec<LinkSpan>,
+}
+
+/// 戻り値は[`DrawnTranscript`]（`scroll_offset`の上限・枠の内側・リンクの区間）。
 ///
 /// 枠全体をホイールで送れる場所として登録する。さかのぼっている間だけ見出しに出る「さかのぼり中」の案内は、
 /// 押すと末尾へ戻る（見出しを`Block`に持たせず、上辺へ自分で描いて描いた場所を登録する）。
-fn render_transcript(f: &mut Frame, area: Rect, app: &AppState, targets: &mut Targets) -> u16 {
+fn render_transcript(
+    f: &mut Frame,
+    area: Rect,
+    app: &AppState,
+    targets: &mut Targets,
+) -> DrawnTranscript {
     // 末尾追従の描画と上限の算出は`harness_term::scrollback`が持つ
     // （ポリシーエディタの記録画面と共有。同局のdoc参照）。
     // 戻り値の上限を`AppState::apply_draw_feedback`へ渡すのは呼び出し側の責務（BUG-076）。
     // assistantの返答を描く幅は、描く枠と同じ枠の内側から測る（実装へ渡す幅は`crate::markdown`が狭める）。
     let block = Block::default().borders(Borders::ALL);
-    let (lines, joins) = transcript_lines(app, app.collapsed, block.inner(area).width);
+    let inner = block.inner(area);
+    let TranscriptLines {
+        lines,
+        joins,
+        links,
+    } = transcript_lines(app, app.collapsed, inner.width);
     let max = harness_term::scrollback::render_with_bar(
         f,
         area,
@@ -614,7 +672,7 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &AppState, targets: &mut Ta
     let title = [Span::raw(head), Span::raw(notice), told];
     let drawn = harness_term::row::draw(f, edge, &title);
     targets.click(drawn[1], Click::ScrollToLatest);
-    max
+    DrawnTranscript { max, inner, links }
 }
 
 /// `text`を表示幅`width`桁に収める。入り切らなければ末尾を`…`にして切る（切ったことを黙らない）。
@@ -738,12 +796,13 @@ fn render_status(f: &mut Frame, area: Rect, app: &AppState) {
         app.session_usage.output,
         scope_label(app),
     );
-    let paragraph = Paragraph::new(Line::from(Span::styled(
-        text,
-        Style::default().fg(Color::Black).bg(Color::Gray),
-    )));
+    let paragraph = Paragraph::new(Line::from(Span::styled(text, STATUS_STYLE)));
     f.render_widget(paragraph, area);
 }
+
+/// ステータスバーの見た目。リンクの吹き出し（[`link_tooltip`]）も同じにする——どちらも会話の文章ではなく、画面が
+/// 添える知らせ。
+const STATUS_STYLE: Style = Style::new().fg(Color::Black).bg(Color::Gray);
 
 /// 入力欄の行を描く——左に入力欄、右に枠付きの「送信」（応答中は「中断」も）。戻り値は入力欄の矩形
 /// （IMEのカーソルを置く場所。[`set_input_cursor`]）。

@@ -1662,10 +1662,19 @@ fn the_ime_cursor_stays_inside_the_narrowed_input_box() {
 
 /// **ポインタが動いただけ・キーを離しただけのイベントは描き直さない**（`Step::Unchanged`）。押下とホイールは
 /// 何にも当たらない場所でも描き直す（今までどおり）。
+///
+/// **例外は、指しているリンクが変わる移動**——計画書のT11aで意図して書き換えた（リンクの吹き出しは、描き直さないと
+/// 出ない・消えない）。リンクとして描く実装（整形する実装）では、リンクの上へ動くと描き直し、同じリンクの中を動くのは
+/// 描き直さない。記号のまま描く実装ではリンクが無いので、同じ移動でも描き直さない。リンクの側の詳しい場合分けは
+/// `select_tests::link_hover_tests`。
 #[test]
 fn only_events_that_can_change_something_are_redrawn() {
     let mut app = app_with_transcript(3);
-    draw(&mut app);
+    app.transcript
+        .push(TranscriptItem::Assistant(AssistantText::new(
+            "[リンク](https://example.com)",
+        )));
+    let screen = draw(&mut app);
     for kind in [
         MouseEventKind::Moved,
         MouseEventKind::Up(MouseButton::Left),
@@ -1677,6 +1686,23 @@ fn only_events_that_can_change_something_are_redrawn() {
             "{kind:?}"
         );
     }
+    let at = screen.find("リンク");
+    let look = screen.style(at);
+    let drawn_as_link =
+        look.fg == Some(Color::Blue) && look.add_modifier.contains(Modifier::UNDERLINED);
+    assert_eq!(
+        matches!(mouse(&mut app, MouseEventKind::Moved, at), Step::Handled(_)),
+        drawn_as_link,
+        "リンクの上への移動（リンクとして描いた={drawn_as_link}）"
+    );
+    draw(&mut app);
+    assert!(
+        matches!(
+            mouse(&mut app, MouseEventKind::Moved, (at.0 + 2, at.1)),
+            Step::Unchanged
+        ),
+        "同じリンクの中の移動で描き直した"
+    );
     for kind in [
         MouseEventKind::Down(MouseButton::Left),
         MouseEventKind::ScrollUp,
