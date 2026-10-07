@@ -54,6 +54,10 @@
 //   (12) コードブロックの2桁の字下げを外した。コードとHTMLの行のタブを空白にする（`render/wrap.rs`の`expand_tabs`）
 //   (13) リンクの文字の場所とURLを`Rendered::links`で返す（`render/wrap.rs`の`Sink`）。リンクの書式は上流のまま
 //        青の下線で、文中にURLは出さない。画像は区間を返さない（代わりの文字の描き方は上流のまま）
+// - 計画書のT11a（リンクの吹き出し）で、(13)の画像の扱いを変えた。
+//   (14) 画像の代わりの文字（上流のままリンクの書式で描く）を、画像のURLへのリンクとして区間を返す——書式はリンクなのに
+//        吹き出しが出ない、という見た目と動きの食い違いを無くすため。リンクの中の画像は外側のリンク先の区間にする
+//        （`link_id`・`outer_link`）。描く行は変えていない
 //   段落の末尾のハードな改行を捨てるのは`render/wrap.rs`の`fill`。
 //   T7bで直した構造を含まない入力では、今も元と1つも違わない（`super::equivalence_tests`が確かめる）。
 // - 計画書のT8で、既に何か描いた文書の続きとして描く口`render_lines_following`と、描いた結果をつなぐ口`append`を
@@ -184,6 +188,9 @@ struct Renderer {
     in_html: bool,
     /// 【harness】いま読んでいるリンクの番号（T7b）
     link: Option<usize>,
+    /// 【harness】いま中にいるリンクのリンク先（T11a。リンクの中の画像を、外側のリンクの区間にするため）。リンクは
+    /// 入れ子にならない（解析器はリンクの中のリンクを許さない）ので1つで足りる
+    outer_link: Option<String>,
     table: Option<TableBuf>,
     /// blank line owed before the next block
     pending_gap: bool,
@@ -259,6 +266,7 @@ impl Renderer {
             in_code: false,
             in_html: false,
             link: None,
+            outer_link: None,
             table: None,
             pending_gap: false,
             wrote_any: false,
@@ -374,22 +382,23 @@ impl Renderer {
     }
 
     /// 【harness】文字の書式`style`がリンクの中なら、そのリンクの番号（T7b）。同じリンクの中で書式が変わっても同じ
-    /// 番号。画像の代わりの文字はリンクとして扱わない（区間を返さない）。
+    /// 番号。**画像の代わりの文字も、画像のURLへのリンクとして扱う**（書式がリンクなので、見た目と動きを揃える。
+    /// T11a）。ただしリンクの中の画像は外側のリンク先（ブラウザで押したときに開く先。READMEのバッジの形）。
     fn link_id(&mut self, style: &InlineStyle) -> Option<usize> {
-        match &style.link {
-            Some(link) if !link.image => {
-                let id = match self.link {
-                    Some(id) if self.out.url(id) == link.href => id,
-                    _ => self.out.add_link(&link.href),
-                };
-                self.link = Some(id);
-                Some(id)
-            }
-            _ => {
-                self.link = None;
-                None
-            }
-        }
+        let Some(link) = &style.link else {
+            self.link = None;
+            return None;
+        };
+        let href = match &self.outer_link {
+            Some(outer) if link.image => outer.clone(),
+            _ => link.href.clone(),
+        };
+        let id = match self.link {
+            Some(id) if self.out.url(id) == href => id,
+            _ => self.out.add_link(&href),
+        };
+        self.link = Some(id);
+        Some(id)
     }
 
     /// Prefix spans for the first line of a block (consumes each level's marker once), plus width.
@@ -455,13 +464,33 @@ impl Renderer {
             }
             Event::Text { text, style, .. } => self.text(text, style),
             // 【harness】リンクの出入りでリンクの番号を区切る（隣り合う別のリンクを1つの区間にしないため。T7b）。
+            // 中にいる間はリンク先を覚える（リンクの中の画像を外側のリンクの区間にする。T11a）。
             Event::EnterInline {
+                inline: Inline::Link(link),
+                ..
+            } => {
+                self.link = None;
+                self.outer_link = Some(link.href.clone());
+            }
+            Event::ExitInline {
                 inline: Inline::Link(_),
+            } => {
+                self.link = None;
+                self.outer_link = None;
+            }
+            // 【harness】リンクの外の画像の出入りでも番号を区切る（隣り合う画像とリンクを1つの区間にしないため。T11a）。
+            // リンクの中の画像は外側のリンクの一部なので区切らない。
+            Event::EnterInline {
+                inline: Inline::Image(_),
                 ..
             }
             | Event::ExitInline {
-                inline: Inline::Link(_),
-            } => self.link = None,
+                inline: Inline::Image(_),
+            } => {
+                if self.outer_link.is_none() {
+                    self.link = None;
+                }
+            }
             // Inline nesting is already baked into each Text event's `InlineStyle`.
             Event::EnterInline { .. } | Event::ExitInline { .. } => {}
             Event::SoftBreak => {

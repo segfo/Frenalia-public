@@ -31,6 +31,7 @@ fn link(line: usize, start: usize, end: usize) -> LinkSpan {
         start,
         end,
         url: "https://example.com".to_string(),
+        continues: false,
     }
 }
 /// **実装へは、枠の内側の幅から右端の1桁を空けた幅を渡す**（`harness_term::wrap::text_width`と同じ規則。

@@ -110,7 +110,7 @@ pub(crate) struct Rendered {
 /// 場所は`lines[line]`の中の文字（書記素）の半開区間`start..end`。**数え方は範囲選択の位置
 /// （`harness_term::select`の`Pos.offset`）と同じ**——`Line::styled_graphemes`が返す書記素で数え、描かれない
 /// 制御文字は数えない。範囲選択の地図が返す「何行目の何文字目」をそのまま当てて、指した文字がリンクかを引けるように
-/// するため。折り返しをまたぐリンクは、行ごとに1つずつ分かれる。
+/// するため。折り返しをまたぐリンクは、行ごとに1つずつ分かれ、2行目以降の区間には[`Self::continues`]が付く。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinkSpan {
     pub line: usize,
@@ -120,6 +120,13 @@ pub(crate) struct LinkSpan {
     /// 試験でないビルドの「使われていない」の警告を止める（[`MarkdownView::reset`]と同じ扱い）。T11で読んだら外す。
     #[cfg_attr(not(test), allow(dead_code))]
     pub url: String,
+    /// この区間が、**すぐ前の区間と同じリンクの続き**か（リンクが折り返しをまたいで、前の行から続いている）。
+    /// 分かれた区間を1つのリンクにまとめるのに使う（どちらの区間を指しても、吹き出しはリンクの最後の文字の後ろに
+    /// 出す）。同じリンクかどうかは描画部品が知っている（リンクごとの番号）ので、描画部品が付ける——使う側がURLや
+    /// 位置から推し量らない（隣り合う別のリンクはURLが同じでも別のリンク）。**製品で読むところはまだ無い**（[`Self::url`]と
+    /// 同じ扱い。計画書のT11aの吹き出しで読んだら外す）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub continues: bool,
 }
 
 /// どの実装で描くか。**ここ1か所で決める**（モジュールdoc）。feature `markdown-codewandler`（既定で有効）なら整形する

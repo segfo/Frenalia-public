@@ -1,6 +1,7 @@
 // 【harness側で書いたファイル】上流（`codewandler-markdown-ratatui`）には無い。写した描画部品（`super`）の
 // 折り返しを、このファイルの部品で置き換えた（計画書`plans/PLAN-TUI-IMPROVEMENTS.md`§0のT7a）。
 // T7bで、行と一緒にリンクの文字の場所を積む口（`Piece`・`Sink`のリンクの区間）と、タブを空白にする`expand_tabs`を足した。
+// T11aで、折り返しをまたいだリンクの2行目以降の区間に続きの印（`LinkSpan::continues`）を付けるようにした。
 
 //! 写した描画部品が、長い1行を渡された幅に合わせて**自分で**複数の行へ分ける部品（計画書§1.5の1と7・§2）と、
 //! 出した行を積む置き場（[`Sink`]。行・つながりの印・リンクの区間。計画書§1.5の6・§3）。
@@ -29,7 +30,8 @@
 //!
 //! - 同じ番号の文字が同じ行に続けば1つの区間（間の空白——英語の語の間——も区間に入る）
 //! - 次の行の最初のリンクの文字が同じ番号なら、リンクが折り返しをまたいだので、前の行の区間を行末まで延ばす
-//!   （分けた所に残した空白を含める。各行の区間の文字をつなぐと、リンクの文字に戻る）
+//!   （分けた所に残した空白を含める。各行の区間の文字をつなぐと、リンクの文字に戻る）。次の行の区間には続きの印
+//!   （`LinkSpan::continues`）を付ける——使う側が分かれた区間を1つのリンクにまとめるため（吹き出しの置き場所）
 //!
 //! 番号で見分けるので、URLが同じでも隣り合う別のリンクは別の区間になる。
 //!
@@ -114,6 +116,7 @@ impl Sink {
 
     /// 番号`id`のリンクの文字が、`line`行目の`start..end`に描かれた（モジュールdoc）。
     fn mark_link(&mut self, id: usize, line: usize, start: usize, end: usize) {
+        let mut continues = false;
         if let Some((index, last_id)) = self.last_link {
             if last_id == id {
                 let previous = self.links[index].line;
@@ -124,6 +127,7 @@ impl Sink {
                 if previous + 1 == line {
                     let line_end = self.lines[previous].spans.iter().map(graphemes).sum();
                     self.links[index].end = line_end;
+                    continues = true;
                 }
             }
         }
@@ -132,6 +136,7 @@ impl Sink {
             start,
             end,
             url: self.urls[id].clone(),
+            continues,
         });
         self.last_link = Some((self.links.len() - 1, id));
     }

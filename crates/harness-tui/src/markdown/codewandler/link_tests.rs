@@ -17,8 +17,10 @@
 //! - 隣り合う2つのリンクは、URLが同じでも別の区間になる。リンクの中の書式（太字・コード）とソフト改行（空白1つ）は
 //!   1つの区間に収まる
 //! - 裸のURL（GFMの自動リンク）と`<…>`の自動リンクも同じ扱い
-//! - **画像は区間を返さない**。代わりの文字（alt）は素の描画部品と同じくリンクの書式で描く（計画書§1.5は画像に
-//!   触れていない）
+//! - **画像の代わりの文字（alt）はリンクの書式のまま描き、画像のURLへのリンクとして区間を返す**（計画書のT11aで
+//!   決めた。それまでは書式だけがリンクで区間を返さず、見た目と動きが食い違っていた）。見た目は素の描画部品のまま。
+//!   **リンクの中の画像**（`[![alt](画像)](リンク先)`。READMEのバッジの形）は、画像のURLではなく外側のリンク先の
+//!   区間になる（ブラウザで押したときに開く先と同じ）。外側のリンクの文字と続いていれば1つの区間
 //!
 //! # 限界
 //!
@@ -46,6 +48,15 @@ fn link(line: usize, start: usize, end: usize, url: &str) -> LinkSpan {
         start,
         end,
         url: url.to_string(),
+        continues: false,
+    }
+}
+
+/// 折り返しで分かれたリンクの、2行目以降の区間（前の行の区間の続き。`LinkSpan::continues`）。
+fn cont(line: usize, start: usize, end: usize, url: &str) -> LinkSpan {
+    LinkSpan {
+        continues: true,
+        ..link(line, start, end, url)
     }
 }
 
@@ -102,7 +113,8 @@ fn only_text_with_links_returns_link_spans() {
 }
 
 /// 英語の語の切れ目で折り返すリンクは、行ごとに1つずつ区間を返す。前の行の末尾に残した空白は、リンクが次の行へ
-/// 続くので前の行の区間に含める。リンクの後ろの語（`end`）との間の空白は含めない。
+/// 続くので前の行の区間に含める。リンクの後ろの語（`end`）との間の空白は含めない。2行目の区間は前の行の続き
+/// （`continues`。使う側が、分かれた区間を1つのリンクにまとめるため）。
 #[test]
 fn a_link_wrapped_over_lines_yields_one_span_per_line() {
     let rendered = draw("see [alpha beta gamma](https://e.x) end\n", 12);
@@ -112,7 +124,7 @@ fn a_link_wrapped_over_lines_yields_one_span_per_line() {
     );
     assert_eq!(
         rendered.links,
-        [link(0, 4, 10, "https://e.x"), link(1, 0, 10, "https://e.x")]
+        [link(0, 4, 10, "https://e.x"), cont(1, 0, 10, "https://e.x")]
     );
     let texts: Vec<String> = rendered
         .links
@@ -132,7 +144,7 @@ fn a_link_with_wide_characters_counts_characters_not_columns() {
     );
     assert_eq!(
         rendered.links,
-        [link(0, 1, 5, "https://e.x"), link(1, 0, 3, "https://e.x")]
+        [link(0, 1, 5, "https://e.x"), cont(1, 0, 3, "https://e.x")]
     );
 }
 
@@ -196,15 +208,41 @@ fn autolinks_are_returned_with_their_url() {
     );
 }
 
-/// 画像は区間を返さない。代わりの文字はリンクの書式のまま描く（モジュールdoc）。
+/// **画像の代わりの文字は、画像のURLへのリンク**——リンクの書式で描き（素の描画部品のまま）、区間を返す（モジュールdoc）。
+/// 隣り合う画像とリンクは、URLが同じでも別の区間。
 #[test]
-fn an_image_keeps_its_alt_text_and_returns_no_link_span() {
+fn an_image_alt_text_is_a_link_to_the_image() {
     let rendered = draw("![alt](https://e.x/a.png)\n", 40);
     assert_eq!(
         describe(&Text::from(rendered.lines.clone())),
         ["«link|alt»"]
     );
-    assert!(rendered.links.is_empty());
+    assert_eq!(rendered.links, [link(0, 0, 3, "https://e.x/a.png")]);
+    assert_eq!(
+        draw("![a](https://e.x)[b](https://e.x)\n", 40).links,
+        [link(0, 0, 1, "https://e.x"), link(0, 1, 2, "https://e.x")]
+    );
+}
+
+/// **リンクの中の画像は、外側のリンク先**（READMEのバッジの形。ブラウザで押したときに開く先）。外側のリンクの文字と
+/// 続いていれば1つの区間。リンクの外の画像は今までどおり画像のURL。
+#[test]
+fn an_image_inside_a_link_belongs_to_the_link() {
+    assert_eq!(
+        draw("[![build](https://img.x/b.svg)](https://h.x)\n", 40).links,
+        [link(0, 0, 5, "https://h.x")]
+    );
+    assert_eq!(
+        draw(
+            "[see ![i](https://img.x/b.svg) here](https://h.x) ![j](https://img.x/c.png)\n",
+            60
+        )
+        .links,
+        [
+            link(0, 0, 10, "https://h.x"),
+            link(0, 11, 12, "https://img.x/c.png")
+        ]
+    );
 }
 
 /// 隣り合う2つのリンクは、URLが同じでも別の区間。間の空白はどちらにも含めない。
@@ -225,7 +263,7 @@ fn a_link_containing_styles_and_a_soft_break_is_one_span() {
 }
 
 /// **どの入力をどの幅で描いても**、区間は行の中に収まり、区間の中の空白でない文字はどれもリンクの書式で描かれ、
-/// リンクの書式で描いた文字はどれも区間に入る（画像を含む入力は後者から外す）。各区間の文字をつなぐと、
+/// リンクの書式で描いた文字はどれも区間に入る（画像の代わりの文字も）。各区間の文字をつなぐと、
 /// どこでも分けない広い幅で描いたときの区間の文字と同じになり、URLの並びも同じ。
 #[test]
 fn every_link_span_matches_the_drawn_link_text_at_every_width() {
@@ -262,16 +300,14 @@ fn every_link_span_matches_the_drawn_link_text_at_every_width() {
                 }
                 spans_checked += 1;
             }
-            if !src.contains("![") {
-                for (index, line) in rendered.lines.iter().enumerate() {
-                    for (offset, (symbol, style)) in graphemes(line).into_iter().enumerate() {
-                        if is_link_style(style) {
-                            assert!(
-                                rendered.links.iter().any(|span| span.line == index
-                                    && (span.start..span.end).contains(&offset)),
-                                "リンクの書式の文字{symbol:?}（{index}行目の{offset}文字目・幅{width}）が区間に無い: {src:?}"
-                            );
-                        }
+            for (index, line) in rendered.lines.iter().enumerate() {
+                for (offset, (symbol, style)) in graphemes(line).into_iter().enumerate() {
+                    if is_link_style(style) {
+                        assert!(
+                            rendered.links.iter().any(|span| span.line == index
+                                && (span.start..span.end).contains(&offset)),
+                            "リンクの書式の文字{symbol:?}（{index}行目の{offset}文字目・幅{width}）が区間に無い: {src:?}"
+                        );
                     }
                 }
             }
@@ -288,6 +324,30 @@ fn every_link_span_matches_the_drawn_link_text_at_every_width() {
                 .collect();
             urls.dedup();
             assert_eq!(urls, wide_urls, "幅{width}: {src:?}");
+            // 続きの区間（`continues`）は、すぐ上の行の区間の続き——同じURLで、前の区間はその行の末尾まで。最初の区間は
+            // 続きではない。続きをまとめたリンクの数は、どこでも分けない幅と同じ（分かれた区間を使う側が1つにまとめられる）。
+            assert!(
+                !rendered.links.first().is_some_and(|span| span.continues),
+                "最初の区間が続きになっている（幅{width}）: {src:?}"
+            );
+            for pair in rendered.links.windows(2) {
+                let (before, after) = (&pair[0], &pair[1]);
+                if after.continues {
+                    assert_eq!(before.url, after.url, "幅{width}: {src:?}");
+                    assert_eq!(before.line + 1, after.line, "幅{width}: {src:?}");
+                    assert_eq!(
+                        before.end,
+                        graphemes(&rendered.lines[before.line]).len(),
+                        "続く前の区間が行の末尾まで無い（幅{width}）: {src:?}"
+                    );
+                }
+            }
+            let whole = |links: &[LinkSpan]| links.iter().filter(|span| !span.continues).count();
+            assert_eq!(
+                whole(&rendered.links),
+                whole(&wide.links),
+                "続きをまとめたリンクの数（幅{width}）: {src:?}"
+            );
             split_links += rendered.links.len().saturating_sub(wide.links.len());
         }
     }

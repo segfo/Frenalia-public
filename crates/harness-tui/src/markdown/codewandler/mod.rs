@@ -103,7 +103,8 @@
 //! - 写した描画部品は、**元の出力が幅に左右されず、T7bで直した構造を含まない入力では、今も元と1文字も違わない**
 //!   （`equivalence_tests`）。行の分け方（`wrap_tests`）・構造（`characterization_tests`・`structure_tests`）・
 //!   リンクの区間（`link_tests`）はそれぞれの試験が固定する。
-//! - 画像は、代わりの文字（alt）をリンクと同じ書式で描くが、リンクの区間は返さない（`link_tests`のモジュールdoc）。
+//! - 画像は、代わりの文字（alt）をリンクと同じ書式で描き、画像のURLへのリンクとして区間を返す（リンクの中の画像は
+//!   外側のリンク先。`link_tests`のモジュールdoc）。画像そのものは描かない。
 
 use std::any::Any;
 use std::ops::Range;
