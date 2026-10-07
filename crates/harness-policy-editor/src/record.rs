@@ -91,7 +91,7 @@ pub struct RecordRequest<'a> {
     pub collector: &'a SharedCollector,
     /// 常駐netfilterd（あれば）。パス1はWFPを張らないので`ApplyRules`への相乗りは使えないが、
     /// **netfilterdが既に生きているなら、そこから収集器を連鎖起動できる**（D-60の適用範囲。
-    /// `record_net::start_collector`と同じ`ChainLaunchHelper`経路）。渡さない/生きていない
+    /// `record_net::SharedNetfilter::chain_launch_collector`と同じ`ChainLaunchHelper`経路）。渡さない/生きていない
     /// なら`runas`にフォールバックする——`None`は「使えない」ことを表すだけで、記録自体は
     /// 従来どおり成立する。
     pub wfp: Option<&'a crate::record_net::SharedNetfilter>,
@@ -358,7 +358,7 @@ pub fn record(
         capture_argv: true,
     };
     // D-56 段階2: 生きているdaemonがあれば`StartCollect`を再送するだけ（UACは出ない）。
-    // 無ければ、常駐netfilterdがあればそこから連鎖起動し（D-60、`record_net::start_collector`と
+    // 無ければ、常駐netfilterdがあればそこから連鎖起動し（D-60、`record_net::SharedNetfilter::chain_launch_collector`と
     // 同じ経路）、それも無ければ`runas`で起こす。
     // **この行より後の全経路が`stop_collector`（＝`StopCollect`）を通る。**
     let (learn_prelude, chain_attempted) = if request.collector.is_live() {
