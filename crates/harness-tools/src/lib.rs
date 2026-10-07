@@ -70,7 +70,8 @@ pub use shell::{run_shell_bootstrap_stdin, RUN_SHELL_COMMAND_ENV_VAR, RUN_SHELL_
 /// これを経路ごとに書き直すと、片方だけ「proxyはあるがWFPが無い」状態で外向きソケットを
 /// 開けてしまう（proxyを読まない子は素通りできるので、それは強制ではない）。
 pub use shell::{should_grant_tier2a_network_capability, NetDecision};
-pub use web::WebFetchTool;
+// 開いてよいURLの判定（http/httpsだけ）は会話TUIも借りる（リンクを開く前の検査。`web::parse_http_url`）。
+pub use web::{parse_http_url, HttpUrlError, WebFetchTool};
 
 /// 登録済みツールの集合。`ToolSpec` へ一括展開してプロバイダへ渡す。
 ///

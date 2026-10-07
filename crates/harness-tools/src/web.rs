@@ -29,6 +29,47 @@ struct WebFetchInput {
     max_bytes: Option<usize>,
 }
 
+/// URLの文字列を解析し、**http/httpsのときだけ**正規化したURLを返す（モジュールdocのガード(4)の入口）。
+///
+/// `web_fetch`の入口と、会話TUIがリンクを開く前（`harness-tui`の`open_url`）が同じこれを通る——開いてよい形式の
+/// 判定を2か所に写さない。返す`Url`の文字列（`as_str`）は正規化した形（スキームとホストは小文字・空白などは
+/// `%`で符号化・パスの無いものは`/`）で、検査した値と使う値を別物にしないよう、呼び出し側はこれを使う（B-21）。
+/// スキームの無い相対URL（`foo.html`・`//host/path`）は解析できないので断る。
+pub fn parse_http_url(raw: &str) -> Result<reqwest::Url, HttpUrlError> {
+    let url = reqwest::Url::parse(raw).map_err(HttpUrlError::Invalid)?;
+    ensure_http_scheme(&url)?;
+    Ok(url)
+}
+
+/// [`parse_http_url`]が断った理由。文面（`Display`）は`web_fetch`がモデルへ返す文面と同じ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpUrlError {
+    /// URLとして解析できない（相対URLを含む）。中身は`url`クレートの`ParseError`（reqwestは型の名前を再公開して
+    /// いないので、`FromStr`の失敗の型として書く）。
+    Invalid(<reqwest::Url as std::str::FromStr>::Err),
+    /// http/https以外の形式（中身はスキーム）。
+    Scheme(String),
+}
+
+impl std::fmt::Display for HttpUrlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(e) => write!(f, "invalid url: {e}"),
+            Self::Scheme(scheme) => write!(f, "only http(s) schemes are allowed: {scheme}"),
+        }
+    }
+}
+
+impl std::error::Error for HttpUrlError {}
+
+/// `url`がhttp/httpsか（入口と、リダイレクトの毎ホップで同じこれを通す）。
+fn ensure_http_scheme(url: &reqwest::Url) -> Result<(), HttpUrlError> {
+    match url.scheme() {
+        "http" | "https" => Ok(()),
+        other => Err(HttpUrlError::Scheme(other.to_string())),
+    }
+}
+
 pub struct WebFetchTool;
 
 #[async_trait]
@@ -74,16 +115,12 @@ impl Tool for WebFetchTool {
         let input: WebFetchInput = parse_tool_input(&input)?;
         let max_bytes = input.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
 
-        let mut current_url = reqwest::Url::parse(&input.url)
-            .map_err(|e| ToolError::InvalidInput(format!("invalid url: {e}")))?;
+        let mut current_url =
+            parse_http_url(&input.url).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
 
         for _ in 0..=MAX_REDIRECTS {
-            if current_url.scheme() != "http" && current_url.scheme() != "https" {
-                return Err(ToolError::InvalidInput(format!(
-                    "only http(s) schemes are allowed: {}",
-                    current_url.scheme()
-                )));
-            }
+            // リダイレクト先も毎ホップ同じ判定で検査する（モジュールdocのガード(2)）。
+            ensure_http_scheme(&current_url).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
             let host = current_url
                 .host_str()
                 .ok_or_else(|| ToolError::InvalidInput("url has no host".to_string()))?
@@ -261,6 +298,45 @@ mod tests {
         // 別表記IPv4を正準ドット表記へ正規化するため、host_str()の時点で既に "127.0.0.1"。
         let url = reqwest::Url::parse("http://2130706433/").unwrap();
         assert_eq!(url.host_str(), Some("127.0.0.1"));
+    }
+
+    /// `parse_http_url`（`web_fetch`の入口の判定。会話TUIがリンクを開く前にも使う）: http/httpsだけを通し、
+    /// 正規化した形（スキームとホストは小文字・空白は`%20`・パスの無いものは`/`）を返す。それ以外の形式と、
+    /// スキームの無い相対URLは断る。断るときの文面は`web_fetch`が返してきたものと同じ。
+    #[test]
+    fn parse_http_url_accepts_only_http_and_https_and_normalises() {
+        let accepted = [
+            ("HTTPS://Example.COM/a b", "https://example.com/a%20b"),
+            ("http://e.x", "http://e.x/"),
+            ("https://example.com/a?q=1#f", "https://example.com/a?q=1#f"),
+        ];
+        for (raw, normalised) in accepted {
+            let url = parse_http_url(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!(url.as_str(), normalised, "{raw}");
+        }
+        let refused = [
+            "file:///C:/x",
+            "javascript:alert(1)",
+            "ms-msdt:id",
+            "search-ms:query=x",
+            "data:text/html,x",
+            "vbscript:msgbox(1)",
+            "mailto:a@b",
+            "ftp://e.x/",
+            "foo.html",
+            "//host/path",
+        ];
+        for raw in refused {
+            assert!(parse_http_url(raw).is_err(), "{raw}");
+        }
+        assert_eq!(
+            parse_http_url("ftp://e.x/").unwrap_err().to_string(),
+            "only http(s) schemes are allowed: ftp"
+        );
+        assert!(parse_http_url("foo.html")
+            .unwrap_err()
+            .to_string()
+            .starts_with("invalid url: "));
     }
 
     #[tokio::test]
