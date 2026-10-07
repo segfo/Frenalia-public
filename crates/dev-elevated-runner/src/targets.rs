@@ -834,6 +834,7 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
     // 起こすため管理者権限と外部への到達性が要る（`crates/harness-policy-editor/tests/
     // record_net_e2e.rs`）。**2本目は対のテスト**で、生ソケットがWFPに落とされることを
     // 確かめる——落とされないなら1本目の「到達できた」は強制の証明にならない。
+    // [決定68] パス2は入口から・生成禁止つきで走るので、子を起こす試験は入口から入口への辺を書く。
     //
     // **`harness_grants::`（#71の4点目）は外す**——付与側が残した状態を撤収側が片付ける順序を持つ対で、
     // `e2e-mock`付きの`harness.exe`も要る（下の`e2e-policy-editor-keeps-harness-grants`の注記）。
@@ -1078,8 +1079,8 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "transport_stdio_e2e_tests",
         ],
     ),
-    // T2の対の片側: **ポリシーエディタのパス2の子は要求受付パイプへ届き、
-    // `unknown_source_domain`で断られる**。`e2e-policy-editor-pass2`へ混ぜないのは
+    // T2の対の片側: **ポリシーエディタのパス2の子は要求受付パイプへ届き、入口のドメインから
+    // `no_matching_edge`で断られる**（決定68。遷移元は入口`workspace-shell`）。`e2e-policy-editor-pass2`へ混ぜないのは
     // `e2e-policy-editor-exec-ace`と同じ理由で、**1要素＝1測定**にするため
     // ——あちらの3本は外部到達性を要するので、所要時間がそちらに引きずられる。
     // フィルタ文字列はテスト関数名と一致していなければならない（0件マッチを
@@ -1097,6 +1098,27 @@ pub const KNOWN_TARGETS: &[(&str, &[&str])] = &[
             "--test-threads=1",
             "--nocapture",
             "pass2_reaches_the_request_pipe",
+        ],
+    ),
+    // 決定68: パス2を本番と同じ形（入口から・遷移を強制して）で走らせ、断られたファイル操作を Spawn Daemon の
+    // 許可した生成の記録（`spawn-audit.jsonl`）で起こした子のドメインへ振り分けることを、遷移先のドメイン`p6-child`への
+    // 辺つきで測る（`crates/harness-policy-editor/tests/pass2_domains_e2e.rs`）。Daemon が取った子の通し番号と ETW の
+    // 番号の一致の実測・撤収後の AppContainer プロファイルの数・プロセス内の2回目のパス2で後から書いた辺が効くことも
+    // 同じ1本で見る。目印を`C:\harness-e2e\_pass2-domains-marker`に作り、緑なら消す。
+    // フィルタはテスト関数名と一致させる（0件マッチは`check_tests_actually_ran`が非0で落とす、BUG-056同型）。
+    (
+        "e2e-policy-editor-pass2-domains",
+        &[
+            "test",
+            "-p",
+            "harness-policy-editor",
+            "--test",
+            "pass2_domains_e2e",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+            "a_pass2_from_the_entry_attributes_each_denial_to_the_domain_that_spawned_it",
         ],
     ),
     (
