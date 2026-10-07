@@ -24,6 +24,10 @@ mod tier3_progress;
 /// [段階6e] 遷移MACについてモデルへ何を見せるかの判定（§19.3.8）。**windows専用にしない**
 /// ——判定も一覧の組み立ても純粋で、**昇格もWin32も無しに単体テストできることが要**である。
 mod transition_tool;
+/// [#55] 遷移先ドメインの用意とSpawn Daemonの起動（`run_agent.rs`から移した。P7.1）。**順序が本質**で、
+/// 用意とDaemonの起動の間にドメインごとの中継プロキシとWFPの適用が入る（同モジュールのdoc）。
+#[cfg(windows)]
+mod transitions;
 /// WFP（Layer2出口強制）の経路選択と、立たなかったときの説明文。
 #[cfg(windows)]
 mod wfp_outcome;
