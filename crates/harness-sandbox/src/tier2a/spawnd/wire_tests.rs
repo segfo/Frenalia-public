@@ -31,13 +31,15 @@ fn control_request_hello_keeps_its_wire_shape() {
         // [残課題 サンドボックス周辺 #65] 空でない値で固定する——空だと、欄が
         // 落ちても`[]`と区別の付かない形でしか見えない。
         writable_outside_policy: vec!["C:/tools".to_string()],
+        // [決定68] 記録の名前（パスではなく1要素）。空でない値で固定する。
+        spawn_audit_record: Some("policy-editor-1-1".to_string()),
     })
     .expect("serialize");
     // `policy.schema_version`は`PolicyFile::default()`の版（`POLICY_SCHEMA_VERSION`）をそのまま運ぶ——2026-10-06
     // （P5.3、Strict の印）に 2 → 3。Daemon はこの値を見ずにグラフを組むので、欄の形は変わっていない。
     assert_eq!(
         json,
-        r#"{"kind":"hello","harness_process":4660,"protocol_version":11,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"]}"#
+        r#"{"kind":"hello","harness_process":4660,"protocol_version":12,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":["C:/tools"],"spawn_audit_record":"policy-editor-1-1"}"#
     );
 }
 
@@ -61,6 +63,7 @@ fn a_hello_carries_the_output_setting_of_an_edge() {
         workspace_root: "C:/w".to_string(),
         domains: Vec::new(),
         writable_outside_policy: Vec::new(),
+        spawn_audit_record: None,
     })
     .expect("serialize");
     assert!(json.contains(r#""output":"discard""#), "{json}");
@@ -87,6 +90,31 @@ fn a_hello_without_writable_outside_policy_is_refused() {
         serde_json::from_str::<ControlRequest>(without).is_err(),
         "a Hello missing writable_outside_policy must not parse as an empty list"
     );
+}
+
+/// [決定68] 記録を頼まない`Hello`（`harness.exe`）は`null`を運び、Daemon は何も書かない書き手を作る。
+/// 欄の無い電文も「頼まない」と読む——欄が無いことは検査を緩めない（記録は境界ではない）。古い相手は版の一致で断る。
+#[test]
+fn a_hello_without_a_spawn_audit_record_asks_for_no_record() {
+    let json = serde_json::to_string(&ControlRequest::Hello {
+        harness_process: 1,
+        protocol_version: PROTOCOL_VERSION,
+        policy: Box::new(harness_policy::policy_file::PolicyFile::default()),
+        workspace_root: "C:/w".to_string(),
+        domains: Vec::new(),
+        writable_outside_policy: Vec::new(),
+        spawn_audit_record: None,
+    })
+    .expect("serialize");
+    assert!(json.ends_with(r#""spawn_audit_record":null}"#), "{json}");
+    let missing = r#"{"kind":"hello","harness_process":1,"protocol_version":12,"policy":{"schema_version":3,"domains":[]},"workspace_root":"C:/w","domains":[],"writable_outside_policy":[]}"#;
+    let ControlRequest::Hello {
+        spawn_audit_record, ..
+    } = serde_json::from_str::<ControlRequest>(missing).expect("parses")
+    else {
+        panic!("not a hello");
+    };
+    assert_eq!(spawn_audit_record, None);
 }
 
 #[test]
@@ -173,7 +201,7 @@ fn control_responses_keep_their_wire_shape() {
     };
     assert_eq!(
         serde_json::to_string(&ready).expect("serialize"),
-        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":11}"#
+        r#"{"kind":"ready","request_pipe":"\\\\.\\pipe\\harness-spawnd-1-0-2","daemon_pid":1234,"protocol_version":12}"#
     );
     assert_eq!(
         serde_json::to_string(&ControlResponse::Spawned {

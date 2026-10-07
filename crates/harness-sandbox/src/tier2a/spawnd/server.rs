@@ -80,6 +80,7 @@ use crate::win_pipe_ipc::{
 
 use super::child_plan::ChildPlan;
 use super::console_holder::ConsoleHolders;
+use super::spawn_audit::SpawnAudit;
 use super::nested_inputs::{
     caller_handles_for, close_all, env_for_nested, force_request_pipe, pull_caller_stdio, OpenedStdio,
 };
@@ -196,6 +197,8 @@ struct Shared {
     /// nestedの子は`env_for_nested`が同じ名前を系統の基準envから強制するので、
     /// **ここを入口にすれば系統の全員が持つ**。
     request_pipe: String,
+    /// [決定68] 許可した生成の記録。Hello が名前を運ばなければ何も書かない（`harness.exe`）。
+    spawn_audit: SpawnAudit,
 }
 
 /// [段階6b・残課題 サンドボックス周辺 #65] `Hello`で受け取った入力から遷移のグラフを組む。
@@ -248,7 +251,7 @@ pub fn serve(
     let _control_guard = HandleGuard(control);
 
     // --- ハンドシェイク: harnessのプロセスハンドルと遷移ポリシーを受け取る ---
-    let (harness_process, graph, transitions, provisioned_domains) = match read_control(control)? {
+    let (harness_process, graph, transitions, provisioned_domains, spawn_audit) = match read_control(control)? {
         ControlRequest::Hello {
             harness_process,
             protocol_version,
@@ -256,6 +259,7 @@ pub fn serve(
             workspace_root,
             domains,
             writable_outside_policy,
+            spawn_audit_record,
         } => {
             // **harnessと同じ関数を通る**（`protocol_version_mismatch`のdoc）。
             // 片側だけが検査すると、検査していない側から古いバイナリが入れる。
@@ -275,11 +279,15 @@ pub fn serve(
             // 置き場のパスを電文で受け取らないのは、昇格した書き手が後から来るためである
             // （§10.2・`P-01`。`client::hello_request`のdocが対になっている）。
             let transitions = TransitionQueue::new(std::path::Path::new(workspace_root.as_str()));
+            // [決定68] 許可した生成の記録も**同じ`workspace_root`から**置き場を組む（名前だけを受け取る）。
+            let spawn_audit = SpawnAudit::open(&workspace_root, spawn_audit_record.as_deref())
+                .map_err(protocol_err)?;
             (
                 HANDLE(harness_process as *mut _),
                 graph,
                 transitions,
                 domains,
+                spawn_audit,
             )
         }
         other => {
@@ -304,6 +312,7 @@ pub fn serve(
         console_holders: ConsoleHolders::default(),
         transitions,
         request_pipe: request_pipe_name.clone(),
+        spawn_audit,
     });
 
     let user =
@@ -417,6 +426,8 @@ pub fn serve(
     // Jobのkill-on-closeでも畳まれるが、**それは保険であって正面の畳み方ではない**
     // （§10.1.1がキャンセルについて採ったのと同じ形）。
     shared.console_holders.shutdown();
+    // [決定68] あふれた生成の数を1行書く（あれば）。
+    shared.spawn_audit.finish();
 
     // [段階6c] **畳み込みバッファに残った回数を書き切る**（§10.2）。
     //
@@ -1069,7 +1080,10 @@ fn borrow_console_if_needed<'a>(
     );
     shared
         .console_holders
-        .borrow(&domain_key)
+        .borrow(&domain_key, &|old_pid, old_exit, new_pid| {
+            // [決定68] §7.1.2 決定4の立て直しの記録を、記録があれば同じファイルへ束ねる。
+            shared.spawn_audit.console_holder_restarted(&domain.policy_domain, old_pid, old_exit, new_pid)
+        })
         .map(Some)
         .map_err(|e| err(format!("console holder: {e}")))
 }
@@ -1348,6 +1362,8 @@ fn spawn_top_level(
         close_received_handles(job, &inherit_handles, false);
         return Err(err(format!("process table registration failed: {e}")));
     }
+    // [決定68] 許可した生成の記録（**書く点は2つのうち1つ目**。Resume より前＝子がファイルに触る前に行が在る）。
+    shared.spawn_audit.spawned(pid, info.hProcess, &request.domain.policy_domain, &request.exe, true);
 
     // harnessへ返すハンドル。**必要最小限に絞る**（§14と同じ姿勢）——harnessがこれで
     // したいのは「終わるまで待つ」と「終了コードを読む」だけである。
@@ -1585,6 +1601,8 @@ fn spawn_nested(
             "process table registration failed for the nested child: {e}"
         )));
     }
+    // [決定68] 許可した生成の記録（**書く点は2つのうち2つ目**）。ドメインは起こした先（自己ループなら呼び出し元と同じ）。
+    shared.spawn_audit.spawned(pid, info.hProcess, &target_domain.policy_domain, request.image, false);
 
     // [段階6f-1] **呼び出し元へ返すハンドルを、動かす前に作る。**
     //

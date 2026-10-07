@@ -141,6 +141,9 @@ pub(super) async fn stage_run_agent(sandbox: SandboxPrepared) -> ExitCode {
             workspace_root: workspace_root.to_string_lossy().into_owned(),
             writable_outside_policy,
             domains: provisioned.domains,
+            // [決定68 の前例の(4)] **`harness.exe`は許可した生成の記録を頼まない**（暫定）。セッションは長く
+            // `cargo build`1回で数千行になるのに、量の上限と回転を決めていない。決めた日にここで置き場の名前を渡す。
+            spawn_audit_record: None,
         };
         // **この値が段階6eの露出条件の3つ目である。** `Unrestricted`である限り、
         // 子は要求受付パイプへ頼まずに自分で生成できるので、モデルへ

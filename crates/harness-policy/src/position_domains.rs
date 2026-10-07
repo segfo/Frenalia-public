@@ -920,6 +920,18 @@ pub fn partition_fs<'e>(events: &'e [FsAuditEvent], assignment: &Assignment) -> 
             .insert(position.exe.clone());
     }
 
+    partition_by_sequence(events, &domains, &unassigned, &mut partition);
+    partition
+}
+
+/// 通し番号でファイル操作をドメインへ振り分ける本体。位置ごとのドメイン（[`partition_fs`]）とパス2の許可した生成の記録
+/// （`crate::spawn_audit::partition_fs_by_spawns`。決定68）が**同じこれを通る**（2つ目の振り分けを書かない、`B-13`）。
+pub(crate) fn partition_by_sequence<'e>(
+    events: &'e [FsAuditEvent],
+    domains: &BTreeMap<u64, &str>,
+    unassigned: &BTreeSet<u64>,
+    partition: &mut Partition<'e>,
+) {
     for event in events {
         if event.kind == FsAuditKind::Control {
             continue;
@@ -939,7 +951,6 @@ pub fn partition_fs<'e>(events: &'e [FsAuditEvent], assignment: &Assignment) -> 
             None => partition.unattributed.unknown_sequence_number += 1,
         }
     }
-    partition
 }
 
 #[cfg(test)]

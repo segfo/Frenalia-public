@@ -689,6 +689,7 @@ fn hello_request(harness_process: u64, policy: super::TransitionPolicy) -> Contr
         workspace_root,
         writable_outside_policy,
         domains,
+        spawn_audit_record,
     } = policy;
     precreate_transition_queue(&workspace_root);
     ControlRequest::Hello {
@@ -702,6 +703,8 @@ fn hello_request(harness_process: u64, policy: super::TransitionPolicy) -> Contr
         domains,
         // [残課題 サンドボックス周辺 #65] harness側の検査と同じ入力をDaemonの検査へ渡す。
         writable_outside_policy,
+        // [決定68] 記録の名前（ファイルはホストが先に作っておく）。
+        spawn_audit_record,
     }
 }
 

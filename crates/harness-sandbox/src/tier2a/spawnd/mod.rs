@@ -71,6 +71,9 @@ pub use child_process_policy::{
 };
 #[cfg(windows)]
 pub mod server;
+/// [決定68] Daemon が許可して起こした生成の記録（`spawn-audit.jsonl`）の書き手。
+#[cfg(windows)]
+mod spawn_audit;
 #[cfg(windows)]
 pub use client::{SharedSpawnDaemon, SpawnDaemonHandle, SpawnedChild, TopLevelSpawn};
 
@@ -155,7 +158,8 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 /// Strict の子へ渡す**ので、固定した操作の中身を呼び出し元が環境変数で選べる（黙って緩くなる向き）。
 /// **`harness-spawnd.exe`はテストのビルドで作り直されない**ので、版9の個体は実在し得る。
 /// **11へ上げたのは P5.4d である**（電文の形は不変）。Strict の辺の作業ディレクトリも起こす直前に検査するようになり、版10の Daemon は黙って通す。
-pub const PROTOCOL_VERSION: u32 = 11;
+/// **12へ上げたのは P6.4（決定68）である。** `Hello`に記録の名前（`spawn_audit_record`）が載った。版11の Daemon は欄を捨て、許可した生成の記録を黙って書かない。
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// 相手が名乗った制御プロトコルの版を判定する。合わなければ理由の文面を返す。
 ///
@@ -349,6 +353,9 @@ pub struct TransitionPolicy {
     /// **宣言と一緒に運ぶ。** 別々に渡すと、宣言だけ届いて表が届かない瞬間ができ、
     /// その窓の間に来た遷移だけが「用意されていない」として断られる。
     pub domains: Vec<DomainSpec>,
+    /// [決定68] 許可した生成の記録を書く**記録のディレクトリの名前**（パスの1要素）。`None`なら書かない
+    /// （`harness.exe`。量の上限と回転を決めていないので暫定。`ControlRequest::Hello::spawn_audit_record`のdoc）。
+    pub spawn_audit_record: Option<String>,
 }
 
 impl TransitionPolicy {
@@ -365,6 +372,8 @@ impl TransitionPolicy {
             // 宣言が無ければ遷移先も無い。**空は「用意できなかった」と同じ扱い**で、
             // Daemonは別ドメインへの遷移を断る（fail-closed）。
             domains: Vec::new(),
+            // 記録を頼まない（テストと、記録の無い呼び出しの出発点）。
+            spawn_audit_record: None,
         }
     }
 }
@@ -440,6 +449,12 @@ pub enum ControlRequest {
         /// 黙って空として受け付けると、その緩さが症状を出さずに成立する
         /// （[`RedirectorSpec::Cow`]の`diff_layer_capability_sid`と同じ姿勢）。
         writable_outside_policy: Vec<String>,
+        /// [決定68] 許可した生成の記録を書く**記録のディレクトリの名前**（`.harness/sandbox/`の下の1要素）。
+        ///
+        /// **パスではなく名前を運ぶ。** Daemon が`workspace_root`から置き場を組み立て、区切りや`.`で始まる名前を断り、
+        /// 在るファイルにしか追記しない（`spawnd::spawn_audit`。拒否の待ち行列が`workspace_root`から導くのと同じ作法、§10.2）。
+        /// `None`は「書かない」（`harness.exe`。暫定——決定68の前例の(4)）。**追加は必ず末尾へ**（`wire_tests`）。
+        spawn_audit_record: Option<String>,
     },
     /// トップレベルのプロセスを起こす（§12「harnessもSpawn Daemon経由でspawnを依頼する」）。
     ///

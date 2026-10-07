@@ -146,6 +146,10 @@ mod cmd_nested_spawn_tests;
 /// 撃つのは`spike-spawnd-store-alias-job`。
 mod store_alias_job_spike_tests;
 
+/// [決定68] 許可した生成の記録（`spawn-audit.jsonl`）の受け入れ（対で2本）。**同じ理由でここに置いてある**——
+/// 昇格の的`spawn-daemon`のフィルタが`win_appcontainer::spawnd_e2e_tests`なので、外へ出すと0件マッチで黙って走らない（BUG-056）。
+mod spawn_audit_record_tests;
+
 /// [段階6b] このファイルのテストが名乗る**遷移元ドメイン名**。
 ///
 /// **`DomainSpec::name`（プロファイル名の側）とわざと別の綴りにしてある。**
@@ -185,7 +189,7 @@ pub(super) fn setup_with_policy_and_transitions(
 ) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
     // **遷移先ドメインを1つも用意しない**（＝自己ループだけが通る）。
     // 用意する腕は[`setup_with_provisioned_domains`]を使う。
-    setup_with_transitions_and_domains(label, child_process_policy, declare, false)
+    setup_with_transitions_and_domains(label, child_process_policy, declare, false, None)
 }
 
 /// [#55] **遷移先ドメインを実際に用意して**同じ土台を作る。
@@ -197,7 +201,23 @@ pub(super) fn setup_with_provisioned_domains(
     child_process_policy: ChildProcessPolicy,
     declare: impl FnOnce(&std::path::Path) -> harness_policy::policy_file::PolicyFile,
 ) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
-    setup_with_transitions_and_domains(label, child_process_policy, declare, true)
+    setup_with_transitions_and_domains(label, child_process_policy, declare, true, None)
+}
+
+/// [決定68] **許可した生成の記録を頼んで**同じ土台を作る（遷移先は用意しない）。記録のディレクトリと空のファイルは
+/// 製品のホストと同じく**Daemon を起こす前に**ここで作る（Daemon はファイルを作らない）。戻り値の3つ目はファイルのパス。
+pub(super) fn setup_with_spawn_audit(
+    label: &str,
+    record: &str,
+    declare: impl FnOnce(&std::path::Path) -> harness_policy::policy_file::PolicyFile,
+) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
+    setup_with_transitions_and_domains(
+        label,
+        ChildProcessPolicy::Unrestricted,
+        declare,
+        false,
+        Some(record),
+    )
 }
 
 fn setup_with_transitions_and_domains(
@@ -205,6 +225,7 @@ fn setup_with_transitions_and_domains(
     child_process_policy: ChildProcessPolicy,
     declare: impl FnOnce(&std::path::Path) -> harness_policy::policy_file::PolicyFile,
     provision: bool,
+    spawn_audit_record: Option<&str>,
 ) -> (Case, OwnedContainerSid, Vec<crate::win_common::OwnedSid>) {
     let guard = TestDirGuard::create(label);
     let workspace = guard.path().to_path_buf();
@@ -252,6 +273,13 @@ fn setup_with_transitions_and_domains(
     );
 
     let policy = declare(&canonical);
+    // [決定68] 記録を頼む腕は、置き場を製品のホスト（エディタ）と同じく Daemon を起こす前に作る。
+    if let Some(record) = spawn_audit_record {
+        let dir = canonical.join(".harness").join("sandbox").join(record);
+        std::fs::create_dir_all(&dir).expect("the record directory");
+        std::fs::write(dir.join(harness_policy::spawn_audit::SPAWN_AUDIT_FILE), b"")
+            .expect("precreate the spawn audit");
+    }
     // [#55] **製品と同じ発行器を通す。** 手で表を組むと、製品が用意しないものを
     // テストだけが用意して緑になる（`B-13`: 判定を2つ持たない）。
     let domains = if provision {
@@ -278,6 +306,8 @@ fn setup_with_transitions_and_domains(
             // このテストは`--fs-allow`も`settings.json`も通らないので、宣言の外の書込場所は無い。
             writable_outside_policy: Vec::new(),
             domains,
+            // [決定68] 許可した生成の記録（受け入れ`spawn_audit_record_tests.rs`だけが頼む）。
+            spawn_audit_record: spawn_audit_record.map(str::to_string),
         },
         child_process_policy,
     )

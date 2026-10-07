@@ -203,6 +203,8 @@ pub(super) fn run_pass2<'a>(
         //
         // **空は「用意できなかった」と同じ扱い**で、別ドメインへの遷移は断られる（fail-closed）。
         domains: Vec::new(),
+        // [決定68] 許可した生成の記録は P6.5 で頼む（入口から走らせる段で記録の名前を渡す）。
+        spawn_audit_record: None,
     };
     let spawn_daemon = request
         .spawn_daemon
