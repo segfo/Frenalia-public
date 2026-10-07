@@ -1,6 +1,7 @@
 //! 承認待ち画面（`F2`）の**確定を1回の保存で書く**——予約から[`crate::position_approve`]の要求を組み立て、確認ダイアログを
 //! 出し、`y`で`policy.json`を**1回だけ**保存する（`plans/POLICY-EDITOR-TOMOYO-DIG.md` 決定65、`plans/position-domains/P4.md`の
-//! P4.5・P4.6）。
+//! P4.5・P4.6）。`p`なら同じものを書いてから記録画面に次のパス2を用意する（決定68(3)。P4 #43 の「確定の後は留まる」を
+//! 「選べる」へ改めた。既定の`y`は留まる）。
 //!
 //! # いつここを通るか（範囲は2つ）
 //!
@@ -35,6 +36,7 @@ use crate::position_view::{
     declared_cwds, key_of, position_edges, renamed_name, strict_destinations,
 };
 use crate::transition_approve::SourcedEdgeRef;
+use crate::tui::modal::{AfterCommit, PASS2_HINT};
 use crate::tui::state::{App, Confirm, Modal};
 use crate::tui::transition::CandidateKey;
 use crate::tui::transition_dismissed;
@@ -138,9 +140,23 @@ impl App {
         self.request_commit(Scope::Everything);
     }
 
-    /// [`Confirm::Position`]の`y`。
-    pub(crate) fn commit_position(&mut self) {
-        self.commit_scoped(Scope::Everything);
+    /// [`Confirm::Position`]の`y`（留まる）と`p`（書けたら記録画面に次のパス2を用意する。決定68(3)）。コマンドと作業
+    /// ディレクトリは開いている記録のマニフェストから、通信の扱いは記録のパスから決める（ファイルの確定と同じ`prepare_pass2`）。
+    pub(crate) fn commit_position(&mut self, after: AfterCommit) {
+        // 確定の入力（由来）と同じ記録から取る（`commit_inputs`は記録が無ければ書かない＝下の`None`の腕は書けた後には来ない）。
+        let record = self
+            .selected_session()
+            .map(|entry| (entry.manifest.pass, entry.manifest.command.clone(), entry.manifest.cwd.clone()));
+        if !self.commit_scoped(Scope::Everything) {
+            return;
+        }
+        match (after, record) {
+            (AfterCommit::Pass2, Some((pass, command, cwd))) => {
+                let note = self.status.clone();
+                self.prepare_pass2(pass, command, cwd, &note);
+            }
+            (AfterCommit::Stay, _) | (AfterCommit::Pass2, None) => self.status.push_str(PASS2_HINT),
+        }
     }
 
     /// 確定の内容を組み立てて確認ダイアログを出す（**まだ書かない**）。書けないならその理由のダイアログ。
@@ -227,15 +243,15 @@ impl App {
 
     /// 確認後に実際に書く。**入力も`plan`も作り直す**——ダイアログを見ている間に`policy.json`が別の経路（CLI・手編集）で
     /// 変わっていた場合に、古い読み込み結果で上書きしないため。却下印も、書く直前に読み直したファイルへ予約の差分を当てる
-    /// （[`transition_dismissed::update`]）。
-    pub(super) fn commit_scoped(&mut self, scope: Scope) {
+    /// （[`transition_dismissed::update`]）。**最後まで進んだら`true`**（何も書かずに断ったら`false`。`p`はそのときパス2へ進まない）。
+    pub(super) fn commit_scoped(&mut self, scope: Scope) -> bool {
         let Some(inputs) = self.commit_inputs(scope) else {
-            return;
+            return false;
         };
         if inputs.has_dismissals() {
             if let Err(e) = transition_dismissed::load(&self.workspace_root) {
                 self.status = format!("却下印を書けませんでした（何も書いていません）: {e}");
-                return;
+                return false;
             }
         }
         let mut done: Vec<String> = Vec::new();
@@ -244,7 +260,7 @@ impl App {
                 Ok(plan) => plan,
                 Err(e) => {
                     self.status = format!("書けませんでした（何も書いていません）: {e}");
-                    return;
+                    return false;
                 }
             };
             match position_approve::commit(&self.workspace_root, &plan, &policy_file::save) {
@@ -260,7 +276,7 @@ impl App {
                 ),
                 Err(e) => {
                     self.status = e.to_string();
-                    return;
+                    return false;
                 }
             }
             self.clear_written_reservations(scope);
@@ -296,6 +312,7 @@ impl App {
         // 宣言が変わったので重ね（`[x]`）と遷移の候補を作り直す。
         self.refresh_declared_overlay();
         self.reload_transitions();
+        true
     }
 
     /// 書いた予約を空にする。範囲の外の予約（[`Scope::TransitionsOnly`]のファイル・通信の選択）は残す。

@@ -1501,19 +1501,14 @@ impl App {
         if harness_term::is_chorded_char(&key) {
             return None;
         }
-        let kind = self.modal.as_ref().map(|m| m.confirm);
-        let confirm = kind.is_some_and(Confirm::asks);
+        let confirm = self.modal.as_ref().is_some_and(|m| m.confirm.asks());
         // 差分が長いと画面に収まらない。**最後まで読めないと確認にならない**ので送れるようにする。
         // 上限（最後の行が枠の一番下に来る位置）はここでは掛けない——折り返した後の行数は描くまで
         // 分からない。行き過ぎた分は次の描画の後に`apply_draw_feedback`が切り詰める（BUG-196・BUG-076）。
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') if confirm => {
-                self.modal = None;
-                self.modal_scroll = 0;
-                // **何を書くのかはモーダルが持っている**（開いた画面を推測しない。振り分けは`tui::modal`）。
-                if let Some(kind) = kind {
-                    self.commit_confirmed(kind);
-                }
+            // `y`＝書いて留まる・`p`＝書いてパス2へ（決定68(3)）。何を書くのか・`p`を受けるかはモーダルが持つ（`tui::modal`）。
+            KeyCode::Char('y' | 'Y' | 'p' | 'P') if confirm => {
+                self.on_commit_key(key.code);
                 None
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {

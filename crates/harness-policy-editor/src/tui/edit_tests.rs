@@ -274,7 +274,8 @@ fn approving_into_a_transition_destination_lists_the_widened_edge() {
     assert!(text.contains(&format!("{ENTRY_DOMAIN} → cargo")), "{text}");
 }
 
-/// `y`で実際に`policy.json`が増える（許可側。B-35の対）。次はパス2、というガイドまで含めて固定する。
+/// `p`で実際に`policy.json`が増える（許可側。B-35の対）。次はパス2、というガイドまで含めて固定する。
+/// [決定68(3)] 以前は`y`がこの形（書いて記録画面へ移る）だった。いまは`y`＝書いて留まる・`p`＝書いてパス2へ進む。
 #[test]
 fn confirming_the_diff_writes_the_policy_file_and_points_at_pass2() {
     let ws = workspace();
@@ -286,7 +287,7 @@ fn confirming_the_diff_writes_the_policy_file_and_points_at_pass2() {
     app.on_key(key(KeyCode::Char(' ')));
     app.on_key(key(KeyCode::Char('a')));
 
-    app.on_key(key(KeyCode::Char('y')));
+    app.on_key(key(KeyCode::Char('p')));
 
     let policy = crate::policy_file::load(ws.path()).expect("policy.json");
     let domain = policy.domain("cargo").expect("ドメインが作られている");
@@ -314,6 +315,59 @@ fn confirming_the_diff_writes_the_policy_file_and_points_at_pass2() {
         "パス2を書いたドメインから始めるように読める: {}",
         app.status
     );
+}
+
+/// [決定68(3)] **確定のダイアログの`y`は書いて留まる**（既定・暫定）。承認待ちの画面のまま、パスもコマンドも記録画面へ用意しない。
+/// 知らせは書いたことと、`p`ならパス2へ進めることを言う。対の側: `p`は同じ中身を書いてパス2へ進む（下の試験）。
+#[test]
+fn y_in_the_approval_dialog_writes_and_stays_on_the_screen() {
+    let ws = workspace();
+    seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+    let mut app = open_edit(&ws);
+    app.edit_focus = EditField::Proposals;
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('a')));
+    assert_eq!(app.modal.as_ref().map(|m| m.confirm), Some(Confirm::Approval));
+
+    app.on_key(key(KeyCode::Char('y')));
+
+    assert!(app.modal.is_none());
+    let policy = crate::policy_file::load(ws.path()).expect("policy.json");
+    assert!(!policy.domain("cargo").expect("ドメイン").fs.is_empty(), "書けていない");
+    assert_eq!(app.screen, Screen::Edit, "留まる");
+    assert_eq!(app.pass, Pass::One, "パス2を用意しない");
+    assert_eq!(app.command.text(), "", "記録画面へコマンドを用意しない");
+    assert!(app.status.contains("書きました"), "{}", app.status);
+    assert!(
+        app.status.contains(crate::tui::modal::PASS2_HINT),
+        "p でパス2へ進めることを言う: {}",
+        app.status
+    );
+}
+
+/// [決定68(3)] **`p`は`y`と同じ中身を書き、記録画面にパス2を用意する**（パス1の候補なので通信は記録で集める）。
+#[test]
+fn p_in_the_approval_dialog_writes_and_prepares_pass2() {
+    let written = |answer: char| {
+        let ws = workspace();
+        seed_pass1(&ws, "s1", "cargo build", &[r"C:\Users\me\.cargo\a.rs"]);
+        let mut app = open_edit(&ws);
+        app.edit_focus = EditField::Proposals;
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(key(KeyCode::Char(answer)));
+        let policy = crate::policy_file::load(ws.path()).expect("policy.json");
+        let domain = policy.domain("cargo").expect("ドメイン").clone();
+        (app.screen, app.pass, app.net_mode, app.command.text().to_string(), (domain.fs, domain.commands))
+    };
+    let (stay_screen, _, _, _, stay_written) = written('y');
+    let (screen, pass, net_mode, command, pass2_written) = written('p');
+    assert_eq!(pass2_written, stay_written, "y と p で書く中身が違う");
+    assert_eq!(stay_screen, Screen::Edit);
+    assert_eq!(screen, Screen::Record, "p は記録画面へ移る");
+    assert_eq!(pass, Pass::Two);
+    assert_eq!(net_mode, NetMode::RecordAll);
+    assert_eq!(command, "cargo build");
 }
 
 /// 差分は**access種別ごとにまとめる**。`+ fs.read = <パス>`を1行ずつ出すと、687件では
@@ -1000,6 +1054,8 @@ fn a_pass2_recording_shows_the_domain_candidates() {
 /// （宣言した通信先だけで動くかを確かめるのが次の一手）。パス1の候補を承認したときは
 /// 記録モード（`fs_approval_leads_to_pass2`の側）——モードを取り違えると、宣言をまだ持たない
 /// ドメインを全部断る実行へ案内してしまう。
+///
+/// [決定68(3)] パス2へ進むのは`p`（`y`は書いて留まる）。
 #[test]
 fn approving_domains_leads_to_the_enforcing_pass2() {
     let ws = workspace();
@@ -1009,7 +1065,7 @@ fn approving_domains_leads_to_the_enforcing_pass2() {
     app.on_key(key(KeyCode::Char(' ')));
     app.on_key(key(KeyCode::Char('a')));
 
-    app.on_key(key(KeyCode::Char('y')));
+    app.on_key(key(KeyCode::Char('p')));
 
     let policy = crate::policy_file::load(ws.path()).expect("policy.json");
     assert_eq!(

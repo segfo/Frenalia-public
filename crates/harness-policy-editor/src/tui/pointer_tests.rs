@@ -1221,7 +1221,8 @@ fn a_letter_hint_leaves_the_field_before_pressing_the_key() {
 }
 
 /// **確認ダイアログの下辺の`y=書く`・`n / Esc=やめる`は、`y`・`n`を押したのと同じ。**読むだけのダイアログの
-/// `Enter / Esc=閉じる`は`Enter`。`y`は書く——`policy.json`の中身もキーで書いたものと一致する。
+/// `Enter / Esc=閉じる`は`Enter`。`y`は書く——`policy.json`の中身もキーで書いたものと一致する。ファイルの確定の
+/// `y=書いて留まる`・`p=書いてパス2へ`も`y`・`p`を押したのと同じ（決定68(3)。`p`のボタンでパス2が用意される）。
 #[test]
 fn the_confirmation_buttons_do_what_their_keys_do() {
     type Make = fn(&std::path::Path) -> App;
@@ -1235,11 +1236,22 @@ fn the_confirmation_buttons_do_what_their_keys_do() {
         });
         app
     };
+    // [決定68(3)] ファイルの確定のダイアログ（`p`を受ける。ボタンが3つ）。
+    let approval: Make = |ws| {
+        let mut app = edit_screen_with_a_tree(ws);
+        app.selected_row = tree_row(&app, "a.rs");
+        press(&mut app, KeyCode::Char(' '));
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.modal.as_ref().map(|m| m.confirm), Some(Confirm::Approval));
+        app
+    };
     let modal_bottom = |grid: &[Vec<String>], app: &App| {
         let area = modal_box(grid, app);
         Rect::new(area.x, area.bottom() - 1, area.width, 1)
     };
-    let cases: [(&str, Make, &str, KeyCode); 3] = [
+    let cases: [(&str, Make, &str, KeyCode); 5] = [
+        ("y=書いて留まる", approval, "y=書いて留まる", KeyCode::Char('y')),
+        ("p=書いてパス2へ", approval, "p=書いてパス2へ", KeyCode::Char('p')),
         ("y=書く", confirmation, "y=書く", KeyCode::Char('y')),
         (
             "n / Esc=やめる",

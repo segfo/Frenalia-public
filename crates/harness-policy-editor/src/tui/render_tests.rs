@@ -777,10 +777,12 @@ fn the_end_key_reaches_the_last_line_even_when_every_line_wraps() {
         .map(|i| format!("{i:02}{}", "折り返す長さの行".repeat(6)))
         .collect();
     lines.push("ここが最後の行です".to_string());
+    // [P6.7] 種類は遷移の確定（ボタン2つ）。ファイルの確定はボタンが3つになり、80桁では送り方の案内が収まらず
+    // 「N〜M/T行」だけになる（決定68(3)。その形は`modal_tests`が測る）。ここで測るのは折り返した後の行で送ること。
     app.modal = Some(state::Modal {
         title: "承認の確認".to_string(),
         lines,
-        confirm: Confirm::Approval,
+        confirm: Confirm::Transition,
     });
     let modal_screen = |app: &mut App| {
         let rows: Vec<String> = frame(app, 80, 24)
@@ -1064,10 +1066,11 @@ fn pressing_down_at_the_end_does_not_bank_up_rows_to_unwind() {
 fn a_long_diff_scrolls_row_by_row_and_page_by_page_and_stops_at_the_end() {
     let ws = workspace();
     let mut app = App::new(ws.path().to_path_buf(), harness_core::RequireSandbox::None);
+    // [P6.7] 種類は遷移の確定（ボタン2つ）。ファイルの確定のボタン3つでは送り方の案内が下辺に収まらない（`modal_tests`）。
     app.modal = Some(state::Modal {
         title: "承認の確認".to_string(),
         lines: (0..50).map(|i| format!("  + fs.read = C:/x/{i}")).collect(),
-        confirm: Confirm::Approval,
+        confirm: Confirm::Transition,
     });
     // 下辺の「N〜M/T行」と、枠の中の行数。
     let shown = |app: &mut App| {

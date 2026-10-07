@@ -1,5 +1,6 @@
 //! 承認待ち画面（`F2`）のFS/ネットのタブの**確定**——選んだ候補（と外したチェック）から確認ダイアログを
-//! 組み立て、`y`で`policy.json`へ書く（[`crate::tui::state::App`]の続き）。
+//! 組み立て、`y`で`policy.json`へ書く（[`crate::tui::state::App`]の続き）。`p`なら書いて記録画面に次のパス2を
+//! 用意する（決定68(3)、[`App::prepare_pass2`]。位置の確定の`p`も同じこれを通る）。
 //!
 //! 候補を開く・選ぶ操作は[`super::edit`]が持つ。2026-10-05に`edit.rs`から**そのまま**移した
 //! （本体が1,000行を超えていたため。`plans/position-domains/P4.md`のP4.0。振る舞いは変えていない）。
@@ -14,6 +15,7 @@
 use crate::approve::{self, ApproveRequest, PathClass};
 use crate::policy_file;
 use crate::session_dir::NetMode;
+use crate::tui::modal::{AfterCommit, PASS2_HINT};
 use crate::tui::state::{App, Confirm, EditField, Modal, Pass, RecordField, Screen};
 
 impl App {
@@ -248,8 +250,9 @@ impl App {
         self.modal_scroll = 0;
     }
 
-    /// モーダルで`y`が押されたときに実際に書く。**planを作り直してから**書く（モジュールdoc）。
-    pub(crate) fn commit_approval(&mut self) {
+    /// モーダルで`y`（`p`）が押されたときに実際に書く。**planを作り直してから**書く（モジュールdoc）。書けたら`after`で
+    /// 留まるか、記録画面に次のパス2を用意する（決定68(3)。[`Self::prepare_pass2`]）。書けなかったらどちらでも留まる。
+    pub(crate) fn commit_approval(&mut self, after: AfterCommit) {
         if self.view.is_none() {
             return;
         }
@@ -322,10 +325,24 @@ impl App {
         let written = policy_file::path(&self.workspace_root)
             .display()
             .to_string();
-        // ガイド: 次の1回を記録画面に用意する（Enterで開始。「パス」欄で変えられる）。
-        //  - パス1の候補を承認した → パス2（記録）。ここで初めてACEが付き、通信先を集める。
-        //  - パス2の候補を承認した → パス2（強制）。宣言した通信先だけで動くか、宣言の外で
-        //    断られる宛先が無いかを確かめる（決定64）。
+        let note = format!("書きました: {written}{unapproved_note}");
+        match after {
+            AfterCommit::Stay => self.status = format!("{note}{PASS2_HINT}"),
+            AfterCommit::Pass2 => self.prepare_pass2(pass_of_record, command, cwd, &note),
+        }
+    }
+
+    /// 確定の後に、次の1回（パス2）を記録画面に用意する（Enterで開始。「パス」欄で変えられる）。ファイルの確定と位置の確定
+    /// （`tui::position_commit`）の`p`が同じこれを通る（決定68(3)）。`note`は書いた結果の知らせで、次の一手の前に置く。
+    ///  - パス1の候補を承認した → パス2（記録）。ここで初めてACEが付き、通信先を集める。
+    ///  - パス2の候補を承認した → パス2（強制）。宣言した通信先だけで動くか、宣言の外で断られる宛先が無いかを確かめる（決定64）。
+    pub(super) fn prepare_pass2(
+        &mut self,
+        pass_of_record: u8,
+        command: String,
+        cwd: std::path::PathBuf,
+        note: &str,
+    ) {
         let next_mode = if pass_of_record == 2 {
             NetMode::Declared
         } else {
@@ -340,11 +357,10 @@ impl App {
         self.record_focus = RecordField::Command;
         self.status = match next_mode {
             NetMode::RecordAll => format!(
-                "書きました: {written}{unapproved_note}。次はパス2——\
-                 **ここで初めてACEが付きます**。Enterで開始"
+                "{note}。次はパス2——**ここで初めてACEが付きます**。Enterで開始"
             ),
             NetMode::Declared => format!(
-                "書きました: {written}{unapproved_note}。次はパス2の強制——\
+                "{note}。次はパス2の強制——\
                  宣言した通信先だけを許して走らせ、断られる宛先が無いかを確かめます。Enterで開始"
             ),
         };
